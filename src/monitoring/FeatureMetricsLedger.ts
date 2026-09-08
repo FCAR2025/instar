@@ -160,6 +160,27 @@ export interface FeatureReliabilitySummary {
   components: FeatureReliabilityComponent[];
 }
 
+export type FeatureReliabilityHealthState =
+  | 'failing-now'
+  | 'degraded-now'
+  | 'healthy-recent'
+  | 'insufficient-recent-sample'
+  | 'historical-window'
+  | 'unverified-no-recent-calls';
+
+export interface FeatureReliabilityHealthSummary extends FeatureReliabilitySummary {
+  state: FeatureReliabilityHealthState;
+  windowHours: number;
+  freshnessHours: number;
+  lastCallAt: number | null;
+  lastCallAgeMs: number | null;
+  recentRealCalls: number;
+  recentlySampledComponents: number;
+  sufficientlySampledComponents: number;
+  historical: FeatureReliabilitySummary;
+  recent: FeatureReliabilitySummary;
+}
+
 export const FEATURE_RELIABILITY_MINIMUM_CALLS = 20;
 export const FEATURE_RELIABILITY_DEGRADED_ERROR_RATE = 0.2;
 export const FEATURE_RELIABILITY_FAILING_ERROR_RATE = 0.5;
@@ -1031,6 +1052,82 @@ export class FeatureMetricsLedger {
         errorRate: realLlmCalls > 0 ? llmErrors / realLlmCalls : null,
       };
     }));
+  }
+
+  /**
+   * Freshness-aware reliability for /health. A broken historical window remains
+   * visible, but only a sufficiently sampled recent slice can mark the service
+   * degraded. This avoids claiming both "failing now" and "healthy now" when
+   * the provider has been silent.
+   */
+  healthReliability(opts: { windowHours?: number; freshnessHours?: number } = {}): FeatureReliabilityHealthSummary {
+    const windowHours = opts.windowHours && opts.windowHours > 0 ? opts.windowHours : 24;
+    const freshnessHours = opts.freshnessHours && opts.freshnessHours > 0 ? opts.freshnessHours : 1;
+    const now = this.now();
+    const windowSinceMs = now - windowHours * 3_600_000;
+    const freshnessSinceMs = now - freshnessHours * 3_600_000;
+    const rows = this.db.prepare(
+      `SELECT
+         feature,
+         SUM(CASE WHEN outcome!='shed' THEN 1 ELSE 0 END) AS realLlmCalls,
+         SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) AS llmErrors,
+         SUM(CASE WHEN ts >= @freshnessSinceMs AND outcome!='shed' THEN 1 ELSE 0 END) AS recentRealLlmCalls,
+         SUM(CASE WHEN ts >= @freshnessSinceMs AND outcome='error' THEN 1 ELSE 0 END) AS recentLlmErrors,
+         MAX(CASE WHEN outcome!='shed' THEN ts ELSE NULL END) AS lastRealCallAt
+       FROM feature_metrics
+       WHERE ts >= @windowSinceMs AND kind='llm'
+       GROUP BY feature`,
+    ).all({ windowSinceMs, freshnessSinceMs }) as Array<{
+      feature: string;
+      realLlmCalls: number;
+      llmErrors: number;
+      recentRealLlmCalls: number;
+      recentLlmErrors: number;
+      lastRealCallAt: number | null;
+    }>;
+    const toReliabilityRows = (recent: boolean) => rows.map((row) => {
+      const realLlmCalls = Number(recent ? row.recentRealLlmCalls : row.realLlmCalls) || 0;
+      const llmErrors = Number(recent ? row.recentLlmErrors : row.llmErrors) || 0;
+      return {
+        feature: String(row.feature),
+        realLlmCalls,
+        llmErrors,
+        errorRate: realLlmCalls > 0 ? llmErrors / realLlmCalls : null,
+      };
+    });
+    const historical = summarizeFeatureReliability(toReliabilityRows(false));
+    const recent = summarizeFeatureReliability(toReliabilityRows(true));
+    const recentRealCalls = rows.reduce((sum, row) => sum + (Number(row.recentRealLlmCalls) || 0), 0);
+    const recentlySampled = rows.filter((row) => (Number(row.recentRealLlmCalls) || 0) > 0);
+    const sufficientlySampled = recentlySampled.filter(
+      (row) => (Number(row.recentRealLlmCalls) || 0) >= FEATURE_RELIABILITY_MINIMUM_CALLS,
+    );
+    const lastCallAt = rows.reduce<number | null>((latest, row) => {
+      const ts = row.lastRealCallAt == null ? null : Number(row.lastRealCallAt);
+      return ts !== null && Number.isFinite(ts) && (latest === null || ts > latest) ? ts : latest;
+    }, null);
+    const state: FeatureReliabilityHealthState = recent.status === 'failing'
+      ? 'failing-now'
+      : recent.status === 'degraded'
+        ? 'degraded-now'
+        : recentRealCalls === 0
+          ? historical.status === 'ok' ? 'unverified-no-recent-calls' : 'historical-window'
+          : sufficientlySampled.length !== recentlySampled.length
+            ? 'insufficient-recent-sample'
+            : 'healthy-recent';
+    return {
+      ...recent,
+      state,
+      windowHours,
+      freshnessHours,
+      lastCallAt,
+      lastCallAgeMs: lastCallAt === null ? null : Math.max(0, now - lastCallAt),
+      recentRealCalls,
+      recentlySampledComponents: recentlySampled.length,
+      sufficientlySampledComponents: sufficientlySampled.length,
+      historical,
+      recent,
+    };
   }
 
   /** Per-feature rollup over the lookback window (default: all time). */

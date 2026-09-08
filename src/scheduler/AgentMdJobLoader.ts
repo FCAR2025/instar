@@ -945,6 +945,28 @@ function loadAgentMdBody(
   const fmValidation = validateFrontmatterShape(frontmatter, manifest);
   if (fmValidation.problem) return { job: null, problem: fmValidation.problem };
 
+  if (frontmatter.grounding !== undefined) {
+    const grounding = z.object({
+      requiresIdentity: BoolField,
+      processesExternalInput: BoolField.optional(),
+      contextFiles: z.array(z.string().trim().min(1)).optional(),
+      questions: z.array(z.string().trim().min(1)).optional(),
+    }).strict().safeParse(frontmatter.grounding);
+    if (!grounding.success) {
+      return {
+        job: null,
+        problem: {
+          kind: 'agentmd-frontmatter-invalid',
+          slug: manifest.slug,
+          origin: manifest.origin,
+          path: resolved,
+          message: `Invalid grounding: ${grounding.error.message}`,
+        },
+      };
+    }
+    frontmatter.grounding = grounding.data;
+  }
+
   // Build the JobDefinition. Manifest fields win over frontmatter fields by
   // spec §"Open Questions Resolved" — manifest is authority for cron; frontmatter
   // is authority for behavior (name/description). For Phase 1a we surface
@@ -1219,6 +1241,7 @@ function manifestToJobDefinition(
     manifestVersion: manifest.manifestVersion,
     mcpAccess: manifest.mcpAccess,
     perMachineIndependent: manifest.perMachineIndependent,
+    grounding: frontmatter?.grounding as JobDefinition['grounding'],
   };
 
   if (manifest.execute.type === 'agentmd') {

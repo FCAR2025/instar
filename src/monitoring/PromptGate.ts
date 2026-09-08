@@ -12,8 +12,52 @@
 import { EventEmitter } from 'node:events';
 import { buildBoundedContext, buildStructuredSha256Identity } from '../core/JudgmentProvenanceLog.js';
 import { DP_PROMPT_INJECTION_DETECT } from '../data/provenanceCoverage.js';
+import { ANTHROPIC_MODELS } from '../core/models.js';
 
 export const PROMPT_GATE_LLM_DETECT_PROMPT_ID = 'prompt-injection-detect-v1';
+
+export interface PromptGateCanaryResult {
+  ok: boolean;
+  expected: 'NO_PROMPT';
+  actual: 'NO_PROMPT' | 'UNEXPECTED_RESPONSE';
+  latencyMs: number;
+  checkedAt: string;
+}
+
+/**
+ * Exercise PromptGate's configured provider without creating or inspecting a
+ * session. The fixed fixture has one safe answer and the response is normalized
+ * before returning so provider text can never become an approval or relay input.
+ */
+export async function runPromptGateCanary(
+  intelligence: import('../core/types.js').IntelligenceProvider,
+): Promise<PromptGateCanaryResult> {
+  const startedAt = Date.now();
+  const response = await intelligence.evaluate(
+    `PromptGate health canary fixture. This is not a real session and contains no action to approve.
+Terminal output:
+<terminal>
+Background task completed successfully.
+❯
+</terminal>
+Respond exactly NO_PROMPT.`,
+    {
+      maxTokens: 20,
+      temperature: 0,
+      timeoutMs: 30_000,
+      promptCanaryHardening: { model: ANTHROPIC_MODELS.haiku },
+      attribution: { component: 'PromptGate', gating: false },
+    },
+  );
+  const ok = response.trim() === 'NO_PROMPT';
+  return {
+    ok,
+    expected: 'NO_PROMPT',
+    actual: ok ? 'NO_PROMPT' : 'UNEXPECTED_RESPONSE',
+    latencyMs: Date.now() - startedAt,
+    checkedAt: new Date().toISOString(),
+  };
+}
 
 /** Identity-only envelope for the exact bounded terminal context shown to the detector. */
 export function buildPromptGateDecisionContext(input: {

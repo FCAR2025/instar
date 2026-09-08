@@ -24,6 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildClaudeReviewerArgs,
+  buildClaudePromptCanaryArgs,
   buildClaudeReviewerChildEnv,
 } from '../../src/core/ClaudeCliIntelligenceProvider.js';
 import {
@@ -54,6 +55,25 @@ describe('hardened reviewer ARGV (§1.4 — deterministic)', () => {
     // no positional prompt: print-mode with no prompt arg reads stdin
     expect(args).toContain('--print');
     expect(args).not.toContain('-p');
+  });
+});
+
+describe('PromptGate canary ARGV (deterministic)', () => {
+  const args = buildClaudePromptCanaryArgs('claude-haiku-4-5');
+
+  it('removes tools, MCPs, and session persistence on the canary-only path', () => {
+    const tools = args.indexOf('--tools');
+    expect(tools).toBeGreaterThanOrEqual(0);
+    expect(args[tools + 1]).toBe('');
+    expect(args).toContain('--strict-mcp-config');
+    expect(args).toContain('--safe-mode');
+    expect(args).toContain('--no-session-persistence');
+    expect(args).not.toContain('-p');
+  });
+
+  it('pins the canonical cheap model and one turn', () => {
+    expect(args[args.indexOf('--model') + 1]).toBe('claude-haiku-4-5');
+    expect(args[args.indexOf('--max-turns') + 1]).toBe('1');
   });
 });
 

@@ -368,6 +368,34 @@ export class SubscriptionEmailReconciliationBarrier {
   }
 }
 
+/**
+ * Read the pool count only when machine-backed authority is ready. Optional
+ * subscription features must not crash server boot by enumerating an
+ * unavailable pool.
+ */
+export function readySubscriptionAccountCount(pool: {
+  getAvailability(): SubscriptionPoolAvailability;
+  size(): number;
+}): number {
+  return pool.getAvailability().state === 'ready' ? pool.size() : 0;
+}
+
+/**
+ * Finish reconciliation only when the authoritative gap list is readable.
+ * A failed read deliberately leaves the barrier in its initial blocking state.
+ */
+export function finishSubscriptionEmailBarrierIfReadable(
+  pool: { listEmailGaps(): unknown[] },
+  barrier: SubscriptionEmailReconciliationBarrier,
+): boolean {
+  try {
+    barrier.finish(pool.listEmailGaps().length);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface AddAccountInput {
   id: string;
   nickname: string;

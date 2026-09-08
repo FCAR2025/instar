@@ -92,6 +92,22 @@ export function buildClaudeReviewerArgs(model: string): string[] {
   ];
 }
 
+/** Tool-free, sessionless argv for the fixed PromptGate health canary only. */
+export function buildClaudePromptCanaryArgs(model: string): string[] {
+  return [
+    '--print',
+    '--safe-mode',
+    '--no-session-persistence',
+    '--tools', '',
+    '--allowedTools', '',
+    '--strict-mcp-config',
+    '--model', model,
+    '--max-turns', '1',
+    '--output-format', 'json',
+    '--setting-sources', 'user',
+  ];
+}
+
 export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
   private claudePath: string;
 
@@ -113,15 +129,19 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
     // the call runs locked down (empty allowed-tools, strict-mcp-config, neutral
     // scratch cwd, stdin prompt, env allowlist).
     const hardened = options?.reviewerHardening;
-    const model = resolveCliFlag(hardened?.model ?? options?.model ?? DEFAULT_MODEL);
+    const canaryHardened = options?.promptCanaryHardening;
+    const isolated = !!hardened || !!canaryHardened;
+    const model = resolveCliFlag(canaryHardened?.model ?? hardened?.model ?? options?.model ?? DEFAULT_MODEL);
     // Observable Intelligence: surface the resolved provider/model before the
     // call runs, so the metrics funnel can attribute it even on error/timeout.
     try { options?.onModel?.({ model, framework: 'claude-code' }); } catch { /* @silent-fallback-ok: onModel is pure observability — a throw must never break the LLM path */ }
 
     return new Promise((resolve, reject) => {
-      const args = hardened
-        ? buildClaudeReviewerArgs(model)
-        : [
+      const args = canaryHardened
+        ? buildClaudePromptCanaryArgs(model)
+        : hardened
+          ? buildClaudeReviewerArgs(model)
+          : [
             '-p', prompt,
             '--model', model,
             '--max-turns', '1',
@@ -139,7 +159,7 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
       // Env: hardened calls use the ALLOWLIST-only env (agent secrets never
       // cross); the default path strips only the Claude Code session markers so a
       // nested session can't wedge it (unchanged behavior).
-      const childEnv = hardened
+      const childEnv = isolated
         ? buildClaudeReviewerChildEnv(process.env)
         : (() => {
             const e = { ...process.env };
@@ -155,10 +175,10 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
         // conformance gate reviewing a full spec) need more than 30s.
         timeout: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         // Hardened reviewer replies are full spec reviews — allow a larger buffer.
-        maxBuffer: hardened ? 8 * 1024 * 1024 : 1024 * 1024,
+        maxBuffer: isolated ? 8 * 1024 * 1024 : 1024 * 1024,
         env: childEnv,
         // Neutral scratch cwd for a hardened call (§1.4) — never the repo root.
-        ...(hardened ? { cwd: resolveReviewerScratchDir() } : {}),
+        ...(isolated ? { cwd: resolveReviewerScratchDir() } : {}),
       }, (error, stdout, stderr) => {
         if (error) {
           // Timeout or other error — reject so caller can fall back. Include a
@@ -175,7 +195,7 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
 
       // Hardened calls pass the prompt over STDIN (§1.4) so it never appears in
       // ps-visible argv; the default path already carries it as the `-p` arg.
-      if (hardened) {
+      if (isolated) {
         child.stdin?.write(prompt);
       }
       // Write prompt via stdin for very long prompts (belt and suspenders)

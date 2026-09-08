@@ -138,6 +138,71 @@ describe('GET /metrics/features (integration)', () => {
     });
   });
 
+  it('keeps historical failures visible without claiming they are failing now', async () => {
+    const now = Date.parse('2026-09-08T16:00:00.000Z');
+    ledger = new FeatureMetricsLedger({ dbPath: ':memory:', now: () => now });
+    for (let i = 0; i < 20; i++) {
+      ledger.record({
+        feature: 'PromptGate',
+        outcome: 'error',
+        ts: now - 7 * 3_600_000,
+      });
+    }
+
+    const res = await request(appWith(ledger)).get('/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.llmReliability).toMatchObject({
+      state: 'historical-window',
+      windowHours: 24,
+      freshnessHours: 1,
+      lastCallAt: now - 7 * 3_600_000,
+      lastCallAgeMs: 7 * 3_600_000,
+      recentRealCalls: 0,
+      historical: {
+        status: 'failing',
+        components: [expect.objectContaining({ feature: 'PromptGate', errors: 20, realCalls: 20 })],
+      },
+      recent: { status: 'ok', components: [] },
+    });
+  });
+
+  it('reports no recent telemetry as unverified instead of healthy', async () => {
+    const now = Date.parse('2026-09-08T16:00:00.000Z');
+    ledger = new FeatureMetricsLedger({ dbPath: ':memory:', now: () => now });
+
+    const res = await request(appWith(ledger)).get('/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.llmReliability).toMatchObject({
+      state: 'unverified-no-recent-calls',
+      lastCallAt: null,
+      lastCallAgeMs: null,
+      recentRealCalls: 0,
+    });
+  });
+
+  it('does not combine undersampled components into a healthy-recent claim', async () => {
+    const now = Date.parse('2026-09-08T16:00:00.000Z');
+    ledger = new FeatureMetricsLedger({ dbPath: ':memory:', now: () => now });
+    for (const feature of ['GateA', 'GateB']) {
+      for (let i = 0; i < 10; i++) ledger.record({ feature, outcome: 'error' });
+    }
+
+    const res = await request(appWith(ledger)).get('/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+    expect(res.body.llmReliability).toMatchObject({
+      state: 'insufficient-recent-sample',
+      recentRealCalls: 20,
+      recentlySampledComponents: 2,
+      sufficientlySampledComponents: 0,
+    });
+  });
+
   it('renders reliability enumeration failure as unavailable, never healthy or empty', async () => {
     ledger = new FeatureMetricsLedger({ dbPath: ':memory:' });
     ledger.close();

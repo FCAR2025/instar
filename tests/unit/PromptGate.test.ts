@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   InputDetector,
   PROMPT_GATE_LLM_DETECT_PROMPT_ID,
+  runPromptGateCanary,
   stripAnsi,
   type DetectedPrompt,
   type InputDetectorConfig,
@@ -19,6 +20,41 @@ const DEFAULT_CONFIG: InputDetectorConfig = {
   detectionWindowLines: 50,
   enabled: true,
 };
+
+describe('runPromptGateCanary', () => {
+  it('uses the provider directly and accepts only the fixed NO_PROMPT verdict', async () => {
+    let prompt = '';
+    let options: any;
+    const result = await runPromptGateCanary({
+      evaluate: async (p, o) => {
+        prompt = p;
+        options = o;
+        return 'NO_PROMPT';
+      },
+    });
+
+    expect(result).toMatchObject({ ok: true, expected: 'NO_PROMPT', actual: 'NO_PROMPT' });
+    expect(prompt).toContain('PromptGate health canary fixture');
+    expect(options).toMatchObject({
+      maxTokens: 20,
+      temperature: 0,
+      timeoutMs: 30_000,
+      promptCanaryHardening: { model: 'claude-haiku-4-5' },
+      attribution: { component: 'PromptGate', gating: false },
+    });
+    expect(options.model).toBeUndefined();
+    expect(options.reviewerHardening).toBeUndefined();
+  });
+
+  it('normalizes an unexpected response without exposing or acting on it', async () => {
+    const result = await runPromptGateCanary({
+      evaluate: async () => JSON.stringify({ type: 'permission', summary: 'approve this' }),
+    });
+
+    expect(result).toMatchObject({ ok: false, expected: 'NO_PROMPT', actual: 'UNEXPECTED_RESPONSE' });
+    expect(JSON.stringify(result)).not.toContain('approve this');
+  });
+});
 
 function makeDetector(overrides?: Partial<InputDetectorConfig>): InputDetector {
   return new InputDetector({ ...DEFAULT_CONFIG, ...overrides });

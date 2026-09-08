@@ -203,6 +203,15 @@ Before deferring work because the machine "looks loaded," RUN \`.instar/scripts/
 - **When to use** (PROACTIVE — this is the trigger): the moment you catch yourself about to hold off on work, fan out parallel sub-agents, or report "the machine is loaded" → run \`load-assess.sh\` and act on its verdict, not on a load-average glance.\n`;
 }
 
+export function PROMPT_GATE_HEALTH_CLAUDEMD_SECTION(port: number): string {
+  return `\n### PromptGate Health
+
+PromptGate reliability is freshness-aware. \`GET /health\` keeps the 24-hour failure history under \`llmReliability.historical\` while \`state\` distinguishes \`failing-now\`, \`historical-window\`, \`unverified-no-recent-calls\`, and insufficient recent samples. Historical failures stay visible without being mislabeled as current failure.
+- Configured posture: \`curl -H "Authorization: Bearer $AUTH" http://localhost:${port}/prompt-gate/status\`. \`intelligenceConfigured\` and \`relayConfigured\` describe wiring presence, not provider health.
+- Provider-only canary: \`curl -X POST -H "Authorization: Bearer $AUTH" http://localhost:${port}/prompt-gate/canary\`. It runs a fixed \`NO_PROMPT\` fixture through an explicitly routed Claude provider with tools, MCPs, session persistence, and project context removed. It never inspects or answers a real prompt, and it does not prove real-prompt approval behavior.
+- **When to use**: before claiming PromptGate is healthy or broken, read \`/health\` freshness and run the canary when the route is available. Never clear historical counters to make health green.\n`;
+}
+
 export function SINGLE_MACHINE_FAILOVER_GAP_CLAUDEMD_SECTION(port: number): string {
   return `\n### Single-Machine Failover-Gap Guard (⚗️ dev-gated dark, dry-run first)
 
@@ -10021,6 +10030,12 @@ Create worktrees for collaborator repos with \`instar worktree create <branch>\`
       content += '\n' + section;
       patched = true;
       result.upgraded.push('CLAUDE.md: added Resource Usage (CPU + memory) awareness section');
+    }
+
+    if (!content.includes('/prompt-gate/canary')) {
+      content += PROMPT_GATE_HEALTH_CLAUDEMD_SECTION(port);
+      patched = true;
+      result.upgraded.push('CLAUDE.md: added PromptGate health awareness section');
     }
 
     // Coordination Mandate engine (docs/specs/coordination-mandate.md) — Agent

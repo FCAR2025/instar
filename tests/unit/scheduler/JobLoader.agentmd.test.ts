@@ -95,6 +95,34 @@ describe('JobLoader · agentmd (Phase 1a)', () => {
     it('exposes the bounded-concurrency limit at 32', () => {
       expect(READ_CONCURRENCY_LIMIT).toBe(32);
     });
+
+    it('normalizes grounding into runtime execution metadata', () => {
+      const a = setup({
+        manifests: { grounded: mkManifest({ slug: 'grounded' }) },
+        instarMd: { grounded: mkAgentMd({
+          frontmatter: {
+            name: 'Grounded',
+            grounding: { requiresIdentity: 'true', processesExternalInput: 'false' },
+          },
+          body: 'Read the fixture only.\n',
+        }) },
+      });
+
+      const jobs = loadJobs(a.jobsFile);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].grounding).toEqual({ requiresIdentity: true, processesExternalInput: false });
+    });
+
+    it('rejects malformed grounding instead of silently loading an ungrounded job', () => {
+      const a = setup({
+        manifests: { malformed: mkManifest({ slug: 'malformed' }) },
+        instarMd: { malformed: mkAgentMd({
+          frontmatter: { name: 'Malformed', grounding: { requiresIdentity: 'sometimes' } },
+        }) },
+      });
+
+      expect(loadJobs(a.jobsFile)).toHaveLength(0);
+    });
   });
 
   // ── YAML hardening ────────────────────────────────────────────────────

@@ -14,7 +14,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PostUpdateMigrator, MACHINE_LOAD_ASSESSMENT_CLAUDEMD_SECTION } from '../../src/core/PostUpdateMigrator.js';
+import {
+  PostUpdateMigrator,
+  MACHINE_LOAD_ASSESSMENT_CLAUDEMD_SECTION,
+  PROMPT_GATE_HEALTH_CLAUDEMD_SECTION,
+} from '../../src/core/PostUpdateMigrator.js';
 import { generateClaudeMd } from '../../src/scaffold/templates.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 
@@ -170,5 +174,36 @@ describe('CLAUDE.md — Machine Load Assessment section', () => {
     expect(generated).toContain('Machine Load Assessment');
     // shared single-source: the exported section function feeds both paths
     expect(MACHINE_LOAD_ASSESSMENT_CLAUDEMD_SECTION()).toContain('load-assess.sh');
+  });
+});
+
+describe('CLAUDE.md — PromptGate health awareness', () => {
+  it('fresh init documents freshness and the fixed provider-only canary', () => {
+    const generated = generateClaudeMd(
+      { name: 'test-agent', role: 'test', personality: 'test' } as never,
+      { projectName: 'test-agent', projectDir: '/tmp/test-agent', port: 4042 } as never,
+    );
+    expect(generated).toContain('/prompt-gate/canary');
+    expect(generated).toContain('historical-window');
+    expect(PROMPT_GATE_HEALTH_CLAUDEMD_SECTION(4042)).toMatch(/provider-only/i);
+  });
+
+  it('migrates existing CLAUDE.md once', () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'instar-prompt-gate-health-'));
+    try {
+      fs.mkdirSync(path.join(projectDir, '.instar'), { recursive: true });
+      const claudeMd = path.join(projectDir, 'CLAUDE.md');
+      fs.writeFileSync(claudeMd, '# Existing\n');
+      runMigrateClaudeMd(createMigrator(projectDir));
+      runMigrateClaudeMd(createMigrator(projectDir));
+      const content = fs.readFileSync(claudeMd, 'utf8');
+      expect(content.split('/prompt-gate/canary')).toHaveLength(2);
+    } finally {
+      SafeFsExecutor.safeRmSync(projectDir, {
+        recursive: true,
+        force: true,
+        operation: 'tests/unit/PostUpdateMigrator-loadAssess.test.ts:prompt-gate-health',
+      });
+    }
   });
 });

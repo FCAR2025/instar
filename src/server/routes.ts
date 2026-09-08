@@ -4576,12 +4576,12 @@ export function createRoutes(ctx: RouteContext): Router {
     // inside the window). See DegradationReporter.getRecentEvents.
     const degradations = DegradationReporter.getInstance().getRecentEvents();
     let llmReliability:
-      | import('../monitoring/FeatureMetricsLedger.js').FeatureReliabilitySummary
+      | import('../monitoring/FeatureMetricsLedger.js').FeatureReliabilityHealthSummary
       | { status: 'unavailable'; components: []; reason: string }
       | null = null;
     if (ctx.featureMetricsLedger) {
       try {
-        llmReliability = ctx.featureMetricsLedger.reliability({ sinceHours: 24 });
+        llmReliability = ctx.featureMetricsLedger.healthReliability({ windowHours: 24, freshnessHours: 1 });
       } catch {
         // Three-outcome health contract: unavailable telemetry is not rendered
         // as healthy and not rendered as an empty component list.
@@ -4596,7 +4596,11 @@ export function createRoutes(ctx: RouteContext): Router {
       sessionExhausted
       || totalFailures >= 5
       || degradations.length > 0
-      || (llmReliability !== null && llmReliability.status !== 'ok');
+      || (llmReliability !== null && (
+        llmReliability.status === 'unavailable'
+        || llmReliability.state === 'failing-now'
+        || llmReliability.state === 'degraded-now'
+      ));
 
     const base: Record<string, unknown> = {
       status: isDegraded ? 'degraded' : 'ok',
@@ -35489,19 +35493,39 @@ document.getElementById('mcpForm').addEventListener('submit', async function (e)
    * Returns which sessions have pending prompts, their type, and duration.
    */
   router.get('/prompt-gate/status', (_req, res) => {
-    if (!ctx.telegram) {
-      res.json({ enabled: false, sessions: [] });
-      return;
-    }
-    // The detailed status comes from the TelegramAdapter's pendingPromptReply map
-    // For now, return basic status
     const promptGateConfig = ctx.config.monitoring?.promptGate;
     res.json({
       enabled: !!promptGateConfig?.enabled,
       autoApproveEnabled: !!promptGateConfig?.autoApprove?.enabled,
       dryRun: !!promptGateConfig?.dryRun,
       ownerId: promptGateConfig?.ownerId ?? null,
+      intelligenceConfigured: !!ctx.intelligence,
+      relayConfigured: !!ctx.telegram,
     });
+  });
+
+  /**
+   * Provider-only PromptGate canary. It never captures a pane, creates a
+   * session, sends input, auto-approves a prompt, or touches historical rows.
+   */
+  router.post('/prompt-gate/canary', async (_req, res) => {
+    const promptGateFramework = ctx.config.sessions?.componentFrameworks?.overrides?.PromptGate;
+    if (
+      !ctx.config.monitoring?.promptGate?.enabled
+      || !ctx.intelligence
+      || promptGateFramework !== 'claude-code'
+    ) {
+      res.status(503).json({ error: 'PromptGate canary unavailable (requires enabled gate and explicit hardened claude-code route)' });
+      return;
+    }
+    try {
+      const { runPromptGateCanary } = await import('../monitoring/PromptGate.js');
+      res.json(await runPromptGateCanary(ctx.intelligence));
+    } catch {
+      res.status(503).json({
+        error: 'PromptGate canary provider call failed',
+      });
+    }
   });
 
   // ── Feature Registry (Consent & Discovery Framework) ────────────────

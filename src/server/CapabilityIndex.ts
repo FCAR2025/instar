@@ -28,6 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { SafeGitExecutor } from '../core/SafeGitExecutor.js';
 import { resolveDevAgentGate } from '../core/devAgentGate.js';
+import { readySubscriptionAccountCount } from '../core/SubscriptionPool.js';
 import { activeAutonomousJobs, DEFAULT_MAX_CONCURRENT_AUTONOMOUS } from '../core/AutonomousSessions.js';
 import type { SecretDrop } from './SecretDrop.js';
 import type { RouteContext } from './routes.js';
@@ -80,7 +81,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     description: 'Subscription & Auth Standard — a multi-account subscription pool (N logins of the same provider) with live per-account quota (5h + weekly utilization + reset dates, measured burn), reset-date-optimal account selection, a hard session-continuity guarantee (a session that hits its account quota resumes on another account via --resume, never dies), proactive PRE-LIMIT swap (move a session off an account before it walls, at a lag-aware threshold — covers untagged sessions on the default login), and a mobile-first enrollment wizard (start a login, surface the public code/URL, auto-reissue an expired code). The registry stores login LOCATION (config home), never tokens. Backs the dashboard Subscriptions tab. Single-account pools are a no-op; auto-swap of live sessions is opt-in (subscriptionPool.autoSwapOnRateLimit reactive; subscriptionPool.proactiveSwap pre-limit).',
     build: ({ ctx }) => ({
       configured: !!ctx.subscriptionPool,
-      accounts: ctx.subscriptionPool ? ctx.subscriptionPool.size() : 0,
+      accounts: ctx.subscriptionPool ? readySubscriptionAccountCount(ctx.subscriptionPool) : 0,
       quotaPoller: !!ctx.quotaPoller,
       scheduler: !!ctx.quotaAwareScheduler,
       proactiveSwap: !!ctx.proactiveSwapMonitor,

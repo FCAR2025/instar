@@ -132,4 +132,21 @@ describe('CapabilityIndex — invariants on the registry itself', () => {
     expect(block.endpoints).toContain('POST /apprenticeship/cycles/:id/close');
     expect(block.endpoints).toContain('GET /apprenticeship/cycles/integrity');
   });
+
+  it('subscriptionPool capability does not enumerate unavailable authority', () => {
+    const subscription = CAPABILITY_INDEX.find((e) => e.key === 'subscriptionPool');
+    expect(subscription).toBeDefined();
+    const block = subscription!.build({
+      ctx: {
+        subscriptionPool: {
+          getAvailability: () => ({ state: 'unavailable', reason: 'machine-identity-unavailable', maintenance: null }),
+          size: () => { throw new Error('must not enumerate unavailable authority'); },
+        },
+      } as any,
+      scripts: [],
+      secretDrop: { listPending: () => [] } as any,
+    }) as { configured: boolean; accounts: number };
+
+    expect(block).toMatchObject({ configured: true, accounts: 0 });
+  });
 });

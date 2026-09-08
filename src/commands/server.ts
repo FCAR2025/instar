@@ -13945,6 +13945,8 @@ export async function startServer(options: StartOptions): Promise<void> {
     // quarantined and visible instead of being guessed from metadata.
     const { repairMissingSubscriptionEmails } = await import('../core/SubscriptionAccountEmailRepair.js');
     const {
+      finishSubscriptionEmailBarrierIfReadable,
+      readySubscriptionAccountCount,
       SubscriptionAccountEmailRegistrar,
       SubscriptionEmailReconciliationBarrier,
     } = await import('../core/SubscriptionPool.js');
@@ -14240,7 +14242,7 @@ export async function startServer(options: StartOptions): Promise<void> {
     void credentialSeedReady
       .then(() => runSubscriptionEmailRepair())
       .catch((error) => {
-        subscriptionEmailBarrier.finish(subscriptionPool.listEmailGaps().length);
+        finishSubscriptionEmailBarrierIfReadable(subscriptionPool, subscriptionEmailBarrier);
         console.warn(`[subscription-email] reconciliation degraded: ${error instanceof Error ? error.message : String(error)}`);
       });
 
@@ -14380,7 +14382,7 @@ export async function startServer(options: StartOptions): Promise<void> {
       },
     });
     quotaPollerRef = quotaPoller;
-    if (subscriptionPool.size() > 0) {
+    if (readySubscriptionAccountCount(subscriptionPool) > 0) {
       quotaPoller.start();
       console.log(pc.green('  Subscription quota poller started'));
     }

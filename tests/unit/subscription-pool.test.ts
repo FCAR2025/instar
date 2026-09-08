@@ -10,7 +10,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   MAX_BOUNDED_POOL_SCAN,
+  finishSubscriptionEmailBarrierIfReadable,
+  readySubscriptionAccountCount,
   SubscriptionPool,
+  SubscriptionEmailReconciliationBarrier,
   SubscriptionPoolUnavailableError,
   ValidationError,
 } from '../../src/core/SubscriptionPool.js';
@@ -270,5 +273,27 @@ describe('SubscriptionPool', () => {
       state: 'unavailable', reason: 'machine-identity-unavailable', maintenance: null,
     });
     expect(() => pool.list()).toThrow(SubscriptionPoolUnavailableError);
+  });
+});
+
+describe('subscription pool boot-safe reads', () => {
+  it('does not enumerate an unavailable pool for capability or poller startup', () => {
+    const unavailable = {
+      getAvailability: () => ({ state: 'unavailable' as const, reason: 'machine-identity-unavailable', maintenance: null }),
+      size: () => { throw new SubscriptionPoolUnavailableError('machine-identity-unavailable'); },
+    };
+
+    expect(readySubscriptionAccountCount(unavailable)).toBe(0);
+  });
+
+  it('leaves email reconciliation blocking when authority cannot enumerate gaps', () => {
+    const barrier = new SubscriptionEmailReconciliationBarrier();
+    const pool = {
+      listEmailGaps: () => { throw new SubscriptionPoolUnavailableError('machine-identity-unavailable'); },
+    };
+
+    expect(finishSubscriptionEmailBarrierIfReadable(pool, barrier)).toBe(false);
+    expect(barrier.snapshot()).toMatchObject({ state: 'running', unresolvedCount: 0 });
+    expect(barrier.isBlocking()).toBe(true);
   });
 });

@@ -5,13 +5,27 @@
  * exercise the verdict-threshold boundaries deterministically, plus the --json
  * contract and the fail-soft path (no server → ledger=unavailable, still a verdict).
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import url from 'node:url';
+import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const SCRIPT = path.resolve(__dirname, '../../src/templates/scripts/load-assess.sh');
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    SafeFsExecutor.safeRmSync(dir, {
+      recursive: true,
+      force: true,
+      operation: 'tests/unit/load-assess-script.test.ts',
+    });
+  }
+});
 
 function run(forceIdle: string | null, json = true): string {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -63,5 +77,60 @@ describe('load-assess.sh — fail-soft', () => {
     expect(out).toContain('VERDICT:');
     expect(out).toContain('context only');
     expect(out).toContain('CPU capacity only');
+  });
+
+  it('reads legacy config authToken and derives the agent id when the vault and projectName are absent', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'load-assess-config-auth-'));
+    tempDirs.push(root);
+    const scriptsDir = path.join(root, '.instar', 'scripts');
+    const binDir = path.join(root, 'bin');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.copyFileSync(SCRIPT, path.join(scriptsDir, 'load-assess.sh'));
+    fs.writeFileSync(path.join(root, '.instar', 'config.json'), JSON.stringify({
+      port: 4040,
+      authToken: 'fixture-token',
+    }));
+    const expectedAgentId = path.basename(root);
+    fs.writeFileSync(path.join(binDir, 'curl'), `#!/usr/bin/env bash\ncase "$*" in\n  *"Authorization: Bearer fixture-token"*"X-Instar-AgentId: ${expectedAgentId}"*) printf '%s\\n' '{"sampleCount":3,"sources":[{"source":"aggregate","avgCpuPercent":12,"peakCpuPercent":34,"currentCpuPercent":5}]}' ;;\n  *) printf '%s\\n' '{"error":"wrong auth"}' ;;\nesac\n`);
+    fs.chmodSync(path.join(binDir, 'curl'), 0o755);
+
+    const out = execFileSync('bash', [path.join(scriptsDir, 'load-assess.sh'), '--json'], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, LOAD_ASSESS_FORCE_IDLE: '40' },
+      encoding: 'utf-8',
+      timeout: 20000,
+    });
+
+    expect(JSON.parse(out).ledger).toBe('avg=12 peak=34 current=5 samples=3');
+  });
+
+  it('emits valid single-line JSON when curl fails after malformed output and Linux ps contains quotes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'load-assess-fail-soft-json-'));
+    tempDirs.push(root);
+    const scriptsDir = path.join(root, '.instar', 'scripts');
+    const binDir = path.join(root, 'bin');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.copyFileSync(SCRIPT, path.join(scriptsDir, 'load-assess.sh'));
+    fs.writeFileSync(path.join(root, '.instar', 'config.json'), JSON.stringify({
+      port: 4040,
+      authToken: 'fixture-token',
+    }));
+    fs.writeFileSync(path.join(binDir, 'curl'), '#!/usr/bin/env bash\nprintf %s "{bad"\nexit 28\n');
+    fs.writeFileSync(path.join(binDir, 'ps'), `#!/usr/bin/env bash\ncase "$*" in\n  *"--sort=-pcpu"*) printf '%s\\n' '91.2 "quoted-node"' '8.0 rustc' '3.0 bash' ;;\n  *) exit 9 ;;\nesac\n`);
+    fs.chmodSync(path.join(binDir, 'curl'), 0o755);
+    fs.chmodSync(path.join(binDir, 'ps'), 0o755);
+
+    const out = execFileSync('bash', [path.join(scriptsDir, 'load-assess.sh'), '--json'], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, LOAD_ASSESS_FORCE_IDLE: '40' },
+      encoding: 'utf-8',
+      timeout: 20000,
+    });
+    const parsed = JSON.parse(out);
+
+    expect(out.trim().split('\n')).toHaveLength(1);
+    expect(parsed.ledger).toBe('unavailable');
+    expect(parsed.topConsumer).toBe('"quoted-node"');
+    expect(parsed.topClass).toContain('agent-work');
   });
 });

@@ -65,15 +65,27 @@ LOAD_PER_CORE=$(awk -v l="${L5:-0}" -v c="${CORES:-0}" 'BEGIN{if(c+0>0)printf "%
 # --- instar ResourceLedger: time-windowed agent-attributed CPU (the durable signal) ---
 LEDGER="unavailable"
 AUTH=$(node .instar/scripts/secret-get.mjs authToken 2>/dev/null || echo "")
+# Deployed agents created before the encrypted vault keep the server bearer in
+# config.json. The server still reads that location, so the assessor must follow
+# the same compatibility path instead of declaring a healthy ledger unavailable.
+if [ -z "$AUTH" ]; then
+  AUTH=$(node -pe "const c=require('./.instar/config.json'); typeof c.authToken==='string' ? c.authToken : ''" 2>/dev/null || echo "")
+fi
 PORT=$(node -pe "require('./.instar/config.json').port" 2>/dev/null || echo 4042)
-AGENT_ID="${INSTAR_AGENT_ID:-$(node -pe "require('./.instar/config.json').projectName" 2>/dev/null || echo "")}"
+AGENT_ID="${INSTAR_AGENT_ID:-$(node -pe "const c=require('./.instar/config.json'); typeof c.projectName==='string' && c.projectName ? c.projectName : require('node:path').basename(process.cwd())" 2>/dev/null || basename "$PWD")}"
 if [ -n "$AUTH" ]; then
-  LEDGER=$(curl -s -m 8 -H "Authorization: Bearer $AUTH" -H "X-Instar-AgentId: ${AGENT_ID}" "http://localhost:${PORT}/resources/summary?sinceHours=1" 2>/dev/null \
-    | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const a=(j.sources||[]).find(s=>s.source==='aggregate')||{};console.log('avg='+(a.avgCpuPercent??'?')+' peak='+(a.peakCpuPercent??'?')+' current='+(a.currentCpuPercent??'?')+' samples='+(j.sampleCount??'?'))}catch(e){console.log('unavailable')}})" 2>/dev/null || echo "unavailable")
+  if LEDGER_VALUE=$(curl -fsS -m 8 -H "Authorization: Bearer $AUTH" -H "X-Instar-AgentId: ${AGENT_ID}" "http://localhost:${PORT}/resources/summary?sinceHours=1" 2>/dev/null \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{try{const j=JSON.parse(d);const a=(j.sources||[]).find(s=>s.source==='aggregate');if(!a)process.exit(1);console.log('avg='+(a.avgCpuPercent??'?')+' peak='+(a.peakCpuPercent??'?')+' current='+(a.currentCpuPercent??'?')+' samples='+(j.sampleCount??'?'))}catch{process.exit(1)}})" 2>/dev/null); then
+    [ -n "$LEDGER_VALUE" ] && LEDGER="$LEDGER_VALUE"
+  fi
 fi
 
 # --- top CPU consumers + classify my-work vs external ---
-TOP=$(ps -Ao pcpu,comm -r 2>/dev/null | sed -n '2,4p')
+if [ "$OS" = "Darwin" ]; then
+  TOP=$(ps -Ao pcpu,comm -r 2>/dev/null | sed -n '2,4p')
+else
+  TOP=$(ps -Ao pcpu=,comm= --sort=-pcpu 2>/dev/null | sed -n '1,3p')
+fi
 TOP1=$(echo "$TOP" | head -1 | awk '{print $2}')
 EXTERNAL="unknown"
 case "$TOP1" in
@@ -92,8 +104,25 @@ elif awk_lt "$IDLE" 30; then VERDICT="ELEVATED"; REASON="CPU busy but not satura
 else VERDICT="OK"; REASON="CPU mostly idle"; fi
 
 if [ "$JSON" = "1" ]; then
-  printf '{"verdict":"%s","reason":"%s","cpuIdlePercent":%s,"cpuBusyPercent":%s,"cores":%s,"loadAvg1":"%s","loadAvg5":"%s","loadPerCore":"%s","ledger":"%s","topConsumer":"%s","topClass":"%s","scope":"cpu-capacity-only","os":"%s"}\n' \
-    "$VERDICT" "$REASON" "${IDLE:-null}" "${BUSY:-null}" "${CORES:-0}" "${L1:-}" "${L5:-}" "$LOAD_PER_CORE" "$LEDGER" "${TOP1:-}" "$EXTERNAL" "$OS"
+  node - "$VERDICT" "$REASON" "${IDLE:-}" "${BUSY:-}" "${CORES:-0}" "${L1:-}" "${L5:-}" "$LOAD_PER_CORE" "$LEDGER" "${TOP1:-}" "$EXTERNAL" "$OS" <<'NODE'
+const [verdict, reason, idle, busy, cores, load1, load5, loadPerCore, ledger, topConsumer, topClass, os] = process.argv.slice(2);
+const numberOrNull = (value) => value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+console.log(JSON.stringify({
+  verdict,
+  reason,
+  cpuIdlePercent: numberOrNull(idle),
+  cpuBusyPercent: numberOrNull(busy),
+  cores: numberOrNull(cores) ?? 0,
+  loadAvg1: load1,
+  loadAvg5: load5,
+  loadPerCore,
+  ledger,
+  topConsumer,
+  topClass,
+  scope: 'cpu-capacity-only',
+  os,
+}));
+NODE
 else
   echo "=== MACHINE LOAD ASSESSMENT ==="
   echo "VERDICT: $VERDICT — $REASON"

@@ -1023,6 +1023,12 @@ export interface IntelligenceOptions {
    * field (they are already hardened by their own scratch/stdin/env allowlist).
    */
   reviewerHardening?: { model: string };
+  /**
+   * Fixed PromptGate health-canary isolation for Claude CLI. The provider
+   * removes tool schemas, user MCPs, session persistence, and project context.
+   * Ordinary PromptGate judgments and other intelligence calls never set it.
+   */
+  promptCanaryHardening?: { model: string };
   /** Maximum tokens for the response */
   maxTokens?: number;
   /** Temperature (0-1, lower = more deterministic) */

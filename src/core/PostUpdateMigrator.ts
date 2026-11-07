@@ -191,7 +191,7 @@ import {
 } from '../users/testIdentityMarkers.js';
 import { readRegistryHighWater, setRegistryHighWater } from './registryHighWater.js';
 import { ITERATIVE_CONVERGING_AUDIT_SKILL_CONTENT } from '../data/builtinSkillContent.js';
-import { SUBSCRIPTION_SIGNIN_SKILL_CONTENT } from '../data/builtinSkillContent.js';
+import { MEMORY_HYGIENE_SKILL_CONTENT, SUBSCRIPTION_SIGNIN_SKILL_CONTENT } from '../data/builtinSkillContent.js';
 import { NORMAL_CHROME_BROWSER_LINUX_SECTION, NORMAL_CHROME_BROWSER_SKILL_CONTENT, NORMAL_CHROME_BROWSER_SKILL_WINDOWS_APPENDIX } from '../data/builtinSkillContent.js';
 import { ensureAgentOwnedMemoryAllHomes } from './AgentOwnedMemory.js';
 import { migrateStageBReleaseConfig, verifyBundledStageBReleaseEvidence } from './StageBActivationGate.js';
@@ -2675,6 +2675,7 @@ export class PostUpdateMigrator {
     this.migrateLegacyDefaultJobs(result);
     this.autoMigrateLegacyJobsJson(result);
     this.migrateSkillPortHardcoding(result);
+    this.migrateMemoryHygieneStoreSkill(result);
     this.migrateSchedulerSkillReportChoice(result);
     this.migrateBuildSkillMethodology(result);
     this.migrateSubscriptionSigninByHand(result);
@@ -5925,6 +5926,27 @@ export class PostUpdateMigrator {
       result.upgraded.push('skills/instar-scheduler/SKILL.md (per-job report choice)');
     } catch (err) {
       result.errors.push(`skills/instar-scheduler/SKILL.md report choice migration: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Replace the stock memory-hygiene skill (which told the agent to hand-edit the
+   * generated MEMORY.md) with the version that cleans SemanticMemory and regenerates
+   * the file. installBuiltinSkills never overwrites, so existing agents need this.
+   * Idempotent on the new marker; a customized skill (stock phrase absent) is left alone.
+   */
+  private migrateMemoryHygieneStoreSkill(result: MigrationResult): void {
+    const skillFile = path.join(this.config.projectDir, '.claude', 'skills', 'memory-hygiene', 'SKILL.md');
+    try {
+      if (!fs.existsSync(skillFile)) return;
+      const current = fs.readFileSync(skillFile, 'utf8');
+      if (current.includes('Never edit MEMORY.md directly')) return;
+      if (!current.includes('name: memory-hygiene') || !current.includes('Fix duplicates and minor cleanups directly (edit the file)')) return;
+      const content = MEMORY_HYGIENE_SKILL_CONTENT.split('${INSTAR_PORT:-4040}').join(`\${INSTAR_PORT:-${this.config.port}}`);
+      fs.writeFileSync(skillFile, content);
+      result.upgraded.push('skills/memory-hygiene/SKILL.md (works on SemanticMemory, not MEMORY.md)');
+    } catch (err) {
+      result.errors.push(`skills/memory-hygiene/SKILL.md store migration: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

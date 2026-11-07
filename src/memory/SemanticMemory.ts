@@ -881,7 +881,7 @@ export class SemanticMemory {
    * This is the source of truth for disaster recovery — if semantic.db
    * is lost, the JSONL can reconstruct the full knowledge graph.
    *
-   * Actions: remember, connect, forget, verify, supersede, update, import
+   * Actions: remember, connect, disconnect, forget, verify, supersede, update, import
    */
   private appendToJournal(action: string, data: Record<string, unknown>): void {
     try {
@@ -1530,6 +1530,23 @@ export class SemanticMemory {
     return id;
   }
 
+  /**
+   * Delete every edge touching `entityId` (as source or target) whose context
+   * starts with `contextPrefix` (exact prefix match, no LIKE wildcards). Edges
+   * with other contexts, including null, are untouched. Journaled as
+   * `disconnect` only when something was deleted. Returns the number removed.
+   */
+  removeEdgesTouching(entityId: string, contextPrefix: string): number {
+    const db = this.ensureOpen();
+    const result = db.prepare(
+      'DELETE FROM edges WHERE (from_id = ? OR to_id = ?) AND context IS NOT NULL AND substr(context, 1, length(?)) = ?',
+    ).run(entityId, entityId, contextPrefix, contextPrefix);
+    if (result.changes > 0) {
+      this.appendToJournal('disconnect', { entityId, contextPrefix });
+    }
+    return result.changes;
+  }
+
   // ─── Lookup ─────────────────────────────────────────────────────
 
   /**
@@ -1922,6 +1939,42 @@ export class SemanticMemory {
     this.appendToJournal('verify', { entityId: id, confidence: newConfidence ?? null });
   }
 
+  /**
+   * Replace an entity's content in place (name, type, tags, confidence and
+   * createdAt are untouched). Used by recurring jobs that keep one keyed entity
+   * and refresh it each run. Journaled so a JSONL rebuild replays it.
+   * Returns false when no entity has that id.
+   */
+  updateContent(
+    id: string,
+    patch: { content: string; lastVerified: string; sourceSession?: string },
+  ): boolean {
+    const db = this.ensureOpen();
+    const result = db.prepare(
+      'UPDATE entities SET content = ?, last_verified = ?, source_session = COALESCE(?, source_session) WHERE id = ?',
+    ).run(patch.content, patch.lastVerified, patch.sourceSession ?? null, id);
+    if (result.changes === 0) return false;
+
+    this.appendToJournal('update', {
+      entityId: id,
+      content: patch.content,
+      lastVerified: patch.lastVerified,
+      sourceSession: patch.sourceSession ?? null,
+    });
+
+    if (this._vectorAvailable && this.embeddingProvider && this.vectorSearch) {
+      const row = db.prepare('SELECT name FROM entities WHERE id = ?').get(id) as { name: string } | undefined;
+      const embeddingText = `${row?.name ?? ''} ${patch.content}`;
+      this.embeddingProvider.embed(embeddingText).then(embedding => {
+        if (this.db && this.vectorSearch) {
+          this.vectorSearch.upsert(this.db, id, embedding);
+        }
+      }).catch(() => { // @silent-fallback-ok: embedding failure is non-fatal, FTS5 search still works
+      });
+    }
+    return true;
+  }
+
   // ─── Supersede ──────────────────────────────────────────────────
 
   /**
@@ -2184,6 +2237,8 @@ export class SemanticMemory {
     const deleteEdges = db.prepare('DELETE FROM edges WHERE from_id = ? OR to_id = ?');
 
     const updateVerify = db.prepare('UPDATE entities SET last_verified = ?, confidence = COALESCE(?, confidence) WHERE id = ?');
+    const deleteEdgesByPrefix = db.prepare('DELETE FROM edges WHERE (from_id = ? OR to_id = ?) AND context IS NOT NULL AND substr(context, 1, length(?)) = ?');
+    const updateContentStmt = db.prepare('UPDATE entities SET content = ?, last_verified = ?, source_session = COALESCE(?, source_session) WHERE id = ?');
 
     const runReplay = db.transaction(() => {
       for (const line of lines) {
@@ -2229,6 +2284,19 @@ export class SemanticMemory {
               const id = entry.entityId;
               if (!id) break;
               updateVerify.run(entry.timestamp, entry.confidence ?? null, id);
+              break;
+            }
+
+            case 'disconnect': {
+              if (!entry.entityId || typeof entry.contextPrefix !== 'string') break;
+              deleteEdgesByPrefix.run(entry.entityId, entry.entityId, entry.contextPrefix, entry.contextPrefix);
+              break;
+            }
+
+            case 'update': {
+              const id = entry.entityId;
+              if (!id || typeof entry.content !== 'string') break;
+              updateContentStmt.run(entry.content, entry.lastVerified ?? entry.timestamp, entry.sourceSession ?? null, id);
               break;
             }
 

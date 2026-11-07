@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "slug": "job-digest-entity-upsert",
+  "sessionId": "1d44ee68-3024-4af9-87a0-aa4ae4309356",
+  "timestamp": "2026-11-07T19:42:48.587Z",
+  "artifactPath": "upgrades/side-effects/job-digest-entity-upsert.md",
+  "artifactSha256": "ca145d00fd58191229c907fc8bfbf729ec2ccfc86ca15fafa2605ebedbfdeb54",
+  "coveredFiles": [
+    "docs/specs/job-digest-entity-upsert.eli16.md",
+    "src/memory/SemanticMemory.ts",
+    "src/monitoring/SessionActivitySentinel.ts",
+    "tests/unit/SessionActivitySentinel-job-entity-upsert.test.ts",
+    "upgrades/next/job-digest-entity-upsert.md",
+    "upgrades/side-effects/job-digest-entity-upsert.md"
+  ],
+  "phase": "complete",
+  "tier": 1,
+  "tierReasoning": "Memory-write dedupe change in one sentinel method plus two journaled store operations; no block/allow surface, no fleet migration, a revert leaves keyed entries as ordinary entities. Second-pass review ran (three rounds, final concur).",
+  "eli16Path": "docs/specs/job-digest-entity-upsert.eli16.md",
+  "sideEffectsPath": "upgrades/side-effects/job-digest-entity-upsert.md",
+  "secondPass": "true",
+  "reviewerConcurred": true
+}

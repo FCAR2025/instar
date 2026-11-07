@@ -327,7 +327,7 @@ export class SessionActivitySentinel {
     let entityIds: string[] = [];
     if (this.config.semanticMemory && parsed.entities.length > 0) {
       try {
-        entityIds = this.materializeEntities(session.id, parsed.entities);
+        entityIds = this.materializeEntities(session.id, parsed.entities, session.jobSlug);
       } catch (err) {
         // @silent-fallback-ok — entity extraction is best-effort; the
         // digest is the canonical record. Log and continue so future scans
@@ -375,12 +375,25 @@ export class SessionActivitySentinel {
    * reflects observation-grade certainty (the LLM extracted from real
    * conversation content), not user-asserted certainty (which would be 0.95).
    *
+   * Job sessions (jobSlug set) take a different pass 1. LLM-worded names are
+   * never a dedupe key there ("Disk usage 56%" vs "disk health 57%" would each
+   * add a row every run). Instead the batch is grouped by type and each group
+   * is upserted on `source = "job-digest:<jobSlug>:<type>"`, so a recurring job
+   * keeps one entity per type. Each member is written as the line
+   * `- <name>: <content>` (newlines collapsed). The keyed entity is a per-RUN
+   * snapshot: when its `sourceSession` equals this session (another unit of the
+   * same run) the lines are merged, an ordered exact-line union; when it is a
+   * different session the content is replaced and every `digest:` edge
+   * touching it (either direction) is removed before pass 2 re-adds this run's. Pass 2 is
+   * otherwise unchanged.
+   *
    * Returns the array of entity IDs (existing + newly-created) for
    * traceability via ActivityDigest.entities.
    */
   private materializeEntities(
     sessionId: string,
     entities: ExtractedEntity[],
+    jobSlug?: string,
   ): string[] {
     const sm = this.config.semanticMemory;
     if (!sm) return [];
@@ -390,26 +403,70 @@ export class SessionActivitySentinel {
     const nameToId = new Map<string, string>();
     const allIds: string[] = [];
 
-    // Pass 1 — remember entities, build name→id map.
-    for (const e of entities) {
-      const existing = sm.findByName(e.name, e.type);
-      let id: string;
-      if (existing) {
-        id = existing.id;
-      } else {
-        id = sm.remember({
-          type: e.type,
-          name: e.name,
-          content: e.content,
-          confidence: 0.7,
-          lastVerified: now,
-          source: sourceTag,
-          sourceSession: sessionId,
-          tags: [],
-        });
+    if (jobSlug) {
+      const groups = new Map<string, ExtractedEntity[]>();
+      for (const e of entities) {
+        const g = groups.get(e.type);
+        if (g) g.push(e); else groups.set(e.type, [e]);
       }
-      nameToId.set(e.name.toLowerCase(), id);
-      allIds.push(id);
+      for (const [type, members] of groups) {
+        const key = `job-digest:${jobSlug}:${type}`;
+        const oneLine = (t: string) => t.replace(/\r?\n/g, ' ');
+        const newLines = members.map(m => `- ${oneLine(m.name)}: ${oneLine(m.content)}`);
+        const existing = sm.findBySource(key);
+        let id: string | undefined;
+        if (existing) {
+          let lines = newLines;
+          if (existing.sourceSession === sessionId) {
+            // Same run, another unit or call: keep earlier lines, add new ones.
+            const prior = existing.content.split('\n');
+            lines = [...prior, ...newLines.filter(l => !prior.includes(l))];
+          } else {
+            // New run: the previous run's edges describe replaced content.
+            sm.removeEdgesTouching(existing.id, 'digest:');
+          }
+          const content = lines.join('\n');
+          if (sm.updateContent(existing.id, { content, lastVerified: now, sourceSession: sessionId })) {
+            id = existing.id;
+          }
+        }
+        if (!id) {
+          id = sm.remember({
+            type: type as ExtractedEntity['type'],
+            name: `${jobSlug}: latest ${type}`,
+            content: newLines.join('\n'),
+            confidence: 0.7,
+            lastVerified: now,
+            source: key,
+            sourceSession: sessionId,
+            tags: ['job-digest', `job:${jobSlug}`],
+          });
+        }
+        for (const m of members) nameToId.set(m.name.toLowerCase(), id);
+        allIds.push(id);
+      }
+    } else {
+      // Pass 1 — remember entities, build name→id map.
+      for (const e of entities) {
+        const existing = sm.findByName(e.name, e.type);
+        let id: string;
+        if (existing) {
+          id = existing.id;
+        } else {
+          id = sm.remember({
+            type: e.type,
+            name: e.name,
+            content: e.content,
+            confidence: 0.7,
+            lastVerified: now,
+            source: sourceTag,
+            sourceSession: sessionId,
+            tags: [],
+          });
+        }
+        nameToId.set(e.name.toLowerCase(), id);
+        allIds.push(id);
+      }
     }
 
     // Pass 2 — connect relationships. Resolve targets via batch map first,

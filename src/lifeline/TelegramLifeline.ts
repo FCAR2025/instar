@@ -1,3 +1,13 @@
+import { isNotificationCategory } from '../messaging/notificationCategories.js';
+import { QuietRecordedError, notificationContext, isVerifiedReplyEnvelope } from '../messaging/NotificationSelectivityGate.js';
+import { LiveConfig } from '../config/LiveConfig.js';
+import type { SelectivityConfig } from '../messaging/NotificationSelectivityGate.js';
+import { notificationStamper, responseNotificationStamper, withNotificationEnvelope } from '../messaging/notificationStampers.js';
+const stampNotification = notificationStamper('src/lifeline/TelegramLifeline.ts');
+const stampResponse = responseNotificationStamper('src/lifeline/TelegramLifeline.ts');
+import { withDeterministicOrigin } from '../messaging/telegram-origin/OriginDeterministicSend.js';
+import { checkThrowawayExpiry, describeExpiry, takeLastAutoStartRefusal, throwawayStartupDecision } from '../core/ThrowawayAgentGuard.js';
+import { TelegramOriginHoldError } from '../messaging/telegram-origin/types.js';
 /**
  * Telegram Lifeline — minimal persistent process that owns the Telegram connection.
  *
@@ -34,20 +44,22 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import pc from 'picocolors';
-import { loadConfig, ensureStateDir, detectTmuxPath, getInstarVersion } from '../core/Config.js';
+import { loadConfig, ensureStateDir, detectTmuxPath, getInstarVersion, readClaudeChildAuthEnabled, readConfiguredAnthropicKey } from '../core/Config.js';
+import { claudeAuthShellPrefix, configureClaudeChildAuth, removeClaudeAuthEnvFile, writeClaudeAuthEnvFile } from '../core/claudeChildAuth.js';
 import { registerAgent, unregisterAgent, startHeartbeat } from '../core/AgentRegistry.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import {
   readLifelineRestartSignal,
   clearLifelineRestartSignal,
 } from '../core/version-skew.js';
+import { LifelineIngressSecretHolder, LIFELINE_SECRET_HEADER } from '../core/LifelineIngressSecret.js';
 // setup.ts uses @inquirer/prompts which requires Node 20.12+
 // Dynamic import to avoid breaking the lifeline on older Node versions
 // import { installAutoStart } from '../commands/setup.js';
 import { MessageQueue, type QueuedMessage } from './MessageQueue.js';
+import { isEphemeralCredentialCommand } from './ephemeralCredentialCommand.js';
 import { ServerSupervisor } from './ServerSupervisor.js';
-import { SessionRecoveryChannel } from '../core/SessionRecoveryChannel.js';
-import { SessionRecoveryConsumer } from '../core/SessionRecoveryConsumer.js';
+import { createProductionSessionRecoveryConsumer, stageCActivationLeaseIsLive } from '../core/CodexLifecycleProductionComposition.js';
 import { retryWithBackoff } from './retryWithBackoff.js';
 import { notifyMessageDropped } from './droppedMessages.js';
 import {
@@ -56,12 +68,14 @@ import {
   ForwardServerBootError,
   ForwardVersionSkewError,
   isTerminalForwardError,
+  ForwardSecretRefusedError,
   type VersionSkewBody,
 } from './forwardErrors.js';
 import { decideReplay, type ForwardOutcome } from './replayPolicy.js';
 import { writeStartupMarker } from './startupMarker.js';
+import { acquireLockFile, startLockHeartbeat } from './lifelineLock.js';
 import { shouldOwnTelegramPoll } from './telegramPollOwnership.js';
-import { decidePollAction, type PollOverride } from './pollDecision.js';
+import { bootHoldStep, decidePollAction, hasRecent409, holdPollAtBoot, type PollOverride } from './pollDecision.js';
 import { readPollIntent, effectivePollIntent, writePollActive, pidAlive } from '../core/pollIntent.js';
 import { resolveDevAgentGate } from '../core/devAgentGate.js';
 import { writeLease as writePollOwnerLease } from './TelegramPollOwnerLease.js';
@@ -69,6 +83,8 @@ import { RestartOrchestrator } from './RestartOrchestrator.js';
 import { writeWakeRequestIfSlept } from './agentSleepWake.js';
 import { detectLaunchdSupervised } from './detectLaunchdSupervised.js';
 import { LifelineDriftPromoter, DRIFT_RESTART_PENDING_NOTICE_FILE } from './LifelineDriftPromoter.js';
+import { buildQueuedNotice } from './queuedNotice.js';
+import { buildQueueAcknowledgement, buildQueueDeliveryNotices } from './queueDeliveryNotice.js';
 import {
   LifelineHealthWatchdog,
   DEFAULT_WATCHDOG_THRESHOLDS,
@@ -80,123 +96,19 @@ import {
   decide as decideRateLimit,
   writeRateLimitState,
   isRestartStorm,
+  markLatestRestartExited,
+  WATCHDOG_DAILY_CAP,
   type RestartBucket,
 } from './rateLimitState.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import { applyTelegramFormatter } from '../messaging/TelegramAdapter.js';
 import type { FormatMode } from '../messaging/TelegramMarkdownFormatter.js';
 import { recordFormatFallbackPlainRetry } from '../messaging/telegramFormatMetrics.js';
+import { assertTelegramPayloadVisible, InvisiblePayloadRefusedError } from '../messaging/invisible-payload.js';
+import { telegramFetch } from '../messaging/telegram-egress.js';
+import { inboundTopicId, normalizeInboundThread, toWireParams } from '../messaging/telegramTopicSpace.js';
 import { formatLocalTimestamp } from '../utils/localTime.js';
-
-/**
- * Acquire an exclusive lock file to prevent multiple lifeline instances.
- * Returns true if lock acquired, false if another instance holds it.
- *
- * Handles three cases:
- * 1. No lock file → acquire immediately
- * 2. Lock held by dead process → take over (stale lock)
- * 3. Lock held by alive process → check age. If the lock holder has been
- *    running for >5 minutes but isn't responding (zombie after sleep/wake),
- *    force-kill it and take over. This prevents permanently stuck lifelines
- *    from blocking new instances after a crash.
- */
-function acquireLockFile(lockPath: string): boolean {
-  try {
-    // Check if lock file exists and if the PID is still alive
-    if (fs.existsSync(lockPath)) {
-      const raw = fs.readFileSync(lockPath, 'utf-8');
-      const data = JSON.parse(raw);
-      if (data.pid && typeof data.pid === 'number') {
-        try {
-          // Signal 0 checks if process exists without killing it
-          process.kill(data.pid, 0);
-
-          // Process is alive — but is it actually functional?
-          // We have three "stuck" states to detect:
-          //   1. Zombie (Z) or stopped (T) — clearly dead-but-not-reaped.
-          //   2. Sleeping (S) for >5 min without responding to SIGTERM —
-          //      observed in the 2026-05-20 b2lead-insights incident: the
-          //      previous lifeline received SIGTERM via the CLI's pkill
-          //      fallback path and went to 'S' state but never exited,
-          //      holding the lock for >5 min until manual SIGKILL.
-          //   3. A live, healthy lifeline (R/S < 5 min) — DON'T touch it.
-          if (data.startedAt) {
-            const lockAge = Date.now() - new Date(data.startedAt).getTime();
-            const fiveMinutes = 5 * 60_000;
-            if (lockAge > fiveMinutes) {
-              // Check process state
-              const procInfo = spawnSync('/bin/ps', ['-p', String(data.pid), '-o', 'stat='], {
-                encoding: 'utf-8', timeout: 3000,
-              }).stdout?.trim() ?? '';
-
-              // Z (zombie) / T (stopped) — always recoverable.
-              const isZombieOrStopped = procInfo.includes('Z') || procInfo.includes('T');
-
-              // Sleeping process that is post-SIGTERM-but-not-exiting:
-              // if it received SIGTERM and is still alive after 5 min,
-              // it's wedged. We probe by sending SIGTERM ourselves (or
-              // detect 'S+' / sleep + signal-pending) and if it's still
-              // alive after the grace window, escalate. The presence of
-              // 'S' state alone for >5 min after the lock was written
-              // is the failure shape — a healthy lifeline writes the
-              // lock and starts running tasks within seconds, leaving
-              // 'R' or short 'S' bursts. Sustained 'S' for 5+ min with
-              // no progress is the wedged state we observed.
-              const isWedgedSleeping =
-                /^S/i.test(procInfo) && lockAge > fiveMinutes;
-
-              if (isZombieOrStopped) {
-                console.log(`[Lifeline] Lock holder PID ${data.pid} is zombie/stopped (state: ${procInfo}) — taking over`);
-                try { process.kill(data.pid, 'SIGKILL'); } catch { /* ignore */ }
-              } else if (isWedgedSleeping) {
-                // Try SIGTERM with a short grace window, then SIGKILL.
-                console.log(`[Lifeline] Lock holder PID ${data.pid} sleeping >5min after lock write (state: ${procInfo}) — sending SIGTERM`);
-                try { process.kill(data.pid, 'SIGTERM'); } catch { /* ignore */ }
-                // Synchronously poll for exit up to 3s, then SIGKILL.
-                const killDeadline = Date.now() + 3000;
-                let alive = true;
-                while (Date.now() < killDeadline) {
-                  try {
-                    process.kill(data.pid, 0);
-                    spawnSync('/bin/sleep', ['0.25'], { timeout: 500 });
-                  } catch {
-                    alive = false;
-                    break;
-                  }
-                }
-                if (alive) {
-                  console.log(`[Lifeline] PID ${data.pid} survived SIGTERM grace — SIGKILL`);
-                  try { process.kill(data.pid, 'SIGKILL'); } catch { /* ignore */ }
-                }
-              } else {
-                // Process is alive and not a zombie — another lifeline is truly running
-                return false;
-              }
-            } else {
-              // Lock is fresh — another lifeline is running
-              return false;
-            }
-          } else {
-            // No startedAt — legacy lock, respect it
-            return false;
-          }
-        } catch {
-          // Process is dead — stale lock, we can take over
-          console.log(`[Lifeline] Removing stale lock (PID ${data.pid} is dead)`);
-        }
-      }
-    }
-
-    // Write our PID
-    const tmpPath = `${lockPath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-    fs.renameSync(tmpPath, lockPath);
-    return true;
-  } catch (err) {
-    console.error(`[Lifeline] Lock acquisition failed: ${err}`);
-    return false;
-  }
-}
+import { INVITE_PREFIX } from '../threadline/PairingInvite.js';
 
 /** Execute a shell command safely, returning stdout. */
 function shellExec(cmd: string, timeout = 5000): string {
@@ -219,6 +131,8 @@ function releaseLockFile(lockPath: string): void {
 interface LifelineConfig {
   token: string;
   chatId: string;
+  /** Optional issues forum chat (docs/specs/telegram-issues-group.md). */
+  issuesChatId?: string;
   pollIntervalMs?: number;
   lifelineTopicId?: number;
 }
@@ -232,6 +146,9 @@ interface TelegramUpdate {
     message_thread_id?: number;
     text?: string;
     caption?: string;
+    forum_topic_created?: { name?: string };
+    forum_topic_edited?: { name?: string };
+    reply_to_message?: { message_id?: number; forum_topic_created?: { name?: string } };
     photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
     document?: {
       file_id: string;
@@ -251,6 +168,7 @@ interface TelegramUpdate {
 }
 
 export class TelegramLifeline {
+  private telegramOriginBoot?: Awaited<ReturnType<typeof import('../messaging/telegram-origin/TelegramOriginBoot.js').bootTelegramOrigin>>;
   private config: LifelineConfig;
   private projectConfig: ReturnType<typeof loadConfig>;
   private queue: MessageQueue;
@@ -260,12 +178,19 @@ export class TelegramLifeline {
   private pollTimeout: ReturnType<typeof setTimeout> | null = null;
   private offsetPath: string;
   private stopHeartbeat: (() => void) | null = null;
+  private stopLockHeartbeat: (() => void) | null = null;
   private replayInterval: ReturnType<typeof setInterval> | null = null;
   private restartSignalInterval: ReturnType<typeof setInterval> | null = null;
   private sessionRecoveryInterval: ReturnType<typeof setInterval> | null = null;
   private lifelineTopicId: number | null = null;
   private lockPath: string;
   private consecutive409s = 0;
+  /** When the last 409 arrived; with the count, says whether the conflict is still current. */
+  private last409AtMs = 0;
+  /** One report per process when the watchdog's daily restart cap is reached. */
+  private selfRestartExhaustedReported = false;
+  /** One report per process when the restart-history file is corrupt. */
+  private restartStateCorruptReported = false;
   private consecutive429s = 0;
   /**
    * B1 (multimachine-lease-poll-robustness, Decision 4) — the monotonic ms at
@@ -274,6 +199,13 @@ export class TelegramLifeline {
    * out a flap). Reset to 0 whenever the intent is not awake / we already poll.
    */
   private pollIntentAwakeSinceMs = 0;
+  /** Non-zero while a boot waits for the lease's opinion; see holdPollAtBoot. */
+  private bootPollHeldSinceMs = 0;
+  /** One poll start at a time: a flush can outlast several reconciles, and loses to a newer stop. */
+  private pollStartGen = 0;
+  private pollStartPending = false;
+  /** Only the newest poll loop continues, so a restart cannot leave two running. */
+  private pollLoopId = 0;
   private pollBackoffMs = 2000; // Grows on 409/429 errors
 
   // Doctor session tracking (Crash Recovery UX)
@@ -283,6 +215,13 @@ export class TelegramLifeline {
 
   constructor(projectDir?: string) {
     this.projectConfig = loadConfig(projectDir);
+    // This process outlives a key change, so it reads the file rather than its frozen copy.
+    let lastClaudeKey = this.projectConfig.sessions?.anthropicApiKey;
+    configureClaudeChildAuth(() => {
+      const read = readConfiguredAnthropicKey(this.projectConfig.stateDir);
+      if (read !== undefined) lastClaudeKey = read ?? undefined;
+      return readClaudeChildAuthEnabled(this.projectConfig.stateDir) ? lastClaudeKey : undefined;
+    }, () => this.projectConfig.sessions?.anthropicBaseUrl);
     ensureStateDir(this.projectConfig.stateDir);
 
     // Find Telegram config
@@ -321,6 +260,9 @@ export class TelegramLifeline {
 
     // Wire supervisor events
     this.supervisor.on('serverUp', () => {
+      // A server (re)start re-reads the secret: probe at once, not after the backoff.
+      this.secretRefusedLastAt = 0;
+      void this.proveIngressSecret();
       console.log('[Lifeline] Server is up — replaying queued messages');
       if (this.hasNotifiedServerDown) {
         this.hasNotifiedServerDown = false;
@@ -364,17 +306,17 @@ export class TelegramLifeline {
     });
 
     this.supervisor.on('debugRestartRequested', (request: { fixDescription: string; requestedBy: string }) => {
-      this.sendToTopic(this.lifelineTopicId ?? 1,
+      withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(this.lifelineTopicId ?? 1,
         `🔧 Doctor session applied fix: "${request.fixDescription}"\n` +
         `(Note: fix description is self-reported by the diagnostic session)\n` +
         `Restarting server...`
-      ).catch(() => {});
+      )).catch(() => {});
     });
 
     this.supervisor.on('debugRestartSkipped', (info: { fixDescription: string; reason: string }) => {
-      this.sendToTopic(this.lifelineTopicId ?? 1,
+      withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(this.lifelineTopicId ?? 1,
         `Server already recovered. Doctor session fix noted: "${info.fixDescription}"`
-      ).catch(() => {});
+      )).catch(() => {});
     });
 
     this.loadOffset();
@@ -430,11 +372,31 @@ export class TelegramLifeline {
       process.exit(2);
     }
 
+    // Test-agent leak guard (docs/specs/test-agent-leak-guard.md): an expired
+    // throwaway tears down its own autostart and exits (or idles when the
+    // unload is quarantined) before starting anything — no server, no polling.
+    {
+      let startup: ReturnType<typeof throwawayStartupDecision> = { decision: 'run', check: { expired: false, marker: null }, backfilled: null };
+      try {
+        startup = throwawayStartupDecision(this.projectConfig.projectName, this.projectConfig.projectDir);
+      } catch (err) {
+        console.warn(pc.yellow(`[Lifeline] Throwaway-agent check failed (continuing): ${err instanceof Error ? err.message : String(err)}`));
+      }
+      if (startup.decision !== 'run') {
+        console.log(pc.yellow(`[Lifeline] ${describeExpiry(startup.check)}`));
+        if (startup.decision === 'exit') process.exit(0);
+        console.log(pc.yellow('[Lifeline] Teardown could not unload the auto-start job after 5 attempts; idling instead of restart-looping.'));
+        setInterval(() => { /* quarantined: hold the process, start nothing */ }, 60 * 60 * 1000);
+        return;
+      }
+    }
+
     // Acquire exclusive lock — prevent multiple lifeline instances
     if (!acquireLockFile(this.lockPath)) {
       console.error(pc.red('[Lifeline] Another lifeline instance is already running. Exiting.'));
       process.exit(0); // Clean exit — launchd will restart after ThrottleInterval, acting as a watchdog
     }
+    this.stopLockHeartbeat = startLockHeartbeat(this.lockPath);
 
     // Register in agent registry (lifeline entry — uses project dir + "-lifeline" suffix).
     // Registry operations are NON-CRITICAL — the lifeline must survive ELOCKED errors
@@ -459,8 +421,55 @@ export class TelegramLifeline {
         );
       });
     } catch (err) {
+      /* @silent-fallback-ok: logged advisory discovery failure; lease still owns message transport */
       console.error(`[Lifeline] Registry heartbeat failed to start (non-critical): ${err instanceof Error ? err.message : err}`);
     }
+
+    const { bootTelegramOrigin } = await import('../messaging/telegram-origin/TelegramOriginBoot.js');
+    const notificationLiveConfig = new LiveConfig(this.projectConfig.stateDir);
+    const lifelineNotificationGate: NonNullable<import('../messaging/telegram-origin/TelegramOriginService.js').TelegramOriginService['notificationGate']> = {
+      markAnswered: () => {},
+      route: async (topicId, _text, envelope, operationId) => {
+        if (isVerifiedReplyEnvelope(envelope)) return { verdict: { decision: 'deliver', reason: 'verified-reply-floor', category: envelope!.category, dryRun: false } };
+        const declared = notificationLiveConfig.get<SelectivityConfig>('notifications.selectivity', {});
+        if (!resolveDevAgentGate(declared.enabled, this.projectConfig) || declared.dryRun !== false) return {
+          verdict: { decision: 'deliver', reason: 'lifeline-observation', category: envelope?.category ?? 'uncategorized', dryRun: true },
+        };
+        const inbound = envelope?.inboundMessageId;
+        if (inbound && Date.now() - (this.notificationInbound.get(topicId)?.get(inbound) ?? 0) <= 900000
+          && ['command-response', 'cold-start-fallback', 'message-loss-notice'].includes(envelope?.category ?? '')) return {
+          verdict: { decision: 'deliver', reason: 'lifeline-inbound-floor', category: envelope!.category, dryRun: false },
+        };
+        const secret = this.ingressSecret.get();
+        if (!operationId || !secret) throw new TelegramOriginHoldError('notification-server-unavailable');
+        try {
+          const response = await fetch(`http://127.0.0.1:${this.projectConfig.port}/notifications/internal/classify`, {
+            method: 'POST', headers: { Authorization: `Bearer ${this.projectConfig.authToken}`, 'Content-Type': 'application/json', [LIFELINE_SECRET_HEADER]: secret },
+            body: JSON.stringify({ operationId }), signal: AbortSignal.timeout(2000),
+          });
+          if (!response.ok) throw new Error('Notification authority unavailable');
+          const result = await response.json() as Awaited<ReturnType<import('../messaging/NotificationSelectivityGate.js').NotificationSelectivityGate['route']>>;
+          if (!result?.verdict || !['deliver', 'deliver-push', 'record'].includes(result.verdict.decision) || !isNotificationCategory(result.verdict.category) || typeof result.verdict.dryRun !== 'boolean'
+            || result.verdict.decision === 'record' && !result.verdict.dryRun && (result.receipt?.recorded !== true || result.receipt.delivered !== false || typeof result.receipt.quietId !== 'string' || !result.receipt.quietId)) throw new Error('Invalid notification verdict');
+          return result;
+        } catch { throw new TelegramOriginHoldError('notification-server-unavailable', operationId); }
+      },
+    };
+
+    this.telegramOriginBoot = await bootTelegramOrigin({ config: this.projectConfig, notificationGate: lifelineNotificationGate, token: this.config.token,
+      noticeOwner: true,
+      skipRetention: true,
+      diagnosticMode: 'delegate',
+      holdsLease: () => this.polling && shouldOwnTelegramPoll(this.projectConfig),
+      diagnoseUnknown: async (originId, reason) => {
+        const response = await fetch(`http://127.0.0.1:${this.projectConfig.port}/telegram/origins/diagnose`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.projectConfig.authToken}` },
+          body: JSON.stringify({ originId, reason }), signal: AbortSignal.timeout(30_000),
+        });
+        if (response.status !== 202) throw new Error('origin diagnostic server unavailable');
+      },
+      onNoticeState: notice => console.info('[Lifeline] origin notification state', notice),
+    });
 
     // Ensure Lifeline topic exists (auto-recreate if deleted)
     this.lifelineTopicId = await this.ensureLifelineTopic();
@@ -486,7 +495,19 @@ export class TelegramLifeline {
     // unchanged — only a machine that explicitly opts out is suppressed. This is
     // a per-machine LOCAL flag, so a credential-less standby can honor it.
     const telegramPollingEnabled = shouldOwnTelegramPoll(this.projectConfig);
-    if (telegramPollingEnabled) {
+    const mmPoll = this.projectConfig.multiMachine as { pollFollowsLease?: { enabled?: boolean; dryRun?: boolean }; telegramPolling?: boolean; pollOverride?: string } | undefined;
+    const holdForLease = holdPollAtBoot({
+      followsLeaseEnabled: resolveDevAgentGate(mmPoll?.pollFollowsLease?.enabled, this.projectConfig as { developmentAgent?: boolean }),
+      dryRun: mmPoll?.pollFollowsLease?.dryRun,
+      telegramPolling: mmPoll?.telegramPolling,
+      pollOverride: mmPoll?.pollOverride,
+    });
+    if (holdForLease) {
+      // Poll-follows-lease is live: the lease decides, in reconcilePolling below.
+      this.polling = false;
+      this.bootPollHeldSinceMs = Date.now();
+      console.log(pc.yellow('  Telegram polling waiting for the lease (poll-follows-lease is live)'));
+    } else if (telegramPollingEnabled) {
       // Flush stale Telegram connections before starting poll loop.
       // After hard kills or sleep/wake, a previous long-poll connection may still be
       // held by Telegram's servers, causing 409 Conflict errors for ~30s.
@@ -509,6 +530,9 @@ export class TelegramLifeline {
     this.replayInterval = setInterval(() => {
       if (this.supervisor.healthy && this.queue.length > 0) {
         this.replayQueue();
+      }
+      if (this.supervisor.healthy && Date.now() - this.lastIngressProofAt > 15 * 60_000) {
+        void this.proveIngressSecret();
       }
       // B1 — reconcile poll-ownership to the lease intent (no-op unless
       // pollFollowsLease is on; DRY-RUN by default — see reconcilePolling).
@@ -540,13 +564,15 @@ export class TelegramLifeline {
     // docs/specs/CODEX-SESSION-WEDGE-SELF-RECOVERY.md
     const codexWedgeCfg = this.projectConfig.monitoring?.codexWedgeRecovery;
     if (codexWedgeCfg?.enabled) {
-      const recoveryChannel = new SessionRecoveryChannel(this.projectConfig.stateDir);
-      const consumer = new SessionRecoveryConsumer({
-        channel: recoveryChannel,
+      const consumer = createProductionSessionRecoveryConsumer({
+        stateDir: this.projectConfig.stateDir,
+        actuationEnabled: () => this.projectConfig.codexSessionLifecycle?.stageCRecoveryEnabled === true
+          && this.projectConfig.monitoring?.codexWedgeRecovery?.enabled === true
+          && stageCActivationLeaseIsLive(this.projectConfig.stateDir),
         restart: (reason: string) => this.supervisor.performGracefulRestart(reason),
         replay: () => { this.replayQueue(); },
         dryRun: codexWedgeCfg.dryRun ?? true,
-        cooldownMs: codexWedgeCfg.restartCooldownMs ?? 600_000,
+        restartCooldownMs: codexWedgeCfg.restartCooldownMs ?? 600_000,
       });
       this.sessionRecoveryInterval = setInterval(() => {
         consumer.tick().catch(() => { /* best-effort; never crash the lifeline */ });
@@ -575,11 +601,20 @@ export class TelegramLifeline {
     // The user must always be able to reach their agent remotely — this is non-negotiable.
     try {
       if (!this.isAutostartInstalled()) {
-        // Dynamic import — setup.ts uses @inquirer/prompts which requires Node 20.12+
-        const { installAutoStart } = await import('../commands/setup.js');
-        const installed = installAutoStart(this.projectConfig.projectName, this.projectConfig.projectDir, true);
-        if (installed) {
-          console.log(pc.green(`  Auto-start self-healed: installed ${process.platform === 'darwin' ? 'LaunchAgent' : 'systemd service'}`));
+        // Test-agent leak guard: a non-interactive / throwaway init recorded
+        // autoInstall:false — never install a missing unit on our own.
+        if (this.projectConfig.autostart?.autoInstall === false) {
+          console.log(pc.dim('  Auto-start not installed: this agent was created without asking for it (run `instar autostart install` to add it).'));
+        } else {
+          // Dynamic import — setup.ts uses @inquirer/prompts which requires Node 20.12+
+          const { installAutoStart } = await import('../commands/setup.js');
+          const installed = installAutoStart(this.projectConfig.projectName, this.projectConfig.projectDir, true);
+          const refusal = takeLastAutoStartRefusal();
+          if (installed) {
+            console.log(pc.green(`  Auto-start self-healed: installed ${process.platform === 'darwin' ? 'LaunchAgent' : 'systemd service'}`));
+          } else if (refusal) {
+            console.log(pc.yellow(`  Auto-start not installed: ${refusal}`));
+          }
         }
       } else {
         // Self-healing: validate plist uses boot wrapper, not a hardcoded Node path.
@@ -616,14 +651,33 @@ export class TelegramLifeline {
 
     process.on('SIGINT', externalShutdown);
     process.on('SIGTERM', externalShutdown);
+
+    // Test-agent leak guard: re-check expiry every 60s. A server the supervisor
+    // restarts inside that window stops at the expired marker on its own.
+    const throwawayTimer = setInterval(() => {
+      try {
+        const check = checkThrowawayExpiry(this.projectConfig.projectName, this.projectConfig.projectDir);
+        if (!check.expired) return;
+        clearInterval(throwawayTimer);
+        console.log(pc.yellow(`[Lifeline] ${describeExpiry(check)}`));
+        void this.quiesceEverything().finally(() => process.exit(0));
+      } catch (err) {
+        console.error(`[Lifeline] throwaway expiry check failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, 60 * 1000);
+    throwawayTimer.unref?.();
   }
 
   /**
    * Stop all in-flight / scheduled mutation sources so the queue snapshot
    * is consistent when persisted.
    */
-  private async quiesceEverything(): Promise<void> {
+  private async quiesceEverything(opts: { keepServer?: boolean } = {}): Promise<void> {
+    // Synchronous teardown FIRST: the orchestrator bounds this whole function (quiesce
+    // budget), so anything after an await may never run. Timers, the registry entry,
+    // the lock and the supervisor's grip on the server are settled before the first await.
     this.polling = false;
+    this.cancelPollStart();
     if (this.pollTimeout) clearTimeout(this.pollTimeout);
     if (this.replayInterval) { clearInterval(this.replayInterval); this.replayInterval = null; }
     if (this.restartSignalInterval) { clearInterval(this.restartSignalInterval); this.restartSignalInterval = null; }
@@ -634,8 +688,21 @@ export class TelegramLifeline {
     // generation's late shutdown must not delete the successor's fresh entry
     // (registry lost-update race; same shape as the server-side fix).
     try { unregisterAgent(this.projectConfig.projectDir + '-lifeline', { onlyIfPid: process.pid }); } catch { /* non-critical */ }
+    if (this.stopLockHeartbeat) { this.stopLockHeartbeat(); this.stopLockHeartbeat = null; }
     try { releaseLockFile(this.lockPath); } catch { /* non-critical */ }
-    try { await this.supervisor.stop(); } catch { /* best-effort */ }
+    const keepServer = opts.keepServer === true;
+    if (keepServer) {
+      // A lifeline-only restart: the server is already on the current code, so it keeps
+      // running (with whatever it is doing) and the next lifeline adopts it. Detached
+      // before any await so no supervisor callback can still reach the server.
+      console.log('[Lifeline] lifeline-only restart — leaving the server running for the next lifeline to adopt');
+      try { this.supervisor.detach(); } catch { /* @silent-fallback-ok: detach only clears timers; a throw here must not stop the exit */ }
+    }
+    try { await this.telegramOriginBoot?.close(); }
+    catch (error) { console.error('[telegram-origin] lifeline shutdown cleanup incomplete', error); }
+    if (!keepServer) {
+      try { await this.supervisor.stop(); } catch { /* @silent-fallback-ok: the process is exiting; a failed stop is found by the successor's orphan handling */ }
+    }
   }
 
   /**
@@ -655,7 +722,7 @@ export class TelegramLifeline {
     const isSupervised = detectLaunchdSupervised();
 
     this.orchestrator = new RestartOrchestrator({
-      quiesce: () => this.quiesceEverything(),
+      quiesce: (req) => this.quiesceEverything({ keepServer: req?.keepServer === true }),
       persistAll: async () => {
         // Each persist is best-effort; Promise.all so they run in parallel.
         await Promise.all([
@@ -668,6 +735,10 @@ export class TelegramLifeline {
         ]);
       },
       exitFn: (code) => process.exit(code),
+      // Only restarts that really exit count toward the watchdog daily cap.
+      recordExit: () => markLatestRestartExited(this.projectConfig.stateDir),
+      // A stop request that arrived during a keep-server quiesce still stops the server.
+      stopServer: () => this.supervisor.stop({ evenIfDetached: true }),
       isSupervised,
       isShadowInstallUpdating: () => {
         // Shadow-install sibling path: `.instar/shadow-install/.updating`.
@@ -724,10 +795,14 @@ export class TelegramLifeline {
               console.warn(`[Lifeline] DriftPromoter wanted to restart (reason=${reason}) but no orchestrator installed`);
               return;
             }
+            // Patch drift is the LIFELINE being behind: the server already runs the current
+            // code, so this restart leaves it up (stopping it killed in-flight server work,
+            // e.g. a 23-minute local verify on 2026-10-26).
             await this.orchestrator.requestRestart({
               reason,
               bucket: 'versionSkew',
               context: { source: 'drift-auto-promote' },
+              keepServer: true,
             });
           },
           recordPendingNotice: (info) => this.writeDriftRestartPendingMarker(info),
@@ -817,7 +892,7 @@ export class TelegramLifeline {
     if (!payload || typeof payload.observedDiff !== 'number') return;
     const topicId = this.lifelineTopicId ?? 1;
     const prev = typeof payload.previousVersion === 'string' ? payload.previousVersion : 'an older version';
-    void this.sendToTopic(
+    void this.sendFixedNotice(
       topicId,
       `Lifeline self-restarted: was ${payload.observedDiff} patches behind the server (was on v${prev}, now on v${this.lifelineVersion}). ` +
       `This was an automatic catch-up — no action needed.`,
@@ -901,6 +976,28 @@ export class TelegramLifeline {
     const dec = decideRateLimit(outcome, bucket);
     if (!dec.allowed) {
       console.log(`[Lifeline] restart suppressed by rate limit: ${dec.reason} (bucket=${bucket} reason=${reason})`);
+      if (dec.reason === 'rate-limit-file-corrupt' && !this.restartStateCorruptReported) {
+        // A corrupt file blocks every self-restart until it is rewritten, so it must be seen.
+        this.restartStateCorruptReported = true;
+        DegradationReporter.getInstance().report({
+          feature: 'TelegramLifeline.restartStateCorrupt',
+          primary: 'Self-restart to clear a stuck lifeline',
+          fallback: 'No self-restarts until the restart-history file is readable again',
+          reason: 'The self-restart history file is unreadable or holds a malformed entry',
+          impact: 'The lifeline cannot restart itself to recover until the file is fixed or removed.',
+        });
+      }
+      if (dec.reason === 'watchdog-daily-cap' && !this.selfRestartExhaustedReported) {
+        // Self-heal has run out for today: say so once, then stay up in the stuck state.
+        this.selfRestartExhaustedReported = true;
+        DegradationReporter.getInstance().report({
+          feature: 'TelegramLifeline.selfRestartExhausted',
+          primary: 'Self-restart to clear a stuck lifeline',
+          fallback: 'No more self-restarts for now; the lifeline stays up as it is',
+          reason: `${WATCHDOG_DAILY_CAP} watchdog restarts in 24h did not clear it; latest signal ${reason}`,
+          impact: 'Messages may not be collected or forwarded until the cause is fixed or the agent is restarted.',
+        });
+      }
       return;
     }
     // Storm escalation signal (fires in addition to the normal restart
@@ -1016,12 +1113,7 @@ export class TelegramLifeline {
     try { writePollActive(stateDir, this.polling); } catch { /* advisory */ }
 
     // Effective intent (freshness/dead-writer gated → null = no opinion → HOLD).
-    const rec = readPollIntent(stateDir);
-    const intentShouldPoll = effectivePollIntent(rec, {
-      nowMs: Date.now(),
-      maxStaleMs: 90_000,
-      serverPidAlive: rec ? pidAlive(rec.serverPid) : false,
-    });
+    const intentShouldPoll = this.currentPollIntent(stateDir);
 
     // Operator override (LOCAL config floor; Phase-0 telegramPolling:false survives
     // as force-mute; force-poll needs the explicit pollOverride).
@@ -1040,6 +1132,24 @@ export class TelegramLifeline {
     const startDebounceElapsed =
       this.pollIntentAwakeSinceMs > 0 && now - this.pollIntentAwakeSinceMs >= POLL_START_DEBOUNCE_MS;
 
+    const forcePoll = override === 'force-poll';
+    if (intentShouldPoll === false && !forcePoll) {
+      this.cancelPollStart();
+      this.bootPollHeldSinceMs = 0; // a real standby: the normal decision holds it
+    }
+    if (this.bootPollHeldSinceMs > 0) {
+      // The hold stays armed until a poll really starts, so an opinion that then
+      // disappears still reaches the bound.
+      const step = bootHoldStep({ heldSinceMs: this.bootPollHeldSinceMs, nowMs: now, intentShouldPoll });
+      if (step === 'wait') return;
+      if (step === 'expired') {
+        console.log('[Lifeline] [poll-follows-lease] no lease opinion after the boot hold, polling as a boot always did');
+        this.startPollAfterFlush(stateDir);
+        return;
+      }
+    }
+
+    const recent409 = hasRecent409({ consecutive409s: this.consecutive409s, last409AtMs: this.last409AtMs, nowMs: now });
     const action = decidePollAction({
       currentlyPolling: this.polling,
       intentShouldPoll,
@@ -1047,8 +1157,8 @@ export class TelegramLifeline {
       // Peer poll-state cross-check (B5 surface) is a follow-up; the 409 signal is
       // the partition-immune backstop and peerPresumedGone stays conservative
       // (false → START always rides the debounce, never an unsafe fast-path here).
-      anotherMachinePolling: this.consecutive409s > 0,
-      recentLocal409: this.consecutive409s > 0,
+      anotherMachinePolling: recent409,
+      recentLocal409: recent409,
       startDebounceElapsed,
       peerPresumedGone: false,
     });
@@ -1062,19 +1172,56 @@ export class TelegramLifeline {
     // LIVE (dryRun:false) — apply. STOP is immediate; START flushes first.
     if (action === 'stop') {
       this.polling = false;
+      this.cancelPollStart();
+      // A standby is not stuck in a 409 fight, so the watchdog stops timing one. The count
+      // and its time stay: a lease that flaps back inside the window still sees the conflict,
+      // and hasRecent409 lets the evidence lapse so the next start is never blocked forever.
+      this.conflict409StartedAt = null;
       console.log('[Lifeline] [poll-follows-lease] stopping poll (lost the lease)');
     } else if (action === 'start') {
-      void this.flushStaleConnection().then(() => {
-        this.polling = true;
-        void this.poll();
-        console.log('[Lifeline] [poll-follows-lease] starting poll (became the awake holder)');
-      });
+      this.startPollAfterFlush(stateDir, forcePoll);
     }
     try { writePollActive(stateDir, this.polling); } catch { /* advisory */ }
   }
 
-  private async poll(): Promise<void> {
-    if (!this.polling) return;
+  private currentPollIntent(stateDir: string): boolean | null {
+    const rec = readPollIntent(stateDir);
+    return effectivePollIntent(rec, {
+      nowMs: Date.now(),
+      maxStaleMs: 90_000,
+      serverPidAlive: rec ? pidAlive(rec.serverPid) : false,
+    });
+  }
+
+  private cancelPollStart(): void {
+    this.pollStartGen += 1;
+    this.pollStartPending = false;
+  }
+
+  private startPollAfterFlush(stateDir: string, forcePoll = false): void {
+    if (this.pollStartPending || this.polling) return;
+    this.pollStartPending = true;
+    const gen = ++this.pollStartGen;
+    void this.flushStaleConnection().then(() => {
+      if (gen !== this.pollStartGen) return; // stopped or lost the lease meanwhile
+      this.pollStartPending = false;
+      if (!forcePoll && this.currentPollIntent(stateDir) === false) return; // the flush can take a minute
+      this.bootPollHeldSinceMs = 0;
+      this.polling = true;
+      this.pollLoopId += 1;
+      if (this.pollTimeout) clearTimeout(this.pollTimeout);
+      void this.poll();
+      console.log('[Lifeline] [poll-follows-lease] starting poll');
+      try { writePollActive(stateDir, true); } catch { /* advisory */ }
+    }).catch((err) => {
+      // @silent-fallback-ok: logged, and the next reconcile tries again.
+      if (gen === this.pollStartGen) this.pollStartPending = false;
+      console.warn(`[Lifeline] [poll-follows-lease] poll start failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  private async poll(loopId: number = this.pollLoopId): Promise<void> {
+    if (!this.polling || loopId !== this.pollLoopId) return;
 
     try {
       const updates = await this.getUpdates();
@@ -1096,19 +1243,23 @@ export class TelegramLifeline {
       // instead of double-polling and producing 409 Conflicts. Refreshed on
       // every successful tick. Best-effort + non-throwing (writeLease swallows
       // and warns on any I/O hiccup — polling is what matters).
-      writePollOwnerLease(this.projectConfig.stateDir, this.config.token, process.pid);
+      writePollOwnerLease(this.projectConfig.stateDir, this.config.token, process.pid, Date.now(),
+        this.telegramOriginBoot ? 'instar-telegram-origin-v1' : undefined);
     } catch (err) {
+      if (loopId !== this.pollLoopId) return; // retired: its 401 or 409 belongs to nobody now
       const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes('401') || errMsg.includes('Unauthorized')) {
         console.error('[Lifeline] FATAL: Bot token invalid. Stopping.');
         this.polling = false;
+        this.cancelPollStart();
         return;
       }
       // Handle 409 Conflict (multiple bot instances polling)
       if (errMsg.includes('409') && errMsg.includes('Conflict')) {
         // 0→>0 edge: record when conflict started so watchdog can time the stuck state.
-        if (this.consecutive409s === 0) this.conflict409StartedAt = Date.now();
+        if (this.consecutive409s === 0 || this.conflict409StartedAt === null) this.conflict409StartedAt = Date.now();
         this.consecutive409s++;
+        this.last409AtMs = Date.now();
         // Exponential backoff: 4s, 8s, 16s, 32s, max 60s
         this.pollBackoffMs = Math.min(60_000, 2000 * Math.pow(2, this.consecutive409s));
         if (this.consecutive409s === 1 || this.consecutive409s % 10 === 0) {
@@ -1149,10 +1300,27 @@ export class TelegramLifeline {
       }
     }
 
-    this.pollTimeout = setTimeout(() => this.poll(), this.pollBackoffMs);
+    if (loopId !== this.pollLoopId) return;
+    this.pollTimeout = setTimeout(() => this.poll(loopId), this.pollBackoffMs);
   }
 
+  private notificationInbound = new Map<number, Map<string, number>>();
   private async processUpdate(update: TelegramUpdate): Promise<void> {
+    const msg = update.message;
+    normalizeInboundThread(msg, { mainChatId: this.config.chatId, issuesChatId: this.config.issuesChatId });
+    const configured = this.projectConfig.messaging?.find(item => item.type === 'telegram')?.config;
+    const authorized = configured?.authorizedUserIds as number[] | undefined;
+    if (msg?.from && (!authorized?.length || authorized.includes(msg.from.id))) {
+      const topic = msg.message_thread_id ?? 1;
+      const inbound = this.notificationInbound.get(topic) ?? new Map<string, number>();
+      inbound.set(String(msg.message_id), Number.isFinite(msg.date) ? Math.min(Date.now(), msg.date * 1000) : 0); while (inbound.size > 20) inbound.delete(inbound.keys().next().value!);
+      this.notificationInbound.set(topic, inbound);
+      while (this.notificationInbound.size > 1000) this.notificationInbound.delete(this.notificationInbound.keys().next().value!);
+      return notificationContext.run({ origin: 'automated', category: 'message-loss-notice', sourceContext: 'lifeline-inbound', inboundMessageId: String(msg.message_id) }, () => this.processUpdateAdmitted(update));
+    }
+    return this.processUpdateAdmitted(update);
+  }
+  private async processUpdateAdmitted(update: TelegramUpdate): Promise<void> {
     // Agent hard-sleep wake trigger. ANY inbound update is user activity — so write
     // the wake-request FIRST, before the supervisor.healthy gate below. A slept
     // server is NOT healthy, so without this the message would take the "server
@@ -1170,6 +1338,17 @@ export class TelegramLifeline {
 
     const msg = update.message;
     if (!msg) return;
+    // Issues-group messages get their internal topic id before anything reads it,
+    // so every forwarded topicId is internal (docs/specs/telegram-issues-group.md).
+    normalizeInboundThread(msg, { mainChatId: this.config.chatId, issuesChatId: this.config.issuesChatId });
+
+    // A topic created or renamed in Telegram carries its name only in this service
+    // message, which has no text. Pass the name on, or the server never learns it.
+    const serviceName = msg.forum_topic_created?.name ?? msg.forum_topic_edited?.name;
+    if (serviceName && !msg.text) {
+      await this.forwardTopicName(msg.message_thread_id ?? 1, serviceName, Boolean(msg.forum_topic_edited?.name));
+      return;
+    }
 
     // Handle photo messages
     if (msg.photo && msg.photo.length > 0 && !msg.text) {
@@ -1208,10 +1387,24 @@ export class TelegramLifeline {
       const forwarded = await this.forwardToServer(topicId, text, msg);
       if (forwarded) {
         // Delivery confirmation — user knows message reached the server
-        await this.sendToTopic(topicId, '✓ Delivered');
+        await this.sendFixedNotice(topicId, '✓ Delivered');
         return;
       }
-      // Server appears healthy but forward failed — queue with accurate message
+    }
+    // Remote desktop approval codes are one-use credentials. If forwarding
+    // fails, do not put the command (and its code) into the durable queue.
+    if (isEphemeralCredentialCommand(text)) {
+      await this.sendFixedNotice(topicId, "I couldn't pass that remote desktop approval through just now. Ask for a new code in the dashboard and try again.");
+      return;
+    }
+    // A pairing invite is never queued (its secret would sit on disk): say so instead.
+    if (text.includes(INVITE_PREFIX)) {
+      await this.sendFixedNotice(topicId, "I couldn't pass that pairing invite to the agent just now, and I don't store invites. Forward it again in a minute.");
+      return;
+    }
+    if (this.supervisor.healthy) {
+      // Server appears healthy but forward failed. Preserve the message, but do
+      // not announce an outage: a slow ingress decision is not a dead server.
       this.queue.enqueue({
         id: `tg-${msg.message_id}`,
         topicId,
@@ -1220,11 +1413,11 @@ export class TelegramLifeline {
         fromUsername: msg.from.username,
         fromFirstName: msg.from.first_name,
         timestamp: new Date(msg.date * 1000).toISOString(),
+        queueReason: 'healthy-forward-failed',
       });
       if (this.shouldSendQueueAck(topicId)) {
-        await this.sendToTopic(topicId,
-          `Server is restarting. Your message has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
-        );
+        const notice = buildQueueAcknowledgement('healthy-forward-failed', 'message');
+        if (notice) await this.sendFixedNotice(topicId, notice);
       }
       return;
     }
@@ -1238,12 +1431,13 @@ export class TelegramLifeline {
       fromUsername: msg.from.username,
       fromFirstName: msg.from.first_name,
       timestamp: new Date(msg.date * 1000).toISOString(),
+      queueReason: 'server-unhealthy',
     });
 
     // Notify user that message is queued (rate-limited to prevent spam during restart loops)
     if (this.shouldSendQueueAck(topicId)) {
-      await this.sendToTopic(topicId,
-        `Server is temporarily down. Your message has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
+      await this.sendFixedNotice(topicId,
+        buildQueuedNotice('message', this.queue.length, /* serverHealthy */ false)
       );
     }
   }
@@ -1270,10 +1464,11 @@ export class TelegramLifeline {
       console.error(`[lifeline] Failed to download photo: ${err}`);
     }
 
-    if (this.supervisor.healthy) {
+    const serverWasHealthy = this.supervisor.healthy;
+    if (serverWasHealthy) {
       const forwarded = await this.forwardToServer(topicId, content, msg);
       if (forwarded) {
-        await this.sendToTopic(topicId, '✓ Delivered');
+        await this.sendFixedNotice(topicId, '✓ Delivered');
         return;
       }
     }
@@ -1288,18 +1483,13 @@ export class TelegramLifeline {
       fromFirstName: msg.from.first_name,
       timestamp: new Date(msg.date * 1000).toISOString(),
       photoPath,
+      queueReason: serverWasHealthy ? 'healthy-forward-failed' : 'server-unhealthy',
     });
 
     if (this.shouldSendQueueAck(topicId)) {
-      if (this.supervisor.healthy) {
-        await this.sendToTopic(topicId,
-          `Server is restarting. Your photo has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
-        );
-      } else {
-        await this.sendToTopic(topicId,
-          `Server is temporarily down. Your photo has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
-        );
-      }
+      const reason = serverWasHealthy ? 'healthy-forward-failed' : 'server-unhealthy';
+      const delayedNotice = buildQueueAcknowledgement(reason, 'photo');
+      await this.sendFixedNotice(topicId, delayedNotice ?? buildQueuedNotice('photo', this.queue.length, false));
     }
   }
 
@@ -1308,7 +1498,7 @@ export class TelegramLifeline {
    */
   private async downloadPhoto(fileId: string, messageId: number): Promise<string> {
     // Get file path from Telegram
-    const infoRes = await fetch(
+    const infoRes = await telegramFetch(
       `https://api.telegram.org/bot${this.config.token}/getFile?file_id=${encodeURIComponent(fileId)}`
     );
     if (!infoRes.ok) throw new Error(`getFile failed: ${infoRes.status}`);
@@ -1321,7 +1511,7 @@ export class TelegramLifeline {
     const filename = `photo-${Date.now()}-${messageId}.jpg`;
     const localPath = path.join(photoDir, filename);
 
-    const fileRes = await fetch(
+    const fileRes = await telegramFetch(
       `https://api.telegram.org/file/bot${this.config.token}/${filePath}`
     );
     if (!fileRes.ok) throw new Error(`File download failed: ${fileRes.status}`);
@@ -1335,7 +1525,7 @@ export class TelegramLifeline {
    * Preserves the original filename when available.
    */
   private async downloadDocument(fileId: string, messageId: number, originalName?: string): Promise<string> {
-    const infoRes = await fetch(
+    const infoRes = await telegramFetch(
       `https://api.telegram.org/bot${this.config.token}/getFile?file_id=${encodeURIComponent(fileId)}`
     );
     if (!infoRes.ok) throw new Error(`getFile failed: ${infoRes.status}`);
@@ -1352,7 +1542,7 @@ export class TelegramLifeline {
     const filename = `${Date.now()}-${baseName}`;
     const localPath = path.join(docDir, filename);
 
-    const fileRes = await fetch(
+    const fileRes = await telegramFetch(
       `https://api.telegram.org/file/bot${this.config.token}/${filePath}`
     );
     if (!fileRes.ok) throw new Error(`File download failed: ${fileRes.status}`);
@@ -1381,10 +1571,11 @@ export class TelegramLifeline {
       console.error(`[lifeline] Failed to download document: ${err}`);
     }
 
-    if (this.supervisor.healthy) {
+    const serverWasHealthy = this.supervisor.healthy;
+    if (serverWasHealthy) {
       const forwarded = await this.forwardToServer(topicId, content, msg);
       if (forwarded) {
-        await this.sendToTopic(topicId, '✓ Delivered');
+        await this.sendFixedNotice(topicId, '✓ Delivered');
         return;
       }
     }
@@ -1400,18 +1591,13 @@ export class TelegramLifeline {
       timestamp: new Date(msg.date * 1000).toISOString(),
       documentPath,
       documentName: doc.file_name,
+      queueReason: serverWasHealthy ? 'healthy-forward-failed' : 'server-unhealthy',
     });
 
     if (this.shouldSendQueueAck(topicId)) {
-      if (this.supervisor.healthy) {
-        await this.sendToTopic(topicId,
-          `Server is restarting. Your file has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
-        );
-      } else {
-        await this.sendToTopic(topicId,
-          `Server is temporarily down. Your file has been queued (${this.queue.length} in queue). It will be delivered when the server recovers.`
-        );
-      }
+      const reason = serverWasHealthy ? 'healthy-forward-failed' : 'server-unhealthy';
+      const delayedNotice = buildQueueAcknowledgement(reason, 'file');
+      await this.sendFixedNotice(topicId, delayedNotice ?? buildQueuedNotice('file', this.queue.length, false));
     }
   }
 
@@ -1433,26 +1619,34 @@ export class TelegramLifeline {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
       try {
-        const cbHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (this.projectConfig.authToken) {
-          cbHeaders['Authorization'] = `Bearer ${this.projectConfig.authToken}`;
-        }
-        const response = await fetch(
-          `http://127.0.0.1:${this.projectConfig.port}/internal/telegram-callback`,
-          {
-            method: 'POST',
-            headers: cbHeaders,
-            body: JSON.stringify({
-              callbackQueryId: query.id,
-              data: query.data,
-              fromUserId: query.from.id,
-              fromUsername: query.from.username,
-              messageId: query.message?.message_id,
-              chatId: query.message?.chat?.id,
-            }),
-            signal: controller.signal,
+        const cbBody = JSON.stringify({
+          callbackQueryId: query.id,
+          data: query.data,
+          fromUserId: query.from.id,
+          fromUsername: query.from.username,
+          messageId: query.message?.message_id,
+          chatId: query.message?.chat?.id,
+        });
+        const sendCallback = (): Promise<Response> => {
+          const cbHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (this.projectConfig.authToken) {
+            cbHeaders['Authorization'] = `Bearer ${this.projectConfig.authToken}`;
           }
-        );
+          this.addIngressSecretHeader(cbHeaders);
+          return fetch(
+            `http://127.0.0.1:${this.projectConfig.port}/internal/telegram-callback`,
+            { method: 'POST', headers: cbHeaders, body: cbBody, signal: controller.signal },
+          );
+        };
+        let response = await sendCallback();
+        // The server refused our secret: the file may have been replaced since
+        // we cached it. Re-read once and retry. The server dedupes on the
+        // callback id, so a retried tap can never be applied twice.
+        if (response.status === 401 && await this.isLifelineSecretRefusal(response)) {
+          this.ingressSecret.reload();
+          response = await sendCallback();
+        }
+        if (response.ok) this.observeStaleSecretHint(response);
         if (!response.ok) {
           await this.apiCall('answerCallbackQuery', {
             callback_query_id: query.id,
@@ -1491,6 +1685,148 @@ export class TelegramLifeline {
 
   /** Full semver of this lifeline, read once at construction. */
   private readonly lifelineVersion = getInstarVersion();
+
+  /**
+   * The lifeline ingress secret (docs/specs/telegram-internal-route-lifeline-secret.md).
+   * Held in this process's memory and in its 0600 file only — never in
+   * `process.env`, so nothing this process spawns inherits it.
+   */
+  private _ingressSecret: LifelineIngressSecretHolder | null = null;
+  private get ingressSecret(): LifelineIngressSecretHolder {
+    if (!this._ingressSecret) this._ingressSecret = new LifelineIngressSecretHolder(this.projectConfig.stateDir);
+    return this._ingressSecret;
+  }
+
+  private lastSecretRefusalLogAt = 0;
+  private lastIngressProofAt = 0;
+  /** Start of the current secret-refusal episode (0 = none). */
+  private secretRefusedSince = 0;
+  private secretRefusedLastAt = 0;
+  private secretRefusalNoticeSent = false;
+  private secretRefusalNoticeInFlight = false;
+  private replayInFlight = false;
+
+  /** Consecutive refused replay passes in the current episode (drives the backoff). */
+  private secretRefusedPasses = 0;
+
+  /**
+   * While the server refuses our secret, replay backs off: one minute, then
+   * doubling, capped at fifteen. The message is never dropped; only the rate
+   * of asking falls.
+   */
+  private static readonly SECRET_REFUSAL_RETRY_MS = 60_000;
+  private static readonly SECRET_REFUSAL_RETRY_MAX_MS = 15 * 60_000;
+  private secretRefusalBackoffMs(): number {
+    const n = Math.max(0, this.secretRefusedPasses - 1);
+    return Math.min(TelegramLifeline.SECRET_REFUSAL_RETRY_MAX_MS, TelegramLifeline.SECRET_REFUSAL_RETRY_MS * 2 ** Math.min(n, 10));
+  }
+  /** After this long refused, tell the user once (per episode). */
+  private static readonly SECRET_REFUSAL_NOTICE_AFTER_MS = 10 * 60_000;
+
+  /**
+   * The server refused our lifeline secret even after a re-read. Not a
+   * property of the message and not an outage: the message stays queued with
+   * no drop budget burned. This bounds the consequences — one log line a
+   * minute, replay backs off from one minute to fifteen (see replayQueue), and
+   * at the first refusal after ten minutes the user is told ONCE, on the
+   * lifeline's own always-available channel, that messages are held and why.
+   */
+  private noteSecretRefusal(inboundTopicId: number): void {
+    const nowMs = Date.now();
+    if (this.secretRefusedSince === 0) this.secretRefusedSince = nowMs;
+    this.secretRefusedLastAt = nowMs;
+    if (nowMs - this.lastSecretRefusalLogAt > 60_000) {
+      this.lastSecretRefusalLogAt = nowMs;
+      console.error(
+        '[Lifeline] server refused the lifeline ingress secret after a re-read — ' +
+        `messages stay queued. Secret readable here: ${this.ingressSecret.get() !== null}`,
+      );
+    }
+    if (!this.secretRefusalNoticeSent && !this.secretRefusalNoticeInFlight
+        && nowMs - this.secretRefusedSince >= TelegramLifeline.SECRET_REFUSAL_NOTICE_AFTER_MS) {
+      const topic = this.resolveUpdatesAlertTopic();
+      if (topic !== null) {
+        // "Sent" is recorded only once the send succeeded; a failure leaves it
+        // unset, so the next refusal (the backoff cadence) tries again.
+        this.secretRefusalNoticeInFlight = true;
+        withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topic,
+          'Heads up: your Telegram messages are reaching my lifeline but my server is not accepting them, ' +
+          'because the two no longer agree on their shared key. Your messages are NOT lost — they are saved ' +
+          'and will be delivered as soon as this is fixed. Sending /lifeline restart usually resolves it.'
+        )).then(() => {
+          this.secretRefusalNoticeSent = true;
+        }).finally(() => {
+          this.secretRefusalNoticeInFlight = false;
+        }).catch((sendErr) => {
+          console.warn(
+            `[Lifeline] failed to send secret-refusal notice to topic ${topic} (inbound was ${inboundTopicId}): ` +
+            `${sendErr instanceof Error ? sendErr.message : sendErr}`,
+          );
+        });
+      }
+    }
+  }
+
+  /** Name-only forward: a topic's name from its created/renamed service message. Best effort. */
+  private async forwardTopicName(topicId: number, name: string, renamed: boolean): Promise<void> {
+    if (!this.supervisor.healthy) return; // the next message in the topic carries the name again
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.projectConfig.authToken) headers['Authorization'] = `Bearer ${this.projectConfig.authToken}`;
+    this.addIngressSecretHeader(headers);
+    try {
+      await fetch(`http://127.0.0.1:${this.projectConfig.port}/internal/telegram-forward`, {
+        method: 'POST', headers, signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ topicId, text: '', topicName: name, topicRenamed: renamed, nameOnly: true, lifelineVersion: this.lifelineVersion }),
+      });
+    } catch { /* @silent-fallback-ok: a later message in the topic carries its name again */ }
+  }
+
+  private addIngressSecretHeader(headers: Record<string, string>): void {
+    const secret = this.ingressSecret.get();
+    if (secret) headers[LIFELINE_SECRET_HEADER] = secret;
+  }
+
+  /** The server accepted a secret that is not its own (observe): re-read ours. */
+  private observeStaleSecretHint(response: Response): void {
+    if (response.headers.get('x-instar-lifeline-secret-stale') === '1') {
+      this.ingressSecret.reload();
+    }
+  }
+
+  /**
+   * Tell the server that THIS lifeline sends the ingress secret — at lifeline
+   * start, whenever the server comes up, and every 15 minutes — so the
+   * server's guard is armed within seconds instead of waiting for the next
+   * Telegram message (a standby lifeline never forwards one at all).
+   * Best-effort: an older server answers 404 and nothing changes.
+   */
+  private async proveIngressSecret(): Promise<void> {
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (this.projectConfig.authToken) headers['Authorization'] = `Bearer ${this.projectConfig.authToken}`;
+      this.addIngressSecretHeader(headers);
+      const post = (): Promise<Response> => fetch(
+        `http://127.0.0.1:${this.projectConfig.port}/internal/lifeline-proof`,
+        { method: 'POST', headers, body: JSON.stringify({ lifelineVersion: this.lifelineVersion }), signal: AbortSignal.timeout(5_000) },
+      );
+      this.lastIngressProofAt = Date.now();
+      let response = await post();
+      if (response.status === 401 && await this.isLifelineSecretRefusal(response)) {
+        this.ingressSecret.reload();
+        this.addIngressSecretHeader(headers);
+        response = await post();
+      }
+      if (response.ok) this.observeStaleSecretHint(response);
+    } catch {
+      // @silent-fallback-ok — the proof is an optimisation; the first real
+      // forward carries the same secret and arms the guard just the same.
+    }
+  }
+
+  private async isLifelineSecretRefusal(response: Response): Promise<boolean> {
+    const body = (await response.clone().json().catch(() => ({}))) as { error?: string };
+    return body.error === 'lifeline-secret-required';
+  }
 
   /**
    * Agent hard-sleep wake trigger. When the ServerSupervisor has intentionally
@@ -1550,6 +1886,14 @@ export class TelegramLifeline {
     const rawForward = rawMsg as unknown as Record<string, unknown>;
     const isForwarded = Boolean(rawForward.forward_origin || rawForward.forward_from || rawForward.forward_date);
 
+    // Scope-accretion ratification (spec autonomous-scope-accretion-completion.md
+    // R38/R45): carry reply_to_message_id across the lifeline hop so a
+    // reply-anchored confirmation of a server-authored enumeration works on
+    // lifeline-owned-polling agents. An older server ignores the extra field;
+    // an older lifeline omits it → only the explicit "ratify"-token confirmation
+    // binds (the safe, stricter direction).
+    const replyToMessageId = (rawMsg as { reply_to_message?: { message_id?: number } }).reply_to_message?.message_id;
+
     const buildBody = (includeVersion: boolean): string =>
       JSON.stringify({
         topicId,
@@ -1560,12 +1904,19 @@ export class TelegramLifeline {
         messageId: rawMsg.message_id,
         timestamp: new Date(rawMsg.date * 1000).toISOString(),
         senderIsBot,
+        ...(typeof replyToMessageId === 'number' ? { replyToMessageId } : {}),
+        // A message in a topic replies to the topic's creation message, which
+        // carries the topic's name: pass it on so the server can name the topic.
+        ...(typeof (rawMsg as TelegramUpdate['message'])?.reply_to_message?.forum_topic_created?.name === 'string'
+          ? { topicName: (rawMsg as TelegramUpdate['message'])!.reply_to_message!.forum_topic_created!.name }
+          : {}),
         ...(isForwarded ? { forwarded: true } : {}),
         ...(senderChatId !== undefined ? { senderChatId } : {}),
         ...(senderBotId !== undefined ? { senderBotId } : {}),
         ...(includeVersion ? { lifelineVersion: this.lifelineVersion } : {}),
       });
 
+    let secretReloaded = false;
     const doForward = async (): Promise<true> => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10_000);
@@ -1574,6 +1925,7 @@ export class TelegramLifeline {
         if (this.projectConfig.authToken) {
           fwdHeaders['Authorization'] = `Bearer ${this.projectConfig.authToken}`;
         }
+        this.addIngressSecretHeader(fwdHeaders);
         const response = await fetch(
           `http://127.0.0.1:${this.projectConfig.port}/internal/telegram-forward`,
           {
@@ -1585,6 +1937,7 @@ export class TelegramLifeline {
         );
         if (response.ok) {
           this.observeForwardResponseDriftHeader(response);
+          this.observeStaleSecretHint(response);
           return true;
         }
         if (response.status === 426) {
@@ -1594,6 +1947,19 @@ export class TelegramLifeline {
         if (response.status === 503) {
           const body = (await response.json().catch(() => ({}))) as { retryAfterMs?: number };
           throw new ForwardServerBootError(body.retryAfterMs ?? 1000);
+        }
+        if (response.status === 401 && await this.isLifelineSecretRefusal(response)) {
+          // The server refused our secret: the file may have been replaced
+          // since we cached it. Re-read it ONCE per forward and let
+          // retryWithBackoff try again with the fresh value. If the server
+          // still refuses, stop retrying: the message is re-queued without
+          // burning any replay budget (never dropped as "server unreachable").
+          if (!secretReloaded) {
+            secretReloaded = true;
+            this.ingressSecret.reload();
+            throw new ForwardTransientError(401);
+          }
+          throw new ForwardSecretRefusedError();
         }
         if (response.status === 400) {
           const body = await response.json().catch(() => ({}));
@@ -1640,6 +2006,11 @@ export class TelegramLifeline {
       // Record success for watchdog.
       this.consecutiveForwardFailures = 0;
       this.lastForwardSuccessAt = Date.now();
+      // A delivered forward ends any secret-refusal episode.
+      this.secretRefusedSince = 0;
+      this.secretRefusedLastAt = 0;
+      this.secretRefusedPasses = 0;
+      this.secretRefusalNoticeSent = false;
       // Successful forward → the skew episode (if any) has resolved.
       // Clear the flag and the alert-dedupe timestamp so the next episode
       // gets its own user-visible notification.
@@ -1650,6 +2021,13 @@ export class TelegramLifeline {
       // Version-skew handler: emit signal + request restart via orchestrator.
       if (err instanceof ForwardVersionSkewError) {
         this.handleVersionSkew(err, topicId);
+        return 'skew';
+      }
+      // The server will not accept our lifeline secret. Not a property of the
+      // message and not an outage: re-queue with no budget burned (the same
+      // replay decision as a skew), and say so loudly — at most once a minute.
+      if (err instanceof ForwardSecretRefusedError) {
+        this.noteSecretRefusal(topicId);
         return 'skew';
       }
       this.consecutiveForwardFailures++;
@@ -1736,7 +2114,7 @@ export class TelegramLifeline {
       const alertTopicId = this.resolveUpdatesAlertTopic();
       if (alertTopicId !== null) {
         // Best-effort fire-and-forget — never block the forward path.
-        this.sendToTopic(alertTopicId, alertBody).catch((sendErr) => {
+        withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(alertTopicId, alertBody)).catch((sendErr) => {
           console.warn(
             `[Lifeline] failed to send version-skew alert to topic ${alertTopicId} ` +
             `(inbound was ${inboundTopicId}): ` +
@@ -1859,40 +2237,40 @@ export class TelegramLifeline {
           lines.push(`  Last crash: ${status.lastCrashOutput.split('\n').pop()?.slice(0, 100) ?? 'unknown'}`);
         }
       }
-      await this.sendToTopic(topicId, lines.join('\n'));
+      await withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId, lines.join('\n')));
       return;
     }
 
     if (cmd === '/lifeline restart') {
-      await this.sendToTopic(topicId, 'Restarting server...');
+      await this.sendFixedNotice(topicId, 'Restarting server...');
       this.supervisor.wakeFromSleep(); // explicit restart clears any hard-sleep state
       this.supervisor.resetCircuitBreaker();
       await this.supervisor.stop();
       const started = await this.supervisor.start();
-      await this.sendToTopic(topicId, started ? 'Server restarted.' : 'Server failed to restart.');
+      await this.sendFixedNotice(topicId, started ? 'Server restarted.' : 'Server failed to restart.');
       return;
     }
 
     if (cmd === '/lifeline reset') {
       this.supervisor.wakeFromSleep(); // explicit reset clears any hard-sleep state
       this.supervisor.resetCircuitBreaker();
-      await this.sendToTopic(topicId, 'Circuit breaker reset. Restarting server...');
+      await this.sendFixedNotice(topicId, 'Circuit breaker reset. Restarting server...');
       await this.supervisor.stop();
       const started = await this.supervisor.start();
-      await this.sendToTopic(topicId, started ? 'Server restarted after reset.' : 'Server failed to restart after reset.');
+      await this.sendFixedNotice(topicId, started ? 'Server restarted after reset.' : 'Server failed to restart after reset.');
       return;
     }
 
     if (cmd === '/lifeline queue') {
       const messages = this.queue.peek();
       if (messages.length === 0) {
-        await this.sendToTopic(topicId, 'No queued messages.');
+        await this.sendFixedNotice(topicId, 'No queued messages.');
         return;
       }
       const lines = messages.map((m, i) =>
         `${i + 1}. [${m.fromFirstName}] ${m.text.slice(0, 60)}${m.text.length > 60 ? '...' : ''}`
       );
-      await this.sendToTopic(topicId, `Queued messages (${messages.length}):\n${lines.join('\n')}`);
+      await withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId, `Queued messages (${messages.length}):\n${lines.join('\n')}`));
       return;
     }
 
@@ -1924,11 +2302,11 @@ export class TelegramLifeline {
         'The lifeline keeps your Telegram connection alive even when the server is down.',
         'Messages sent while the server is down are queued and replayed on recovery.',
       ];
-      await this.sendToTopic(topicId, lines.join('\n'));
+      await this.sendFixedNotice(topicId, lines.join('\n'));
       return;
     }
 
-    await this.sendToTopic(topicId, 'Unknown lifeline command. Try /lifeline help');
+    await this.sendFixedNotice(topicId, 'Unknown lifeline command. Try /lifeline help');
   }
 
   // ── Queue Replay ──────────────────────────────────────────
@@ -1941,14 +2319,30 @@ export class TelegramLifeline {
     // the very episodes that trigger queuing) lost the in-memory messages with
     // no trace. That is the 2026-06-06 topic-21487 untracked-loss: a real user
     // question vanished without even a dropped-messages.json record.
+    // Single flight: a pass that outlives the tick must not overlap the next.
+    if (this.replayInFlight) return;
+    // While the server refuses our secret every forward fails identically, so
+    // back off (one minute, doubling, capped at fifteen) instead of
+    // re-forwarding the whole queue on every tick.
+    if (this.secretRefusedLastAt !== 0
+        && Date.now() - this.secretRefusedLastAt < this.secretRefusalBackoffMs()) return;
     const messages = this.queue.peek();
     if (messages.length === 0) return;
+    this.replayInFlight = true;
+    try {
+      await this.replayQueueLocked(messages);
+    } finally {
+      this.replayInFlight = false;
+    }
+  }
 
+  /* @self-action-controller: lifeline-secret-refusal-redrive */
+  private async replayQueueLocked(messages: QueuedMessage[]): Promise<void> {
     console.log(`[Lifeline] Replaying ${messages.length} queued messages`);
     let replayed = 0;
     let failed = 0;
     let dropped = 0;
-    const deliveredByTopic = new Map<number, number>();
+    const deliveredByTopic = new Map<number, { outage: number; delayedHandoff: number; legacyUnknown: number }>();
 
     for (const msg of messages) {
       // CRITICAL: never drop while a version-skew episode is in flight. A hard
@@ -1975,11 +2369,21 @@ export class TelegramLifeline {
         poisonFailures: msg.replayFailures ?? 0,
         transientFailures: msg.transientReplayFailures ?? 0,
       });
+      // The server refused our secret: the rest of the queue would be refused
+      // the same way. Stop this pass; everything stays on disk, no budget burned.
+      if (outcome === 'skew' && this.secretRefusedLastAt !== 0 && !this.versionSkewActive) {
+        this.secretRefusedPasses++; // one refused PASS — drives the backoff
+        break;
+      }
 
       if (decision.action === 'delivered') {
         this.queue.markDelivered(msg.id); // remember id so a redelivery can't re-queue it
         replayed++;
-        deliveredByTopic.set(msg.topicId, (deliveredByTopic.get(msg.topicId) ?? 0) + 1);
+        const counts = deliveredByTopic.get(msg.topicId) ?? { outage: 0, delayedHandoff: 0, legacyUnknown: 0 };
+        if (msg.queueReason === 'server-unhealthy') counts.outage++;
+        else if (msg.queueReason === 'healthy-forward-failed') counts.delayedHandoff++;
+        else if (msg.queueReason === undefined) counts.legacyUnknown++;
+        deliveredByTopic.set(msg.topicId, counts);
       } else if (decision.action === 'drop') {
         dropped++;
         // Before the drop becomes silent: persist the record, report a
@@ -1993,7 +2397,7 @@ export class TelegramLifeline {
             text: msg.text,
             retryCount: decision.poisonFailures + decision.transientFailures,
             reason: decision.dropReason ?? 'Message could not be delivered',
-            sendToTopic: (topicId, body) => this.sendToTopic(topicId, body),
+            sendToTopic: (topicId, body) => withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId, body)),
           });
         } catch (err) {
           // notifyMessageDropped only throws on true disk failure after the notice/report paths
@@ -2035,14 +2439,12 @@ export class TelegramLifeline {
 
     // Notify the user that their queued messages were delivered.
     if (replayed > 0) {
-      for (const [topicId, count] of deliveredByTopic) {
-        try {
-          await this.sendToTopic(topicId,
-            count === 1
-              ? '✓ Server recovered — your queued message has been delivered.'
-              : `✓ Server recovered — ${count} queued messages delivered.`
-          );
-        } catch { /* best effort */ }
+      for (const [topicId, counts] of deliveredByTopic) {
+        for (const notice of buildQueueDeliveryNotices(counts)) {
+          try {
+            await this.sendFixedNotice(topicId, notice);
+          } catch { /* best effort */ }
+        }
       }
     }
   }
@@ -2154,7 +2556,7 @@ export class TelegramLifeline {
     this.suppressedServerDownCount = 0;
     this.saveRateLimitState();
 
-    await this.sendToTopic(topicId, message).catch(() => {});
+    await withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId, message)).catch(() => {});
   }
 
   private async notifyCircuitBroken(totalFailures: number, lastCrashOutput: string): Promise<void> {
@@ -2173,7 +2575,7 @@ export class TelegramLifeline {
       `  stderr: ${stateDir}/logs/server-stderr.log\n` +
       `  stdout: ${stateDir}/logs/server-stdout.log`;
 
-    await this.sendToTopic(topicId,
+    await withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId,
       `⚠️ CIRCUIT BREAKER TRIPPED\n\n` +
       `Server failed ${totalFailures} times in the last hour. ` +
       `Auto-restart has been disabled to prevent resource waste.` +
@@ -2182,7 +2584,7 @@ export class TelegramLifeline {
       debugCommand +
       `\n\nTo retry: /lifeline reset (resets circuit breaker and restarts)\n` +
       `You'll be notified when the server recovers.`
-    ).catch(() => {});
+    )).catch(() => {});
   }
 
   /**
@@ -2192,7 +2594,7 @@ export class TelegramLifeline {
    */
   private async notifySentinelStalled(info: { hoursStalled: number; retryIntervalHours: number }): Promise<void> {
     const topicId = this.lifelineTopicId ?? 1;
-    await this.sendToTopic(topicId,
+    await this.sendFixedNotice(topicId,
       `⏳ STILL DOWN AFTER ${info.hoursStalled} HOURS\n\n` +
       `My server has been down for about ${info.hoursStalled} hours. I've kept retrying every ` +
       `${info.retryIntervalHours} hours and will keep trying — but at this point a human may be needed.\n\n` +
@@ -2212,7 +2614,7 @@ export class TelegramLifeline {
     // Singleton enforcement — check for existing doctor session
     const existingSession = this.findExistingDoctorSession();
     if (existingSession) {
-      await this.sendToTopic(topicId,
+      await this.sendFixedNotice(topicId,
         `A diagnostic session is already running: ${existingSession}\n\n` +
         `Attach from any terminal:\n` +
         `  tmux attach -t ${existingSession}`
@@ -2220,7 +2622,7 @@ export class TelegramLifeline {
       return;
     }
 
-    await this.sendToTopic(topicId, '🔍 Gathering crash diagnostics and starting diagnostic session...');
+    await this.sendFixedNotice(topicId, '🔍 Gathering crash diagnostics and starting diagnostic session...');
 
     try {
       const { sessionName, sessionSecret } = await this.spawnDoctorSession();
@@ -2234,7 +2636,7 @@ export class TelegramLifeline {
         ? '\n\nℹ️ Server is currently healthy. Starting diagnostic session anyway.'
         : '';
 
-      await this.sendToTopic(topicId,
+      await this.sendFixedNotice(topicId,
         `Diagnostic session started: ${sessionName}\n\n` +
         `Attach from any terminal:\n` +
         `  tmux attach -t ${sessionName}\n\n` +
@@ -2246,12 +2648,12 @@ export class TelegramLifeline {
       );
     } catch (err) {
       const stateDir = this.projectConfig.stateDir;
-      await this.sendToTopic(topicId,
+      await withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId,
         `Failed to start diagnostic session: ${err}\n\n` +
         `You can diagnose manually:\n` +
         `  cd ${this.projectConfig.projectDir}\n` +
         `  claude "Read the crash logs at ${stateDir}/logs/ and diagnose the server failure"`
-      );
+      ));
     }
   }
 
@@ -2458,7 +2860,10 @@ export class TelegramLifeline {
     }
 
     // Use shell to pipe the prompt file to claude via --message flag
-    const shellCmd = `cat "${promptPath}" | ${claudePath} ${permFlag} --message -`;
+    // The configured sign-in key, through a private file (this string is tmux argv). A key-only
+    // agent has no stored login, so the doctor could not start (spec cloud-key-internal-calls).
+    const authFile = writeClaudeAuthEnvFile(stateDir);
+    const shellCmd = `${authFile ? `${claudeAuthShellPrefix(authFile)} ` : ''}cat "${promptPath}" | ${claudePath} ${permFlag} --message -`;
 
     const tmuxArgs = [
       'new-session', '-d',
@@ -2469,6 +2874,14 @@ export class TelegramLifeline {
       // Do blank database credentials (consistent with existing pattern)
       '-e', 'DATABASE_URL=',
       '-e', 'DIRECT_DATABASE_URL=',
+      // ROUND-19: the FIFTH spawn site, and the most exposed one — this pane
+      // is Bash-capable, lives 30 minutes, and is the crash-doctor session.
+      // Round-18 scrubbed four sites and its verifying test read ONE FILE
+      // (SessionManager.ts), so 4-of-4 passed while 4-of-5 was the truth. The
+      // test's own comment claimed the method "needs no knowledge of which
+      // sites exist" — the hardcoded filename WAS that knowledge.
+      '-e', 'XAI_API_KEY=',
+      '-e', 'GROK_DEPLOYMENT_KEY=',
       '-e', 'DATABASE_URL_PROD=',
       '-e', 'DATABASE_URL_DEV=',
       '-e', 'DATABASE_URL_TEST=',
@@ -2477,7 +2890,7 @@ export class TelegramLifeline {
 
     await new Promise<void>((resolve, reject) => {
       execFile(tmuxPath, tmuxArgs, { encoding: 'utf-8' }, (err) => {
-        if (err) reject(new Error(`Failed to create doctor tmux session: ${err}`));
+        if (err) { removeClaudeAuthEnvFile(authFile); reject(new Error(`Failed to create doctor tmux session: ${err}`)); }
         else resolve();
       });
     });
@@ -2579,7 +2992,7 @@ export class TelegramLifeline {
         clearTimeout(this.doctorSessionTimeout);
         this.doctorSessionTimeout = null;
       }
-      this.sendToTopic(this.lifelineTopicId ?? 1,
+      this.sendFixedNotice(this.lifelineTopicId ?? 1,
         `⏱️ Doctor session ${sessionName} timed out after 30 minutes and was terminated.\n` +
         `Use /lifeline doctor to start a new session if needed.`
       ).catch(() => {});
@@ -2804,7 +3217,7 @@ export class TelegramLifeline {
       console.log(`[Lifeline] ${existingId ? 'Recreated' : 'Created'} Lifeline topic: ${topicId}`);
 
       // Send welcome message in new topic
-      await this.sendToTopic(topicId,
+      await this.sendFixedNotice(topicId,
         '🟢 Lifeline connected. This topic is always available — even when the server is down.'
       );
 
@@ -2848,6 +3261,13 @@ export class TelegramLifeline {
 
   // ── Telegram API ──────────────────────────────────────────
 
+  /** Only audited final templates use this path; crash/doctor/queue excerpts
+   * retain the ordinary unknown-source contract. */
+  private sendFixedNotice(topicId: number, text: string): Promise<void> {
+    return withDeterministicOrigin(this.telegramOriginBoot?.runtime.service, 'telegram-lifeline',
+      () => withNotificationEnvelope(stampResponse(), async () => this.sendToTopic(topicId, text)));
+  }
+
   private async sendToTopic(topicId: number, text: string): Promise<void> {
     const params: Record<string, unknown> = {
       chat_id: this.config.chatId,
@@ -2859,7 +3279,19 @@ export class TelegramLifeline {
 
     try {
       await this.apiCall('sendMessage', { ...params, parse_mode: 'Markdown' });
-    } catch {
+    } catch (firstErr) {
+      if (firstErr instanceof QuietRecordedError) return;
+      if (firstErr instanceof TelegramOriginHoldError) {
+        console.warn(`[Lifeline] origin held topic ${topicId}: ${firstErr.reason}`);
+        return;
+      }
+      // A CONTENT refusal is terminal — see the adapter's note. Retrying cannot make an invisible
+      // payload visible, and the bare retry emitted a second structured refusal record for one
+      // operation (review pass 30 finding 2).
+      if (firstErr instanceof InvisiblePayloadRefusedError) {
+        console.error(`[Lifeline] refused invisible payload for topic ${topicId}`);
+        return;
+      }
       // Retry without Markdown parse mode
       try {
         await this.apiCall('sendMessage', params);
@@ -2892,25 +3324,37 @@ export class TelegramLifeline {
   }
 
   private async apiCall(method: string, params: Record<string, unknown>, retryCount = 0): Promise<unknown> {
+    // THE FUNNEL for this class. The lifeline defines its OWN private `sendToTopic` and its own
+    // `apiCall`, so every previous placement of the invisible-payload refusal inside TelegramAdapter
+    // left this sender completely unguarded — two `apiCall('sendMessage')` sites with no check at
+    // all, which four consecutive enumerations of "every send site" all missed because they only
+    // ever enumerated the adapter. `scripts/lint-telegram-egress-boundary.mjs` (which replaced the deleted per-sender
+    // lint) proves that every Bot API `fetch` is confined to the egress door — NOT that anything
+    // passes through this private `apiCall`. Pass 38 finding 6: this said the lint enforces THIS
+    // funnel, which it has never done and cannot; the enforcement it does provide is one level
+    // out, at the door.
+    // Pre-format guard REMOVED (CMT-1246 criterion b). It closed the same case as the egress
+    // door — proven by execution: with it gone every payload it caught is still refused, and
+    // only the message changes. Two copies of one case mask each other's tests.
+
     // PR2: format sendMessage / editMessageText via the shared helper used by
     // TelegramAdapter. Legacy-passthrough (default) preserves caller parse_mode.
+    // Issues-group topics → the issues chat with the real thread id (idempotent).
+    params = toWireParams(params, { mainChatId: this.config.chatId, issuesChatId: this.config.issuesChatId });
     const sendParams = applyTelegramFormatter(method, params, this.currentFormatMode());
+    // The content check runs at the egress door below, on the serialised request — after this
+    // transform, because a formatter can remove the evidence an earlier check relied on (pass 33
+    // finding 1). No pre-format call remains here; the comment that claimed one was corrected by
+    // pass 36 finding 6.
     const url = `https://api.telegram.org/bot${this.config.token}/${method}`;
     const timeoutMs = method === 'getUpdates' ? 60_000 : 15_000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(sendParams.outgoingParams),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+    // Origin review/storage/capacity must finish before this request's clock starts.
+    const response = await telegramFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sendParams.outgoingParams),
+      networkTimeoutMs: timeoutMs,
+    });
 
     if (!response.ok) {
       // Handle 429 Too Many Requests — respect Telegram's retry_after

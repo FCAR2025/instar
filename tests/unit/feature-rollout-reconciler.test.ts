@@ -60,6 +60,29 @@ describe('derivePipelineStage', () => {
 });
 
 describe('FeatureRolloutReconciler', () => {
+  it('accounts five active, three composed, and one excluded without synthetic child controls', async () => {
+    const contract = { cadenceHours: 6, evidenceMaxAgeHours: 12, metrics: [
+      { id: 'proof', source: 'feature-summary' as const, sourceRef: 'feedback-factory.completed-runs', direction: 'at-least' as const, threshold: 1, minSamples: 1 },
+    ] };
+    const active = Array.from({ length: 5 }, (_, n) => art({ id: `active-${n}`, specPath: `docs/specs/active-${n}.md`,
+      merged: true, shipsStaged: true, flagPath: `flags.active${n}`, rolloutDisposition: 'active', sourcePrNumber: 1531 + n,
+      promotionCriteria: 'feature proof', maturationEvaluation: contract }));
+    const composed = Array.from({ length: 3 }, (_, n) => art({ id: `composed-${n}`, specPath: `docs/specs/composed-${n}.md`,
+      merged: true, rolloutDisposition: 'composed', sourcePrNumber: 1536 + n, ownerFeatureId: 'active-0',
+      promotionCriteria: 'component proof', maturationEvaluation: contract }));
+    const excluded = art({ id: 'excluded', specPath: 'docs/specs/excluded.md', merged: true,
+      rolloutDisposition: 'excluded', sourcePrNumber: 1532, exclusionReason: 'docs-only' });
+    await makeReconciler([...active, ...composed, excluded], { flagEnabled: true, flagDryRun: false }).reconcile();
+    const rows = tracker.list().map(i => i.rolloutAccounting).filter(Boolean);
+    expect(rows.filter(r => r!.disposition === 'active')).toHaveLength(5);
+    expect(rows.filter(r => r!.disposition === 'composed')).toHaveLength(3);
+    expect(rows.filter(r => r!.disposition === 'excluded')).toHaveLength(1);
+    expect(tracker.list().filter(i => i.rolloutAccounting?.disposition === 'active')
+      .every(i => i.rolloutAccounting?.ownerFeatureId === i.id)).toBe(true);
+    expect(rows.filter(r => r!.disposition !== 'active').every(r => r!.rung === null)).toBe(true);
+    expect(tracker.list().filter(i => i.rolloutAccounting?.disposition === 'composed').every(i => i.rollout === undefined)).toBe(true);
+  });
+
   it('auto-creates a task at the right pipelineStage (dogfood: a spec appears on its own)', async () => {
     await makeReconciler([art({ approved: true, traceExists: true, prNumber: 42 })]).reconcile();
     const got = tracker.get('feat-x')!;
@@ -106,6 +129,23 @@ describe('FeatureRolloutReconciler', () => {
     expect(got.rollout?.stage).toBe('live');
     expect(got.phases.find(p => p.id === 'dry-run')?.status).toBe('done');
     expect(got.phases.find(p => p.id === 'live')?.status).toBe('in-progress');
+  });
+
+  it.each([
+    ['same stage', { flagEnabled: true, flagDryRun: true }, { flagEnabled: true, flagDryRun: true }],
+    ['advance', { flagEnabled: true, flagDryRun: true }, { flagEnabled: true, flagDryRun: false }],
+    ['regression', { defaultEnabled: true }, { flagEnabled: true, flagDryRun: false }],
+  ])('repairs rollout and accounting measurement metadata in the same pass as %s', async (_label, before, after) => {
+    const broken = art({ merged: true, shipsStaged: true, flagPath: 'monitoring.featX', sourcePrNumber: 7, maturationContractError: 'invalid-shape' });
+    await makeReconciler([broken], before).reconcile();
+    expect(tracker.get('feat-x')?.rolloutAccounting?.maturationContractError).toBe('invalid-shape');
+    const contract = { cadenceHours: 6, evidenceMaxAgeHours: 12, metrics: [{ id: 'coverage', source: 'blocker-summary' as const, sourceRef: 'clear-latency.coverage', direction: 'at-least' as const, threshold: 0.95, minSamples: 10 }] };
+    await makeReconciler([{ ...broken, maturationContractError: undefined, maturationEvaluation: contract }], after).reconcile();
+    const got = tracker.get('feat-x')!;
+    expect(got.rollout?.maturationEvaluation).toEqual(contract);
+    expect(got.rollout?.maturationContractError).toBeUndefined();
+    expect(got.rolloutAccounting?.maturationEvaluation).toEqual(contract);
+    expect(got.rolloutAccounting?.maturationContractError).toBeUndefined();
   });
 
   it('default-on PARKS as paused (non-terminal/reopenable) and never marks all phases done', async () => {

@@ -54,6 +54,7 @@ import {
 import type { SessionManagerConfig, Session, InstarConfig } from '../../src/core/types.js';
 
 const AUTH = 'test-tmux-resilience-slow-stub';
+const maintenanceTicks = new WeakMap<SessionManager, () => Promise<void>>();
 
 /** A stub tmux that sleeps STUB_SLEEP_SECS before answering (the degraded shared
  *  server). It accepts ANY tmux subcommand and just sleeps then exits 0 — the
@@ -132,10 +133,18 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
     let server: AgentServer;
     let sm: SessionManager;
     let app: ReturnType<AgentServer['getApp']>;
+    let priorHome: string | undefined;
 
     beforeAll(async () => {
       const t = mkTmp('tmux-routes');
       tmpDir = t.tmpDir;
+      // The server reads this machine's home at boot and then on timers (the
+      // token ledger scans ~/.claude/projects). On a host with a large real
+      // history that scan held the event loop for over a second, which is what
+      // the timed checks below then measured. An empty home keeps them about
+      // these routes only.
+      priorHome = process.env.HOME;
+      process.env.HOME = tmpDir;
       const tmuxPath = writeSlowTmuxStub(tmpDir);
       const state = new StateManager(t.stateDir);
       sm = new SessionManager(smConfig(tmpDir, tmuxPath), state, {
@@ -157,6 +166,8 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
 
     afterAll(async () => {
       await server.stop();
+      if (priorHome === undefined) delete process.env.HOME;
+      else process.env.HOME = priorHome;
       SafeFsExecutor.safeRmSync(tmpDir, { recursive: true, force: true, operation: 'tmux-resilience-slow-stub.test.ts' });
     });
 
@@ -168,6 +179,17 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
       // Cache-served: must return WAY under the 15s stub sleep (and under the 800ms
       // per-call bound too — /health issues zero tmux calls).
       expect(elapsed).toBeLessThan(3000);
+    });
+
+    it('sentinel-style running-session enumeration is state-served and cannot starve health', async () => {
+      const t0 = Date.now();
+      const listed = sm.listRunningSessions();
+      const res = await request(app).get('/health');
+      const elapsed = Date.now() - t0;
+
+      expect(listed.some((session) => session.tmuxSession === 'route-sess')).toBe(true);
+      expect(res.status).toBe(200);
+      expect(elapsed).toBeLessThan(1000);
     });
 
     it('GET /sessions answers fast (state-served listSessions, no tmux)', async () => {
@@ -223,10 +245,13 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
       tmpDir = t.tmpDir;
       const tmuxPath = writeSlowTmuxStub(tmpDir);
       state = new StateManager(t.stateDir);
+      let maintenanceTick!: () => Promise<void>;
       sm = new SessionManager(smConfig(tmpDir, tmuxPath), state, {
         tmuxAsyncEnabled: true,
         tmuxCallTimeoutMs: 800,
+        bindMaintenanceTickForTesting: (tick) => { maintenanceTick = tick; },
       });
+      maintenanceTicks.set(sm, maintenanceTick);
       seedRunningSession(state, 'tick-sess');
     });
 
@@ -239,7 +264,7 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
       sm.on('sessionComplete', () => { completedEmitted = true; });
 
       const t0 = Date.now();
-      await (sm as unknown as { monitorTick: () => Promise<void> }).monitorTick();
+      await maintenanceTicks.get(sm)!();
       const elapsed = Date.now() - t0;
 
       // The session is STILL running — a slow has-session resolves indeterminate,
@@ -253,7 +278,7 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
     });
 
     it('does NOT zero _cachedRunningSessions when tmux is slow', async () => {
-      await (sm as unknown as { monitorTick: () => Promise<void> }).monitorTick();
+      await maintenanceTicks.get(sm)!();
       const cached = sm.getCachedRunningSessions();
       // Cache reflects the STILL-running session (the tick refreshes it from state,
       // and state stayed `running` because indeterminate did not transition it).
@@ -272,7 +297,7 @@ describe('tmux Event-Loop Resilience — slow-stub integration (GROUP G)', () =>
       let killEmitted = false;
       sm.on('beforeSessionKill', () => { killEmitted = true; });
 
-      await (sm as unknown as { monitorTick: () => Promise<void> }).monitorTick();
+      await maintenanceTicks.get(sm)!();
 
       expect(termSpy.calls.length).toBe(0);
       expect(killEmitted).toBe(false);

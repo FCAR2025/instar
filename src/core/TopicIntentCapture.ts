@@ -26,8 +26,9 @@
  */
 
 import type { IntelligenceProvider, IntelligenceOptions } from './types.js';
-import type { TopicIntentStore, EstablishedRef } from './TopicIntent.js';
+import type { TopicIntentStore, EstablishedRef, ProjectionResult } from './TopicIntent.js';
 import type { TopicIntentExtractor, ExtractorInput } from './TopicIntentExtractor.js';
+import type { MessageProvenance } from '../messaging/shared/MessageProvenance.js';
 
 // ── Pre-filter (deterministic state-detector, fail-open) ──────────────────
 
@@ -177,6 +178,8 @@ export interface CaptureTurnEntry {
   fromUser: boolean;
   /** ISO8601 string or epoch ms. */
   timestamp?: string | number;
+  /** Structural origin stamped at the send/receive seam. `automation` is not captured. */
+  provenance?: MessageProvenance;
 }
 
 /** Minimal rolling-summary surface (satisfied by TopicMemory). */
@@ -199,6 +202,7 @@ export interface CaptureLoopDeps {
 export type CaptureStatus =
   | 'captured'
   | 'skipped-prefilter'
+  | 'skipped-automation'
   | 'skipped-shed'
   | 'skipped-rate'
   | 'no-topic'
@@ -222,6 +226,41 @@ function toEstablishedRef(r: EstablishedRef): EstablishedRef {
 }
 
 /**
+ * Upper bound on how many existing refs are rendered into one extraction
+ * prompt. The store keeps every ref a topic has ever established, so without
+ * a cap the prompt grows with the topic's lifetime: a long-running topic with
+ * 858 refs made every captured turn a ~40k-token call. The extractor only
+ * needs the refs it might reinforce or contradict, which are the confident
+ * and recently-reinforced ones. Refs outside the window stay in the store
+ * untouched; they are simply not offered as anchors for this turn.
+ */
+export const MAX_PROMPT_REFS = 40;
+
+const TIER_RANK: Record<ProjectionResult['tier'], number> = { observation: 0, tentative: 1, authoritative: 2 };
+
+/**
+ * Pick the refs offered to the extractor: highest projected tier first, then
+ * most recently reinforced, bounded by `max`. Pure and deterministic (ties
+ * break on refId) so the same store state always yields the same prompt.
+ */
+export function selectPromptRefs<T extends EstablishedRef & { projection: ProjectionResult }>(
+  refs: T[],
+  max: number = MAX_PROMPT_REFS,
+): T[] {
+  if (refs.length <= max) return refs;
+  const at = (iso: string): number => {
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? t : 0;
+  };
+  return [...refs]
+    .sort((a, b) =>
+      TIER_RANK[b.projection.tier] - TIER_RANK[a.projection.tier]
+      || at(b.lastReinforcedAt) - at(a.lastReinforcedAt)
+      || (a.refId < b.refId ? -1 : a.refId > b.refId ? 1 : 0))
+    .slice(0, Math.max(0, max));
+}
+
+/**
  * Capture one conversation turn. Pre-filter → (shed/rate gates) → build broader
  * context → extractor.ingest. Never throws; on any unexpected failure it ticks
  * `degraded_cap_or_error` and returns { status: 'degraded' }.
@@ -239,6 +278,27 @@ export async function captureTurn(
   try {
     topicId = typeof entry.topicId === 'number' ? entry.topicId : undefined;
     if (topicId === undefined) return { status: 'no-topic' };
+
+    // Count every user turn before any capture gate. Awareness freshness must
+    // age honestly when a turn is trivial, shed, rate-limited, or extraction
+    // fails; otherwise a stale projection can look current indefinitely.
+    const turn = entry.fromUser
+      ? deps.store.bumpTurn(topicId)
+      : (deps.store.read(topicId).turn ?? 0);
+
+    // Server-generated traffic (job sends, monitor/sentinel notices, standby
+    // lines) is not conversation. It was ~64% of extractor tokens and mostly
+    // filed near-identical "unmerged branches" facts
+    // (docs/research/jev/field-notes/2026-09-30-idea1-intent-skip.md). Keyed on
+    // the structural provenance stamp, never on text; a missing stamp (legacy
+    // or unstamped path) is still captured. Skipping also skips this message's
+    // awareness refresh; the rolling topic summary still covers automated
+    // messages, so the next conversational turn's extraction sees them as
+    // context.
+    if (entry.provenance === 'automation') {
+      deps.store.bumpCaptureCounters(topicId, { turns_seen: 1, prefilter_skipped: 1 });
+      return { status: 'skipped-automation' };
+    }
 
     // Pre-filter — deterministic, fail-open.
     if (!isSubstantiveTurn(entry.text, entry.fromUser)) {
@@ -268,11 +328,8 @@ export async function captureTurn(
 
     // Build broader context: the topic's established refs + rolling summary.
     const at = toIso(entry.timestamp, now);
-    const turn = entry.fromUser
-      ? deps.store.bumpTurn(topicId)
-      : (deps.store.read(topicId).turn ?? 0);
-    const existingRefs = deps.store
-      .getRefsAtOrAbove(topicId, 'observation')
+    const topicFile = deps.store.read(topicId);
+    const existingRefs = selectPromptRefs(deps.store.getRefsAtOrAbove(topicId, 'observation'))
       .map(toEstablishedRef);
     let rollingSummary: string | undefined;
     try {
@@ -291,6 +348,7 @@ export async function captureTurn(
       },
       existingRefs,
       rollingSummary,
+      existingAwareness: topicFile.awareness,
     };
 
     const result = await deps.extractor.ingest(input);
@@ -301,6 +359,7 @@ export async function captureTurn(
         extractions_attempted: 1,
         extractions_emitted: result.emitted.length > 0 ? 1 : 0,
         refs_created: result.createdRefs.length,
+        awareness_invalid: result.awarenessInvalid ? 1 : 0,
       },
       at,
       result.createdRefs.map(r => r.kind),

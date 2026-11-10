@@ -23,7 +23,11 @@
  * via `instarHookFilename()` — never add a `filename` field to these objects,
  * or new agents' settings would gain a stray key.
  *
- * Scope: the Claude-Code `Bash` and `mcp__.*` PreToolUse matchers only.
+ * Scope: the Claude-Code `Bash`, `mcp__.*` and `*` (wildcard) PreToolUse
+ * matchers. The wildcard set exists for guards that must see EVERY tool, not a
+ * command shape — the duplicate-session stand-down muzzle is the first: a
+ * standing-down session must not start work through ANY tool, and a guard that
+ * only saw `Bash` would leave Write/Edit/Task/WebFetch wide open.
  * slopcheck-guard keeps its own dedicated ensure-block in migrateSettings
  * (it is intentionally NOT in this set — it is added by that block for both
  * new and existing agents). Codex hooks (installCodexHooks.ts, `.*` matcher)
@@ -46,32 +50,32 @@ const PD = '${CLAUDE_PROJECT_DIR}';
 export const INSTAR_BASH_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry> = [
   {
     type: 'command',
-    command: `bash ${PD}/.instar/hooks/instar/dangerous-command-guard.sh "$TOOL_INPUT"`,
+    command: `bash "${PD}/.instar/hooks/instar/dangerous-command-guard.sh" "$TOOL_INPUT"`,
     blocking: true,
   },
   {
     type: 'command',
-    command: `bash ${PD}/.instar/hooks/instar/grounding-before-messaging.sh "$TOOL_INPUT"`,
+    command: `bash "${PD}/.instar/hooks/instar/grounding-before-messaging.sh" "$TOOL_INPUT"`,
     blocking: false,
   },
   {
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/deferral-detector.js`,
+    command: `node "${PD}/.instar/hooks/instar/deferral-detector.js"`,
     timeout: 5000,
   },
   {
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/self-stop-guard.js`,
+    command: `node "${PD}/.instar/hooks/instar/self-stop-guard.js"`,
     timeout: 5000,
   },
   {
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/external-communication-guard.js`,
+    command: `node "${PD}/.instar/hooks/instar/external-communication-guard.js"`,
     timeout: 5000,
   },
   {
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/post-action-reflection.js`,
+    command: `node "${PD}/.instar/hooks/instar/post-action-reflection.js"`,
     timeout: 5000,
   },
   {
@@ -80,9 +84,21 @@ export const INSTAR_BASH_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry
     // the branch's lease; blocks (exit 2) only on a deny. Dev-gated dark + dryRun;
     // fail-open on every uncertainty (a broken guard never blocks a push).
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/pr-hand-lease-guard.js`,
+    command: `node "${PD}/.instar/hooks/instar/pr-hand-lease-guard.js"`,
     blocking: true,
     timeout: 6000,
+  },
+  {
+    // Doorway-scan command-allowlist guard (spec DOORWAY-MODEL-KNOWLEDGE-REGISTRY §2.7):
+    // a strict command-shape allowlist that fires only inside the doorway-scan job
+    // session (env-first, INSTAR_JOB_SLUG=doorway-scan). Scope resolution fails OPEN
+    // (a guard bug never blocks an unrelated instar-dev/interactive session); command
+    // matching fails CLOSED (a non-sanctioned command in the doorway-scan session is
+    // refused). Strict no-op everywhere else.
+    type: 'command',
+    command: `node "${PD}/.instar/hooks/instar/doorway-scan-guard.js"`,
+    blocking: true,
+    timeout: 5000,
   },
 ];
 
@@ -93,10 +109,50 @@ export const INSTAR_BASH_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry
 export const INSTAR_MCP_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry> = [
   {
     type: 'command',
-    command: `node ${PD}/.instar/hooks/instar/external-operation-gate.js`,
+    command: `node "${PD}/.instar/hooks/instar/external-operation-gate.js"`,
     blocking: true,
     timeout: 5000,
   },
+];
+
+/**
+ * The canonical instar PreToolUse `*`-matcher (EVERY tool) hook entries.
+ *
+ * WHY A WILDCARD MATCHER EXISTS. The `Bash` and `mcp__.*` sets gate a COMMAND
+ * SHAPE. The stand-down muzzle gates a SESSION: while a duplicate copy is
+ * standing down it must not start new work through any tool at all, and an
+ * unmatched `Write` could rewrite the guard script itself. A matcher that
+ * enumerated today's tool names would also silently fail open for every tool
+ * added later, so the guard matches `*` and owns its ALLOWLIST internally
+ * (unknown tool ⇒ mutating ⇒ blocked).
+ *
+ * Cost discipline is therefore load-bearing, not an optimization: this hook runs
+ * on EVERY tool call on EVERY session, so its steady state is a config read plus
+ * a marker-file stat, with zero HTTP unless this session is actually listed.
+ */
+export const INSTAR_WILDCARD_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry> = [
+  { type: 'command', command: `node "${PD}/.instar/hooks/instar/signin-profile-guard.js"`, blocking: true, timeout: 2000 },
+  { type: 'command', command: `node "${PD}/.instar/hooks/instar/telegram-origin-guard.js"`, blocking: true, timeout: 2000 },
+  {
+    type: 'command',
+    command: `node "${PD}/.instar/hooks/instar/standdown-guard.js"`,
+    blocking: true,
+    // Deliberately SHORTER than the lease guard's 6s: that hook fires only on a
+    // `git push`, this one fires on every tool call, and fail-open makes a short
+    // timeout free.
+    timeout: 2000,
+  },
+];
+
+/**
+ * The canonical instar PreToolUse `Write|Edit|MultiEdit`-matcher hook entries. The attribution write
+ * gate decides nothing itself and exits at once for a file out of scope; its route answers 503 on an
+ * agent where the feature is dark, and the hook passes. The timeout is over its 20s budget, so the
+ * hook always passes on its own terms rather than being killed.
+ */
+export const INSTAR_WRITE_PRETOOLUSE_MATCHER = 'Write|Edit|MultiEdit';
+export const INSTAR_WRITE_PRETOOLUSE_HOOKS: ReadonlyArray<InstarSettingsHookEntry> = [
+  { type: 'command', command: `node "${PD}/.instar/hooks/instar/attribution-gate.js"`, blocking: true, timeout: 25000 },
 ];
 
 /**
@@ -109,7 +165,7 @@ export const INSTAR_BASH_PRETOOLUSE_FILENAMES: ReadonlyArray<string> =
 
 /**
  * Extract the instar hook script filename from a settings hook command, e.g.
- * `node ${CLAUDE_PROJECT_DIR}/.instar/hooks/instar/deferral-detector.js` ->
+ * `node "${CLAUDE_PROJECT_DIR}/.instar/hooks/instar/deferral-detector.js"` ->
  * `deferral-detector.js`. Returns null if the command does not reference an
  * instar hook script. Used for idempotent presence detection during migration
  * (substring/filename match is robust to ${CLAUDE_PROJECT_DIR} vs absolute
@@ -147,6 +203,9 @@ export interface SettingsMatcherEntry {
  * Does NOT touch slopcheck-guard (its own dedicated ensure-block owns it) or
  * any non-Bash matcher.
  */
+export const INSTAR_WILDCARD_PRETOOLUSE_FILENAMES: ReadonlyArray<string> =
+  INSTAR_WILDCARD_PRETOOLUSE_HOOKS.map((h) => instarHookFilename(h.command) ?? '');
+
 export function ensureInstarBashPreToolUseHooks(preToolUse: SettingsMatcherEntry[]): string[] {
   const added: string[] = [];
   let bashEntry = preToolUse.find((e) => e.matcher === 'Bash');
@@ -162,6 +221,62 @@ export function ensureInstarBashPreToolUseHooks(preToolUse: SettingsMatcherEntry
     const present = bashEntry.hooks.some((h) => typeof h.command === 'string' && h.command.includes(fname));
     if (!present) {
       bashEntry.hooks.push({ ...canonical });
+      added.push(fname);
+    }
+  }
+  return added;
+}
+
+/**
+ * Idempotently ensure every canonical instar `*`-matcher PreToolUse hook is
+ * present. Same contract as the Bash mirror above — add-only, filename-keyed
+ * presence detection, hand-curated entries preserved, safe to run repeatedly.
+ *
+ * WHY THIS MIRROR IS DECLARED NEW WORK. The migrator today canonicalizes only
+ * `Bash`, and its `mcp__.*` handling is existence-only (it never appends to a
+ * matcher that is already present). Neither would install a wildcard hook on an
+ * existing agent, so shipping the stand-down without this function would leave
+ * the tool-muzzle half working for NEW agents only — the exact dark-guardrail
+ * migration gap this module was created to close.
+ */
+export function ensureInstarWildcardPreToolUseHooks(preToolUse: SettingsMatcherEntry[]): string[] {
+  const added: string[] = [];
+  let entry = preToolUse.find((e) => e.matcher === '*');
+  if (!entry) {
+    entry = { matcher: '*', hooks: [] };
+    preToolUse.push(entry);
+  }
+  if (!entry.hooks) entry.hooks = [];
+
+  for (const canonical of INSTAR_WILDCARD_PRETOOLUSE_HOOKS) {
+    const fname = instarHookFilename(canonical.command);
+    if (!fname) continue;
+    const present = entry.hooks.some((h) => typeof h.command === 'string' && h.command.includes(fname));
+    if (!present) {
+      entry.hooks.push({ ...canonical });
+      added.push(fname);
+    }
+  }
+  return added;
+}
+
+/**
+ * Idempotently ensure the canonical instar write-tool PreToolUse hooks are present, for new agents
+ * (init.ts) and existing ones (PostUpdateMigrator) alike. Returns the filenames it added.
+ */
+export function ensureInstarWritePreToolUseHooks(preToolUse: SettingsMatcherEntry[]): string[] {
+  const added: string[] = [];
+  let entry = preToolUse.find((e) => e.matcher === INSTAR_WRITE_PRETOOLUSE_MATCHER);
+  if (!entry) {
+    entry = { matcher: INSTAR_WRITE_PRETOOLUSE_MATCHER, hooks: [] };
+    preToolUse.push(entry);
+  }
+  if (!entry.hooks) entry.hooks = [];
+  for (const canonical of INSTAR_WRITE_PRETOOLUSE_HOOKS) {
+    const fname = instarHookFilename(canonical.command);
+    if (!fname) continue;
+    if (!entry.hooks.some((h) => typeof h.command === 'string' && h.command.includes(fname))) {
+      entry.hooks.push({ ...canonical });
       added.push(fname);
     }
   }

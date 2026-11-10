@@ -36,6 +36,16 @@ import type { StateManager } from '../core/StateManager.js';
 import type { HookEventReceiver } from '../monitoring/HookEventReceiver.js';
 import type { StreamTicketStore } from './StreamTicketStore.js';
 import { PeerStreamProxy, type UpstreamTransport, type UpstreamHandlers } from './PeerStreamProxy.js';
+import type { SessionPlatformInfo } from './sessionPlatform.js';
+import { sessionDisplayName } from './sessionPlatform.js';
+import { createSessionPresentationResolver, type SessionPresentationSources } from './sessionPresentation.js';
+import { isVerifiedChannelName } from '../messaging/shared/channelIdentity.js';
+import type { DesktopStreamManager } from './DesktopStreamManager.js';
+import type { DesktopMeshBroker } from './DesktopMeshBroker.js';
+import { DesktopMeshStreamRelay } from './DesktopMeshStreamRelay.js';
+import { machineAuthMiddleware, type MachineAuthDeps, type MachineAuthContext } from './machineAuth.js';
+import { isLoopbackPeer } from '../core/desktopTransport.js';
+import type { Request as ExpressRequest, Response as ExpressResponse } from 'express';
 
 /** Pool Dashboard Streaming §2.1: only tmux-safe session names ever reach tmux. */
 const SAFE_SESSION_NAME = /^[A-Za-z0-9_.:@-]+$/;
@@ -64,6 +74,7 @@ interface ClientState {
 }
 
 export class WebSocketManager {
+  private readonly desktopMeshRelay?: DesktopMeshStreamRelay;
   private wss: WebSocketServer;
   private clients: Map<WebSocket, ClientState> = new Map();
   private sessionOutputCache: Map<string, string> = new Map();
@@ -74,6 +85,7 @@ export class WebSocketManager {
   private state: StateManager;
   private authToken?: string;
   private registryPath?: string;
+  private sessionPresentationSources?: () => SessionPresentationSources;
   private hookEventReceiver?: HookEventReceiver;
   /** Pool Dashboard Streaming (serving side): consumes one-time tickets on the
    *  /pool-stream upgrade. Absent → /pool-stream is refused (feature dark). */
@@ -87,6 +99,7 @@ export class WebSocketManager {
   private selfMachineId?: string;
   /** One multiplexed upstream proxy per peer machine (requesting side). */
   private peerProxies = new Map<string, PeerStreamProxy>();
+  private resolveSessionPlatform?: (tmuxSession: string) => SessionPlatformInfo;
 
   constructor(options: {
     server: HttpServer;
@@ -94,20 +107,34 @@ export class WebSocketManager {
     state: StateManager;
     authToken?: string;
     instarDir?: string;
+    sessionPresentationSources?: () => SessionPresentationSources;
     hookEventReceiver?: HookEventReceiver;
     streamTicketStore?: StreamTicketStore;
+    desktopStreamManager?: DesktopStreamManager;
+    desktopMeshBroker?: DesktopMeshBroker | null;
+    desktopMeshSigningKeyPem?: string;
+    desktopPeerAuth?: MachineAuthDeps;
     poolStreamAllowRemoteInput?: boolean;
     poolStreamConnector?: PoolStreamConnector;
     selfMachineId?: string;
+    /** Which messaging platform a local session is bound to (the same
+     *  derivation GET /sessions uses). Without it every local row lacks
+     *  `platform` and the dashboard draws the headless icon. */
+    resolveSessionPlatform?: (tmuxSession: string) => SessionPlatformInfo;
   }) {
     this.sessionManager = options.sessionManager;
     this.state = options.state;
+    this.sessionPresentationSources = options.sessionPresentationSources;
     this.authToken = options.authToken;
     this.hookEventReceiver = options.hookEventReceiver;
     this.streamTicketStore = options.streamTicketStore;
     this.poolStreamAllowRemoteInput = options.poolStreamAllowRemoteInput ?? false;
     this.poolStreamConnector = options.poolStreamConnector;
     this.selfMachineId = options.selfMachineId;
+    this.resolveSessionPlatform = options.resolveSessionPlatform;
+    if (options.desktopMeshBroker && options.selfMachineId && options.desktopMeshSigningKeyPem) {
+      this.desktopMeshRelay = new DesktopMeshStreamRelay(options.selfMachineId, options.desktopMeshSigningKeyPem);
+    }
     if (options.instarDir) {
       this.registryPath = path.join(options.instarDir, 'topic-session-registry.json');
     }
@@ -119,6 +146,54 @@ export class WebSocketManager {
     // Handle upgrade manually for auth
     options.server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+
+      if (url.pathname === '/desktop-stream') {
+        const offered = typeof request.headers['sec-websocket-protocol'] === 'string'
+          ? request.headers['sec-websocket-protocol'].split(',').map(part => part.trim()) : [];
+        const ticket = offered[0] === 'instar-desktop-v1' && offered[1]?.startsWith('ticket.')
+          ? offered[1].slice(7) : '';
+        if (!request.headers['x-machine-id'] && ticket && options.desktopMeshBroker) {
+          const tlsSocket = 'encrypted' in socket && socket.encrypted === true;
+          const loopback = isLoopbackPeer(request.socket?.remoteAddress);
+          const scheme = tlsSocket || (loopback && request.headers['x-forwarded-proto'] === 'https')
+            ? 'https' : 'http';
+          if ((!tlsSocket && !loopback) || request.headers.origin !== `${scheme}://${request.headers.host}`) {
+            socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          const remote = options.desktopMeshBroker.consumeTicket(ticket);
+          if (remote && this.desktopMeshRelay) {
+            this.desktopMeshRelay.handleUpgrade(request, socket, head, remote.requestId, ticket, remote.url);
+            return;
+          }
+        }
+        if (request.headers['x-machine-id']) {
+          if (!options.desktopPeerAuth) {
+            socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+          }
+          const machineRequest = request as IncomingMessage & { body: object; machineAuth?: MachineAuthContext; desktopRelayMachineId?: string };
+          machineRequest.body = {};
+          let accepted = false;
+          const refusal = { status: (_code: number) => refusal, json: (_body: unknown) => refusal };
+          machineAuthMiddleware(options.desktopPeerAuth)(
+            machineRequest as unknown as ExpressRequest,
+            refusal as unknown as ExpressResponse,
+            () => { accepted = true; },
+          );
+          if (!accepted || !machineRequest.machineAuth) {
+            socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+          }
+          machineRequest.desktopRelayMachineId = machineRequest.machineAuth.machineId;
+        }
+        if (!options.desktopStreamManager) {
+          socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        void options.desktopStreamManager.handleUpgrade(request, socket, head);
+        return;
+      }
 
       // ── /pool-stream: a PEER machine streaming a remote session (§2.3) ──
       // Authenticated by a single-use bearer ticket minted over the machine-
@@ -527,8 +602,8 @@ export class WebSocketManager {
    * Resolve display names by cross-referencing the topic-session registry.
    * Maps tmux session names to their Telegram topic names.
    */
-  private getTopicDisplayNames(): Map<string, string> {
-    const map = new Map<string, string>();
+  private getTopicDisplayNames(): Map<string, { topicId: number; name: string }> {
+    const map = new Map<string, { topicId: number; name: string }>();
     if (!this.registryPath) return map;
     try {
       const data = JSON.parse(fs.readFileSync(this.registryPath, 'utf-8'));
@@ -537,8 +612,8 @@ export class WebSocketManager {
       // Build reverse map: tmux session name → topic display name
       for (const [topicId, tmuxSession] of Object.entries(topicToSession)) {
         const name = topicToName[topicId];
-        if (name) {
-          map.set(tmuxSession, name);
+        if (isVerifiedChannelName('telegram', topicId, name)) {
+          map.set(tmuxSession, { topicId: Number(topicId), name });
         }
       }
     } catch {
@@ -549,11 +624,12 @@ export class WebSocketManager {
 
   private buildSessionList() {
     const running = this.sessionManager.listRunningSessions();
-    const displayNames = this.getTopicDisplayNames();
+    const presentSession = this.sessionPresentationSources ? createSessionPresentationResolver(this.sessionPresentationSources()) : null;
+    const displayNames = presentSession ? new Map<string, { topicId: number; name: string }>() : this.getTopicDisplayNames();
     return running.map(s => {
       const base: Record<string, unknown> = {
         id: s.id,
-        name: displayNames.get(s.tmuxSession) || s.name,
+        name: s.name,
         tmuxSession: s.tmuxSession,
         status: s.status,
         startedAt: s.startedAt,
@@ -562,9 +638,30 @@ export class WebSocketManager {
         type: s.jobSlug ? 'job' : 'interactive',
       };
 
+      if (presentSession) {
+        Object.assign(base, presentSession(s));
+      } else {
+        if (this.resolveSessionPlatform) {
+          try {
+            Object.assign(base, this.resolveSessionPlatform(s.tmuxSession));
+          } catch {
+            // Adapter lookup failed — leave platform unset (dashboard shows headless)
+          }
+        }
+        if ((!base.platform || base.platform === 'headless') && Number.isSafeInteger(s.telegramTopicId) && s.telegramTopicId! > 0) {
+          base.platform = 'telegram';
+          base.platformId = s.telegramTopicId;
+        }
+        const registeredTitle = displayNames.get(s.tmuxSession);
+        if (base.platform === 'telegram' && !base.platformName && registeredTitle?.topicId === Number(base.platformId)) {
+          base.platformName = registeredTitle.name;
+        }
+        base.name = sessionDisplayName(base.name, base as unknown as SessionPlatformInfo);
+      }
+
       // Enrich with hook event telemetry when available
       if (this.hookEventReceiver) {
-        const summary = this.hookEventReceiver.getSessionSummary(s.tmuxSession);
+        const summary = this.hookEventReceiver.getSessionSummaryForTmux(s.tmuxSession);
         if (summary) {
           base.telemetry = {
             eventCount: summary.eventCount,
@@ -651,7 +748,10 @@ export class WebSocketManager {
   /**
    * Graceful shutdown — close all connections and stop intervals.
    */
+  closeDesktopMeshRequest(requestId: string): void { this.desktopMeshRelay?.closeRequest(requestId); }
+
   shutdown(): void {
+    this.desktopMeshRelay?.close();
     if (this.streamInterval) clearInterval(this.streamInterval);
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     if (this.sessionBroadcastInterval) clearInterval(this.sessionBroadcastInterval);

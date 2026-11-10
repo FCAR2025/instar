@@ -12,6 +12,7 @@ import {
 } from '../../src/core/CircuitBreakingIntelligenceProvider.js';
 import { LlmCircuitOpenError } from '../../src/core/LlmCircuitBreaker.js';
 import { FeatureMetricsLedger } from '../../src/monitoring/FeatureMetricsLedger.js';
+import { _resetDecisionQualityForTest } from '../../src/core/decisionQualityTypes.js';
 import type { IntelligenceProvider } from '../../src/core/types.js';
 
 function fakeBreaker(opts: {
@@ -31,12 +32,13 @@ const recorder: FeatureMetricsRecorder = { record: (e) => { recorded.push(e as R
 
 afterEach(() => {
   setFeatureMetricsRecorder(null);
+  _resetDecisionQualityForTest();
   recorded.length = 0;
   vi.restoreAllMocks();
 });
 
 describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)', () => {
-  it('records a success as outcome=noop with the feature label + latency', async () => {
+  it('records a success without a verdict classifier as outcome=unclassified', async () => {
     setFeatureMetricsRecorder(recorder);
     const inner: IntelligenceProvider = { evaluate: async () => 'ok' };
     const p = new CircuitBreakingIntelligenceProvider(inner, fakeBreaker());
@@ -45,7 +47,7 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
 
     expect(res).toBe('ok');
     expect(recorded.length).toBe(1);
-    expect(recorded[0]).toMatchObject({ feature: 'MessagingToneGate', kind: 'llm', outcome: 'noop', waited: false });
+    expect(recorded[0]).toMatchObject({ feature: 'MessagingToneGate', kind: 'llm', outcome: 'unclassified', waited: false });
     expect(typeof recorded[0].latencyMs).toBe('number');
   });
 
@@ -76,7 +78,7 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
     const res = await p.evaluate('x', { attribution: { component: 'CoherenceGate' }, rateLimitWaitMs: 500 } as any);
 
     expect(res).toBe('ok');
-    expect(recorded[0]).toMatchObject({ feature: 'CoherenceGate', outcome: 'noop', waited: true, waitMs: 500 });
+    expect(recorded[0]).toMatchObject({ feature: 'CoherenceGate', outcome: 'unclassified', waited: true, waitMs: 500 });
   });
 
   it('records the circuit-open skip as outcome=shed (no call ran) and throws LlmCircuitOpenError', async () => {
@@ -128,7 +130,10 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
       expect(tone.realCalls).toBe(3);   // calls − shed = honest call count
       expect(tone.llmCalls).toBe(5);
       expect(tone.errors).toBe(1);
-      expect(tone.noop).toBe(2);
+      expect(tone.noop).toBe(0);
+      expect(tone.unclassified).toBe(2);
+      expect(tone.fireRate).toBeNull();
+      expect(tone.fireRateInsufficientEvidence).toBe(true);
     } finally {
       ledger.close();
     }
@@ -146,7 +151,7 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
     };
     const p = new CircuitBreakingIntelligenceProvider(inner, fakeBreaker());
     await p.evaluate('x', { attribution: { component: 'ToneGate' } });
-    expect(recorded[0]).toMatchObject({ feature: 'ToneGate', outcome: 'noop', tokensIn: 1234, tokensOut: 56 });
+    expect(recorded[0]).toMatchObject({ feature: 'ToneGate', outcome: 'unclassified', tokensIn: 1234, tokensOut: 56 });
   });
 
   it('composes with (does not clobber) a caller-supplied onUsage', async () => {
@@ -197,7 +202,7 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
     };
     const p = new CircuitBreakingIntelligenceProvider(inner, fakeBreaker());
     await p.evaluate('x', { attribution: { component: 'MessageSentinel' } });
-    expect(recorded[0]).toMatchObject({ feature: 'MessageSentinel', outcome: 'noop', model: 'gpt-5.4-mini', framework: 'codex-cli' });
+    expect(recorded[0]).toMatchObject({ feature: 'MessageSentinel', outcome: 'unclassified', model: 'gpt-5.4-mini', framework: 'codex-cli' });
   });
 
   it('composes with (does not clobber) a caller-supplied onModel', async () => {
@@ -222,7 +227,12 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
     expect(recorded[0]).toMatchObject({ outcome: 'error', model: 'gpt-5.4-mini', framework: 'codex-cli' });
   });
 
-  it('classifyVerdict(acted:true) records outcome=fired with verdictId', async () => {
+  it('classifyVerdict(acted:true) records outcome=fired; the caller verdictId is RELOCATED off verdict_id (FD8)', async () => {
+    // llm-decision-quality-meter FD8: verdict_id on kind:'llm' rows is single-writer
+    // for the seam-minted correlation id. A caller-supplied classifyVerdict.verdictId
+    // no longer lands there (it becomes callerRef in the provenance row via the
+    // router's settlement — the breaker drops it for llm metric rows). This direct
+    // (router-bypassing) call gets a breaker-local 'b-' mint.
     setFeatureMetricsRecorder(recorder);
     const inner: IntelligenceProvider = { evaluate: async () => 'emergency-stop' };
     const p = new CircuitBreakingIntelligenceProvider(inner, fakeBreaker());
@@ -230,7 +240,25 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
       attribution: { component: 'MessageSentinel' },
       classifyVerdict: (r) => ({ acted: r === 'emergency-stop', verdictId: 'v1' }),
     } as any);
-    expect(recorded[0]).toMatchObject({ outcome: 'fired', verdictId: 'v1' });
+    expect(recorded[0]).toMatchObject({ outcome: 'fired' });
+    expect(recorded[0].verdictId).not.toBe('v1');
+    expect(recorded[0].verdictId).toMatch(/^b-/);
+  });
+
+  it('EVERY llm metric row carries a correlation id in verdictId — success, error, and shed (always-on)', async () => {
+    setFeatureMetricsRecorder(recorder);
+    const ok: IntelligenceProvider = { evaluate: async () => 'ok' };
+    const bad: IntelligenceProvider = { evaluate: async () => { throw new Error('boom'); } };
+    await new CircuitBreakingIntelligenceProvider(ok, fakeBreaker()).evaluate('a');
+    await expect(new CircuitBreakingIntelligenceProvider(bad, fakeBreaker()).evaluate('b')).rejects.toThrow('boom');
+    await expect(
+      new CircuitBreakingIntelligenceProvider(ok, fakeBreaker({ allow: false, waitAllow: false }))
+        .evaluate('c', { rateLimitWaitMs: 50 } as any),
+    ).rejects.toBeInstanceOf(LlmCircuitOpenError);
+    expect(recorded).toHaveLength(3);
+    for (const row of recorded) expect(row.verdictId).toMatch(/^b-/); // direct calls = breaker mints
+    // Distinct decisions get distinct ids (uuid-based, never reused).
+    expect(new Set(recorded.map((r) => r.verdictId)).size).toBe(3);
   });
 
   it('classifyVerdict(acted:false) records outcome=noop', async () => {
@@ -244,12 +272,12 @@ describe('CircuitBreakingIntelligenceProvider — feature metrics tap (Phase 1b)
     expect(recorded[0]).toMatchObject({ outcome: 'noop' });
   });
 
-  it('a throwing classifyVerdict defaults to noop and never breaks the call', async () => {
+  it('a throwing classifyVerdict records unclassified and never breaks the call', async () => {
     setFeatureMetricsRecorder(recorder);
     const inner: IntelligenceProvider = { evaluate: async () => 'ok' };
     const p = new CircuitBreakingIntelligenceProvider(inner, fakeBreaker());
     await expect(p.evaluate('x', { classifyVerdict: () => { throw new Error('bad'); } } as any)).resolves.toBe('ok');
-    expect(recorded[0]).toMatchObject({ outcome: 'noop' });
+    expect(recorded[0]).toMatchObject({ outcome: 'unclassified' });
   });
 
   it('surfaces provider/model + fired in the REAL ledger rollup (frameworks/models/fireRate)', async () => {

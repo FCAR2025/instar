@@ -18,6 +18,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import pc from 'picocolors';
+import { evaluateBetweenWindowAdmission } from '../core/BetweenWindowAdmissionGate.js';
 
 type GateMode = 'off' | 'shadow' | 'enforce';
 
@@ -82,6 +83,7 @@ export async function gateStatus(opts: { dir?: string }): Promise<void> {
     autonomousActive: boolean;
     compactionInFlight: boolean;
     routeVersion: number;
+    breaker?: { open: boolean; consecutiveFailures: number; openUntil: number; suppressedCount: number } | null;
   };
   const kill = (await killRes.json()) as { killSwitch: boolean };
 
@@ -94,6 +96,13 @@ export async function gateStatus(opts: { dir?: string }): Promise<void> {
   console.log(`  Autonomous active: ${hot.autonomousActive ? pc.cyan('yes') : pc.gray('no')}`);
   console.log(`  Compaction:        ${hot.compactionInFlight ? pc.yellow('in-flight') : pc.gray('idle')}`);
   console.log(`  Route version:     ${hot.routeVersion}`);
+  if (hot.breaker) {
+    console.log(`  Authority breaker: ${hot.breaker.open ? pc.yellow('open') : pc.green('closed')} (${hot.breaker.consecutiveFailures} failures, ${hot.breaker.suppressedCount} suppressed)`);
+    if (hot.breaker.open) {
+      console.log(`  Next automatic probe: ${new Date(hot.breaker.openUntil).toISOString()}`);
+      console.log('  Repaired the provider? Run: instar gate reset-breaker');
+    }
+  }
   console.log('');
   if (hot.mode === 'off') {
     console.log(pc.gray('  Gate is inert. Use `instar gate set unjustified-stop --mode shadow` to begin data collection.'));
@@ -105,6 +114,17 @@ export async function gateStatus(opts: { dir?: string }): Promise<void> {
   if (kill.killSwitch) {
     console.log(pc.red('  Kill-switch is SET — every evaluation short-circuits to allow. Clear with --clear.'));
   }
+}
+
+export async function gateResetBreaker(opts: { dir?: string }): Promise<void> {
+  const stateDir = resolveStateDir(opts);
+  const { port, authToken } = readConfig(stateDir);
+  const res = await authedFetch(port, authToken, '/internal/stop-gate/reset-breaker', { method: 'POST' });
+  if (!res.ok) {
+    console.error(pc.red(`breaker reset failed: ${res.status}`));
+    process.exit(1);
+  }
+  console.log(pc.green('✓ Stop-gate authority breaker reset; the next Stop event may probe immediately.'));
 }
 
 // ── `instar gate set unjustified-stop --mode <mode>` ────────────────
@@ -226,5 +246,55 @@ export async function gateLog(opts: { tail?: string; dir?: string }): Promise<vo
     if (ev.reasonPreview) {
       console.log(pc.gray(`    ${ev.reasonPreview.slice(0, 120)}`));
     }
+  }
+}
+
+// ── `instar gate between-window --package <file>` ───────────────────
+
+export async function gateBetweenWindowAdmission(opts: {
+  package: string;
+  dir?: string;
+  store?: string;
+  json?: boolean;
+}): Promise<void> {
+  if (!opts.package) {
+    console.error(pc.red('--package is required'));
+    process.exit(1);
+  }
+
+  const projectDir = opts.dir ? path.resolve(opts.dir) : process.cwd();
+  const stateDir = path.join(projectDir, '.instar');
+  const packagePath = path.resolve(opts.package);
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
+  } catch (err) {
+    console.error(pc.red(`between-window admission package unreadable: ${err instanceof Error ? err.message : String(err)}`));
+    process.exit(1);
+  }
+
+  const result = evaluateBetweenWindowAdmission({
+    stateDir,
+    package: parsed,
+    storePath: opts.store,
+  });
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else if (result.admitted) {
+    console.log(pc.green('between-window admission: PASS'));
+    console.log(`  full-history receipts: ${result.checked.fullHistoryReceipts}`);
+    console.log(`  tenet receipts:        ${result.checked.tenetReceipts}`);
+    console.log(`  corpus mismatches:     ${result.corpusMismatches.length} surfaced`);
+  } else {
+    console.log(pc.red('between-window admission: REFUSE'));
+    for (const issue of result.issues) {
+      console.log(`  ${issue.code} ${issue.path}: ${issue.message}`);
+    }
+  }
+
+  if (!result.admitted) {
+    process.exit(1);
   }
 }

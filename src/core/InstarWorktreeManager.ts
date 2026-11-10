@@ -19,12 +19,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadRegistry } from './AgentRegistry.js';
 import { SafeGitExecutor } from './SafeGitExecutor.js';
+import { SafeFsExecutor } from './SafeFsExecutor.js';
 
 // ── Constants ────────────────────────────────────────────────────────────
 
 /** Default allowlist of remote-origin URLs for the canonical instar repo.
- *  Operators can extend via `worktree.repoUrlAllowlist` in `.instar/config.json`. */
+ *  `JKHeadley/instar` is where instar is developed and released; a checkout
+ *  cloned from it was refused until it was listed here (no config could be
+ *  assumed on a fresh machine). Operators can extend via
+ *  `worktree.repoUrlAllowlist` in `.instar/config.json`. */
 export const DEFAULT_INSTAR_REPO_URL_ALLOWLIST: ReadonlyArray<string> = [
+  'git@github.com:JKHeadley/instar.git',
+  'https://github.com/JKHeadley/instar.git',
   'git@github.com:instar-ai/instar.git',
   'https://github.com/instar-ai/instar.git',
 ];
@@ -346,8 +352,19 @@ export function resolveInstarRepo(opts: ResolveInstarRepoOptions = {}): Resolved
     failures.push(`  - ${candidate}: ${result.error}`);
   }
 
+  // Name the remedy, not just the failure. INSTAR_REPO is the FIRST candidate
+  // consulted above, yet it appeared nowhere in this message — so an operator
+  // whose checkout lives outside the default locations (and whose CWD is not
+  // inside it) had no way to learn the escape hatch exists from the error that
+  // blocked them. Earned 2026-08-14: that silence sent an agent around this
+  // command to a raw `git worktree add`, skipping every safety property the
+  // convention exists to provide (jailed destination, per-worktree identity,
+  // shared node_modules, indexer exclusion). The diagnostics above are kept
+  // verbatim; the remedy is appended, never substituted for them.
   throw new Error(
-    `instar repo: no candidate passed integrity validation. Tried:\n${failures.join('\n')}`,
+    `instar repo: no candidate passed integrity validation. Tried:\n${failures.join('\n')}\n\n` +
+      'To fix: run this command from inside your instar checkout, or point INSTAR_REPO at it ' +
+      '(for example: INSTAR_REPO=/path/to/instar instar worktree create <branch>).',
   );
 }
 
@@ -539,6 +556,9 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Creat
 
   const worktreesDir = path.join(agentHome, '.worktrees');
   ensureWorktreesDir(worktreesDir);
+  const createLock = acquireWorktreeCreateLock(agentHome);
+  try {
+  assertWorktreeCapacity(worktreesDir);
 
   const existingSlugsLower = new Set(
     fs.readdirSync(worktreesDir).map((entry) => entry.toLowerCase()),
@@ -586,6 +606,10 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Creat
   } else {
     addArgs.push(worktreePath, opts.branch);
   }
+  if (!isRealDirectory(worktreesDir) || fs.realpathSync(worktreesDir) !== worktreesReal) {
+    throw new Error(`path-containment: ${worktreesDir} changed before worktree add`);
+  }
+  assertWorktreeCapacity(worktreesDir);
   const addResult = tryGit(addArgs, instarRepo, createOp, 'write');
   if (!addResult.ok) {
     throw new Error(classifyWorktreeAddError(addResult.error, worktreePath, instarRepo));
@@ -594,13 +618,16 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Creat
   // Per-worktree git identity. Cosmetic attribution, not authority. Signing
   // configuration (user.signingkey, commit.gpgsign, gpg.format,
   // gpg.ssh.allowedSignersFile) is deliberately untouched.
-  setLocalGitIdentity(worktreePath, agentName);
-  ensureHuskyHooksActive(worktreePath);
+  setLocalGitIdentity(worktreePath, instarRepo, opts.stateDir ?? path.join(agentHome, '.instar'));
 
+  // Share node_modules BEFORE activating hooks: the prepare script is `husky`, a
+  // node_modules binary, and a fresh worktree has none of its own. Activating first
+  // failed every real create with "husky: not found".
   const shareNodeModules = opts.shareNodeModules ?? true;
   if (shareNodeModules) {
     maybeSymlinkNodeModules(instarRepo, worktreePath);
   }
+  ensureHuskyHooksActive(worktreePath);
 
   // Audit ledger — local and durable mirror.
   const stateDir = opts.stateDir ?? path.join(agentHome, '.instar');
@@ -629,6 +656,95 @@ export async function createWorktree(opts: CreateWorktreeOptions): Promise<Creat
     shareNodeModules,
     createdBranch,
   };
+  } finally {
+    createLock.release();
+  }
+}
+
+/** Serialize the physical count and git add across CLI processes for one agent. */
+export function acquireWorktreeCreateLock(agentHome: string): { release: () => void } {
+  const runtimeDir = path.join(agentHome, '.instar');
+  const lockDir = path.join(runtimeDir, 'local');
+  for (const dir of [runtimeDir, lockDir]) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { mode: 0o700 });
+    if (!fs.lstatSync(dir).isDirectory()) throw new Error(`worktree-create-lock: unsafe directory ${dir}`);
+  }
+  const lockPath = path.join(lockDir, 'worktree-create.lock');
+  let fd: number;
+  try {
+    fd = fs.openSync(lockPath,
+      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW ?? 0), 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(`worktree-create-busy: ${lockPath} exists; inspect its holder before clearing a stale lock`);
+    }
+    throw err;
+  }
+  let identity: fs.Stats;
+  try {
+    identity = fs.fstatSync(fd);
+    fs.writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+  } catch (err) {
+    try {
+      const current = fs.lstatSync(lockPath);
+      const opened = fs.fstatSync(fd);
+      if (current.dev === opened.dev && current.ino === opened.ino) {
+        SafeFsExecutor.safeUnlinkSync(lockPath, { operation: 'InstarWorktreeManager.failedCreateLock' });
+      }
+    } catch { /* Preserve the original lock setup error. */ }
+    fs.closeSync(fd);
+    throw err;
+  }
+  let released = false;
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      try {
+        const current = fs.lstatSync(lockPath);
+        if (current.dev === identity.dev && current.ino === identity.ino) {
+          SafeFsExecutor.safeUnlinkSync(lockPath, { operation: 'InstarWorktreeManager.releaseCreateLock' });
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+  };
+}
+
+/** Keep full checkout growth bounded before git creates another source tree. */
+export function assertWorktreeCapacity(worktreesDir: string, limit = 500): void {
+  const directories = fs.readdirSync(worktreesDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  if (directories.length >= limit) {
+    throw new Error(
+      `worktree-capacity: ${directories.length} directories under ${worktreesDir} (limit ${limit}): ` +
+      `${describeWorktreeFolder(worktreesDir, directories)}. ` +
+      'Everything listed counts toward the limit. Reclaim clean idle worktrees and preserve unique commits before creating another checkout',
+    );
+  }
+}
+
+/** What is filling the folder, in a form the reader can act on: checkouts vs other folders, grouped by name. */
+function describeWorktreeFolder(worktreesDir: string, directories: string[]): string {
+  const others = new Map<string, number>();
+  let checkouts = 0;
+  for (const name of directories) {
+    if (fs.existsSync(path.join(worktreesDir, name, '.git'))) { checkouts += 1; continue; }
+    const hyphen = name.indexOf('-', 1);
+    const group = hyphen === -1 ? name : `${name.slice(0, hyphen)}-*`;
+    others.set(group, (others.get(group) ?? 0) + 1);
+  }
+  const otherCount = directories.length - checkouts;
+  const summary = `${checkouts} git checkouts and ${otherCount} other folders`;
+  if (otherCount === 0) return summary;
+  const groups = [...others.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const shown = groups.slice(0, 6).map(([group, count]) => `${group} ${count}`).join(', ');
+  const rest = groups.length > 6 ? `, and ${groups.length - 6} more kinds` : '';
+  return `${summary} (${shown}${rest})`;
 }
 
 export async function resolveBaseBranch(
@@ -686,12 +802,70 @@ function classifyWorktreeAddError(stderr: string, worktreePath: string, repoPath
   return `worktree add failed: ${stderr}`;
 }
 
-function setLocalGitIdentity(worktreePath: string, agentName: string): void {
+export type CommitIdentity = { name: string; email: string };
+
+/**
+ * Resolve the identity a worktree commits as. NEVER invents one.
+ *
+ * Order: (1) `git.commitIdentity` in the agent's config.json; (2) the agent
+ * repo's own user.name/user.email; (3) nothing — the caller must refuse.
+ *
+ * No domain is hardcoded here, deliberately. This function used to stamp
+ * `<agent>@instar.local`, an address linked to no account, which trips
+ * GitHub's `require_extra_approval_for_unattributed_changes` and turns every
+ * release into a human approval. Substituting a different hardcoded domain
+ * would swap one invented identity for another; the point is that an identity
+ * nobody configured must not be minted at all.
+ */
+export function resolveCommitIdentity(instarRepo: string, stateDir: string): CommitIdentity | null {
+  // Rung 1 — explicit configuration wins.
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(stateDir, 'config.json'), 'utf-8'));
+    const id = cfg?.git?.commitIdentity;
+    if (
+      id && typeof id.name === 'string' && typeof id.email === 'string'
+      && id.name.trim() !== '' && id.email.trim() !== ''
+    ) {
+      return { name: id.name.trim(), email: id.email.trim() };
+    }
+  } catch {
+    // @silent-fallback-ok — an absent, unreadable or malformed config is not an
+    //   error here: it simply means rung 1 has nothing to say. Rung 3 still
+    //   refuses if every rung comes up empty, so nothing is minted silently.
+  }
+
+  // Rung 2 — inherit whatever the agent's own repository commits as.
+  const readOp = 'src/core/InstarWorktreeManager.ts:resolveCommitIdentity';
+  // `config --get <key>` is the unambiguous READ form: the bare `config <key>`
+  // shape is classified destructive by SafeGitExecutor's read funnel (it cannot
+  // tell a read from a write), and a missing key exits non-zero, which tryGit
+  // turns into the "absent" branch below rather than a crash.
+  const nameRes = tryGit(['-C', instarRepo, 'config', '--get', 'user.name'], instarRepo, readOp, 'read');
+  const emailRes = tryGit(['-C', instarRepo, 'config', '--get', 'user.email'], instarRepo, readOp, 'read');
+  const name = nameRes.ok ? nameRes.stdout.trim() : '';
+  const email = emailRes.ok ? emailRes.stdout.trim() : '';
+  if (name !== '' && email !== '') return { name, email };
+
+  // Rung 3 — refuse. Do NOT mint.
+  return null;
+}
+
+function setLocalGitIdentity(worktreePath: string, instarRepo: string, stateDir: string): void {
+  const identity = resolveCommitIdentity(instarRepo, stateDir);
+  if (!identity) {
+    throw new Error(
+      'refusing to create the worktree: no commit identity is configured. Set '
+      + '"git": { "commitIdentity": { "name": ..., "email": ... } } in the agent config, or set '
+      + 'user.name and user.email on the agent repository. A worktree that commits as an '
+      + 'unattributed identity costs a human approval at release time, so this refuses rather '
+      + 'than inventing one.',
+    );
+  }
   // Set only user.name + user.email. Do not touch signing configuration —
   // global user.signingkey / commit.gpgsign / gpg.format flow through unchanged.
   const idOp = 'src/core/InstarWorktreeManager.ts:setLocalGitIdentity';
-  tryGit(['-C', worktreePath, 'config', 'user.name', `Instar Agent (${agentName})`], worktreePath, idOp, 'write');
-  tryGit(['-C', worktreePath, 'config', 'user.email', `${agentName}@instar.local`], worktreePath, idOp, 'write');
+  tryGit(['-C', worktreePath, 'config', 'user.name', identity.name], worktreePath, idOp, 'write');
+  tryGit(['-C', worktreePath, 'config', 'user.email', identity.email], worktreePath, idOp, 'write');
 }
 
 function maybeSymlinkNodeModules(instarRepo: string, worktreePath: string): void {
@@ -773,6 +947,9 @@ export function hasRunnableHookShim(shimHookPath: string): boolean {
 
 function ensureWorktreesDir(worktreesDir: string): void {
   if (fs.existsSync(worktreesDir)) {
+    if (!fs.lstatSync(worktreesDir).isDirectory()) {
+      throw new Error(`path-containment: ${worktreesDir} is not a real directory (symlink?)`);
+    }
     // Re-assert 0700 every call to recover from drift.
     fs.chmodSync(worktreesDir, 0o700);
   } else {
@@ -854,7 +1031,7 @@ export function ensureClaudeTranscriptSpotlightExclusion(
  * None of these are usefully Spotlight-searchable (instar reads them via fs, not
  * mdfind), so excluding them is pure OS hygiene.
  */
-const AGENT_DATA_SPOTLIGHT_SUBDIRS = ['telegram-images', 'server-data', 'logs', 'state'];
+const AGENT_DATA_SPOTLIGHT_SUBDIRS = ['telegram-images', 'app-media', 'server-data', 'logs', 'state'];
 
 /**
  * Drop a `.metadata_never_index` marker in each high-churn subdir of the agent's

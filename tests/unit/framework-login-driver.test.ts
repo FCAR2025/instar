@@ -6,7 +6,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { FrameworkLoginDriver, enrollPaneSessionName } from '../../src/core/FrameworkLoginDriver.js';
+import {
+  FrameworkLoginDriver,
+  enrollPaneSessionName,
+  enrollmentBrowserEnv,
+  enrollmentIsolationEnv,
+  enrollmentCredentialPath,
+  DEFAULT_ENROLL_LOGIN_COMMANDS,
+} from '../../src/core/FrameworkLoginDriver.js';
+import { EnrollmentWizard } from '../../src/core/EnrollmentWizard.js';
 import { loadCapturedFixture } from '../helpers/loadCapturedFixture.js';
 
 describe('enrollPaneSessionName (shared pane-name source of truth — ws52-code-paste-back / codex #1)', () => {
@@ -23,6 +31,14 @@ describe('enrollPaneSessionName (shared pane-name source of truth — ws52-code-
     const configHome = '/Users/x/.instar/agents/echo/.claude-followme-adriana';
     const slug = configHome.replace(/[^a-zA-Z0-9]+/g, '-').slice(-24);
     expect(enrollPaneSessionName('claude-code', configHome)).toBe(`instar-enroll-claude-code-${slug}`);
+  });
+});
+
+describe('enrollmentBrowserEnv consent boundary', () => {
+  it('suppresses the provider browser opener only for background renewal', () => {
+    expect(enrollmentBrowserEnv(false)).toEqual({ BROWSER: 'true' });
+    expect(enrollmentBrowserEnv(true)).toEqual({});
+    expect(enrollmentBrowserEnv(undefined)).toEqual({});
   });
 });
 
@@ -195,5 +211,85 @@ describe('FrameworkLoginDriver.drive', () => {
     const driver = new FrameworkLoginDriver(deps);
     const a = await driver.drive({ provider: 'openai', framework: 'codex-cli', kind: 'device-code', scrapeTimeoutMs: 0 });
     expect(a.userCode).toBe('7DAU-W4XJA');
+  });
+});
+
+describe('enrollmentIsolationEnv — each CLI gets the variable it actually reads', () => {
+  const HOME = '/Users/x/.instar/agents/echo/.codex-followme-sagemindai';
+
+  it('confines a Codex login with CODEX_HOME, not CLAUDE_CONFIG_DIR', () => {
+    // The regression this exists for: codex-cli fell through to CLAUDE_CONFIG_DIR,
+    // a variable the Codex CLI ignores, so every instar-started Codex sign-in ran
+    // against the machine's real ~/.codex and signed the operator out of it.
+    expect(enrollmentIsolationEnv('codex-cli', HOME)).toEqual({ CODEX_HOME: HOME });
+    expect(enrollmentIsolationEnv('codex-cli', HOME)).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+  });
+
+  it('keeps claude-code on CLAUDE_CONFIG_DIR and grok on GROK_HOME', () => {
+    expect(enrollmentIsolationEnv('claude-code', HOME)).toEqual({ CLAUDE_CONFIG_DIR: HOME });
+    expect(enrollmentIsolationEnv('grok-build', HOME)).toEqual({ GROK_HOME: HOME });
+  });
+
+  it('gives a framework with no verified isolation variable NONE, never a misleading one', () => {
+    // Handing a CLI a variable it ignores is worse than handing it none: the login
+    // lands in the ambient home while the pool records an isolated configHome.
+    expect(enrollmentIsolationEnv('gemini-cli', HOME)).toEqual({});
+    expect(enrollmentIsolationEnv('pi-cli', HOME)).toEqual({});
+  });
+
+  it('sets nothing when there is no slot to confine the login to', () => {
+    expect(enrollmentIsolationEnv('codex-cli', undefined)).toEqual({});
+    expect(enrollmentIsolationEnv('claude-code', undefined)).toEqual({});
+  });
+});
+
+describe('enrollmentCredentialPath — mirrors where the isolation env points', () => {
+  const ENV = { CODEX_HOME: '/env/codex', GROK_HOME: '/env/grok' };
+
+  it('points at the slot the login was confined to', () => {
+    expect(enrollmentCredentialPath('codex-cli', '/slot/codex', ENV, '/home/u')).toBe('/slot/codex/auth.json');
+    expect(enrollmentCredentialPath('grok-build', '/slot/grok', ENV, '/home/u')).toBe('/slot/grok/auth.json');
+  });
+
+  it('falls back to the ambient home the CLI would use when there is no slot', () => {
+    expect(enrollmentCredentialPath('codex-cli', undefined, ENV, '/home/u')).toBe('/env/codex/auth.json');
+    expect(enrollmentCredentialPath('codex-cli', undefined, {}, '/home/u')).toBe('/home/u/.codex/auth.json');
+    expect(enrollmentCredentialPath('grok-build', undefined, {}, '/home/u')).toBe('/home/u/.grok/auth.json');
+  });
+
+  it('tolerates a trailing slash on the slot rather than emitting a doubled separator', () => {
+    expect(enrollmentCredentialPath('codex-cli', '/slot/codex/', ENV, '/home/u')).toBe('/slot/codex/auth.json');
+  });
+
+  it('returns null for a framework whose credential location is unverified', () => {
+    // A guessed path would read an absent file forever — silently degrading to the
+    // old re-ask loop while looking supported.
+    expect(enrollmentCredentialPath('claude-code', '/slot/claude', ENV, '/home/u')).toBeNull();
+    expect(enrollmentCredentialPath('gemini-cli', '/slot/g', ENV, '/home/u')).toBeNull();
+  });
+});
+
+describe('DEFAULT_ENROLL_LOGIN_COMMANDS (device-code enrollment command invariant)', () => {
+  // Regression guard for the fleet-wide Codex "Set up" bug: plain `codex login`
+  // opens a localhost-callback browser that cannot complete on a headless follow-me
+  // target, so the wizard scrapes no code and enrollment dies `login-did-not-start`.
+  // The COMMAND must match the flow-KIND, or there is no code to scrape.
+  it('codex-cli enrolls with --device-auth (the exact bug)', () => {
+    expect(DEFAULT_ENROLL_LOGIN_COMMANDS['codex-cli']).toBe('codex login --device-auth');
+  });
+
+  it('every device-code-kind framework carries --device-auth (command matches kind)', () => {
+    // Codex→openai, grok→xai; remoteKind proves those providers resolve to
+    // device-code, so the command MUST supply the flag that makes a code appear.
+    expect(EnrollmentWizard.remoteKind('openai')).toBe('device-code');
+    expect(EnrollmentWizard.remoteKind('xai')).toBe('device-code');
+    for (const fw of ['codex-cli', 'grok-build'] as const) {
+      expect(DEFAULT_ENROLL_LOGIN_COMMANDS[fw]).toContain('--device-auth');
+    }
+  });
+
+  it('url-code-paste frameworks keep their two-code flow (no forced --device-auth)', () => {
+    expect(EnrollmentWizard.remoteKind('anthropic')).toBe('url-code-paste');
+    expect(DEFAULT_ENROLL_LOGIN_COMMANDS['claude-code']).not.toContain('--device-auth');
   });
 });

@@ -1,3 +1,7 @@
+import { isQuietReceipt, verifiedJobEnvelope } from '../messaging/NotificationSelectivityGate.js';
+import { notificationStamper, withNotificationEnvelope } from '../messaging/notificationStampers.js';
+const stampNotification = notificationStamper('src/scheduler/JobScheduler.ts');
+import { verifyImportedPortableJob, recordImportedPortableIntegrityFailure } from '../core/JobPortableIntegrity.js';
 /**
  * Job Scheduler — cron-based job execution engine.
  *
@@ -8,6 +12,8 @@
  * no JSONL discovery, no machine coordination.
  */
 
+import { readJobDeclaredFailure } from './jobDeclaredFailure.js';
+import { jobGateReceiptPath, readJobGateReceipt, consumeJobGateReceipt, restoreJobGateReceipt } from './JobGateReceipt.js';
 import { Cron } from 'croner';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -15,14 +21,31 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
+import { parseInstrumentAssessment } from '../core/InstrumentAssessment.js';
+import type { JevJobCompletionAudit } from './JevJobCompletionAudit.js';
+import { findClaudeJobTranscript, readJobTranscriptEvidence } from './jobTranscriptEvidence.js';
 
 const execFileAsync = promisify(execFile);
 import path from 'node:path';
 import { ExecutionJournal } from '../core/ExecutionJournal.js';
 import { IntegrationGate } from './IntegrationGate.js';
 import { JobReflector } from '../core/JobReflector.js';
-import { loadJobs } from './JobLoader.js';
-import { JobRunHistory } from './JobRunHistory.js';
+import { formatLoadProblem, loadJobsDetailed } from './JobLoader.js';
+import { readRecentPromotion, markPromotionSweepComplete } from '../core/roleFollowRestart.js';
+import { PromotionCatchUpStore } from './PromotionCatchUpStore.js';
+import { readAgentMdBody, rehydrateAgentMdJobFromLastValidatedBody, verifyScriptHash } from './AgentMdJobLoader.js';
+import { parseScriptOutput, capScriptOutput, type ParsedScriptRun } from './jobScriptProtocol.js';
+import { notifyScriptRunObservers, type ScriptRunObserver } from './scriptRunObservers.js';
+import { scrubForStore } from '../core/durableSecretScrub.js';
+import { resolveDevAgentGate } from '../core/devAgentGate.js';
+import { SCRIPT_RUNNER_FIRST_WAVE_DISABLED_SLUGS } from '../config/ConfigDefaults.js';
+import { AUDIT_READY_SCRIPT_SLUGS, JOB_COST_AUDIT_READY, JOB_MODEL_ROUTING_AUDIT_READY } from './JobCostAuditReadiness.js';
+import { hashBody } from './AgentMdLockFile.js';
+import { JobRunHistory, isSideRun, type JobRun } from './JobRunHistory.js';
+import { JobSupervisionStore } from './JobSupervisionStore.js';
+import { projectSupervisionEvidence, SUPERVISION_EVIDENCE_POLICY } from './JobSupervisionEvidence.js';
+import { jobSupervisionRolloutState } from './JobSupervisionRollout.js';
+import { decideJobModelRoute, type JobRouteDecision, type JobRouteEvidence } from './JobModelRoute.js';
 import { SkipLedger } from './SkipLedger.js';
 import { classifySessionDeath } from '../monitoring/QuotaExhaustionDetector.js';
 import type { SessionManager } from '../core/SessionManager.js';
@@ -32,9 +55,15 @@ import type { CanRunJobResult, IntelligenceProvider, MessagingAdapter, SkipReaso
 import { TOPIC_STYLE } from '../messaging/TelegramAdapter.js';
 import type { JobDefinition, JobSchedulerConfig, JobState, JobPriority } from '../core/types.js';
 import type { TelegramAdapter } from '../messaging/TelegramAdapter.js';
+import { TelegramOriginHoldError } from '../messaging/telegram-origin/types.js';
+import { reportDeliverySinkFailure } from '../messaging/DeliverySinkFailure.js';
+import { RerouteRefusedError } from '../core/rerouteRefusedError.js';
+import { SessionCapacityRefusedError } from '../core/sessionCapacityRefusedError.js';
+import { jobCapacityNotice, jobFailureNotice } from '../messaging/userNotices.js';
 import type { JobClaimManager } from './JobClaimManager.js';
 import type { JobLeaseClaimStore } from './JobLeaseClaimStore.js';
 import { decideClaimPath, type CutoverGateInput, type CutoverDecision } from './JobLeaseCutoverGate.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
 import type { TopicMemory } from '../memory/TopicMemory.js';
 
 /**
@@ -48,7 +77,21 @@ interface QueuedJob {
   slug: string;
   reason: string;
   queuedAt: string;
+  capacityWait?: boolean;
 }
+
+interface JobCapacityEpisode {
+  version: 1;
+  firstBlockedAt: string;
+  jobs: string[];
+  blockedAtByJob?: Record<string, string>;
+  alertedAt?: string;
+  recordedAt?: string;
+}
+
+const CAPACITY_POLL_MS = 15_000;
+const CRITICAL_CAPACITY_ALERT_MS = 10 * 60_000;
+const OTHER_CAPACITY_ALERT_MS = 30 * 60_000;
 
 interface SchedulerStatus {
   running: boolean;
@@ -66,6 +109,75 @@ const PRIORITY_ORDER: Record<JobPriority, number> = {
   low: 3,
 };
 
+interface JobFailureAlertState {
+  version: 1;
+  lastObservedFailures: number;
+  lastError: string;
+  deliveryAttempts: number;
+  deliveredCount: number;
+  nextEligibleAt: string;
+  lastAttemptAt?: string;
+  lastDeliveredAt?: string;
+  recordedAt?: string;
+  quietId?: string;
+  activeAttemptId?: string;
+}
+
+const FAILURE_ALERT_RETRY_BACKOFF_MS = [
+  5 * 60_000,
+  15 * 60_000,
+  60 * 60_000,
+] as const;
+
+const FAILURE_ALERT_REMINDER_CADENCE_MS = [
+  60 * 60_000,
+  6 * 60 * 60_000,
+  24 * 60 * 60_000,
+] as const;
+
+/** The TokenLedger seam (job-cost-reduction §9) — optional method. */
+export interface JobSessionLedger {
+  recordJobSession?(
+    sessionId: string,
+    slug: string,
+    machineId: string | null,
+    startedAt: string,
+    origin: 'job' | 'triage' | 'rollback',
+  ): void;
+}
+
+/** What a projected (`triage:<slug>`) session ended with. `result` is absent
+ *  only when the outcome is unknown. */
+export interface ProjectedSessionEnd {
+  slugTag: string;
+  sessionName: string;
+  trigger: string;
+  output: string;
+  result?: 'success' | 'failure' | 'timeout' | 'spawn-error';
+}
+
+/** Fired when a projected (`triage:<slug>`) session ends. */
+export type ProjectedSessionListener = (end: ProjectedSessionEnd) => void;
+
+interface ScriptExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+  overBuffer: boolean;
+  spawnError?: string;
+}
+
+/** spawnSession options plus the triage pass-throughs SessionManager gains
+ *  (job-cost-reduction F13: omitAuthEnv, confinedTools, useAgentDefaultModel). */
+type ProjectedSpawnOptions = Parameters<SessionManager['spawnSession']>[0] & {
+  omitAuthEnv?: boolean;
+  confinedTools?: string[];
+  useAgentDefaultModel?: boolean;
+};
+
+/* @self-action-controller: job-failure-alert-delivery */
+/* @self-action-controller: job-silence-alert */
 export class JobScheduler {
   private config: JobSchedulerConfig;
   private sessionManager: SessionManager;
@@ -74,16 +186,65 @@ export class JobScheduler {
   private skipLedger: SkipLedger;
   private runHistory: JobRunHistory;
   private jobs: JobDefinition[] = [];
+  private jobsSignature = '';
+  /** Loader diagnostics already reported by a quiet trigger-boundary reload
+   *  (level|exact line). Cleared per fingerprint when the diagnostic goes
+   *  away so a recurrence is reported again. */
+  private reportedLoadProblems = new Set<string>();
   private cronTasks: Map<string, Cron> = new Map();
   private queue: QueuedJob[] = [];
   private running = false;
+  private promotionCatchUpPending = false;
+  private blockedCronDuringPromotion = new Set<string>();
+  private promotionCatchUpStore: PromotionCatchUpStore;
+  private promotionLeaseProvider: (() => { leaseEpoch: number; machineId: string; holdsLease: boolean; runOnceWitness?: boolean }) | null = null;
   private paused = false;
+
+  /** Last on-disk drift fingerprint warned for each agentmd job. */
+  private bodyDriftWarnings: Map<string, string> = new Map();
 
   /** Map session names to run IDs for completion tracking */
   private activeRunIds: Map<string, string> = new Map();
 
+  // ── job-cost-reduction script runners (§5.1, F8) ──
+  /** Slugs whose script run is in flight (one run per slug at a time). */
+  private scriptInFlight: Set<string> = new Set();
+  /** F8: at most this many scripts run at once per server. */
+  static readonly MAX_CONCURRENT_SCRIPTS = 3;
+  /** Fallback script bound when a template omits scriptTimeoutMinutes. */
+  static readonly DEFAULT_SCRIPT_TIMEOUT_MINUTES = 5;
+  /** F8: fixed per-slug start offset upper bound. */
+  static readonly MAX_SCRIPT_START_OFFSET_MS = 20_000;
+  /** Child-process buffer; the protocol cap (64 KB) is applied after scrub. */
+  private static readonly SCRIPT_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+  private scriptStartOffsetEnabled = true;
+  private scriptRunObservers: ScriptRunObserver[] = [];
+  /** Opened on the first production script attempt; never for canaries. */
+  private supervisionStore: JobSupervisionStore | null = null;
+  private supervisionBlocksLoaded = false;
+  private supervisionCensusHealthy = true;
+  private readonly activeScriptRunIds = new Set<string>();
+  /** A failed durable write moves future fires off the script runner. */
+  private supervisionBlockedSlugs = new Set<string>();
+  private projectedSessionListeners: ProjectedSessionListener[] = [];
+  /** Triage sessions: tmux name → their run row. */
+  private projectedRuns: Map<string, { runId: string; slugTag: string; slug: string; trigger: string }> = new Map();
+  private tokenLedger: JobSessionLedger | null = null;
+  private configReader: (() => Record<string, unknown> | null) | null = null;
+  private configCache: { mtimeMs: number; value: Record<string, unknown> } | null = null;
+  /** One degradation report per (slug, untrusted reason) per process. */
+  private untrustedReported: Set<string> = new Set();
+  /** Slugs already reported to logs/job-runner-migration.jsonl this process. */
+  private shadowLogged: Set<string> = new Set();
+
   /** Retry state for skipped jobs: slug → { retries, lastAttempt, timer } */
   private retryState: Map<string, { retries: number; timer: ReturnType<typeof setTimeout> }> = new Map();
+  private missedJobStartupTimer: ReturnType<typeof setTimeout> | null = null;
+  private catchUpNoticeTimer: ReturnType<typeof setInterval> | null = null;
+  private catchUpAlertsInFlight = new Set<string>();
+  private silenceCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private silenceAlertsInFlight = new Set<string>();
+  private silenceAlertEpoch = new Map<string, number>();
 
   /** Retry delays in ms: 1min, 5min, 15min, 30min, 1h, 2h */
   private static readonly RETRY_DELAYS_MS = [
@@ -112,6 +273,22 @@ export class JobScheduler {
   /** Optional Telegram adapter for job-topic coupling */
   private telegram: TelegramAdapter | null = null;
 
+  /** Coalesce overlapping completion/error callbacks for the same alert episode. */
+  private failureAlertsInFlight: Set<string> = new Set();
+
+  /** Scheduler-owned wakeups for delivery retries and unresolved reminders. */
+  private failureAlertTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+  /** One local admission attempt per poll; persisted episode survives restart. */
+  private capacityPoll: ReturnType<typeof setInterval> | null = null;
+  private capacityAlertInFlight = false;
+  private queueAdmissionInFlight = false;
+  private activeSessionSpawns = new Set<string>();
+  private readonly gatedStarts = new Set<string>();
+
+  /** Startup composition has completed, even when its result is "no sink". */
+  private failureAlertDeliveryActive = false;
+
   /** Optional quota tracker for death classification cross-reference */
   private quotaTracker: QuotaTracker | null = null;
 
@@ -128,6 +305,8 @@ export class JobScheduler {
    * path (byte-for-byte today's behavior).
    */
   private leaseClaimStore: JobLeaseClaimStore | null = null;
+  /** The mechanism that actually acquired each live job, fixed for its fire. */
+  private acquiredClaimPath = new Map<string, 'journal' | 'bus'>();
   /**
    * Live provider for the cutover-gate input (flag + dry-run + the pool peers'
    * advertised ws43JournalLease capability + this machine's lease epoch). Read
@@ -180,6 +359,32 @@ export class JobScheduler {
    */
   private roleGuardAttention: ((slug: string, machineId: string | null) => void) | null = null;
 
+  /** Test-agent leak guard; wired by server.ts (buildThrowawayJobGuard). */
+  private throwawayJobGuard: (() => { refuse: boolean; reason?: string }) | null = null;
+  /** Cached machine-local pin evidence. Absent means no pin can activate. */
+  private jobRouteEvidence: ((job: JobDefinition) => JobRouteEvidence) | null = null;
+
+  setPromotionLeaseProvider(provider: (() => { leaseEpoch: number; machineId: string; holdsLease: boolean; runOnceWitness?: boolean }) | null): void {
+    this.promotionLeaseProvider = provider;
+  }
+
+  setJobRouteEvidenceProvider(provider: ((job: JobDefinition) => JobRouteEvidence) | null): void {
+    this.jobRouteEvidence = provider;
+  }
+
+  hasJobRouteEvidenceProvider(): boolean {
+    return this.jobRouteEvidence !== null;
+  }
+
+  setThrowawayJobGuard(guard: (() => { refuse: boolean; reason?: string }) | null): void {
+    this.throwawayJobGuard = guard;
+  }
+
+  /** Wiring-integrity accessor (tests): is a real guard installed? */
+  hasThrowawayJobGuard(): boolean {
+    return this.throwawayJobGuard !== null;
+  }
+
   constructor(
     config: JobSchedulerConfig,
     sessionManager: SessionManager,
@@ -191,7 +396,227 @@ export class JobScheduler {
     this.state = state;
     this.stateDir = stateDir;
     this.skipLedger = new SkipLedger(stateDir);
+    this.skipLedger.onSkip = (event) => this.observeContinuitySkip(event.slug, event.reason);
     this.runHistory = new JobRunHistory(stateDir);
+    this.promotionCatchUpStore = new PromotionCatchUpStore(stateDir);
+  }
+
+  /**
+   * Compute a stable signature for the currently loaded job set.
+   * Used to avoid rebuilding cron tasks when the on-disk jobs snapshot
+   * has not actually changed.
+   */
+  /**
+   * A job's definition for the post-gate comparison. `topicId` is left out: the
+   * scheduler writes it onto the live job at runtime and a reload drops that
+   * write, so it moves without anyone editing the job. A topic-only edit made
+   * during a gate therefore runs this one fire with the previous topic's notices
+   * and prompt context; the next fire uses the new topic.
+   */
+  private static gatedDefinition(job: JobDefinition): string {
+    return JSON.stringify({ ...job, topicId: undefined });
+  }
+
+  private static signatureForJobs(jobs: JobDefinition[]): string {
+    return crypto.createHash('sha256').update(JSON.stringify(jobs)).digest('hex');
+  }
+
+  /**
+   * Rebuild cron tasks from the current in-memory job snapshot.
+   *
+   * The scheduler keeps the live admission view on the loaded job set and
+   * recreates cron tasks whenever the snapshot changes, so body/manifest
+   * edits become visible without a restart.
+   */
+  private rebuildCronTasks(): JobDefinition[] {
+    for (const [, task] of this.cronTasks) {
+      task.stop();
+    }
+    this.cronTasks.clear();
+
+    const enabledJobs = this.jobs.filter(j => j.enabled);
+
+    // Machine-scoped filtering — skip jobs not targeted at this machine
+    const scopedJobs = enabledJobs.filter(j => this.isJobScopedToThisMachine(j));
+    const skippedByScope = enabledJobs.length - scopedJobs.length;
+    if (skippedByScope > 0) {
+      const skippedNames = enabledJobs
+        .filter(j => !this.isJobScopedToThisMachine(j))
+        .map(j => j.slug);
+      console.log(`[scheduler] ${skippedByScope} job(s) skipped (machine scope): ${skippedNames.join(', ')}`);
+    }
+
+    for (const job of scopedJobs) {
+      try {
+        const task = new Cron(job.schedule, async () => {
+          if (this.promotionCatchUpPending) {
+            this.blockedCronDuringPromotion.add(job.slug);
+            return; // the promotion sweep owns admission until it finishes
+          }
+          // New cron window — reset retry state so we get fresh attempts
+          this.clearRetryState(job.slug);
+          try {
+            await this.triggerJob(job.slug, 'scheduled');
+          } catch (err) {
+            // Cron callbacks are a process-lifetime boundary. A lease demotion
+            // can race the pre-trigger read-only check and make a later shared
+            // bookkeeping write throw; contain that refusal (and every other
+            // trigger failure) here rather than creating an unhandled rejection
+            // that terminates the server.
+            console.error(`[scheduler] Scheduled trigger failed for "${job.slug}": ${err}`);
+          }
+        });
+        this.cronTasks.set(job.slug, task);
+
+        // Stamp when this job STARTED EXISTING, once. The startup missed-job
+        // sweep needs it to tell "brand-new, its window simply hasn't come yet"
+        // apart from "has been sitting here unrun through window after window".
+        // Without it the sweep could only see "no lastRun" and fired both alike
+        // (ACT-724 defect (a)). Never overwritten, so the age is real.
+        const existing = this.state.getJobState(job.slug);
+        if (!existing?.firstSeenAt) {
+          try {
+            this.state.saveJobState({
+              slug: job.slug,
+              consecutiveFailures: 0,
+              ...(existing ?? {}),
+              firstSeenAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            // A bookkeeping write must never stop the scheduler from starting.
+            // Missing firstSeenAt degrades SAFE: the sweep declines to treat the
+            // job as missed (see checkMissedJobs) rather than firing it blind.
+            console.error(`[scheduler] Could not stamp firstSeenAt for "${job.slug}": ${err}`);
+          }
+        }
+      } catch (err) {
+        console.error(`[scheduler] Invalid cron expression for job "${job.slug}": ${job.schedule} — ${err instanceof Error ? err.message : err}`);
+        DegradationReporter.getInstance().report({
+          feature: 'JobScheduler.rebuildCronTasks',
+          primary: 'Register every enabled, machine-scoped job with the live cron scheduler',
+          fallback: `Skip job "${job.slug}" while keeping the remaining schedules active`,
+          reason: `Invalid cron expression "${job.schedule}": ${err instanceof Error ? err.message : String(err)}`,
+          impact: `Job "${job.slug}" will not run on schedule until its cron expression is fixed`,
+        });
+      }
+    }
+
+    return scopedJobs;
+  }
+
+  /**
+   * Reload jobs from disk and resynchronize the live scheduler if the
+   * snapshot changed. Returns true when the loaded job set changed.
+   */
+  refreshJobs(): boolean {
+    if (!this.config.jobsFile?.trim()) {
+      return false;
+    }
+
+    // The FIRST load (start(), or a trigger before start) prints the loader's
+    // boot-time audits exactly as before. Every later reload — one per
+    // admission — is quiet: re-printing the same grounding/deprecation/problem
+    // lines on every trigger is noise, and NEW problems are reported below,
+    // once per transition, instead.
+    const firstLoad = this.jobsSignature === '';
+    const loaded = loadJobsDetailed(this.config.jobsFile, { quiet: !firstLoad });
+    const nextJobs = loaded.jobs;
+
+    // Disk is the truth for the MANIFEST (existence, enabled, schedule, …);
+    // the agentmd BODY is owned by refreshAgentMdBodyIfChanged() at the
+    // trigger boundary, which validates each edit, logs the reload once, and
+    // falls back to the last validated body on an unreadable/malformed file.
+    // Two reconciliations keep that ownership intact across a disk reload:
+    //
+    //  (1) A manifest whose body FAILED to load this pass (deleted, unreadable,
+    //      malformed frontmatter, oversize, symlinked) is rehydrated from the
+    //      current on-disk manifest + the LAST VALIDATED body, instead of the
+    //      job vanishing from the live set. `enabled` still comes from disk,
+    //      so a disable/removal is refused exactly as before; a job that never
+    //      had a validated body stays dropped (nothing to fall back to).
+    //  (2) A body that loaded fine but CHANGED keeps the previously validated
+    //      body here, so the manifest-level signature does not churn (and the
+    //      cron tasks are not rebuilt) on a prose edit; the trigger-boundary
+    //      refresh then adopts the new body for the run and logs the reload.
+    const previousBySlug = new Map(this.jobs.map((j) => [j.slug, j] as const));
+    for (const failure of loaded.bodyFailures) {
+      const previous = previousBySlug.get(failure.manifest.slug);
+      if (!previous) continue;
+      // The fallback is bound to the path the CURRENT manifest resolves to: a
+      // body validated from another path (an origin change on the same slug)
+      // is never carried, so the job stays dropped rather than running the
+      // old origin's file (Observer 2 re-review, Q2).
+      const rehydrated = rehydrateAgentMdJobFromLastValidatedBody(
+        failure.manifest,
+        previous,
+        failure.expectedPath,
+      );
+      if (rehydrated) nextJobs.push(rehydrated);
+    }
+    for (const next of nextJobs) {
+      if (next.execute.type !== 'agentmd' || typeof next.body !== 'string') continue;
+      const previous = previousBySlug.get(next.slug);
+      if (
+        previous &&
+        previous.execute.type === 'agentmd' &&
+        typeof previous.body === 'string' &&
+        previous.resolvedPath === next.resolvedPath &&
+        previous.body !== next.body
+      ) {
+        next.body = previous.body;
+      }
+    }
+
+    // Report EVERY loader diagnostic the quiet reload suppressed — invalid or
+    // skipped legacy entries, a missing jobs file, legacy-shadowing, the
+    // grounding and deprecation audits, agentmd problems — once per
+    // TRANSITION (fingerprint = level + exact line), never once per trigger;
+    // a diagnostic that clears and later recurs is reported again. Body-class
+    // agentmd problems are the one exclusion: the trigger-boundary body
+    // refresh already warns about those, deduped by disk state, so a second
+    // line would be a duplicate.
+    if (!firstLoad) {
+      const bodyProblemLines = new Set(loaded.bodyFailures.map((f) => formatLoadProblem(f.problem)));
+      const seen = new Set<string>();
+      for (const d of loaded.diagnostics) {
+        if (bodyProblemLines.has(d.message)) continue;
+        const fingerprint = `${d.level}|${d.message}`;
+        seen.add(fingerprint);
+        if (this.reportedLoadProblems.has(fingerprint)) continue;
+        this.reportedLoadProblems.add(fingerprint);
+        if (d.level === 'error') console.error(d.message);
+        else console.warn(d.message);
+      }
+      for (const fingerprint of this.reportedLoadProblems) {
+        if (!seen.has(fingerprint)) this.reportedLoadProblems.delete(fingerprint);
+      }
+    }
+
+    const nextSignature = JobScheduler.signatureForJobs(nextJobs);
+    if (nextSignature === this.jobsSignature) {
+      return false;
+    }
+
+    this.jobs = nextJobs;
+    this.jobsSignature = nextSignature;
+
+    if (this.running) {
+      const enabledJobs = this.rebuildCronTasks();
+      if (this.telegram) {
+        this.ensureJobTopics(enabledJobs).catch(err => {
+          console.error(`[scheduler] Failed to ensure job topics (refresh): ${err}`);
+          DegradationReporter.getInstance().report({
+            feature: 'JobScheduler.refreshJobs',
+            primary: 'Synchronize Telegram topics after reloading the live job set',
+            fallback: 'Keep the refreshed schedules active with job topics potentially missing or stale',
+            reason: `Job-topic synchronization failed after refresh: ${err instanceof Error ? err.message : String(err)}`,
+            impact: 'Refreshed jobs can run, but their Telegram topic may be unavailable or out of date',
+          });
+        });
+      }
+    }
+
+    return true;
   }
 
   /**
@@ -224,6 +649,21 @@ export class JobScheduler {
       this.ensureJobTopics(enabledJobs).catch(err => {
         console.error(`[scheduler] Failed to ensure job topics (post-Telegram init): ${err}`);
       });
+    }
+  }
+
+  /**
+   * Mark startup composition complete and arm persisted failure-alert episodes.
+   * Production calls this after every Telegram construction branch, including
+   * the intentional "no sink" result, so an overdue missing-sink episode stays
+   * loud and retryable without ever waking against a half-composed dependency.
+   */
+  activateFailureAlertDelivery(): void {
+    this.failureAlertDeliveryActive = true;
+    if (!this.running) return;
+    for (const job of this.jobs) {
+      const alertState = this.state.get<JobFailureAlertState>(this.failureAlertStateKey(job.slug));
+      if (alertState?.version === 1) this.scheduleFailureAlert(job, alertState);
     }
   }
 
@@ -281,30 +721,44 @@ export class JobScheduler {
     } catch {
       // @silent-fallback-ok — fail toward the legacy bus path (the conservative
       // side) if the live gate read throws; never strand a job on a broken gate.
+      featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws43JournalLease', 'gate-threw', 60 * 60_000, { kind: 'error', reason: 'cutover gate read failed: fell back to the bus path', context: { slug } });
       return null;
     }
     const decision = decideClaimPath(input);
     this.onCutoverDecision?.(slug, decision);
+    if (decision.reason !== 'flag-off' && decision.reason !== 'single-machine') {
+      // Runs for every job firing: one row per decision reason per hour.
+      featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws43JournalLease', decision.reason, 60 * 60_000, {
+        kind: decision.reason === 'peers-incoherent' ? 'held' : 'fired',
+        reason: `claim path: ${decision.path} (${decision.reason})`,
+        context: { path: decision.path, code: decision.reason, dryRun: decision.journalDryRun, incoherentPeers: decision.incoherentPeers.length, peers: input.peers.length, epoch: input.epoch },
+      });
+    }
     return { path: decision.path, epoch: input.epoch, journalDryRun: decision.journalDryRun };
   }
 
   /**
    * Release a claim for a completed job across BOTH mechanisms. The path that
-   * actually took the claim may differ from the path the gate would pick at
-   * completion time (a mid-run flag flip), so we release both — each store's
-   * completeClaim is a strict no-op when this machine does not own the slug's
-   * live record, so releasing the unused store is harmless. The journal release
-   * is synchronous (durable); the bus release is best-effort async.
+   * actually took the claim may differ from the live gate at completion time.
+   * Release only that acquired path: an old local journal file may still hold
+   * a same-slug claim from a previous version and must not be mutated by a bus
+   * job. After a process restart, unknown ownership defaults to the legacy bus
+   * path; a journal lease then expires rather than being completed by guess.
    */
-  private releaseClaim(slug: string, result: 'success' | 'failure'): void {
-    try {
-      this.leaseClaimStore?.completeClaim(slug, result);
-    } catch {
-      /* @silent-fallback-ok — best-effort; lease expires on its own otherwise */
+  private releaseClaim(slug: string, result: 'success' | 'failure' | 'waited'): void {
+    const acquiredPath = this.acquiredClaimPath.get(slug);
+    this.acquiredClaimPath.delete(slug);
+    if (acquiredPath === 'journal') {
+      try {
+        this.leaseClaimStore?.completeClaim(slug, result);
+      } catch {
+        /* @silent-fallback-ok — best-effort; lease expires on its own otherwise */
+      }
+    } else {
+      this.claimManager?.completeClaim(slug, result).catch(err => {
+        console.error(`[scheduler] Failed to broadcast claim completion for "${slug}": ${err}`);
+      });
     }
-    this.claimManager?.completeClaim(slug, result).catch(err => {
-      console.error(`[scheduler] Failed to broadcast claim completion for "${slug}": ${err}`);
-    });
   }
 
   /**
@@ -362,38 +816,23 @@ export class JobScheduler {
   start(): void {
     if (this.running) return;
 
-    this.jobs = loadJobs(this.config.jobsFile);
+    this.refreshJobs();
+    this.promotionCatchUpPending = readRecentPromotion(this.stateDir, Date.now(), this.promotionLeaseProvider?.()) !== null;
     this.running = true;
-
-    // Phase 1b: agentmd entries now flow through the dispatch path
-    // alongside legacy entries. The Phase 1a defensive filter on
-    // execute.type === 'agentmd' has been removed; buildPrompt's
-    // 'agentmd' case returns the cached body, and spawnJobSession
-    // threads the per-job tool allowlist into the spawn call.
-    const enabledJobs = this.jobs.filter(j => j.enabled);
-
-    // Machine-scoped filtering — skip jobs not targeted at this machine
-    const scopedJobs = enabledJobs.filter(j => this.isJobScopedToThisMachine(j));
-    const skippedByScope = enabledJobs.length - scopedJobs.length;
-    if (skippedByScope > 0) {
-      const skippedNames = enabledJobs
-        .filter(j => !this.isJobScopedToThisMachine(j))
-        .map(j => j.slug);
-      console.log(`[scheduler] ${skippedByScope} job(s) skipped (machine scope): ${skippedNames.join(', ')}`);
-    }
-
-    for (const job of scopedJobs) {
-      try {
-        const task = new Cron(job.schedule, async () => {
-          // New cron window — reset retry state so we get fresh attempts
-          this.clearRetryState(job.slug);
-          await this.triggerJob(job.slug, 'scheduled');
-        });
-        this.cronTasks.set(job.slug, task);
-      } catch (err) {
-        console.error(`[scheduler] Invalid cron expression for job "${job.slug}": ${job.schedule} — ${err instanceof Error ? err.message : err}`);
+    this.silenceCheckTimer = setInterval(() => this.checkSilentJobs(), 5 * 60_000);
+    this.silenceCheckTimer.unref?.();
+    const persistedWait = this.state.get<JobCapacityEpisode>('job-capacity-episode');
+    if (persistedWait?.version === 1) {
+      for (const slug of persistedWait.jobs) {
+        const job = this.jobs.find(j => j.slug === slug);
+        if (job?.enabled && this.isJobScopedToThisMachine(job)) this.enqueue(slug, 'capacity-recovery', true);
+        else this.markCapacityJobStarted(slug);
       }
     }
+    const scopedJobs = this.rebuildCronTasks();
+    this.checkSilentJobs();
+    const enabledJobs = this.jobs.filter(j => j.enabled);
+    const skippedByScope = enabledJobs.length - scopedJobs.length;
 
     // Check for missed jobs — any enabled job overdue by >1.5x its interval.
     // Delay the first evaluation by startupGraceMs (default 5s) so the HTTP
@@ -402,16 +841,35 @@ export class JobScheduler {
     const graceMs = this.config.startupGraceMs ?? 5000;
     if (graceMs > 0) {
       console.log(`[scheduler] Startup grace period: ${graceMs}ms before missed-job evaluation`);
-      setTimeout(() => this.checkMissedJobs(scopedJobs), graceMs);
+      this.missedJobStartupTimer = setTimeout(() => {
+        this.missedJobStartupTimer = null;
+        if (!this.running) return;
+        this.checkMissedJobs(scopedJobs).catch((err) => {
+          console.error(`[scheduler] Missed-job startup evaluation failed: ${err}`);
+        });
+      }, graceMs);
     } else {
-      this.checkMissedJobs(scopedJobs);
+      this.checkMissedJobs(scopedJobs).catch((err) => {
+        console.error(`[scheduler] Missed-job startup evaluation failed: ${err}`);
+      });
     }
+
+    // A missed-work prompt remains durable even if messaging is unavailable at boot.
+    this.catchUpNoticeTimer = setInterval(() => this.retryUnresolvedCatchUpNotices(), 5 * 60_000);
+    this.catchUpNoticeTimer.unref?.();
+    this.retryUnresolvedCatchUpNotices();
 
     // Ensure every job has a Telegram topic (job-topic coupling)
     if (this.telegram) {
       this.ensureJobTopics(scopedJobs).catch(err => {
         console.error(`[scheduler] Failed to ensure job topics: ${err}`);
       });
+    }
+
+    // Some embedders attach messaging before start(); the production server
+    // attaches it afterward and explicitly calls the same activation seam.
+    if (this.failureAlertDeliveryActive || this.messenger || this.telegram) {
+      this.activateFailureAlertDelivery();
     }
 
     this.state.appendEvent({
@@ -426,17 +884,30 @@ export class JobScheduler {
    */
   stop(): void {
     if (!this.running) return;
+    if (this.silenceCheckTimer) clearInterval(this.silenceCheckTimer);
+    this.silenceCheckTimer = null;
 
     for (const [, task] of this.cronTasks) {
       task.stop();
     }
     this.cronTasks.clear();
+    if (this.missedJobStartupTimer) {
+      clearTimeout(this.missedJobStartupTimer);
+      this.missedJobStartupTimer = null;
+    }
     this.queue = [];
+    if (this.catchUpNoticeTimer) clearInterval(this.catchUpNoticeTimer);
+    this.catchUpNoticeTimer = null;
+    if (this.capacityPoll) clearInterval(this.capacityPoll);
+    this.capacityPoll = null;
     // Clear all retry timers
     for (const [, state] of this.retryState) {
       if (state.timer) clearTimeout(state.timer);
     }
     this.retryState.clear();
+    for (const timer of this.failureAlertTimers.values()) clearTimeout(timer);
+    this.failureAlertTimers.clear();
+    this.bodyDriftWarnings.clear();
     this.running = false;
 
     this.state.appendEvent({
@@ -450,13 +921,123 @@ export class JobScheduler {
    * Trigger a job by slug. Checks claims, quota, session limits, queues if at capacity.
    */
   async triggerJob(slug: string, reason: string): Promise<'triggered' | 'queued' | 'skipped'> {
-    const job = this.jobs.find(j => j.slug === slug);
-    if (!job) {
-      throw new Error(`Unknown job: ${slug}`);
+    try {
+      this.refreshJobs();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[scheduler] Refusing job "${slug}" — failed to reload jobs before admission: ${message}`);
+      this.skipLedger.recordSkip(slug, 'disabled');
+      this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${slug}" refused — failed to reload the live job set`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug, reason, gateReason: 'reload-failed', error: message },
+      });
+      return 'skipped';
     }
+
+    let job = this.jobs.find(j => j.slug === slug);
+    if (!job) {
+      this.skipLedger.recordSkip(slug, 'disabled');
+      this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${slug}" refused — no longer present in the live job set`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug, reason, gateReason: 'job-missing' },
+      });
+      return 'skipped';
+    }
+
+    if (!job.enabled) {
+      this.skipLedger.recordSkip(slug, 'disabled');
+      this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${slug}" refused — disabled in the live job set`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug, reason, gateReason: 'disabled' },
+      });
+      return 'skipped';
+    }
+
+    if (!verifyImportedPortableJob(this.stateDir, path.dirname(this.stateDir), slug)) {
+      recordImportedPortableIntegrityFailure(this.stateDir, slug);
+      this.skipLedger.recordSkip(slug, 'disabled');
+      this.state.appendEvent({ type: 'job_skipped',
+        summary: `Job "${slug}" refused — imported files no longer match local approval`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug, reason, gateReason: 'portable-integrity' },
+      });
+      return 'skipped';
+    }
+
+    this.refreshAgentMdBodyIfChanged(job);
+
+    // The definition this fire was admitted on, taken BEFORE the rollback
+    // projection below. The post-gate check compares the live set against this:
+    // the projection is a per-fire view of the same definition, never a change.
+    const admittedDefinition = job.gate ? JobScheduler.gatedDefinition(job) : undefined;
+
+    // job-cost-reduction §5.1 / §8.4: an instar-origin `runner: script` job
+    // runs its shipped script — unless the rollback switch (read LIVE here)
+    // turns script runners off globally or for this slug, in which case the
+    // job's body runs as an agentmd session exactly as before the change,
+    // through the normal quota / capacity / claim path below.
+    const isScriptRunner = this.isScriptRunnerJob(job);
+    if (isScriptRunner && !this.scriptRunnersActiveFor(job.slug)) {
+      // This job was introduced with script runners, so it has no historical
+      // session behavior to restore when the rollout is dark.
+      if (job.slug === 'script-job-supervisor') {
+        this.skipLedger.recordSkip(slug, 'disabled');
+        if (!this.state.readOnly) this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" skipped — script supervision is inactive`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, gateReason: 'script-supervision-inactive' },
+        });
+        return 'skipped';
+      }
+      job = this.projectAsAgentmd(job);
+    }
+    let runsAsScript = isScriptRunner && job.execute.type === 'script';
 
     if (this.paused) {
       this.skipLedger.recordSkip(slug, 'paused');
+      return 'skipped';
+    }
+
+    // Test-agent leak guard (docs/specs/test-agent-leak-guard.md). A throwaway
+    // agent (temp-folder project / sandboxed HOME / recorded throwaway) refuses
+    // every scheduled job: instar cannot prove its session would not spend the
+    // operator's real subscription login. Returns before scheduleRetry — the
+    // condition never clears on its own, so retrying would only spin.
+    if (this.throwawayJobGuard) {
+      const verdict = this.throwawayJobGuard();
+      if (verdict.refuse) {
+        this.skipLedger.recordSkip(slug, 'throwaway-agent');
+        this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" refused — ${verdict.reason ?? 'throwaway agent'}`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, gateReason: 'throwaway-agent' },
+        });
+        return 'skipped';
+      }
+    }
+
+    // In the legacy one-awake-machine posture the scheduler is constructed on
+    // the machine that is awake at boot, but it is not torn down if that machine
+    // subsequently loses the fenced lease.  Once StateManager has demoted this
+    // process to a read-only standby, every legacy job path eventually performs
+    // a shared-state write (run state, an event, or both).  Letting a missed-job
+    // pass reach those writes turns the expected refusal into an unhandled
+    // startup rejection and crash-loops the standby.
+    //
+    // Pool-owned sessions have a separate session-scoped write exception, but
+    // scheduler bookkeeping (job state + events) remains shared state.  The
+    // scheduler therefore stays fenced whenever the StateManager is read-only.
+    if (this.state.readOnly) {
+      this.skipLedger.recordSkip(slug, 'role-guard');
+      console.log(`[scheduler] Job "${slug}" skipped — this machine is a read-only standby.`);
       return 'skipped';
     }
 
@@ -493,9 +1074,11 @@ export class JobScheduler {
         // guard is an additive safety, and a broken provider degrades to today's
         // behavior (spawn proceeds) rather than wedging the scheduler.
         guard = { enabled: false, holdsLease: true };
+        featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws43RoleGuard', 'provider-threw', 60 * 60_000, { kind: 'error', reason: 'role guard provider failed: the job spawned unguarded', context: { slug } });
       }
       if (guard.enabled && !guard.holdsLease) {
         this.skipLedger.recordSkip(slug, 'role-guard');
+        featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws43RoleGuard', slug, 60 * 60_000, { kind: 'fired', reason: 'state-writing job refused on a non-holder', context: { slug, trigger: reason, holdsLease: guard.holdsLease } });
         console.log(`[scheduler] Job "${slug}" refused at spawn boundary — state-writing job on a read-only standby (not the lease-holder).`);
         this.state.appendEvent({
           type: 'job_skipped',
@@ -520,10 +1103,17 @@ export class JobScheduler {
     // two never run simultaneously for the same job set (the named migration
     // hazard). The decision is recomputed live at each seam; in the steady
     // coherent state it is stable across the same tick.
-    const claimPath = this.resolveClaimPath(slug);
-    const remoteHeld = claimPath?.path === 'journal'
-      ? this.leaseClaimStore!.hasRemoteClaim(slug)
-      : (this.claimManager?.hasRemoteClaim(slug) ?? false);
+    // DOORWAY-MODEL-KNOWLEDGE-REGISTRY-SPEC §2.8 / D11 — a `perMachineIndependent`
+    // job (like the doorway scan, whose result is a physical fact of THIS
+    // machine's own disk) skips the global jobSlug claim/lease entirely, the same
+    // way `script`-type jobs bypass quota gating. It NEVER consults the claim path
+    // and so never yields to a peer's claim — every machine runs its own scan.
+    const claimPath = job.perMachineIndependent ? null : this.resolveClaimPath(slug);
+    const remoteHeld = job.perMachineIndependent
+      ? false
+      : (claimPath?.path === 'journal'
+          ? this.leaseClaimStore!.hasRemoteClaim(slug)
+          : (this.claimManager?.hasRemoteClaim(slug) ?? false));
     if (remoteHeld) {
       const claimedBy = claimPath?.path === 'journal'
         ? this.leaseClaimStore!.getClaim(slug)?.machineId
@@ -535,6 +1125,7 @@ export class JobScheduler {
         timestamp: new Date().toISOString(),
         metadata: { slug, reason, claimedBy, claimPath: claimPath?.path ?? 'bus' },
       });
+      if (reason.startsWith('queued:')) this.markCapacityJobStarted(slug);
       return 'skipped';
     }
 
@@ -548,7 +1139,7 @@ export class JobScheduler {
     // that outran its cron interval was always at risk; this closes it generally.
     // The boot-reconcile in SessionManager.purgeDeadSessions kills surviving
     // rerouted job sessions, so the steady state is one-run-per-slug.
-    const liveWithSlug = this.sessionManager.listRunningSessions().some(s => s.jobSlug === slug);
+    const liveWithSlug = this.activeSessionSpawns.has(slug) || this.sessionManager.listRunningSessions().some(s => s.jobSlug === slug);
     if (liveWithSlug) {
       this.skipLedger.recordSkip(slug, 'already-running');
       console.log(`[scheduler] Job "${slug}" skipped — a live session already holds this slug (avoiding double-run).`);
@@ -558,6 +1149,7 @@ export class JobScheduler {
         timestamp: new Date().toISOString(),
         metadata: { slug, reason, gateReason: 'already-running' },
       });
+      if (reason.startsWith('queued:')) this.markCapacityJobStarted(slug);
       return 'skipped';
     }
 
@@ -579,12 +1171,125 @@ export class JobScheduler {
       }
     }
 
+    // Serialize gates through launch: a second fire must not overwrite an
+    // unconsumed reservation while the first is queued or spawning.
+    if (job.gate && this.gatedStarts.has(slug)) return 'skipped';
+    const serializesGate = !!job.gate;
+    if (serializesGate) this.gatedStarts.add(slug);
+    try {
     // Run gate command if configured — zero-token pre-screening (async, non-blocking)
     if (job.gate) {
-      if (!await this.runGateAsync(job)) {
+      const gatePassed = await this.runGateAsync(job);
+      // A lease can move while the shell gate is waiting. Refuse this fire
+      // before it reaches a claim, script launch, or session spawn.
+      if (this.paused || this.state.readOnly) {
+        this.skipLedger.recordSkip(slug, 'role-guard');
+        return 'skipped';
+      }
+      if (!gatePassed) {
         this.scheduleRetry(slug, 'gate');
         return 'skipped';
       }
+    }
+
+    if (job.gate) {
+      try { this.refreshJobs(); } catch { return 'skipped'; }
+      const live = this.jobs.find(candidate => candidate.slug === slug);
+      // Each refusal names its own cause. A local job has no portable integrity
+      // to fail, so only a failed portable check may write that record: it feeds
+      // the coverage alert for imported jobs.
+      if (!verifyImportedPortableJob(this.stateDir, path.dirname(this.stateDir), slug)) {
+        recordImportedPortableIntegrityFailure(this.stateDir, slug);
+        this.skipLedger.recordSkip(slug, 'disabled');
+        this.state.appendEvent({ type: 'job_skipped',
+          summary: `Job "${slug}" refused — imported files no longer match local approval`,
+          timestamp: new Date().toISOString(), metadata: { slug, reason, gateReason: 'portable-integrity' },
+        });
+        return 'skipped';
+      }
+      if (!live || !live.enabled) {
+        this.skipLedger.recordSkip(slug, 'disabled');
+        this.state.appendEvent({ type: 'job_skipped',
+          summary: `Job "${slug}" refused — ${live ? 'disabled' : 'removed from the live job set'} during its gate`,
+          timestamp: new Date().toISOString(), metadata: { slug, reason, gateReason: live ? 'disabled' : 'job-missing' },
+        });
+        return 'skipped';
+      }
+      if (JobScheduler.gatedDefinition(live) !== admittedDefinition) {
+        this.skipLedger.recordSkip(slug, 'definition-changed');
+        this.state.appendEvent({ type: 'job_skipped',
+          summary: `Job "${slug}" refused — definition changed during its gate`,
+          timestamp: new Date().toISOString(), metadata: { slug, reason, gateReason: 'post-gate-definition-changed' },
+        });
+        return 'skipped';
+      }
+    }
+
+    // The gate above can wait for seconds. A safety hold recorded during that
+    // wait must take effect on this fire, before the script claim or launch.
+    if (runsAsScript && !this.scriptRunnersActiveFor(slug)) {
+      if (slug === 'script-job-supervisor') {
+        this.skipLedger.recordSkip(slug, 'disabled');
+        this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" skipped — script supervision is inactive`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, gateReason: 'script-supervision-inactive' },
+        });
+        return 'skipped';
+      }
+      job = this.projectAsAgentmd(job);
+      runsAsScript = false;
+      // The earlier quota check was bypassed while this was a script. The
+      // restored full-session route must pay the ordinary quota check.
+      const gateResult = this.normalizeCanRunResult(this.canRunJob(job.priority));
+      if (!gateResult.allowed) {
+        const skipReason: SkipReason = gateResult.reason ?? 'quota';
+        this.skipLedger.recordSkip(slug, skipReason);
+        this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" skipped — ${skipReason}`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, priority: job.priority, gateReason: skipReason, gateDetail: gateResult.detail },
+        });
+        this.scheduleRetry(slug, skipReason);
+        return 'skipped';
+      }
+    }
+
+    // job-cost-reduction §5.1 ordering: a script-runner job takes the same
+    // claim/lease as a session job (below the claim), but stays ABOVE the
+    // session-capacity check — it is governed only by the script cap, so
+    // health-check still runs (and can report sessions-exhausted) when every
+    // session slot is full. perMachineIndependent still skips the claim.
+    if (runsAsScript) {
+      if (this.scriptInFlight.has(slug)) {
+        this.skipLedger.recordSkip(slug, 'already-running');
+        this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" skipped — its previous script run is still in flight`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, gateReason: 'already-running', runner: 'script' },
+        });
+        return 'skipped';
+      }
+      if (this.scriptInFlight.size >= JobScheduler.MAX_CONCURRENT_SCRIPTS) {
+        this.skipLedger.recordSkip(slug, 'script-cap');
+        this.state.appendEvent({
+          type: 'job_skipped',
+          summary: `Job "${slug}" skipped — ${JobScheduler.MAX_CONCURRENT_SCRIPTS} scripts already running`,
+          timestamp: new Date().toISOString(),
+          metadata: { slug, reason, gateReason: 'script-cap', runner: 'script' },
+        });
+        this.scheduleRetry(slug, 'script-cap');
+        return 'skipped';
+      }
+      const scriptBoundMs = (job.scriptTimeoutMinutes ?? JobScheduler.DEFAULT_SCRIPT_TIMEOUT_MINUTES) * 2 * 60_000;
+      if (!this.takeClaim(job, reason, claimPath, scriptBoundMs + JobScheduler.MAX_SCRIPT_START_OFFSET_MS)) return 'skipped';
+      if (!reason.startsWith('retry:')) this.clearRetryState(slug);
+      this.scriptInFlight.add(slug);
+      this.runScriptRunnerJob(job, reason);
+      return 'triggered';
     }
 
     // Script jobs are zero-token shell work — they do NOT spawn a model session,
@@ -593,7 +1298,11 @@ export class JobScheduler {
     // "Run this script: ..." prompt and could hang for hours holding a live
     // session slot, leaving run-history stuck at `pending` (Codey gap-run F005).
     if (job.execute.type === 'script') {
-      this.clearRetryState(slug);
+      // A retry belongs to the current bounded retry episode. Clearing here on
+      // every trigger made each failing script retry look like attempt zero, so
+      // it could repeat the one-minute slot forever. Cron windows clear above;
+      // explicit/non-retry triggers begin a fresh episode here.
+      if (!reason.startsWith('retry:')) this.clearRetryState(slug);
       this.runScriptJob(job, reason);
       return 'triggered';
     }
@@ -601,19 +1310,49 @@ export class JobScheduler {
     // Check session capacity
     const runningSessions = this.sessionManager.listRunningSessions();
     const jobSessions = runningSessions.filter(s => s.jobSlug);
-    if (jobSessions.length >= this.config.maxParallelJobs) {
+    if (jobSessions.length + this.activeSessionSpawns.size >= this.config.maxParallelJobs) {
       this.enqueue(slug, reason);
       return 'queued';
     }
 
+    const timeoutMs = (job.expectedDurationMinutes ?? 30) * 2 * 60_000;
+    if (!this.takeClaim(job, reason, claimPath, timeoutMs)) {
+      if (reason.startsWith('queued:')) this.markCapacityJobStarted(slug);
+      return 'skipped';
+    }
+
+    // Clear retry state on successful trigger
+    this.clearRetryState(slug);
+
+    this.spawnJobSession(job, reason);
+    return 'triggered';
+    } finally { if (serializesGate) this.gatedStarts.delete(slug); }
+  }
+
+  /**
+   * Take the multi-machine claim before running a job (session spawn or, since
+   * job-cost-reduction §5.1, a script-runner run). Returns false when a peer
+   * leased the slug between the check seam and here (the caller skips).
+   */
+  private takeClaim(
+    job: JobDefinition,
+    reason: string,
+    claimPath: { path: 'journal' | 'bus'; epoch: number; journalDryRun: boolean } | null,
+    timeoutMs: number,
+  ): boolean {
+    const slug = job.slug;
     // Take the claim before spawning. The cutover gate (resolved at the check
     // seam above) decides the mechanism: a durable epoch-fenced journal lease
     // when the pool is coherent, else the legacy best-effort AgentBus broadcast.
     // DRY-RUN: when the gate is coherent-but-dry-run, the intended journal claim
     // is LOGGED (the WS-wide "log intended claims" posture) but the bus path
     // still runs — so a dry-run pool never half-migrates.
-    const timeoutMs = (job.expectedDurationMinutes ?? 30) * 2 * 60_000;
-    if (claimPath?.path === 'journal') {
+    // Spec §2.8/D11 — a perMachineIndependent job takes NO claim (neither the
+    // journal lease nor the legacy bus broadcast); each machine runs it locally.
+    if (job.perMachineIndependent) {
+      // no-op: claim/lease deliberately skipped
+      this.acquiredClaimPath.delete(slug);
+    } else if (claimPath?.path === 'journal') {
       // Synchronous, durable: the lease is persisted before the spawn, so a
       // crash between claim and spawn leaves the lease (fenced, expiring) rather
       // than a silent double-run window.
@@ -627,8 +1366,9 @@ export class JobScheduler {
           timestamp: new Date().toISOString(),
           metadata: { slug, reason, claimedBy: attempt.heldBy, claimPath: 'journal' },
         });
-        return 'skipped';
+        return false;
       }
+      this.acquiredClaimPath.set(slug, 'journal');
     } else {
       if (claimPath?.journalDryRun) {
         console.log(`[scheduler] WS4.3 journal-lease DRY-RUN — would lease "${slug}" via journal (epoch ${claimPath.epoch}); running legacy bus path.`);
@@ -638,13 +1378,9 @@ export class JobScheduler {
           console.error(`[scheduler] Failed to broadcast claim for "${slug}": ${err}`);
         });
       }
+      this.acquiredClaimPath.set(slug, 'bus');
     }
-
-    // Clear retry state on successful trigger
-    this.clearRetryState(slug);
-
-    this.spawnJobSession(job, reason);
-    return 'triggered';
+    return true;
   }
 
   /**
@@ -669,17 +1405,72 @@ export class JobScheduler {
    * Process the queue — dequeue and run next job if a slot is available.
    */
   processQueue(): void {
-    if (this.paused || this.queue.length === 0) return;
+    if (this.paused || this.queue.length === 0 || this.queueAdmissionInFlight) return;
+
+    try {
+      this.refreshJobs();
+    } catch (err) {
+      console.error(`[scheduler] Refusing queue drain — failed to reload jobs before admission: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
 
     const runningSessions = this.sessionManager.listRunningSessions();
     const jobSessions = runningSessions.filter(s => s.jobSlug);
-    if (jobSessions.length >= this.config.maxParallelJobs) return;
+    if (jobSessions.length + this.activeSessionSpawns.size >= this.config.maxParallelJobs) return;
+
+    // The normal queue drain checks only maxParallelJobs. The force-mode
+    // reroute has a separate host-wide cap and a live memory-pressure gate.
+    // Keep the queued job in place until that gate opens; no failed spawn is
+    // recorded and only one queued job is admitted per poll.
+    if (this.queue[0]?.capacityWait && this.sessionManager.confinedRerouteCapacity() === 'saturated') {
+      void this.maybeAlertCapacityEpisode();
+      return;
+    }
 
     const next = this.queue.shift();
     if (!next) return;
 
     const job = this.jobs.find(j => j.slug === next.slug);
-    if (!job) return;
+    if (!job) {
+      this.skipLedger.recordSkip(next.slug, 'disabled');
+      if (next.capacityWait) this.markCapacityJobStarted(next.slug);
+      this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${next.slug}" skipped — no longer present in the live job set`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug: next.slug, reason: next.reason, gateReason: 'job-missing' },
+      });
+      return;
+    }
+
+    if (!job.enabled) {
+      this.skipLedger.recordSkip(next.slug, 'disabled');
+      if (next.capacityWait) this.markCapacityJobStarted(next.slug);
+      this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${next.slug}" skipped — disabled in the live job set`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug: next.slug, reason: next.reason, gateReason: 'disabled' },
+      });
+      return;
+    }
+
+    // Same trigger-boundary body ownership as triggerJob(): a valid edit made
+    // while the job sat in the queue takes effect on this run; an
+    // unreadable/malformed file falls back to the last validated body.
+    this.refreshAgentMdBodyIfChanged(job);
+
+    if (this.isScriptRunnerJob(job) && job.slug === 'script-job-supervisor'
+      && !this.scriptRunnersActiveFor(job.slug)) {
+      this.skipLedger.recordSkip(next.slug, 'disabled');
+      if (!this.state.readOnly) this.state.appendEvent({
+        type: 'job_skipped',
+        summary: `Job "${next.slug}" skipped — script supervision is inactive`,
+        timestamp: new Date().toISOString(),
+        metadata: { slug: next.slug, reason: next.reason, gateReason: 'script-supervision-inactive' },
+      });
+      return;
+    }
 
     const queueGate = this.normalizeCanRunResult(this.canRunJob(job.priority));
     if (!queueGate.allowed) {
@@ -688,7 +1479,18 @@ export class JobScheduler {
       return;
     }
 
-    this.spawnJobSession(job, `queued:${next.reason}`);
+    // Re-enter the normal admission path so a recovered wait takes a fresh
+    // machine claim; the old refused attempt released its claim as "waited".
+    this.queueAdmissionInFlight = true;
+    void this.triggerJob(job.slug, `queued:${next.reason}`).then(result => {
+      if (result === 'skipped' && next.capacityWait) {
+        const episode = this.state.get<JobCapacityEpisode>('job-capacity-episode');
+        if (episode?.jobs.includes(job.slug)) this.enqueue(job.slug, next.reason, true);
+      }
+    }).catch(err => {
+      console.error(`[scheduler] Queued trigger failed for "${job.slug}": ${err instanceof Error ? err.message : String(err)}`);
+      if (next.capacityWait) this.enqueue(job.slug, next.reason, true);
+    }).finally(() => { this.queueAdmissionInFlight = false; });
   }
 
   /**
@@ -703,6 +1505,9 @@ export class JobScheduler {
    */
   clearQueue(): void {
     this.queue.length = 0;
+    this.state.set('job-capacity-episode', null);
+    if (this.capacityPoll) clearInterval(this.capacityPoll);
+    this.capacityPoll = null;
   }
 
   /**
@@ -710,12 +1515,18 @@ export class JobScheduler {
    */
   resume(): void {
     this.paused = false;
+    if (this.failureAlertDeliveryActive) this.activateFailureAlertDelivery();
     this.processQueue();
   }
 
   /**
    * Get scheduler status for the /status endpoint.
    */
+  /** Ids of script runs in progress. A read for the machine-maintenance work census. */
+  getActiveScriptRunIds(): string[] {
+    return [...this.activeScriptRunIds];
+  }
+
   getStatus(): SchedulerStatus {
     const runningSessions = this.sessionManager.listRunningSessions();
     return {
@@ -859,6 +1670,17 @@ export class JobScheduler {
         // Best-effort — session may already be dead.
       }
 
+      const existingState = this.state.getJobState(run.slug);
+      const jobState: JobState = {
+        slug: run.slug,
+        lastRun: existingState?.lastRun ?? run.startedAt,
+        lastResult: 'timeout',
+        lastError: `Reaped on wake — effective elapsed ${Math.round(effectiveElapsed / 60_000)}m (cumulative sleep ${Math.round(cumulativeSleepMs / 60_000)}m subtracted) exceeded ${expMin}min × ${multiplier} threshold`,
+        consecutiveFailures: (existingState?.consecutiveFailures ?? 0) + 1,
+        nextScheduled: this.getNextRun(run.slug),
+      };
+      this.state.saveJobState(jobState);
+
       try {
         this.runHistory.recordCompletion({
           runId,
@@ -894,9 +1716,56 @@ export class JobScheduler {
     return result;
   }
 
-  private enqueue(slug: string, reason: string): void {
-    // Don't queue duplicates
-    if (this.queue.some(q => q.slug === slug)) return;
+  /**
+   * Re-read a validated agentmd body at the trigger boundary. Valid edits take
+   * effect on the run being triggered; unreadable or invalid edits fail safe
+   * to the last validated body and emit a warning deduped by disk state.
+   */
+  private refreshAgentMdBodyIfChanged(job: JobDefinition): void {
+    if (
+      job.execute.type !== 'agentmd' ||
+      typeof job.body !== 'string' ||
+      typeof job.resolvedPath !== 'string'
+    ) {
+      return;
+    }
+
+    const disk = readAgentMdBody(job.resolvedPath);
+    if (!disk.ok) {
+      const fingerprint = `unreadable:${disk.reason}`;
+      if (this.bodyDriftWarnings.get(job.slug) === fingerprint) return;
+      this.bodyDriftWarnings.set(job.slug, fingerprint);
+      console.warn(
+        `[scheduler] Job "${job.slug}" body cannot be checked on disk (${disk.reason}); ` +
+        'continuing to use the last validated body until the file is repaired.',
+      );
+      return;
+    }
+
+    const cachedHash = hashBody(job.body);
+    if (disk.bodyHash === cachedHash) {
+      this.bodyDriftWarnings.delete(job.slug);
+      return;
+    }
+
+    job.body = disk.body;
+    this.bodyDriftWarnings.delete(job.slug);
+    console.log(
+      `[scheduler] Job "${job.slug}" body changed on disk after scheduler start; ` +
+      'reloaded the validated body for this run.',
+    );
+  }
+
+  private enqueue(slug: string, reason: string, capacityWait = false): void {
+    // Don't queue duplicates; a capacity refusal upgrades an ordinary wait.
+    const existing = this.queue.find(q => q.slug === slug);
+    if (existing) {
+      if (capacityWait && !existing.capacityWait) {
+        existing.capacityWait = true;
+        this.recordCapacityWait(slug);
+      }
+      return;
+    }
 
     // Cap queue size to prevent unbounded growth
     if (this.queue.length >= 50) {
@@ -904,7 +1773,7 @@ export class JobScheduler {
       return;
     }
 
-    this.queue.push({ slug, reason, queuedAt: new Date().toISOString() });
+    this.queue.push({ slug, reason, queuedAt: new Date().toISOString(), capacityWait });
 
     // Sort by priority — critical first
     this.queue.sort((a, b) => {
@@ -912,6 +1781,99 @@ export class JobScheduler {
       const jobB = this.jobs.find(j => j.slug === b.slug);
       return (PRIORITY_ORDER[jobA?.priority ?? 'low']) - (PRIORITY_ORDER[jobB?.priority ?? 'low']);
     });
+    if (capacityWait) this.recordCapacityWait(slug);
+  }
+
+  private recordCapacityWait(slug: string): void {
+    // A pending capacity episode owns the operator notice until this job can
+    // run again. Suspend any older per-job failure reminder, including one
+    // left by a pre-upgrade capacity error; a later real failure re-arms it.
+    this.clearFailureAlertState(slug);
+    const key = 'job-capacity-episode';
+    const prior = this.state.get<JobCapacityEpisode>(key);
+    const episode: JobCapacityEpisode = prior?.version === 1
+      ? { ...prior, jobs: [...new Set([...prior.jobs, slug])], blockedAtByJob: { ...prior.blockedAtByJob, [slug]: prior.blockedAtByJob?.[slug] ?? new Date().toISOString() } }
+      : { version: 1, firstBlockedAt: new Date().toISOString(), jobs: [slug], blockedAtByJob: { [slug]: new Date().toISOString() } };
+    this.state.set(key, episode);
+    this.state.appendEvent({
+      type: 'job_waited_for_room',
+      summary: `Job "${slug}" waited for reroute capacity`,
+      timestamp: new Date().toISOString(),
+      metadata: { slug, reason: 'reroute-capacity' },
+    });
+    this.armCapacityPoll();
+  }
+
+  /* @self-action-controller: job-capacity-episode */
+  private armCapacityPoll(): void {
+    if (this.capacityPoll) return;
+    this.capacityPoll = setInterval(() => {
+      if (!this.running || this.paused) return;
+      this.processQueue();
+      void this.maybeAlertCapacityEpisode();
+    }, CAPACITY_POLL_MS);
+    this.capacityPoll.unref?.();
+  }
+
+  private markCapacityJobStarted(slug: string): void {
+    const key = 'job-capacity-episode';
+    const episode = this.state.get<JobCapacityEpisode>(key);
+    if (!episode || !episode.jobs.includes(slug)) return;
+    this.queue = this.queue.filter(q => q.slug !== slug);
+    const jobs = episode.jobs.filter(s => s !== slug);
+    if (jobs.length) {
+      const blockedAtByJob = { ...episode.blockedAtByJob };
+      delete blockedAtByJob[slug];
+      this.state.set(key, { ...episode, jobs, blockedAtByJob });
+    }
+    else {
+      this.state.set(key, null);
+      if (this.capacityPoll) clearInterval(this.capacityPoll);
+      this.capacityPoll = null;
+    }
+  }
+
+  private async maybeAlertCapacityEpisode(): Promise<void> {
+    const episode = this.state.get<JobCapacityEpisode>('job-capacity-episode');
+    if (!episode || episode.alertedAt || episode.recordedAt || this.capacityAlertInFlight || !episode.jobs.length) return;
+    const waiting = episode.jobs.map(s => this.jobs.find(j => j.slug === s)).filter((j): j is JobDefinition => Boolean(j));
+    if (!waiting.length) {
+      for (const slug of episode.jobs) this.markCapacityJobStarted(slug);
+      return;
+    }
+    const ageMs = Date.now() - Date.parse(episode.firstBlockedAt);
+    if (!Number.isFinite(ageMs)) return;
+    const eligible = waiting.some(j => {
+      const since = Date.parse(episode.blockedAtByJob?.[j.slug] ?? episode.firstBlockedAt);
+      const threshold = j.priority === 'critical' ? CRITICAL_CAPACITY_ALERT_MS : OTHER_CAPACITY_ALERT_MS;
+      return Number.isFinite(since) && Date.now() - since >= threshold;
+    });
+    if (!eligible) return;
+    this.capacityAlertInFlight = true;
+    try {
+      // Existing session monitoring owns liveness. Give its completion sweep
+      // one chance to free room before an operator-facing alert.
+      await this.sessionManager.purgeDeadSessions(true);
+      if (this.sessionManager.confinedRerouteCapacity() === 'available') {
+        this.processQueue();
+        return;
+      }
+      const names = waiting.sort((a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]).map(j => j.name);
+      const notice = jobCapacityNotice(names, ageMs);
+      const hub = this.state.get<number>('agent-attention-topic');
+      let receipt: unknown;
+      if (this.telegram && hub) receipt = await withNotificationEnvelope(stampNotification(), async () => (this.telegram)!.sendToTopic(hub, notice));
+      else if (!this.telegram && this.messenger) await this.messenger.send({ userId: 'system', content: notice });
+      else return;
+      const current = this.state.get<JobCapacityEpisode>('job-capacity-episode');
+      if (current?.firstBlockedAt === episode.firstBlockedAt && current.jobs.length) {
+        this.state.set('job-capacity-episode', { ...current, ...(isQuietReceipt(receipt) ? { recordedAt: new Date().toISOString() } : { alertedAt: new Date().toISOString() }) });
+      }
+    } catch (err) {
+      console.error(`[scheduler] Capacity episode notice failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.capacityAlertInFlight = false;
+    }
   }
 
   /**
@@ -940,12 +1902,16 @@ export class JobScheduler {
       clampedAllowlist: observability.clampedAllowlist,
     });
 
+    const priorConsecutiveFailures = this.state.getJobState(job.slug)?.consecutiveFailures ?? 0;
     this.state.saveJobState({
       slug: job.slug,
       lastRun: new Date().toISOString(),
       lastResult: 'pending',
       lastError: undefined,
-      consecutiveFailures: 0,
+      // Starting another attempt is not recovery. Preserve the durable streak
+      // until the subprocess actually succeeds; resetting here made every
+      // persistent script failure appear to be failure #1 forever.
+      consecutiveFailures: priorConsecutiveFailures,
       nextScheduled: this.getNextRun(job.slug),
     });
 
@@ -979,41 +1945,888 @@ export class JobScheduler {
       env,
       maxBuffer: 1024 * 1024,
     }).then(({ stdout, stderr }) => {
-      const output = [stdout, stderr].filter(Boolean).join('\n').slice(-1000);
-      this.runHistory.recordCompletion({ runId, result: 'success', outputSummary: output || undefined });
+      // Successful completion (not merely successful trigger) closes the retry
+      // episode for script jobs.
+      this.clearRetryState(job.slug);
+      const rawOutput = [stdout, stderr].filter(Boolean).join('\n');
+      const output = rawOutput.slice(-1000);
+      const lastAssessment = parseInstrumentAssessment(rawOutput) ?? undefined;
+      const startedAtMs = Date.parse(this.state.getJobState(job.slug)?.lastRun ?? '') || Date.now();
+      // Charter clause 1(c): durable job state is saved BEFORE the run-history
+      // completion is recorded, matching the model-session and wake-reaper paths.
+      // A crash between the two must never leave a completed run pointing at
+      // stale job state.
       this.state.saveJobState({
         slug: job.slug,
         lastRun: new Date().toISOString(),
         lastResult: 'success',
         lastError: undefined,
+        lastAssessment,
         consecutiveFailures: 0,
         nextScheduled: this.getNextRun(job.slug),
       });
+      this.runHistory.recordCompletion({ runId, result: 'success', outputSummary: output || undefined });
+      try {
+        this.jevAudit?.capture({
+          runId, slug: job.slug, goal: job.description ?? job.slug, result: 'success',
+          trigger: 'script', output: rawOutput, declaredEffects: job.declaredEffects, conditionalEffects: job.conditionalEffects,
+          completionAudit: job.completionAudit, workDir: path.dirname(this.stateDir),
+          startedAtMs, instrumentAssessment: lastAssessment,
+        });
+      } catch { /* @silent-fallback-ok — the audit must never break completion handling. */ }
+      this.clearFailureAlertState(job.slug);
+      this.noteContinuitySuccess(job.slug);
       this.releaseClaim(job.slug, 'success');
     }).catch((err: unknown) => {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      const output = [
+      const rawOutput = [
         (err as { stdout?: string })?.stdout,
         (err as { stderr?: string })?.stderr,
-      ].filter(Boolean).join('\n').slice(-1000);
+      ].filter(Boolean).join('\n');
+      const output = rawOutput.slice(-1000);
+      const lastAssessment = parseInstrumentAssessment(rawOutput) ?? undefined;
       const result = errorMsg.includes('timed out') || errorMsg.includes('ETIMEDOUT') ? 'timeout' : 'failure';
-      this.runHistory.recordCompletion({ runId, result, error: errorMsg, outputSummary: output || undefined });
       const previous = this.state.getJobState(job.slug);
+      const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
+      // Charter clause 1(c): durable job state first, then the run-history record.
+      // `consecutiveFailures` is still read from the PRE-save state above.
       this.state.saveJobState({
         slug: job.slug,
         lastRun: new Date().toISOString(),
         lastResult: result,
         lastError: errorMsg,
-        consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+        lastAssessment,
+        consecutiveFailures,
         nextScheduled: this.getNextRun(job.slug),
       });
+      this.runHistory.recordCompletion({ runId, result, error: errorMsg, outputSummary: output || undefined });
+      try {
+        this.jevAudit?.capture({
+          runId, slug: job.slug, goal: job.description ?? job.slug, result,
+          trigger: 'script', output: rawOutput, declaredEffects: job.declaredEffects, conditionalEffects: job.conditionalEffects,
+          completionAudit: job.completionAudit, workDir: path.dirname(this.stateDir),
+          startedAtMs: Date.parse(previous?.lastRun ?? '') || Date.now(),
+          instrumentAssessment: lastAssessment,
+        });
+      } catch { /* @silent-fallback-ok — the audit must never break completion handling. */ }
+      void this.alertOnConsecutiveFailures(job, consecutiveFailures, errorMsg);
       this.releaseClaim(job.slug, 'failure');
       this.scheduleRetry(job.slug, 'error');
     });
   }
 
-  private spawnJobSession(job: JobDefinition, reason: string): void {
-    const prompt = this.buildPrompt(job);
+  // ── job-cost-reduction: script runners (docs/specs/job-cost-reduction.md §5) ──
+
+  /** Slugs of converted defaults on this agent (the shipped scripts present
+   *  under `.instar/jobs/instar/scripts/`). */
+  getConvertedDefaultSlugs(): Set<string> {
+    const dir = path.join(this.stateDir, 'jobs', 'instar', 'scripts');
+    try {
+      return new Set(fs.readdirSync(dir).filter((f) => /^[a-z0-9-]+\.mjs$/.test(f)).map((f) => f.slice(0, -4)));
+    } catch {
+      // @silent-fallback-ok — no scripts dir means nothing is converted.
+      return new Set();
+    }
+  }
+
+  /**
+   * §8.3: a user job whose slug matches a converted default is reported,
+   * never rewritten. Logs each such slug ONCE to
+   * `logs/job-runner-migration.jsonl` (deduped against the file itself, so a
+   * restart does not re-log) and returns whether this job shadows one.
+   */
+  shadowsConvertedDefault(job: JobDefinition, hasUserFork: boolean, converted?: Set<string>): boolean {
+    const set = converted ?? this.getConvertedDefaultSlugs();
+    if (!set.has(job.slug)) return false;
+    const shadows = job.origin !== 'instar' || hasUserFork;
+    if (shadows && !this.shadowLogged.has(job.slug)) {
+      this.shadowLogged.add(job.slug);
+      const logPath = path.join(path.dirname(this.stateDir), 'logs', 'job-runner-migration.jsonl');
+      try {
+        const existing = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8') : '';
+        const already = existing.split('\n').some((line) => {
+          try { return (JSON.parse(line) as { slug?: string }).slug === job.slug; } catch { return false; }
+        });
+        if (!already) {
+          fs.mkdirSync(path.dirname(logPath), { recursive: true });
+          fs.appendFileSync(logPath, JSON.stringify({
+            ts: new Date().toISOString(),
+            kind: 'user-job-shadows-converted-default',
+            slug: job.slug,
+            note: 'A user job shares this slug with a default that now runs as a script. The user job was not changed; drop the fork to use the script runner.',
+          }) + '\n');
+        }
+      } catch (err) {
+        // @silent-fallback-ok — the GET /jobs flag is the primary surface.
+        console.warn(`[scheduler] could not write job-runner-migration log: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return shadows;
+  }
+
+  /** The last `limit` script-run output summaries for a slug (this machine). */
+  recentScriptOutputs(slug: string, limit = 3): Array<{ runId: string; result: string; startedAt: string; outputSummary?: string }> {
+    return this.runHistory
+      .localRunsForSlug(slug, 20)
+      .filter((r) => r.runner === 'script' && r.result !== 'pending' && !isSideRun(r))
+      .slice(0, limit)
+      .map((r) => ({ runId: r.runId, result: r.result, startedAt: r.startedAt, outputSummary: r.outputSummary }));
+  }
+
+  /** An instar-origin template whose manifest names its shipped script. User
+   *  `execute.type: 'script'` jobs are NOT script runners (they keep the shell
+   *  path), so `runner: script` grants no new user privilege. */
+  isScriptRunnerJob(job: JobDefinition): boolean {
+    return job.origin === 'instar' && job.execute.type === 'script' && job.runner === 'script';
+  }
+
+  /** Inject a live config reader (e.g. LiveConfig). When unset the scheduler
+   *  re-reads `<stateDir>/config.json` on mtime change. */
+  setConfigReader(reader: (() => Record<string, unknown> | null) | null): void {
+    this.configReader = reader;
+  }
+
+  /** Token attribution sink (job-cost-reduction §9). Optional-chained: the
+   *  ledger may not carry the method on older builds. */
+  setTokenLedger(ledger: JobSessionLedger | null): void {
+    this.tokenLedger = ledger;
+  }
+
+  /** Test seam: disable the fixed per-slug 0–20 s start offset. */
+  setScriptStartOffsetEnabled(enabled: boolean): void {
+    this.scriptStartOffsetEnabled = enabled;
+  }
+
+  addScriptRunObserver(o: ScriptRunObserver): void {
+    this.scriptRunObservers.push(o);
+  }
+
+  /** Subscribe to the end of a projected session (`triage:<slug>` tag). */
+  addProjectedSessionListener(fn: ProjectedSessionListener): void {
+    this.projectedSessionListeners.push(fn);
+  }
+
+  listScriptJobs(): JobDefinition[] {
+    return this.jobs.filter((j) => this.isScriptRunnerJob(j));
+  }
+
+  /** This machine's rows for one slug, newest first. */
+  getLocalRunsForSlug(slug: string, limit: number): JobRun[] {
+    return this.runHistory.localRunsForSlug(slug, limit);
+  }
+
+  /** Fixed per-slug start offset in [0, 20 s] (F8) — spreads co-scheduled
+   *  scripts without making any slug's cadence drift. */
+  static scriptStartOffsetMs(slug: string): number {
+    const h = crypto.createHash('sha256').update(slug).digest();
+    return h.readUInt32BE(0) % (JobScheduler.MAX_SCRIPT_START_OFFSET_MS + 1);
+  }
+
+  private readAgentConfig(): Record<string, unknown> | null {
+    if (this.configReader) {
+      try {
+        return this.configReader();
+      } catch {
+        // @silent-fallback-ok — fall through to the on-disk read.
+      }
+    }
+    const p = path.join(this.stateDir, 'config.json');
+    try {
+      const mtime = fs.statSync(p).mtimeMs;
+      if (this.configCache && this.configCache.mtimeMs === mtime) return this.configCache.value;
+      const value = JSON.parse(fs.readFileSync(p, 'utf-8')) as Record<string, unknown>;
+      this.configCache = { mtimeMs: mtime, value };
+      return value;
+    } catch {
+      // @silent-fallback-ok — no/unreadable config → defaults (the dev gate
+      // then resolves off, which is the conservative agentmd path).
+      return null;
+    }
+  }
+
+  /**
+   * Rollback switch (§8.4), read LIVE at every trigger:
+   * `jobs.scriptRunners.enabled` — omitted rides the development-agent gate —
+   * and `jobs.scriptRunners.disabledSlugs`.
+   */
+  scriptRunnersActiveFor(slug: string): boolean {
+    // The scheduler checks standby role later in triggerJob. Avoid opening a
+    // writable SQLite journal while that read-only role is still being checked.
+    if (this.state.readOnly) return false;
+    if (!this.supervisionBlocksLoaded) {
+      try {
+        const store = this.getJobSupervisionStore();
+        for (const held of store.heldSlugs()) this.supervisionBlockedSlugs.add(held.slug);
+        const baseline = store.censusBaselineAt();
+        const scan = this.runHistory.query({ limit: 100000, excludeSideRuns: true });
+        if (!this.runHistory.isReadHealthy() || scan.total > scan.runs.length) {
+          this.supervisionCensusHealthy = false;
+        } else {
+          for (const run of scan.runs) {
+            if (run.runner !== 'script' || run.startedAt < baseline) continue;
+            const row = store.findByRunId(run.runId);
+            if (!row || row.reason === 'missing-record' || row.reason === 'outcome-unknown'
+              || run.result === 'pending' || !row.completedAt || row.result !== run.result
+              || (row.status === 'pending' && !row.decisionEligible)) {
+              this.supervisionBlockedSlugs.add(run.slug);
+              store.holdSlug(run.slug, 'independent-history-mismatch');
+            }
+          }
+        }
+        this.supervisionBlocksLoaded = true;
+      } catch (error) {
+        // @silent-fallback-ok — supervisionWriteFailed holds in memory, attempts a durable hold, and reports degradation.
+        this.supervisionWriteFailed(slug, error);
+        return false;
+      }
+    }
+    if (!this.supervisionCensusHealthy) return false;
+    if (this.supervisionBlockedSlugs.has(slug)) return false;
+    try {
+      if (this.getJobSupervisionStore().isSlugHeld(slug)) {
+        this.supervisionBlockedSlugs.add(slug);
+        return false;
+      }
+    } catch (error) {
+      // @silent-fallback-ok — supervisionWriteFailed reports degradation and blocks this slug.
+      this.supervisionWriteFailed(slug, error);
+      return false;
+    }
+    if (!JOB_COST_AUDIT_READY.laterScriptJobs && !AUDIT_READY_SCRIPT_SLUGS.has(slug)
+      && (SCRIPT_RUNNER_FIRST_WAVE_DISABLED_SLUGS as readonly string[]).includes(slug)) return false;
+    if (!JOB_COST_AUDIT_READY.dailySupervision && slug === 'script-job-supervisor') return false;
+    const cfg = this.readAgentConfig() ?? {};
+    const jobsCfg = (cfg.jobs ?? {}) as { scriptRunners?: { enabled?: unknown; disabledSlugs?: unknown } };
+    const sr = jobsCfg.scriptRunners ?? {};
+    const explicit = typeof sr.enabled === 'boolean' ? sr.enabled : undefined;
+    if (!resolveDevAgentGate(explicit, cfg as { developmentAgent?: boolean })) return false;
+    const disabledSlugs: readonly string[] = Array.isArray(sr.disabledSlugs)
+      ? sr.disabledSlugs : SCRIPT_RUNNER_FIRST_WAVE_DISABLED_SLUGS;
+    if (disabledSlugs.includes(slug)) return false;
+    return true;
+  }
+
+  /**
+   * The derived agentmd definition of a script job: its body is the prompt,
+   * its frontmatter allowlist + lock trust are kept — never the `legacy`
+   * full-tools path `resolveAllowlist` would give a `script`-typed definition.
+   */
+  projectAsAgentmd(job: JobDefinition): JobDefinition {
+    return { ...job, execute: { type: 'agentmd' } };
+  }
+
+  /** The record-only supervision spine is independent of model rollout gates. */
+  getJobSupervisionStore(): JobSupervisionStore {
+    if (this.state.readOnly) throw new Error('script supervision journal unavailable on read-only standby');
+    return this.supervisionStore ??= new JobSupervisionStore(this.stateDir);
+  }
+
+  isReadOnlyStandby(): boolean { return this.state.readOnly; }
+
+  /** A local pending script is live only while this process owns its run. */
+  isScriptRunLive(runId: string): boolean { return this.activeScriptRunIds.has(runId); }
+
+  private supervisionWriteFailed(slug: string, error: unknown): void {
+    this.supervisionBlockedSlugs.add(slug);
+    const reason = error instanceof Error ? error.message : String(error);
+    // A failure in a later transition may leave a completed, matching attempt
+    // row. Persist the hold independently of that row whenever SQLite permits;
+    // the restart census also catches unfinished transitions while dark.
+    try { this.getJobSupervisionStore().holdSlug(slug, `write-failed:${reason.slice(0, 120)}`); }
+    catch { /* @silent-fallback-ok — admission remains closed in this process; restart census checks both ledgers. */ }
+    DegradationReporter.getInstance().report({
+      feature: 'JobScheduler.jobSupervision',
+      primary: `Record the production script attempt for "${slug}"`,
+      fallback: 'Hold the script route; use the prior agentmd runner for future fires',
+      reason,
+      impact: `Script-result coverage for "${slug}" is incomplete until the durable ledger is repaired`,
+    });
+    void this.telegram?.createAttentionItem({
+      id: `job-supervision-write:${slug}`, conditionKey: `job-supervision-write:${slug}`,
+      title: `A scheduled script cannot be safely recorded: ${slug}`,
+      summary: `The ${slug} script route is held because its result ledger failed: ${reason.slice(0, 200)}`,
+      description: `The ${slug} script route is held because its result ledger failed: ${reason.slice(0, 200)}`,
+      priority: 'HIGH', category: 'job', sourceContext: 'job-supervision',
+    }).catch(e => console.error('[job-supervision] attention delivery failed:', e));
+  }
+
+  private supervisionContractViolated(slug: string, reason: string): void {
+    if (this.supervisionBlockedSlugs.has(slug)) return;
+    this.supervisionBlockedSlugs.add(slug);
+    try { this.getJobSupervisionStore().holdSlug(slug, reason); }
+    catch (error) { this.supervisionWriteFailed(slug, error); }
+    DegradationReporter.getInstance().report({
+      feature: 'JobScheduler.jobSupervision',
+      primary: `Run the verified script for "${slug}"`,
+      fallback: 'Hold this script route and use its prior runner for future fires',
+      reason,
+      impact: `The current result stays unchecked and future script fires for "${slug}" are held`,
+    });
+    void this.telegram?.createAttentionItem({
+      id: `job-supervision-contract:${slug}`, conditionKey: `job-supervision-contract:${slug}`,
+      title: `A scheduled script failed its result contract: ${slug}`,
+      summary: `The ${slug} script route is held after ${reason}. Its latest result is unchecked.`,
+      description: `The ${slug} script route is held after ${reason}. Its latest result is unchecked.`,
+      priority: 'HIGH', category: 'job', sourceContext: 'job-supervision',
+    }).catch(e => console.error('[job-supervision] contract attention failed:', e));
+  }
+
+  /** A failed independent census append cannot silently improve coverage. */
+  private completeScriptHistory(runId: string, slug: string, input: Parameters<JobRunHistory['recordCompletion']>[0]): boolean {
+    try {
+      this.runHistory.recordCompletion(input);
+      if (this.runHistory.findRun(runId)?.result !== input.result) {
+        throw new Error(`script run history did not persist completion for ${runId}`);
+      }
+      return true;
+    } catch (error) {
+      // @silent-fallback-ok — supervisionWriteFailed holds in memory, attempts a durable hold, and reports degradation.
+      this.supervisionWriteFailed(slug, error);
+      return false;
+    }
+  }
+
+  private scriptPathFor(slug: string): string {
+    return path.join(this.stateDir, 'jobs', 'instar', 'scripts', `${slug}.mjs`);
+  }
+
+  private resolveAgentPort(): number | undefined {
+    if (typeof this.config.port === 'number') return this.config.port;
+    const cfg = this.readAgentConfig();
+    return typeof cfg?.port === 'number' ? cfg.port : undefined;
+  }
+
+  /** The reduced environment allowlist (§5.1). Nothing else is inherited. */
+  buildScriptEnv(job: JobDefinition, extra: Record<string, string> = {}): Record<string, string> {
+    const env: Record<string, string> = {};
+    if (process.env.PATH) env.PATH = process.env.PATH;
+    if (process.env.HOME) env.HOME = process.env.HOME;
+    if (this.config.authToken) env.INSTAR_AUTH_TOKEN = this.config.authToken;
+    if (this.config.projectName) env.INSTAR_AGENT_ID = this.config.projectName;
+    const port = this.resolveAgentPort();
+    if (port !== undefined) env.INSTAR_PORT = String(port);
+    env.INSTAR_JOB_SLUG = job.slug;
+    env.INSTAR_MESSAGE_KIND = 'automated';
+    env.INSTAR_SENDER_CLASS = 'script';
+    return { ...env, ...extra };
+  }
+
+  /**
+   * Trust verdict at execution time. `untrusted-no-lockfile` (unsigned dev
+   * builds) runs, as an unsigned agentmd default does today; every tamper
+   * state refuses. A trusted job's script is RE-HASHED here, immediately
+   * before execution, so a file changed after loading never runs.
+   */
+  private checkScriptTrust(job: JobDefinition): { ok: true } | { ok: false; reason: string } {
+    if (job.scriptFile !== `${job.slug}.mjs`) return { ok: false, reason: 'script name does not match the slug' };
+    if (job.lockTrust === 'untrusted-no-lockfile') {
+      try {
+        const st = fs.lstatSync(this.scriptPathFor(job.slug));
+        if (st.isSymbolicLink() || !st.isFile()) return { ok: false, reason: 'script is not a regular file' };
+      } catch {
+        return { ok: false, reason: 'script file missing' };
+      }
+      return { ok: true };
+    }
+    if (job.lockTrust !== 'trusted') return { ok: false, reason: `lock trust is ${job.lockTrust ?? 'unknown'}` };
+    return verifyScriptHash(this.scriptPathFor(job.slug), job.scriptHashExpected);
+  }
+
+  /** Run the script: execFile(node, [absPath, ...args]) — no shell. */
+  private executeScript(
+    job: JobDefinition,
+    args: string[],
+    extraEnv: Record<string, string>,
+  ): Promise<ScriptExecResult> {
+    const timeout = Math.max(1, job.scriptTimeoutMinutes ?? JobScheduler.DEFAULT_SCRIPT_TIMEOUT_MINUTES) * 2 * 60_000;
+    const abs = this.scriptPathFor(job.slug);
+    return new Promise((resolve) => {
+      execFile(
+        process.execPath,
+        [abs, ...args],
+        {
+          cwd: path.dirname(this.stateDir),
+          env: this.buildScriptEnv(job, extraEnv),
+          timeout,
+          maxBuffer: JobScheduler.SCRIPT_MAX_BUFFER_BYTES,
+          encoding: 'utf-8',
+          windowsHide: true,
+        },
+        (err, stdout, stderr) => {
+          const e = err as (NodeJS.ErrnoException & { killed?: boolean; signal?: string | null; code?: number | string }) | null;
+          const overBuffer = e?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+          const timedOut = !!e && !overBuffer && (e.killed === true || e.signal === 'SIGTERM') && typeof e.code !== 'number';
+          const spawnError = !!e && typeof e.code === 'string' && !overBuffer ? e.message : undefined;
+          const exitCode = !e ? 0 : typeof e.code === 'number' ? e.code : 1;
+          resolve({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), exitCode, timedOut, overBuffer, spawnError });
+        },
+      );
+    });
+  }
+
+  /** Scrub (durableSecretScrub) THEN cap, THEN parse (§5.1, §5.2). */
+  private parseExec(job: JobDefinition, exec: ScriptExecResult): { parsed: ParsedScriptRun; scrubbed: string } {
+    const out = capScriptOutput(scrubForStore(exec.stdout).text);
+    const err = exec.stderr ? capScriptOutput(scrubForStore(exec.stderr).text) : { text: '', overCap: false };
+    const overCap = exec.overBuffer || out.overCap || err.overCap;
+    let parsed = parseScriptOutput(out.text, exec.exitCode, {
+      anomalies: job.anomalies,
+      triageFields: job.triageFields,
+      overCap,
+    });
+    if (exec.timedOut || exec.spawnError) {
+      const reason = exec.timedOut ? 'script-timeout' : 'script-spawn-error';
+      parsed = { ...parsed, result: 'failure', reason, reasonCode: reason };
+    }
+    if (parsed.ignoredAnomalies > 0) {
+      console.warn(`[scheduler] Script "${job.slug}" printed ${parsed.ignoredAnomalies} undeclared/malformed JOB_ANOMALY line(s) — ignored.`);
+    }
+    const scrubbed = capScriptOutput(err.text ? `${out.text}\n[stderr]\n${err.text}` : out.text).text;
+    return { parsed, scrubbed };
+  }
+
+  private untrustedParse(reason: string): ParsedScriptRun {
+    return {
+      result: 'failure',
+      reason: `script-untrusted ${reason}`,
+      reasonCode: 'script-untrusted',
+      summary: '',
+      anomalies: [],
+      ignoredAnomalies: 0,
+      fields: {},
+      droppedFields: 0,
+      missingResultLine: true,
+      overCap: false,
+    };
+  }
+
+  /**
+   * Execute an instar `runner: script` job (§5.1). The caller already holds
+   * the claim and has added the slug to `scriptInFlight`.
+   */
+  private runScriptRunnerJob(job: JobDefinition, reason: string): void {
+    const slug = job.slug;
+    const sessionName = `script-${slug}-${Date.now().toString(36)}`;
+    const projected = this.projectAsAgentmd(job);
+    const observability = JobScheduler.computeRunObservability(projected, JobScheduler.resolveAllowlist(projected));
+    const startedAt = new Date().toISOString();
+    let runId: string;
+    try {
+      runId = this.runHistory.recordStart({
+        slug,
+        sessionId: sessionName,
+        trigger: reason,
+        origin: 'instar',
+        runner: 'script',
+        lockTrust: job.lockTrust ?? 'unknown',
+        tokens: 0,
+        resolvedPath: observability.resolvedPath,
+        bodyHash: observability.bodyHash,
+        frontmatterHash: observability.frontmatterHash,
+        manifestVersion: observability.manifestVersion,
+        toolAllowlist: null,
+      });
+    } catch (error) {
+      this.supervisionWriteFailed(slug, error);
+      this.releaseClaim(slug, 'failure');
+      this.scriptInFlight.delete(slug);
+      return;
+    }
+    this.activeScriptRunIds.add(runId);
+    let supervisionId: string;
+    const receiptToken = slug === 'llm-decision-grading' ? crypto.randomBytes(32).toString('hex') : null;
+    const supervisionActiveAtStart = jobSupervisionRolloutState(this.readAgentConfig() ?? {}).active;
+    const featureStateHash = crypto.createHash('sha256').update(JSON.stringify({
+      supervisionActiveAtStart,
+      scriptSupervision: job.scriptSupervision ?? null,
+      triageEvidence: job.triageEvidence ?? null,
+      triageFields: [...(job.triageFields ?? [])].sort(),
+    })).digest('hex');
+    try {
+      const fireId = (this.acquiredClaimPath.get(slug) === 'journal'
+        ? this.leaseClaimStore?.getClaim(slug)?.claimId
+        : this.claimManager?.getClaim(slug)?.claimId) ?? `local:${runId}`;
+      supervisionId = this.getJobSupervisionStore().register({
+        runId, fireId, slug, machineId: this.machineId,
+        templateDigest: job.scriptHashExpected ?? null,
+        featureStateHash,
+        decisionEligible: supervisionActiveAtStart,
+        evidencePolicy: SUPERVISION_EVIDENCE_POLICY,
+        receiptTokenHash: receiptToken ? crypto.createHash('sha256').update(receiptToken).digest('hex') : undefined,
+      });
+    } catch (error) {
+      this.supervisionWriteFailed(slug, error);
+      this.completeScriptHistory(runId, slug, { runId, result: 'failure', error: 'supervision-register-failed' });
+      this.releaseClaim(slug, 'failure');
+      this.scriptInFlight.delete(slug);
+      this.activeScriptRunIds.delete(runId);
+      return;
+    }
+    const prior = this.state.getJobState(slug);
+    this.state.saveJobState({
+      slug,
+      lastRun: startedAt,
+      lastResult: 'pending',
+      lastError: undefined,
+      consecutiveFailures: prior?.consecutiveFailures ?? 0,
+      nextScheduled: this.getNextRun(slug),
+    });
+    this.state.appendEvent({
+      type: 'job_triggered',
+      summary: `Job "${slug}" triggered (${reason})`,
+      sessionId: sessionName,
+      timestamp: startedAt,
+      metadata: { slug, reason, mode: 'script-runner' },
+    });
+
+    const run = async (): Promise<void> => {
+      const trust = this.checkScriptTrust(job);
+      let parsed: ParsedScriptRun;
+      let scrubbed = '';
+      if (!trust.ok) {
+        parsed = this.untrustedParse(trust.reason);
+        const key = `${slug}|${trust.reason}`;
+        if (!this.untrustedReported.has(key)) {
+          this.untrustedReported.add(key);
+          DegradationReporter.getInstance().report({
+            feature: 'JobScheduler.scriptRunner',
+            primary: `Run the shipped script for "${slug}"`,
+            fallback: 'Record the run as failed; start no session',
+            reason: `${job.name || slug} not running: its script failed verification (${trust.reason})`,
+            impact: `"${slug}" does no work until the shipped script verifies again (reinstall or update instar)`,
+          });
+        }
+      } else {
+        const exec = await this.executeScript(job, [], receiptToken
+          ? { INSTAR_JOB_RUN_ID: runId, INSTAR_JOB_RECEIPT_TOKEN: receiptToken }
+          : { INSTAR_JOB_RUN_ID: runId });
+        ({ parsed, scrubbed } = this.parseExec(job, exec));
+      }
+      this.finishScriptRun(job, runId, supervisionId, parsed, scrubbed, startedAt, supervisionActiveAtStart);
+    };
+
+    const offset = this.scriptStartOffsetEnabled ? JobScheduler.scriptStartOffsetMs(slug) : 0;
+    const go = () => {
+      run()
+        .catch((err) => {
+          console.error(`[scheduler] Script runner for "${slug}" threw: ${err instanceof Error ? err.message : String(err)}`);
+          try {
+            this.finishScriptRun(job, runId, supervisionId, { ...this.untrustedParse(''), reason: 'script-runner-error', reasonCode: 'script-runner-error' }, '', startedAt, supervisionActiveAtStart);
+          } catch { /* @silent-fallback-ok — bookkeeping best-effort on an internal throw */ }
+        })
+        .finally(() => { this.scriptInFlight.delete(slug); this.activeScriptRunIds.delete(runId); });
+    };
+    if (offset > 0) {
+      const t = setTimeout(go, offset);
+      t.unref?.();
+    } else {
+      go();
+    }
+  }
+
+  /** Record a finished script run: job state, history, alerts, claim, observers. */
+  private finishScriptRun(
+    job: JobDefinition,
+    runId: string,
+    supervisionId: string,
+    parsed: ParsedScriptRun,
+    scrubbed: string,
+    startedAt: string,
+    supervisionActiveAtStart: boolean,
+  ): void {
+    const slug = job.slug;
+    const finishedAt = new Date().toISOString();
+    const outputSummary = scrubbed ? scrubbed.slice(-1000) : undefined;
+    const lastAssessment = parseInstrumentAssessment(scrubbed) ?? undefined;
+    try {
+      const result = parsed.result === 'success' || parsed.result === 'skipped' ? parsed.result : 'failure';
+      const independentSignal = slug === 'llm-decision-grading' && result === 'success'
+        ? this.getJobSupervisionStore().gradePassSignal(runId, parsed.summary) : null;
+      const evidence = parsed.reasonCode === 'script-untrusted' ? { ok: false as const, reason: 'script-untrusted' }
+        : projectSupervisionEvidence({ job, parsed, scrubbedOutput: scrubbed, independentSignal });
+      this.getJobSupervisionStore().recordResult(supervisionId, {
+        result, completedAt: finishedAt,
+        evidenceHash: evidence.ok ? evidence.hash : null,
+        evidenceText: evidence.ok ? evidence.text : null,
+        evidenceSufficient: evidence.ok && evidence.sufficientForRoutine,
+        reason: parsed.reasonCode || null,
+      });
+      if (!supervisionActiveAtStart) {
+        this.getJobSupervisionStore().markUnchecked(supervisionId,
+          evidence.ok ? 'triage-dark' : evidence.reason);
+      } else if (!evidence.ok) {
+        this.getJobSupervisionStore().markUnchecked(supervisionId, evidence.reason);
+      }
+      if (!evidence.ok && ['script-untrusted', 'parser-integrity', 'output-truncated', 'evidence-over-cap'].includes(evidence.reason)) {
+        this.supervisionContractViolated(slug, evidence.reason);
+      }
+    } catch (error) {
+      this.supervisionWriteFailed(slug, error);
+    }
+    const previous = this.state.getJobState(slug);
+    let historyRecorded = true;
+    const startedAtMs = Date.parse(startedAt) || Date.now();
+    const captureJev = (result: 'success' | 'failure') => {
+      try {
+        this.jevAudit?.capture({
+          runId, slug, goal: job.description ?? slug, result,
+          trigger: 'script', output: scrubbed, declaredEffects: job.declaredEffects, conditionalEffects: job.conditionalEffects,
+          completionAudit: job.completionAudit, workDir: path.dirname(this.stateDir),
+          startedAtMs, instrumentAssessment: lastAssessment,
+        });
+      } catch { /* @silent-fallback-ok — the audit must never break completion handling. */ }
+    };
+
+    if (parsed.result === 'success') {
+      this.state.saveJobState({
+        slug, lastRun: finishedAt, lastResult: 'success', lastError: undefined, lastAssessment,
+        consecutiveFailures: 0, nextScheduled: this.getNextRun(slug),
+      });
+      historyRecorded = this.completeScriptHistory(runId, slug, { runId, result: 'success', outputSummary });
+      if (historyRecorded) {
+        captureJev('success');
+        this.clearRetryState(slug);
+        this.clearFailureAlertState(slug);
+        this.noteContinuitySuccess(slug);
+      }
+      this.releaseClaim(slug, historyRecorded ? 'success' : 'failure');
+    } else if (parsed.result === 'skipped') {
+      // §5.2: neither success nor failure — consecutiveFailures unchanged
+      // (neither raised nor reset), no retry, no Jev audit capture.
+      this.state.saveJobState({
+        slug, lastRun: finishedAt, lastResult: 'skipped', lastError: previous?.lastError, lastAssessment,
+        consecutiveFailures: previous?.consecutiveFailures ?? 0, nextScheduled: this.getNextRun(slug),
+      });
+      historyRecorded = this.completeScriptHistory(runId, slug, { runId, result: 'skipped', error: parsed.reason || undefined, outputSummary });
+      if (historyRecorded) this.clearRetryState(slug);
+      this.releaseClaim(slug, historyRecorded ? 'success' : 'failure');
+    } else {
+      const errorMsg = parsed.reason || 'failed';
+      const consecutiveFailures = (previous?.consecutiveFailures ?? 0) + 1;
+      this.state.saveJobState({
+        slug, lastRun: finishedAt, lastResult: 'failure', lastError: errorMsg, lastAssessment,
+        consecutiveFailures, nextScheduled: this.getNextRun(slug),
+      });
+      historyRecorded = this.completeScriptHistory(runId, slug, { runId, result: 'failure', error: errorMsg, outputSummary });
+      captureJev('failure');
+      void this.alertOnConsecutiveFailures(job, consecutiveFailures, errorMsg);
+      this.releaseClaim(slug, 'failure');
+      // An untrusted script cannot be fixed by a retry; the alert is the path.
+      if (parsed.reasonCode !== 'script-untrusted' && historyRecorded) this.scheduleRetry(slug, 'error');
+    }
+
+    if (!historyRecorded) {
+      this.state.saveJobState({
+        slug, lastRun: finishedAt, lastResult: 'failure', lastError: 'history-write-failed',
+        consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+        nextScheduled: this.getNextRun(slug),
+      });
+    }
+
+    notifyScriptRunObservers(this.scriptRunObservers, {
+      job,
+      runId,
+      machineId: this.machineId,
+      parsed,
+      scrubbedOutput: scrubbed,
+      startedAt,
+      finishedAt,
+      canary: false,
+      lockTrust: job.lockTrust ?? 'unknown',
+    });
+  }
+
+  /**
+   * Run a converted job's script in canary mode (§5.6.4): no claim, no run
+   * history row, no job state. Observers receive the run with `canary: true`
+   * (every observer other than the canary runner must ignore it).
+   */
+  async runScriptCanary(
+    slug: string,
+    opts: { serverUrl: string; extraArgs?: string[]; env?: Record<string, string> },
+  ): Promise<{ parsed: ParsedScriptRun; exitCode: number; stdout: string }> {
+    const job = this.listScriptJobs().find((j) => j.slug === slug);
+    if (!job) {
+      const parsed = { ...this.untrustedParse('not a script job'), reason: 'canary-unknown-slug', reasonCode: 'canary-unknown-slug' };
+      return { parsed, exitCode: 1, stdout: '' };
+    }
+    const trust = this.checkScriptTrust(job);
+    if (!trust.ok) return { parsed: this.untrustedParse(trust.reason), exitCode: 1, stdout: '' };
+    const startedAt = new Date().toISOString();
+    const exec = await this.executeScript(
+      job,
+      ['--canary', '--server-url', opts.serverUrl, ...(opts.extraArgs ?? [])],
+      { ...(opts.env ?? {}), INSTAR_SCRIPT_CANARY: '1' },
+    );
+    const { parsed, scrubbed } = this.parseExec(job, exec);
+    notifyScriptRunObservers(this.scriptRunObservers, {
+      job,
+      runId: `canary-${slug}-${Date.now().toString(36)}`,
+      machineId: this.machineId,
+      parsed,
+      scrubbedOutput: scrubbed,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      canary: true,
+      lockTrust: job.lockTrust ?? 'unknown',
+    });
+    return { parsed, exitCode: exec.exitCode, stdout: capScriptOutput(scrubForStore(exec.stdout).text).text };
+  }
+
+  /**
+   * Spawn a session from a derived agentmd projection of a job (§8.4 rollback,
+   * §5.6.2 triage). For origin `triage` the session is tagged `triage:<slug>`
+   * (so the job's own already-running guard is not tripped), its run row is
+   * `origin: 'triage'` (outside the slug's stats), and JobState / failure
+   * streak / failure-alert state are NEVER touched. Admission (cooldowns,
+   * caps) is the caller's job.
+   */
+  spawnProjectedSession(
+    job: JobDefinition,
+    opts: {
+      prompt: string;
+      slugTag: string;
+      allowlist?: string[] | 'template';
+      modelOverride?: 'agent-default';
+      omitAuthEnv?: boolean;
+      confinedTools?: string[];
+      maxDurationMinutes?: number;
+      telegramNotify?: boolean;
+      origin?: 'triage' | 'rollback';
+      trigger: string;
+    },
+  ): { sessionName: string } | { refused: string } {
+    const projected = this.projectAsAgentmd(job);
+    if (opts.origin !== 'triage') {
+      // Rollback: today's job session, with the template's own frontmatter
+      // allowlist + lock trust and the body as the prompt.
+      if (opts.slugTag !== job.slug) return { refused: 'rollback-slug-tag-must-equal-slug' };
+      const sessionName = this.spawnJobSession({ ...projected, body: opts.prompt || projected.body }, opts.trigger);
+      return { sessionName };
+    }
+
+    if (opts.slugTag !== `triage:${job.slug}`) return { refused: 'triage-slug-tag-must-be-triage:<slug>' };
+    // The row's trigger names the run being triaged: `triage:<runId>`.
+    if (!/^triage:\S+$/.test(opts.trigger)) return { refused: 'triage-trigger-must-be-triage:<runId>' };
+    const tools = opts.confinedTools ?? (Array.isArray(opts.allowlist) ? opts.allowlist : undefined);
+    if (!tools || tools.length === 0) return { refused: 'triage-needs-explicit-tools' };
+    if (this.sessionManager.listRunningSessions().some((s) => s.jobSlug === opts.slugTag)) {
+      return { refused: 'already-running' };
+    }
+
+    const sessionName = `triage-${job.slug}-${Date.now().toString(36)}`;
+    const startedAt = new Date().toISOString();
+    const runId = this.runHistory.recordStart({
+      slug: job.slug,
+      sessionId: sessionName,
+      trigger: opts.trigger,
+      origin: 'triage',
+      toolAllowlist: tools,
+    });
+    this.projectedRuns.set(sessionName, { runId, slugTag: opts.slugTag, slug: job.slug, trigger: opts.trigger });
+
+    const spawnOpts: ProjectedSpawnOptions = {
+      name: sessionName,
+      prompt: opts.prompt,
+      jobSlug: opts.slugTag,
+      triggeredBy: `scheduler:${opts.trigger}`,
+      maxDurationMinutes: opts.maxDurationMinutes ?? job.expectedDurationMinutes,
+      allowedTools: tools,
+      disableProjectMcp: true,
+      ...(opts.modelOverride === 'agent-default' ? { useAgentDefaultModel: true } : { model: job.model }),
+      ...(opts.omitAuthEnv !== undefined ? { omitAuthEnv: opts.omitAuthEnv } : {}),
+      ...(opts.confinedTools !== undefined ? { confinedTools: opts.confinedTools } : {}),
+    };
+    this.sessionManager
+      .spawnSession(spawnOpts as Parameters<SessionManager['spawnSession']>[0])
+      .then((session) => {
+        this.recordLedgerSession(session?.id ?? sessionName, job.slug, startedAt, 'triage');
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.runHistory.recordCompletion({ runId, result: 'failure', error: `spawn-error: ${msg}` });
+        this.projectedRuns.delete(sessionName);
+        this.emitProjectedSessionEnded({ slugTag: opts.slugTag, sessionName, trigger: opts.trigger, output: '', result: 'spawn-error' });
+      });
+    return { sessionName };
+  }
+
+  private recordLedgerSession(sessionId: string, slug: string, startedAt: string, origin: 'job' | 'triage' | 'rollback'): void {
+    try {
+      this.tokenLedger?.recordJobSession?.(sessionId, slug, this.machineId, startedAt, origin);
+    } catch (err) {
+      // @silent-fallback-ok — attribution is observability; never a spawn gate.
+      console.warn(`[scheduler] token-ledger job attribution failed for "${slug}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private emitProjectedSessionEnded(end: ProjectedSessionEnd): void {
+    for (const fn of this.projectedSessionListeners) {
+      try {
+        fn(end);
+      } catch (err) {
+        // @silent-fallback-ok — a listener never affects completion handling.
+        console.error(`[scheduler] projected-session listener threw for ${end.slugTag}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /** Completion for a projected (triage) session — no JobState, no claim,
+   *  no failure-alert state; the row lives outside the slug's stats. */
+  private completeProjectedSession(slugTag: string, session: { name: string; status: string }, tmuxSession: string): void {
+    let output = '';
+    try {
+      output = this.sessionManager.captureOutput(tmuxSession) ?? '';
+    } catch {
+      // @silent-fallback-ok — session may already be gone
+    }
+    const entry = this.projectedRuns.get(session.name);
+    const failed = session.status === 'failed' || session.status === 'killed';
+    const result = session.status === 'killed' ? 'timeout' as const : failed ? 'failure' as const : 'success' as const;
+    if (entry) {
+      this.runHistory.recordCompletion({
+        runId: entry.runId,
+        result,
+        error: failed ? `Session ${session.status}` : undefined,
+        outputSummary: output ? scrubForStore(output).text.slice(-1000) : undefined,
+      });
+      this.projectedRuns.delete(session.name);
+    }
+    // After a restart the in-memory row map is gone; the trigger is then
+    // unknown here (the run row still holds it).
+    this.emitProjectedSessionEnded({
+      slugTag,
+      sessionName: session.name,
+      trigger: entry?.trigger ?? (session as { triggeredBy?: string }).triggeredBy?.replace(/^scheduler:/, '') ?? '',
+      output,
+      result,
+    });
+  }
+
+  /** Set at boot. True or null (cannot tell) means a job must keep out of this topic (team-roles-and-access §4.1). */
+  confinedTopicCheck: ((topicId: number) => boolean | null) | null = null;
+
+  /**
+   * A job runs with owner reach, so it stays out of a confined topic: its summary is member-steered
+   * text, and its posts would land where members read them. Runs at spawn and again before posting.
+   */
+  private dropConfinedTopic(job: JobDefinition): void {
+    if (!job.topicId || !this.confinedTopicCheck) return;
+    if (this.confinedTopicCheck(job.topicId) === false) return;
+    console.warn(`[scheduler] job ${job.slug} is bound to a confined topic; running without it`);
+    job.topicId = undefined;
+  }
+
+  private spawnJobSession(job: JobDefinition, reason: string): string {
+    this.dropConfinedTopic(job);
+    // job-cost-reduction §8.4: a script-runner job that reaches the session
+    // path (rollback, or a queued drain) always runs as its agentmd
+    // projection — never the legacy "Run this script:" full-tools path.
+    if (this.isScriptRunnerJob(job)) job = this.projectAsAgentmd(job);
+    const gateReceiptFile = jobGateReceiptPath(this.stateDir, job.slug);
+    const gateReceipt = job.gate ? readJobGateReceipt(gateReceiptFile) : null;
+    const prompt = this.buildPrompt(job) + (gateReceipt && !gateReceipt.consumed
+      ? '\n\nJob gate admission receipt (untrusted data; process only these admitted IDs):\n' + JSON.stringify(gateReceipt) : '');
     const sessionName = `job-${job.slug}-${Date.now().toString(36)}`;
 
     // Check for gate-written model escalation (e.g., git-sync severity)
@@ -1026,6 +2839,23 @@ export class JobScheduler {
     // was authorized, and (c) whether the resolver clamped to [Read] because
     // the two-flag guard failed.
     const allowlistResolution = JobScheduler.resolveAllowlist(job);
+    let route: JobRouteDecision = { routeBasis: 'default', reason: 'no-pin' };
+    if (job.framework !== undefined || job.frameworkModel !== undefined) {
+      let evidence: JobRouteEvidence = { enabled: false, auditReady: false, enabledFrameworks: new Set() };
+      try {
+        evidence = this.jobRouteEvidence?.(job) ?? evidence;
+      } catch {
+        // A broken cache read cannot prevent the job from running normally.
+      }
+      evidence = { ...evidence, auditReady: JOB_MODEL_ROUTING_AUDIT_READY && evidence.auditReady };
+      route = decideJobModelRoute(
+        { slug: job.slug, framework: job.framework, frameworkModel: job.frameworkModel,
+          toolAllowlist: allowlistResolution.allowlist },
+        evidence,
+      );
+    }
+    const requestedModel = route.routeBasis === 'bench' ? route.model : model;
+    const requestedFramework = route.routeBasis === 'bench' ? route.framework : undefined;
     // Side-channel signals (Dashboard event for clamp; degradation event for
     // both clamp and the instar-origin-without-allowlist Phase 1c gap).
     this.emitAllowlistSignals(job, allowlistResolution);
@@ -1070,10 +2900,17 @@ export class JobScheduler {
     // typical body sizes) — see spec performance budget.
     const observability = JobScheduler.computeRunObservability(job, allowlistResolution);
 
+    // Consumption is durable BEFORE launching: a disk error must never
+    // permit repeated model sessions against one reservation. Failed launches
+    // restore this same batch; queuing never consumes it.
+    if (gateReceipt && !gateReceipt.consumed) consumeJobGateReceipt(gateReceiptFile, gateReceipt.batchId);
+    let gateSpawnAccepted = false;
+    this.activeSessionSpawns.add(job.slug);
     this.sessionManager.spawnSession({
       name: sessionName,
       prompt,
-      model,
+      model: requestedModel,
+      framework: requestedFramework,
       jobSlug: job.slug,
       triggeredBy: `scheduler:${reason}`,
       maxDurationMinutes: job.expectedDurationMinutes,
@@ -1083,13 +2920,22 @@ export class JobScheduler {
       // MCP boot cost + the auth-required-remote-MCP headless hang hazard
       // (docs/specs/LOOP-SESSION-NO-MCP-SPEC.md). Absent/'project' → unchanged.
       disableProjectMcp: job.mcpAccess === 'none' ? true : undefined,
-    }).then(() => {
+    }).then((session) => {
+      gateSpawnAccepted = true;
+      this.markCapacityJobStarted(job.slug);
+      this.recordLedgerSession(session?.id ?? sessionName, job.slug, new Date().toISOString(), 'job');
       // Record in run history with full Phase 1b observability payload
       const runId = this.runHistory.recordStart({
         slug: job.slug,
         sessionId: sessionName,
         trigger: reason,
-        model: model ?? job.model,
+        model: session?.model ?? requestedModel ?? job.model,
+        framework: session?.framework,
+        routeBasis: route.routeBasis === 'bench' &&
+          (session?.framework !== route.framework || session?.model !== route.model) ? 'fallback' : route.routeBasis,
+        reason: route.routeBasis === 'fallback' ? route.reason :
+          route.routeBasis === 'bench' && session?.framework !== route.framework ? 'spawn-framework-fallback' :
+          route.routeBasis === 'bench' && session?.model !== route.model ? 'spawn-model-fallback' : undefined,
         origin: observability.origin,
         resolvedPath: observability.resolvedPath,
         bodyHash: observability.bodyHash,
@@ -1111,6 +2957,7 @@ export class JobScheduler {
         nextScheduled: this.getNextRun(job.slug),
       };
       this.state.saveJobState(jobState);
+      this.clearFailureAlertState(job.slug);
 
       this.state.appendEvent({
         type: 'job_triggered',
@@ -1120,13 +2967,25 @@ export class JobScheduler {
         metadata: { slug: job.slug, reason, model: job.model },
       });
     }).catch((err) => {
+      if (gateReceipt && !gateReceipt.consumed && !gateSpawnAccepted) {
+        try { restoreJobGateReceipt(gateReceiptFile, gateReceipt.batchId); }
+        catch (error) { console.warn('[scheduler] gate receipt restoration failed:', error instanceof Error ? error.message : 'unknown'); }
+      }
+      if (err instanceof RerouteRefusedError || err instanceof SessionCapacityRefusedError) {
+        this.releaseClaim(job.slug, 'waited');
+        this.enqueue(job.slug, reason, true);
+        return;
+      }
+      // A real spawn failure ends this job's capacity wait; it is now handled
+      // by the ordinary failure path, not the capacity episode.
+      this.markCapacityJobStarted(job.slug);
       // Record spawn error in run history
       const errorMsg = err instanceof Error ? err.message : String(err);
       this.runHistory.recordSpawnError({
         slug: job.slug,
         trigger: reason,
         error: errorMsg,
-        model: model ?? job.model,
+        model: requestedModel ?? job.model,
       });
 
       // Track failure with error message
@@ -1145,11 +3004,23 @@ export class JobScheduler {
         type: 'job_error',
         summary: `Job "${job.slug}" failed to spawn: ${errorMsg}`,
         timestamp: new Date().toISOString(),
-        metadata: { slug: job.slug, consecutiveFailures: failures },
+        metadata: {
+          slug: job.slug,
+          consecutiveFailures: failures,
+          error: errorMsg,
+          terminal: true,
+          retry: 'next-trigger',
+        },
       });
 
-      this.alertOnConsecutiveFailures(job, failures, errorMsg);
+      void this.alertOnConsecutiveFailures(job, failures, errorMsg);
+    }).finally(() => {
+      this.activeSessionSpawns.delete(job.slug);
+      // A spawn may settle after its session has already finished. Recheck
+      // ordinary queued work then; capacity waits keep their 15-second pace.
+      if (this.running && this.queue.length && !this.queue[0].capacityWait) this.processQueue();
     });
+    return sessionName;
   }
 
   /**
@@ -1191,14 +3062,14 @@ export class JobScheduler {
         base = `Run this script: ${job.execute.value}${job.execute.args ? ' ' + job.execute.args : ''}`;
         break;
       case 'agentmd':
-        // Phase 1b dispatch: the cached markdown body IS the prompt. The
+        // Phase 1b dispatch: the last validated markdown body IS the prompt. The
         // loader (AgentMdJobLoader.loadAgentMdBody) guarantees `body` is
         // populated for any agentmd JobDefinition that survives validation;
         // if it is somehow missing here, surface that loud and refuse to
         // spawn an empty prompt rather than fail silently.
         if (typeof job.body !== 'string') {
           throw new Error(
-            `JobScheduler.buildPrompt: agentmd job "${job.slug}" has no cached body. ` +
+            `JobScheduler.buildPrompt: agentmd job "${job.slug}" has no validated body. ` +
             `This indicates a loader-hydration bug (see AgentMdJobLoader.isAgentMdJobHydrated). ` +
             `See docs/specs/INSTAR-JOBS-AS-AGENTMD-SPEC.md.`,
           );
@@ -1280,6 +3151,9 @@ export class JobScheduler {
    * Resolve the effective notification mode for a job.
    * Default (undefined) → 'on-alert': quiet unless signaled.
    */
+  /** Memory privacy: true when a job's notice would land where others can read it. Unset means no. */
+  notifyDestinationHasOtherReaders?: (job: JobDefinition) => boolean;
+
   private getNotifyMode(job: JobDefinition): 'always' | 'never' | 'on-alert' {
     if (job.telegramNotify === false) return 'never';
     if (job.telegramNotify === true) return 'always';
@@ -1319,16 +3193,45 @@ export class JobScheduler {
   /**
    * Called when a job's session completes. Updates job state and notifies via messenger.
    */
+  /** Observe-only Jev completion audit (spec: jev-job-supervision.md).
+   * Optional; capture() is fire-and-forget and never awaited. */
+  private jevAudit: JevJobCompletionAudit | null = null;
+  setJevAudit(audit: JevJobCompletionAudit | null): void {
+    this.jevAudit = audit;
+  }
+  getJevAudit(): JevJobCompletionAudit | null {
+    return this.jevAudit;
+  }
+
   async notifyJobComplete(sessionId: string, tmuxSession: string): Promise<void> {
     // Find which job this session belongs to by looking up session state
     const session = this.state.getSession(sessionId);
     if (!session?.jobSlug) return;
 
+    // job-cost-reduction F13: a triage session is tagged `triage:<slug>` and
+    // is handled BEFORE the job lookup — it never touches the job's state.
+    if (session.jobSlug.startsWith('triage:')) {
+      this.completeProjectedSession(session.jobSlug, session, tmuxSession);
+      return;
+    }
+
     const job = this.jobs.find(j => j.slug === session.jobSlug);
     if (!job) return;
+    // First, before anything below reads its topic: it may have become confined since the job loaded,
+    // and a run holds its own copy of the job.
+    this.dropConfinedTopic(job);
+
+    // A prompt job can declare its own run failed (spec feedback-inbox-vault-token
+    // §B). Read synchronously, before any await, from the file named by this
+    // run's unique tmux session.
+    const declaredFailure = readJobDeclaredFailure(this.stateDir, tmuxSession);
 
     // Update job state with completion result
-    const failed = session.status === 'failed' || session.status === 'killed';
+    const failed = session.status === 'failed' || session.status === 'killed' || declaredFailure !== null;
+    const failureError = !failed ? undefined
+      : session.status === 'failed' || session.status === 'killed'
+        ? `Session ${session.status} (${session.name})${session.endedReason === 'codex-rate-limited' ? ' — Codex 429 Too Many Requests' : ''}${declaredFailure ? ` — declared failure: ${declaredFailure}` : ''}`
+        : `Declared failure: ${declaredFailure}`;
 
     // Capture session output FIRST — needed for both history and notifications
     let output = '';
@@ -1338,13 +3241,24 @@ export class JobScheduler {
       // Session may already be dead — that's fine
     }
 
+    const existingState = this.state.getJobState(job.slug);
+    const jobState: JobState = {
+      slug: job.slug,
+      lastRun: existingState?.lastRun ?? new Date().toISOString(),
+      lastResult: failed ? 'failure' : 'success',
+      lastError: failureError,
+      consecutiveFailures: failed ? (existingState?.consecutiveFailures ?? 0) + 1 : 0,
+      nextScheduled: this.getNextRun(job.slug),
+    };
+    this.state.saveJobState(jobState);
+
     // Record completion in run history (with output summary)
     const runId = this.activeRunIds.get(session.name);
     if (runId) {
       this.runHistory.recordCompletion({
         runId,
         result: session.status === 'killed' ? 'timeout' : (failed ? 'failure' : 'success'),
-        error: failed ? `Session ${session.status} (${session.name})` : undefined,
+        error: failureError,
         outputSummary: output ? output.slice(-1000) : undefined,
       });
 
@@ -1355,6 +3269,34 @@ export class JobScheduler {
       }
 
       this.activeRunIds.delete(session.name);
+
+      // Jev completion audit CAPTURE — bounded sync work, everything else
+      // detached; strictly BEFORE the IntegrationGate await below (tested
+      // ordering invariant; spec jev-job-supervision.md §A).
+      try {
+        // The pane is usually gone by now, so `output` is empty for most model-
+        // session jobs. The transcript holds what the job actually did — hand
+        // the audit that, falling back to the pane capture when unavailable.
+        let auditOutput = output;
+        if (this.jevAudit && (session.framework ?? 'claude-code') === 'claude-code' && session.claudeSessionId) {
+          const evidence = readJobTranscriptEvidence(
+            findClaudeJobTranscript(session.claudeSessionId, session.cwd ?? path.dirname(this.stateDir)),
+          );
+          if (evidence) auditOutput = output.trim() ? `${evidence}\n[pane tail]\n${output}` : evidence;
+        }
+        this.jevAudit?.capture({
+          runId,
+          slug: job.slug,
+          goal: job.description ?? job.slug,
+          result: session.status === 'killed' ? 'timeout' : (failed ? 'failure' : 'success'),
+          trigger: session.triggeredBy,
+          output: auditOutput,
+          declaredEffects: job.declaredEffects, conditionalEffects: job.conditionalEffects,
+          completionAudit: job.completionAudit,
+          workDir: path.dirname(this.stateDir),
+          startedAtMs: Date.parse(existingState?.lastRun ?? '') || Date.now(),
+        });
+      } catch { /* @silent-fallback-ok — the audit must never break completion handling. */ }
     }
 
     // Signal claim completion (Phase 4C — Gap 5; WS4.3 journal-lease cutover).
@@ -1366,20 +3308,15 @@ export class JobScheduler {
     if (activeJob?.slug === job.slug) {
       this.state.delete('active-job');
     }
-    const existingState = this.state.getJobState(job.slug);
-    const jobState: JobState = {
-      slug: job.slug,
-      lastRun: existingState?.lastRun ?? new Date().toISOString(),
-      lastResult: failed ? 'failure' : 'success',
-      lastError: failed ? `Session ${session.status} (${session.name})` : undefined,
-      consecutiveFailures: failed ? (existingState?.consecutiveFailures ?? 0) + 1 : 0,
-      nextScheduled: this.getNextRun(job.slug),
-    };
-    this.state.saveJobState(jobState);
+
+    if (!failed) {
+      this.clearFailureAlertState(job.slug);
+      this.noteContinuitySuccess(job.slug);
+    }
 
     // Alert on consecutive failures
     if (failed && jobState.lastError) {
-      this.alertOnConsecutiveFailures(job, jobState.consecutiveFailures, jobState.lastError);
+      void this.alertOnConsecutiveFailures(job, jobState.consecutiveFailures, jobState.lastError);
     }
 
     // Finalize Living Skills execution journal if enabled
@@ -1481,7 +3418,11 @@ export class JobScheduler {
     summary += '\n';
     if (duration > 0) summary += `Duration: ${durationStr}\n`;
 
-    if (output) {
+    if (output && this.notifyDestinationHasOtherReaders?.(job)) {
+      // Memory privacy: a job has owner reach, so its output can hold anything. An
+      // automatic notice to a place with other readers carries name and status only.
+      summary += '\n_Output is available to the agent owner._';
+    } else if (output) {
       // Trim to last ~500 chars to keep the message readable
       const trimmed = output.length > 500
         ? '...' + output.slice(-500)
@@ -1525,9 +3466,12 @@ export class JobScheduler {
     // Send to the job's dedicated topic if available, otherwise fall back to generic messenger
     if (this.telegram && job.topicId) {
       try {
-        await this.telegram.sendToTopic(job.topicId, summary);
+        await withNotificationEnvelope(verifiedJobEnvelope(job.slug), async () => (this.telegram)!.sendToTopic(job.topicId!, summary));
       } catch (err) {
         console.error(`[scheduler] Failed to send to job topic ${job.topicId}: ${err}`);
+        // The original outbox retains custody, including uncertain acceptance.
+        // A different topic would create a new operation outside that custody.
+        if (err instanceof TelegramOriginHoldError) return;
         // Topic may have been deleted — try to recreate
         try {
           const newTopic = await this.telegram.findOrCreateForumTopic(
@@ -1537,7 +3481,7 @@ export class JobScheduler {
           );
           job.topicId = newTopic.topicId;
           this.saveJobTopicMapping(job.slug, newTopic.topicId);
-          await this.telegram.sendToTopic(newTopic.topicId, summary);
+          await withNotificationEnvelope(verifiedJobEnvelope(job.slug), async () => (this.telegram)!.sendToTopic(newTopic.topicId, summary));
         } catch (recreateErr) {
           console.error(`[scheduler] Failed to recreate topic for ${job.slug}: ${recreateErr}`);
         }
@@ -1618,15 +3562,45 @@ export class JobScheduler {
         job.topicId = topic.topicId;
         mappings[job.slug] = topic.topicId;
 
-        await this.telegram.sendToTopic(topic.topicId,
+        await withNotificationEnvelope(stampNotification(), async () => (this.telegram)!.sendToTopic(topic.topicId,
           `*${job.name}*\n${job.description}\n\nSchedule: \`${job.schedule}\`\nPriority: ${job.priority}\n\nThis topic is the home for this job. Reports, status updates, and errors will appear here.`
-        );
+        ));
       } catch (err) {
         console.error(`[scheduler] Failed to create topic for job ${job.slug}: ${err}`);
       }
     }
 
     this.state.set('job-topic-mappings', mappings);
+  }
+
+  /**
+   * The job's Telegram topic, lazily created when missing — the same
+   * find-or-create + mapping save `notifyJobComplete` does for an on-alert job's
+   * first notification. Used by the job-anomaly push (job-cost-reduction §5.4),
+   * which needs a destination before it can send. Null with no Telegram adapter
+   * or when creation fails (the pusher records `no-topic`).
+   */
+  async ensureJobTopic(job: JobDefinition): Promise<number | null> {
+    const live = this.jobs.find(j => j.slug === job.slug) ?? job;
+    this.dropConfinedTopic(live);
+    if (live.topicId) return live.topicId;
+    const mapped = this.state.get<Record<string, number>>('job-topic-mappings')?.[live.slug];
+    if (mapped && this.confinedTopicCheck?.(mapped) !== true && this.confinedTopicCheck?.(mapped) !== null) { live.topicId = mapped; return mapped; }
+    if (!this.telegram) return null;
+    try {
+      const topic = await this.telegram.findOrCreateForumTopic(
+        `${TOPIC_STYLE.JOB.emoji} Job: ${live.name}`,
+        TOPIC_STYLE.JOB.color,
+        { label: 'job-topics' },
+      );
+      live.topicId = topic.topicId;
+      this.saveJobTopicMapping(live.slug, topic.topicId);
+      return topic.topicId;
+    } catch (err) {
+      // @silent-fallback-ok: the anomaly pusher receives null, records no-topic, and retains delivery custody.
+      console.error(`[scheduler] Failed to create topic for ${live.slug}: ${err}`);
+      return null;
+    }
   }
 
   /**
@@ -1656,8 +3630,13 @@ export class JobScheduler {
     // endpoints (e.g. /evolution/actions/overdue). Without this, gates that curl
     // the local API silently return 401 and the downstream pipe crashes, making
     // the job skip every run cycle with no obvious signal.
+    const gatePort = this.resolveAgentPort();
     const gateEnv = {
       ...process.env,
+      INSTAR_GATE_RECEIPT_FILE: jobGateReceiptPath(this.stateDir, job.slug),
+      INSTAR_AGENT_HOME: path.dirname(path.resolve(this.stateDir)),
+      INSTAR_STATE_DIR: path.resolve(this.stateDir),
+      ...(gatePort === undefined ? {} : { INSTAR_PORT: String(gatePort) }),
       ...(this.config.authToken ? { INSTAR_AUTH_TOKEN: this.config.authToken } : {}),
       ...(this.config.projectName ? { INSTAR_AGENT_ID: this.config.projectName } : {}),
     };
@@ -1694,7 +3673,7 @@ export class JobScheduler {
     const gateCmd = job.gate!.length > 200 ? job.gate!.slice(0, 200) + '…' : job.gate!;
 
     this.skipLedger.recordSkip(job.slug, 'gate');
-    this.state.appendEvent({
+    if (!this.state.readOnly) this.state.appendEvent({
       type: 'job_gate_skip',
       summary: `Job "${job.slug}" skipped — gate returned exit ${exitCode} after ${maxAttempts} attempts${stderr ? `: ${stderr.slice(0, 200)}` : ''}`,
       timestamp: new Date().toISOString(),
@@ -1764,89 +3743,333 @@ export class JobScheduler {
   }
 
   /**
-   * Alert when a job hits consecutive failure thresholds.
-   * Critical/high priority jobs alert after 2 failures.
-   * Medium/low priority jobs alert after 3 failures.
-   * Only alerts at the threshold (not every failure after).
+   * Alert when a job reaches or remains beyond its failure threshold.
    *
-   * When the failure is a session limit issue (not a job execution error),
-   * the notification is reframed as "Job Blocked" with intelligent diagnostics:
-   * running session list with ages, stale session flags, memory pressure,
-   * and actionable suggestions.
+   * Eligibility and delivery are separate: an episode remains eligible until a
+   * send succeeds, then follows a widening reminder cadence until recovery.
+   * Both tracks persist across restart. This repairs a missed threshold without
+   * turning every later cron tick into an alert flood.
    */
-  private alertOnConsecutiveFailures(job: JobDefinition, failures: number, error: string): void {
+  private async alertOnConsecutiveFailures(job: JobDefinition, failures: number, error: string): Promise<void> {
     const threshold = (job.priority === 'critical' || job.priority === 'high') ? 2 : 3;
-    if (failures !== threshold) return;
+    if (failures < threshold) return;
 
-    const isSessionBlocked = error.includes('Max sessions') && error.includes('reached');
+    const stateKey = this.failureAlertStateKey(job.slug);
+    const previous = this.state.get<JobFailureAlertState>(stateKey);
+    const sameEpisode = previous?.version === 1 && failures >= previous.lastObservedFailures;
+    const alertState: JobFailureAlertState = sameEpisode
+      ? { ...previous, lastObservedFailures: failures, lastError: error }
+      : {
+          version: 1,
+          lastObservedFailures: failures,
+          lastError: error,
+          deliveryAttempts: 0,
+          deliveredCount: 0,
+          nextEligibleAt: new Date(0).toISOString(),
+        };
 
-    let alertText: string;
-
-    if (isSessionBlocked) {
-      alertText = this.buildSessionBlockedAlert(job, failures, error);
-    } else {
-      alertText = `*Job Alert: ${job.name}*\n\n${failures} consecutive failures.\nLast error: ${error}\nPriority: ${job.priority}`;
+    const now = Date.now();
+    const nextEligible = Date.parse(alertState.nextEligibleAt);
+    if (Number.isFinite(nextEligible) && now < nextEligible) {
+      this.state.set(stateKey, alertState);
+      this.scheduleFailureAlert(job, alertState);
+      return;
     }
 
-    // Send to job's topic if available
-    if (this.telegram && job.topicId) {
-      this.telegram.sendToTopic(job.topicId, alertText).catch(err => {
-        console.error(`[scheduler] Failed to send failure alert: ${err}`);
-      });
-    } else if (this.messenger) {
-      this.messenger.send({ userId: 'system', content: alertText }).catch(err => {
-        console.error(`[scheduler] Failed to send failure alert: ${err}`);
-      });
+    if (this.failureAlertsInFlight.has(job.slug)) return;
+    this.failureAlertsInFlight.add(job.slug);
+
+    try {
+      const alertText = jobFailureNotice(job.name, failures, error);
+
+      alertState.lastAttemptAt = new Date(now).toISOString();
+      const attemptId = crypto.randomUUID();
+      alertState.activeAttemptId = attemptId;
+      this.state.set(stateKey, alertState);
+
+      const noticeTopic = job.topicId ?? this.state.get<number>('agent-attention-topic');
+      const send = this.telegram && noticeTopic
+        ? () => withNotificationEnvelope(verifiedJobEnvelope(job.slug), async () => (this.telegram!)!.sendToTopic(noticeTopic, alertText))
+        : !this.telegram && this.messenger
+          ? () => this.messenger!.send({ userId: 'system', content: alertText })
+          : null;
+
+      if (!send) {
+        this.recordFailureAlertDeliveryFailure(job, alertState, 'No scheduler delivery sink is configured', now);
+        return;
+      }
+
+      try {
+        const receipt = await send();
+        if (!this.isCurrentFailureAlertAttempt(stateKey, attemptId)) return;
+        if (isQuietReceipt(receipt)) {
+          alertState.deliveryAttempts = 0; alertState.recordedAt = new Date(now).toISOString(); alertState.quietId = receipt.quietId;
+          delete alertState.activeAttemptId;
+          alertState.nextEligibleAt = new Date(now + 24 * 60 * 60_000).toISOString();
+          this.state.set(stateKey, alertState); this.scheduleFailureAlert(job, alertState);
+          this.state.appendEvent({ type: 'job_alert_recorded', summary: `Failure alert recorded for ${job.slug}`, timestamp: new Date(now).toISOString(), metadata: { slug: job.slug, quietId: receipt.quietId } });
+          return;
+        }
+        alertState.deliveryAttempts = 0;
+        alertState.deliveredCount += 1;
+        alertState.lastDeliveredAt = new Date(now).toISOString();
+        delete alertState.activeAttemptId;
+        const reminderIndex = Math.min(alertState.deliveredCount - 1, FAILURE_ALERT_REMINDER_CADENCE_MS.length - 1);
+        alertState.nextEligibleAt = new Date(now + FAILURE_ALERT_REMINDER_CADENCE_MS[reminderIndex]).toISOString();
+        this.state.set(stateKey, alertState);
+        this.scheduleFailureAlert(job, alertState);
+        this.state.appendEvent({
+          type: 'job_alert_delivered',
+          summary: `Failure alert delivered for job "${job.slug}" after ${failures} consecutive failures`,
+          timestamp: new Date(now).toISOString(),
+          metadata: { slug: job.slug, consecutiveFailures: failures, deliveredCount: alertState.deliveredCount },
+        });
+      } catch (sendError) {
+        if (!this.isCurrentFailureAlertAttempt(stateKey, attemptId)) return;
+        this.recordFailureAlertDeliveryFailure(
+          job,
+          alertState,
+          `Configured scheduler sink failed: ${sendError instanceof Error ? sendError.message : String(sendError)}`,
+          now,
+        );
+      }
+    } finally {
+      this.failureAlertsInFlight.delete(job.slug);
     }
   }
 
-  /**
-   * Build an intelligent "Job Blocked" notification when a job can't start
-   * because all session slots are occupied. Includes session diagnostics,
-   * staleness detection, memory pressure, and actionable suggestions.
-   */
-  private buildSessionBlockedAlert(job: JobDefinition, failures: number, error: string): string {
-    const diagnostics = this.sessionManager.getSessionDiagnostics();
+  /** A quiet gate or machine pin is evidence of lost job coverage, not success. */
+  private observeContinuitySkip(slug: string, reason: SkipReason): void {
+    if (this.state.readOnly || (reason !== 'gate' && reason !== 'machine-scope' && reason !== 'definition-changed')) return;
+    const job = this.jobs.find((candidate) => candidate.slug === slug);
+    if (!job?.enabled) return;
+    const key = `job-silence-${slug}`;
+    const previous = this.state.get<{ count: number; lastSkip: string; lastNotified?: string; recordedAt?: string; lastAttemptAt?: string }>(key);
+    const now = new Date().toISOString();
+    const count = (previous?.count ?? 0) + 1;
+    const next = { count, lastSkip: now, lastNotified: previous?.lastNotified, recordedAt: previous?.recordedAt, lastAttemptAt: previous?.lastAttemptAt };
+    this.state.set(key, next);
+    if (count >= 3) this.raiseContinuityAlert(job, `${count} scheduled attempts were skipped (${reason})`, key);
+  }
 
-    const lines: string[] = [];
-    lines.push(`*Job Blocked: ${job.name}*`);
-    lines.push('');
-    lines.push(`Could not start — all ${diagnostics.maxSessions} session slots are in use.`);
-    lines.push(`(${failures} consecutive attempts blocked)`);
-    lines.push('');
+  /** A completed success closes the silence episode; a skip never does. */
+  private noteContinuitySuccess(slug: string): void {
+    if (this.state.readOnly) return;
+    try {
+      this.state.set(`job-last-success-${slug}`, new Date().toISOString());
+      const key = `job-silence-${slug}`;
+      this.silenceAlertEpoch.set(key, (this.silenceAlertEpoch.get(key) ?? 0) + 1);
+      this.state.delete(key);
+    } catch (error) {
+      // Alert bookkeeping must never turn a completed job into a failed run.
+      console.error(`[scheduler] Could not close silence alert for ${slug}:`, error);
+    }
+  }
 
-    // Session list with ages
-    lines.push('*Running sessions:*');
-    for (const s of diagnostics.sessions) {
-      const age = s.ageMinutes >= 60
-        ? `${Math.floor(s.ageMinutes / 60)}h ${s.ageMinutes % 60}m`
-        : `${s.ageMinutes}m`;
-      const staleFlag = s.isStale ? ' ⚠️' : '';
-      const jobTag = s.jobSlug ? ` (${s.jobSlug})` : '';
-      lines.push(`• ${s.name}${jobTag} — ${age}${staleFlag}`);
-      if (s.staleReason) {
-        lines.push(`  └ ${s.staleReason}`);
+  private raiseContinuityAlert(job: JobDefinition, detail: string, key: string): void {
+    if (this.state.readOnly) return;
+    const previous = this.state.get<{ count: number; lastSkip: string; lastNotified?: string; recordedAt?: string; lastAttemptAt?: string }>(key);
+    const now = Date.now();
+    const lastVisibleOrRecorded = Math.max(...[previous?.lastNotified, previous?.recordedAt].map(at => at ? Date.parse(at) : 0).filter(Number.isFinite), 0);
+    if (lastVisibleOrRecorded && now - lastVisibleOrRecorded < 24 * 60 * 60_000) return;
+    if (previous?.lastAttemptAt && now - Date.parse(previous.lastAttemptAt) < 60 * 60_000) return;
+    if (this.silenceAlertsInFlight.has(key)) return;
+    const topicId = job.topicId ?? this.state.get<number>('agent-attention-topic');
+    const message = `Scheduled job ${job.name} is not running as expected: ${detail}. Check its gate, machine scope and last successful run.`;
+    const send = this.telegram && topicId
+      ? () => withNotificationEnvelope(verifiedJobEnvelope(job.slug), async () => (this.telegram!)!.sendToTopic(topicId!, message))
+      : !this.telegram && this.messenger
+        ? () => this.messenger!.send({ userId: 'system', content: message })
+        : null;
+    if (!send) return; // No sink yet: the next five-minute check retries.
+    this.silenceAlertsInFlight.add(key);
+    const epoch = this.silenceAlertEpoch.get(key) ?? 0;
+    const attemptedAt = new Date(now).toISOString();
+    this.state.set(key, { count: previous?.count ?? 0, lastSkip: previous?.lastSkip ?? attemptedAt, lastNotified: previous?.lastNotified, recordedAt: previous?.recordedAt, lastAttemptAt: attemptedAt });
+    void Promise.resolve().then(async () => {
+      if (this.state.readOnly || this.paused) return false;
+      const receipt = await send();
+      return isQuietReceipt(receipt) ? receipt : true;
+    }).then((delivered) => {
+      if (!delivered || this.state.readOnly || (this.silenceAlertEpoch.get(key) ?? 0) !== epoch) return;
+      const current = this.state.get<{ count: number; lastSkip: string; lastNotified?: string; recordedAt?: string; lastAttemptAt?: string }>(key);
+      if (isQuietReceipt(delivered)) { this.state.set(key, { ...current, count: current?.count ?? 0, lastSkip: current?.lastSkip ?? attemptedAt, lastAttemptAt: attemptedAt, recordedAt: new Date().toISOString(), quietId: delivered.quietId }); return; }
+      this.state.set(key, { count: current?.count ?? 0, lastSkip: current?.lastSkip ?? attemptedAt, lastAttemptAt: attemptedAt, lastNotified: new Date().toISOString() });
+      this.state.appendEvent({ type: 'job_alert_delivered', summary: `Continuity alert delivered for ${job.slug}`,
+        timestamp: new Date().toISOString(), metadata: { slug: job.slug, kind: 'silence' } });
+    }).catch((error) => {
+      console.error(`[scheduler] Could not deliver silence alert for ${job.slug}:`, error);
+    }).finally(() => this.silenceAlertsInFlight.delete(key));
+  }
+
+  /** Check every enabled job, including machine-pinned jobs with no local cron task. */
+  private checkSilentJobs(): void {
+    if (!this.running || this.state.readOnly || this.paused) return;
+    const now = Date.now();
+    for (const job of this.jobs) {
+      if (!job.enabled) continue;
+      // A failure episode already has a durable alert and reminder cadence.
+      // Keep silence alerts focused on jobs that stopped being attempted.
+      if (this.state.get(this.failureAlertStateKey(job.slug))) continue;
+      if (!this.isJobScopedToThisMachine(job)) {
+        this.raiseContinuityAlert(job, 'this machine holds the scheduler but the job is pinned elsewhere', `job-silence-${job.slug}`);
+        continue;
+      }
+      const state = this.state.getJobState(job.slug);
+      const knownSuccess = this.state.get<string>(`job-last-success-${job.slug}`);
+      // Legacy job states contain the latest attempt, not the latest success.
+      // Keep a durable observation baseline so repeated failed/skipped attempts
+      // cannot move the silence clock forward indefinitely, even when an old
+      // job has no firstSeenAt stamp.
+      const baselineKey = `job-continuity-first-seen-${job.slug}`;
+      let baseline = this.state.get<string>(baselineKey);
+      if (!baseline) {
+        baseline = state?.firstSeenAt ?? new Date(now).toISOString();
+        this.state.set(baselineKey, baseline);
+      }
+      const reference = knownSuccess ?? (state?.lastResult === 'success' ? state.lastRun : baseline);
+      const last = reference ? Date.parse(reference) : NaN;
+      if (!Number.isFinite(last)) continue;
+      try {
+        const cron = new Cron(job.schedule, { paused: true });
+        const next = cron.nextRuns(2, new Date(last));
+        cron.stop();
+        if (next.length < 2) continue;
+        const intervalMs = next[1].getTime() - next[0].getTime();
+        const graceMs = Math.max(5 * 60_000, Math.min(intervalMs * 0.5, 60 * 60_000));
+        if (now > next[0].getTime() + graceMs) {
+          this.raiseContinuityAlert(job, `no successful completion after its scheduled time`, `job-silence-${job.slug}`);
+        }
+      } catch (error) {
+        console.error(`[scheduler] Could not check silence for ${job.slug}:`, error);
       }
     }
-    lines.push('');
+  }
 
-    // Memory pressure
-    const memEmoji = diagnostics.memoryPressure === 'critical' ? '🔴'
-      : diagnostics.memoryPressure === 'high' ? '🟠'
-      : diagnostics.memoryPressure === 'moderate' ? '🟡'
-      : '🟢';
-    lines.push(`Memory: ${memEmoji} ${diagnostics.memoryUsedPercent}% used (${diagnostics.freeMemoryMB} MB free)`);
-    lines.push('');
+  private failureAlertStateKey(slug: string): string {
+    return `job-failure-alert-${slug}`;
+  }
 
-    // Suggestions
-    if (diagnostics.suggestions.length > 0) {
-      lines.push('*Suggestions:*');
-      for (const suggestion of diagnostics.suggestions) {
-        lines.push(`→ ${suggestion}`);
+  private isCurrentFailureAlertAttempt(stateKey: string, attemptId: string): boolean {
+    return this.state.get<JobFailureAlertState>(stateKey)?.activeAttemptId === attemptId;
+  }
+
+  private clearFailureAlertState(slug: string): void {
+    const timer = this.failureAlertTimers.get(slug);
+    if (timer) clearTimeout(timer);
+    this.failureAlertTimers.delete(slug);
+    this.state.delete(this.failureAlertStateKey(slug));
+  }
+
+  private scheduleFailureAlert(job: JobDefinition, alertState: JobFailureAlertState): void {
+    if (!this.running || !this.failureAlertDeliveryActive) return;
+    const existing = this.failureAlertTimers.get(job.slug);
+    if (existing) clearTimeout(existing);
+
+    const eligibleAt = Date.parse(alertState.nextEligibleAt);
+    const delay = Math.max(0, Number.isFinite(eligibleAt) ? eligibleAt - Date.now() : 0);
+    const timer = setTimeout(() => {
+      this.failureAlertTimers.delete(job.slug);
+      if (!this.running || this.paused || this.state.readOnly) return;
+
+      const liveJob = this.jobs.find(candidate => candidate.slug === job.slug);
+      const persisted = this.state.get<JobFailureAlertState>(this.failureAlertStateKey(job.slug));
+      if (!liveJob?.enabled || persisted?.version !== 1) return;
+
+      void this.alertOnConsecutiveFailures(
+        liveJob,
+        persisted.lastObservedFailures,
+        persisted.lastError,
+      );
+    }, delay);
+    if (timer.unref) timer.unref();
+    this.failureAlertTimers.set(job.slug, timer);
+  }
+
+  private recordFailureAlertDeliveryFailure(
+    job: JobDefinition,
+    alertState: JobFailureAlertState,
+    reason: string,
+    now: number,
+  ): void {
+    alertState.deliveryAttempts += 1;
+    delete alertState.activeAttemptId;
+    const backoffIndex = Math.min(alertState.deliveryAttempts - 1, FAILURE_ALERT_RETRY_BACKOFF_MS.length - 1);
+    alertState.nextEligibleAt = new Date(now + FAILURE_ALERT_RETRY_BACKOFF_MS[backoffIndex]).toISOString();
+    this.state.set(this.failureAlertStateKey(job.slug), alertState);
+    this.scheduleFailureAlert(job, alertState);
+    this.state.appendEvent({
+      type: 'job_alert_delivery_failed',
+      summary: `Failure alert for job "${job.slug}" was not delivered: ${reason}`,
+      timestamp: new Date(now).toISOString(),
+      metadata: {
+        slug: job.slug,
+        consecutiveFailures: alertState.lastObservedFailures,
+        deliveryAttempts: alertState.deliveryAttempts,
+        nextEligibleAt: alertState.nextEligibleAt,
+      },
+    });
+    reportDeliverySinkFailure({
+      component: `JobScheduler.${job.slug}`,
+      primary: 'Deliver the scheduler-owned consecutive-failure escalation',
+      reason,
+      impact: `Job ${job.slug} remains failed and its operator alert remains undelivered; retry is scheduled for ${alertState.nextEligibleAt}`,
+    });
+  }
+
+  private noticeMissedPromotionJob(slug: string, promotionId: string): void {
+    if (this.state.readOnly || this.paused) return;
+    const job = this.jobs.find(row => row.slug === slug);
+    if (!job) return;
+    const key = `promotion-catch-up-alert-${slug}`;
+    const prior = this.state.get<{ promotionId: string; attemptAt: number; deliveredAt?: number; recordedAt?: number }>(key);
+    const now = Date.now();
+    if (prior?.promotionId === promotionId && now - prior.attemptAt < (prior.deliveredAt || prior.recordedAt ? 24 * 60 * 60_000 : 60 * 60_000)) return;
+    if (this.catchUpAlertsInFlight.has(key)) return;
+    const summary = `Job ${slug} has a missed or uncertain occurrence after a lease takeover. Review it before choosing a manual run.`;
+    const send = this.telegram
+      ? () => this.telegram!.createAttentionItemConfirmed({ id: `promotion-catch-up-${promotionId}-${slug}`,
+          conditionKey: `promotion-catch-up-${promotionId}-${slug}`, title: `Review missed job: ${slug}`,
+          summary, description: summary, category: 'job', priority: 'HIGH', sourceContext: 'promotion-catch-up' })
+      : !this.telegram && this.messenger
+        ? () => this.messenger!.send({ userId: 'system', content: summary })
+        : null;
+    if (!send) return; // the durable catch-up journal makes the next tick retry
+    this.state.set(key, { promotionId, attemptAt: now });
+    this.catchUpAlertsInFlight.add(key);
+    void Promise.resolve().then(async () => {
+      if (this.state.readOnly || this.paused) return false;
+      const outcome = await send();
+      return outcome && typeof outcome === 'object' && 'hubHeld' in outcome && outcome.hubHeld === true ? 'recorded' : 'delivered';
+    }).then(delivered => {
+      if (!delivered || this.state.readOnly || this.paused) return;
+      const current = this.state.get<{ promotionId: string; attemptAt: number }>(key);
+      const jobState = this.state.getJobState(slug);
+      if (current?.promotionId === promotionId && this.promotionCatchUpStore.hasUnresolved(slug,
+        jobState?.lastResult === 'success' ? jobState.lastRun ?? undefined : undefined)) {
+        this.state.set(key, { ...current, ...(delivered === 'recorded' ? { recordedAt: Date.now() } : { deliveredAt: Date.now() }) });
       }
-    }
+    }).catch(error => console.warn(`[scheduler] Catch-up attention failed for ${slug}:`, error))
+      .finally(() => this.catchUpAlertsInFlight.delete(key));
+  }
 
-    return lines.join('\n');
+  private retryUnresolvedCatchUpNotices(): void {
+    if (!this.running || this.paused || this.state.readOnly) return;
+    try {
+      for (const job of this.jobs) {
+        const row = this.promotionCatchUpStore.latestUnresolved(job.slug);
+        if (!row) continue;
+        const jobState = this.state.getJobState(job.slug);
+        if (this.promotionCatchUpStore.hasUnresolved(job.slug,
+          jobState?.lastResult === 'success' ? jobState.lastRun ?? undefined : undefined)) {
+          this.noticeMissedPromotionJob(job.slug, row.promotionId);
+        } else {
+          this.state.delete(`promotion-catch-up-alert-${job.slug}`);
+          this.telegram?.clearAttentionCondition({ conditionKey: `promotion-catch-up-${row.promotionId}-${job.slug}` },
+            'Job completed successfully');
+        }
+      }
+    } catch (error) { console.warn('[scheduler] Could not retry promotion catch-up notices:', error); }
   }
 
   private async checkMissedJobs(enabledJobs: JobDefinition[]): Promise<void> {
@@ -1863,23 +4086,38 @@ export class JobScheduler {
       const task = this.cronTasks.get(job.slug);
       if (!task) continue;
 
-      // Jobs that have never run: trigger on startup if their first expected
-      // run time has already passed (i.e., the job was added while the server
-      // was down and missed its first scheduled window).
-      if (!jobState?.lastRun) {
-        // Use a large overdueRatio so never-run jobs sort below truly-overdue jobs
-        missedJobs.push({ job, overdueRatio: 1.5 });
-        continue;
-      }
-
-      const lastRun = new Date(jobState.lastRun).getTime();
-
       // Get expected interval from next two runs
       const nextRun = task.nextRun();
       const nextNextRun = task.nextRuns(2)[1];
       if (!nextRun || !nextNextRun) continue;
 
       const intervalMs = nextNextRun.getTime() - nextRun.getTime();
+
+      // Jobs that have never run: trigger on startup ONLY if their first
+      // expected run time has already passed — i.e. the job has existed for
+      // longer than one full interval without ever running, so a window really
+      // did go by. That was always the intended rule (it is stated in the
+      // comment this replaces), but nothing recorded when a job started
+      // existing, so the branch could not check it and fired EVERY never-run
+      // job instead. A reminder scheduled for December discharged itself on the
+      // next boot (ACT-724 defect (a)).
+      //
+      // Fails SAFE in both unknown cases: a job with no firstSeenAt (legacy
+      // state written before this field existed) is treated as not-missed. The
+      // cost is one skipped catch-up; the cost of guessing the other way is a
+      // future-dated job firing early, which is indistinguishable from the
+      // reminder having been delivered.
+      if (!jobState?.lastRun) {
+        const firstSeen = jobState?.firstSeenAt ? new Date(jobState.firstSeenAt).getTime() : null;
+        if (firstSeen === null || Number.isNaN(firstSeen)) continue;
+        const ageMs = now - firstSeen;
+        if (ageMs <= intervalMs) continue; // its window genuinely hasn't come yet
+        // Use a large overdueRatio so never-run jobs sort below truly-overdue jobs
+        missedJobs.push({ job, overdueRatio: 1.5 });
+        continue;
+      }
+
+      const lastRun = new Date(jobState.lastRun).getTime();
       const timeSinceLastRun = now - lastRun;
 
       // If overdue by more than 1.5x the interval, mark as missed
@@ -1895,8 +4133,62 @@ export class JobScheduler {
       return b.overdueRatio - a.overdueRatio;
     });
 
-    for (const { job } of missedJobs) {
-      await this.triggerJob(job.slug, 'missed');
+    const promotion = readRecentPromotion(this.stateDir, now, this.promotionLeaseProvider?.());
+    let sweepComplete = false;
+    try {
+      for (const { job } of missedJobs) {
+        if (!promotion && this.promotionCatchUpStore.hasUnresolved(job.slug,
+          this.state.getJobState(job.slug)?.lastResult === 'success'
+            ? this.state.getJobState(job.slug)?.lastRun ?? undefined : undefined)) {
+          const prior = this.promotionCatchUpStore.latestBlocked(job.slug);
+          if (prior && prior.status !== 'skip') this.noticeMissedPromotionJob(job.slug, prior.promotionId);
+          continue;
+        }
+        if (promotion) {
+          if (!this.promotionCatchUpStore.isHealthy()) {
+            this.noticeMissedPromotionJob(job.slug, promotion.id);
+            continue; // corrupt journal is unknown, never a fresh automatic request
+          }
+          if (this.promotionCatchUpStore.get(promotion.id, job.slug)) continue;
+          const policy = promotion.verified && (job.catchUpPolicy !== 'run-once' || this.promotionLeaseProvider?.().runOnceWitness === true)
+            ? job.catchUpPolicy ?? 'ask' : 'ask';
+          if (policy === 'skip' || policy === 'ask') {
+            this.promotionCatchUpStore.record(promotion.id, job.slug, policy);
+            if (policy === 'ask') this.noticeMissedPromotionJob(job.slug, promotion.id);
+            continue;
+          }
+          if (!this.promotionCatchUpStore.record(promotion.id, job.slug, 'requested')) continue;
+        }
+        try {
+          const result = await this.triggerJob(job.slug, promotion ? 'promotion-catch-up' : 'missed');
+          if (promotion) {
+            this.promotionCatchUpStore.record(promotion.id, job.slug, result === 'triggered' ? 'triggered' : 'uncertain');
+            if (result !== 'triggered') this.noticeMissedPromotionJob(job.slug, promotion.id);
+          }
+        } catch (err) {
+          if (promotion) {
+            this.promotionCatchUpStore.record(promotion.id, job.slug, 'uncertain');
+            this.noticeMissedPromotionJob(job.slug, promotion.id);
+          }
+          console.error(`[scheduler] Missed trigger failed for "${job.slug}": ${err}`);
+        }
+      }
+      sweepComplete = true;
+    } finally {
+      this.promotionCatchUpPending = false;
+      for (const slug of this.blockedCronDuringPromotion) {
+        if (promotion && !this.promotionCatchUpStore.isHealthy()) {
+          this.noticeMissedPromotionJob(slug, promotion.id);
+        } else if (promotion && !this.promotionCatchUpStore.get(promotion.id, slug)) {
+          this.promotionCatchUpStore.record(promotion.id, slug, 'ask');
+          this.noticeMissedPromotionJob(slug, promotion.id);
+        }
+      }
+      this.blockedCronDuringPromotion.clear();
+      if (promotion && sweepComplete && this.promotionCatchUpStore.isHealthy()) {
+        try { markPromotionSweepComplete(this.stateDir, promotion.id, now); }
+        catch (error) { console.warn('[scheduler] Could not consume promotion sweep:', error); }
+      }
     }
   }
 
@@ -1949,7 +4241,7 @@ export class JobScheduler {
     if (this.telegram && topicId) {
       const formatted = reflector.formatInsight(insight);
       try {
-        await this.telegram.sendToTopic(topicId, formatted);
+        await withNotificationEnvelope(stampNotification(), async () => (this.telegram)!.sendToTopic(topicId!, formatted));
       } catch {
         // Topic may not exist — not critical
       }

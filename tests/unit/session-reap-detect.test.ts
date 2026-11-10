@@ -126,7 +126,14 @@ describe('Session reaping and detection', () => {
       expect(monitorSection).toBeTruthy();
       const body = monitorSection![0];
       expect(body).toContain('hasActiveProcesses');
-      expect(body).toContain('idlePromptSince.delete');
+      // The idle tracker is reset through clearIdleClock (idle-clock-survives-
+      // restart): it drops the in-memory entry AND the durable Session.idleSince,
+      // so follow the helper rather than pin a literal the block no longer holds.
+      expect(body).toContain('clearIdleClock(session)');
+      const helper = source.match(/private clearIdleClock\(session: Session\): void \{[\s\S]*?\n  \}/);
+      expect(helper).toBeTruthy();
+      expect(helper![0]).toContain('idlePromptSince.delete(session.id)');
+      expect(helper![0]).toContain('persistIdleSince(session, undefined)');
     });
   });
 
@@ -175,11 +182,12 @@ describe('Session reaping and detection', () => {
       expect(source).toContain('waitForClaudeReady');
     });
 
-    it('waitForClaudeReady checks for Claude-specific prompt character only', () => {
+    it('waitForClaudeReady recognizes Claude and Codex interactive prompt characters', () => {
       source = fs.readFileSync(SOURCE_PATH, 'utf-8');
       // Should ONLY check for Claude Code's specific prompt character (❯)
       // NOT generic shell prompts (> or $) which cause false positives
       expect(source).toContain("'❯'");
+      expect(source).toContain("'›'");
       // Verify it does NOT match generic shell prompts
       const readySection = source.match(/waitForClaudeReady[\s\S]*?return false;\s*\}/);
       expect(readySection).toBeTruthy();

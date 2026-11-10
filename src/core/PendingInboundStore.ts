@@ -46,6 +46,10 @@ export interface SenderEnvelope {
   userId?: string | number;
   username?: string;
   firstName?: string;
+  /** Set when the message was typed in the native app (mobile-operator-chat). */
+  via?: 'mobile-device';
+  deviceId?: string;
+  eventId?: string;
 }
 
 export interface PendingInboundRow {
@@ -135,10 +139,27 @@ export interface ReceiptRow {
  */
 export type CounterKey = string;
 
+export interface DryRunShadowCustodyEvidence {
+  verified: number;
+  refused: number;
+  errors: number;
+  recoveredAfterRestart: number;
+  firstAttemptAt: string | null;
+  lastVerifiedAt: string | null;
+  lastErrorAt: string | null;
+}
+
 // ── Path resolution ───────────────────────────────────────────────────
 
 export function resolvePendingInboundPath(stateDir: string, agentId: string): string {
   return path.join(stateDir, 'state', `pending-inbound.${sanitizeAgentId(agentId)}.sqlite`);
+}
+
+/** Dry-run exercises the real custody schema against this non-authoritative
+ * store. It is deliberately a different file from the live queue: rows here
+ * are proof artifacts only and are never eligible for dispatch. */
+export function resolvePendingInboundShadowPath(stateDir: string, agentId: string): string {
+  return path.join(stateDir, 'state', `pending-inbound-shadow.${sanitizeAgentId(agentId)}.sqlite`);
 }
 
 function sanitizeAgentId(id: string): string {
@@ -227,7 +248,17 @@ export class PendingInboundStore {
    * never quarantines itself.
    */
   static open(agentId: string, stateDir: string): PendingInboundStore {
-    const dbPath = resolvePendingInboundPath(stateDir, agentId);
+    return PendingInboundStore.openPath(resolvePendingInboundPath(stateDir, agentId));
+  }
+
+  /** Open the non-authoritative dry-run custody store. It uses the identical
+   * schema and FULL-sync posture, but its distinct path prevents a shadow row
+   * from ever becoming live queue custody. */
+  static openShadow(agentId: string, stateDir: string): PendingInboundStore {
+    return PendingInboundStore.openPath(resolvePendingInboundShadowPath(stateDir, agentId), true);
+  }
+
+  private static openPath(dbPath: string, secureDelete = false): PendingInboundStore {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
     const db: BetterSqliteDatabase = new Database(dbPath);
@@ -239,6 +270,7 @@ export class PendingInboundStore {
     db.pragma('journal_mode = WAL');
     db.pragma('synchronous = FULL');
     db.pragma('busy_timeout = 5000');
+    if (secureDelete) db.pragma('secure_delete = ON');
 
     for (const ddl of SCHEMA) db.exec(ddl);
 
@@ -670,6 +702,13 @@ export class PendingInboundStore {
     return res.changes === 1;
   }
 
+  /** Read-only: has this remote message already been received here? */
+  hasRemoteReceipt(sessionKey: string, messageId: string): boolean {
+    return !!this.#db
+      .prepare(`SELECT 1 FROM receipts WHERE session_key = ? AND message_id = ? AND class = 'remote'`)
+      .get(sessionKey, messageId);
+  }
+
   /** Flip the `injected` marker after the local inject completes (§3.4 remote
    *  path round-8 — makes peer-crash-between-receipt-and-inject boot-detectable). */
   markReceiptInjected(sessionKey: string, messageId: string, cls: ReceiptClass): void {
@@ -735,10 +774,11 @@ export class PendingInboundStore {
    *
    * Returns the current tenure id (`<selfMachineId>#<generation>`).
    */
-  observeLeaseClaim(selfMachineId: string, tipHolderAtClaim: string | null): string {
+  observeLeaseClaim(selfMachineId: string, tipHolderAtClaim: string | null, nowIso = new Date().toISOString()): string {
     const tx = this.#db.transaction((): string => {
       const genRow = this.#db.prepare(`SELECT value FROM meta WHERE key = 'acquisition_generation'`).get() as { value: string } | undefined;
       let gen = genRow ? Number(genRow.value) : 0;
+      const startsNewTenure = !genRow || (tipHolderAtClaim !== null && tipHolderAtClaim !== selfMachineId);
       if (tipHolderAtClaim !== null && tipHolderAtClaim !== selfMachineId) {
         gen += 1;
       } else if (!genRow) {
@@ -748,6 +788,12 @@ export class PendingInboundStore {
         .prepare(`INSERT INTO meta (key, value) VALUES ('acquisition_generation', @v)
                   ON CONFLICT(key) DO UPDATE SET value = @v`)
         .run({ v: String(gen) });
+      if (startsNewTenure) {
+        this.#db
+          .prepare(`INSERT INTO meta (key, value) VALUES ('tenure_started_at', @v)
+                    ON CONFLICT(key) DO UPDATE SET value = @v`)
+          .run({ v: nowIso });
+      }
       return `${selfMachineId}#${gen}`;
     });
     return tx() as string;
@@ -756,6 +802,13 @@ export class PendingInboundStore {
   currentTenure(selfMachineId: string): string | null {
     const genRow = this.#db.prepare(`SELECT value FROM meta WHERE key = 'acquisition_generation'`).get() as { value: string } | undefined;
     return genRow ? `${selfMachineId}#${genRow.value}` : null;
+  }
+
+  /** Null is intentional for stores created before this evidence existed:
+   * inventing a boot-time timestamp would mislabel an older tenure as new. */
+  currentTenureStartedAt(): string | null {
+    const row = this.#db.prepare(`SELECT value FROM meta WHERE key = 'tenure_started_at'`).get() as { value: string } | undefined;
+    return row?.value ?? null;
   }
 
   /** The bare generation number (capacity-heartbeat field, §5.1). */
@@ -868,6 +921,14 @@ export class PendingInboundStore {
     return res.changes ?? 0;
   }
 
+  /** Shadow-only cleanup: secure_delete overwrites freed content and the
+   * truncate checkpoint removes stale WAL frames after each proof. */
+  pruneShadowTerminal(cutoffIso: string): number {
+    const pruned = this.pruneTerminal(cutoffIso);
+    this.#db.pragma('wal_checkpoint(TRUNCATE)');
+    return pruned;
+  }
+
   // ── Durable counters (§2.4 + observability) ──────────────────────────
 
   incrementCounter(key: CounterKey, by = 1): void {
@@ -882,6 +943,53 @@ export class PendingInboundStore {
   getCounter(key: CounterKey): number {
     const row = this.#db.prepare('SELECT value FROM meta WHERE key = ?').get(`counter:${key}`) as { value: string } | undefined;
     return row ? Number(row.value) : 0;
+  }
+
+  /** Persist the result only after the shadow store has committed and the row
+   * has been read back. Cross-store atomicity is intentionally unnecessary:
+   * a crash before this record leaves a shadow row which boot recovery counts
+   * as recoveredAfterRestart instead of silently losing the evidence. */
+  recordDryRunShadowCustodyResult(
+    result: 'verified' | 'refused' | 'error' | 'recovered-after-restart',
+    nowIso: string,
+  ): void {
+    const counter = result === 'recovered-after-restart'
+      ? 'shadowCustodyRecoveredAfterRestart'
+      : `shadowCustody${result[0].toUpperCase()}${result.slice(1)}`;
+    const tx = this.#db.transaction(() => {
+      this.incrementCounter(counter);
+      this.#db
+        .prepare(`INSERT OR IGNORE INTO meta (key, value) VALUES ('shadow_custody_first_attempt_at', @v)`)
+        .run({ v: nowIso });
+      if (result === 'verified' || result === 'recovered-after-restart') {
+        this.#db
+          .prepare(`INSERT INTO meta (key, value) VALUES ('shadow_custody_last_verified_at', @v)
+                    ON CONFLICT(key) DO UPDATE SET value = @v`)
+          .run({ v: nowIso });
+      } else if (result === 'error') {
+        this.#db
+          .prepare(`INSERT INTO meta (key, value) VALUES ('shadow_custody_last_error_at', @v)
+                    ON CONFLICT(key) DO UPDATE SET value = @v`)
+          .run({ v: nowIso });
+      }
+    });
+    tx();
+  }
+
+  dryRunShadowCustodyEvidence(): DryRunShadowCustodyEvidence {
+    const meta = (key: string): string | null => {
+      const row = this.#db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
+      return row?.value ?? null;
+    };
+    return {
+      verified: this.getCounter('shadowCustodyVerified'),
+      refused: this.getCounter('shadowCustodyRefused'),
+      errors: this.getCounter('shadowCustodyError'),
+      recoveredAfterRestart: this.getCounter('shadowCustodyRecoveredAfterRestart'),
+      firstAttemptAt: meta('shadow_custody_first_attempt_at'),
+      lastVerifiedAt: meta('shadow_custody_last_verified_at'),
+      lastErrorAt: meta('shadow_custody_last_error_at'),
+    };
   }
 
   // ── Test-only diagnostics (no handle export) ─────────────────────────

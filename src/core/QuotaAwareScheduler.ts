@@ -26,8 +26,9 @@
 import type {
   SubscriptionAccount,
   AccountQuotaSnapshot,
+  SubscriptionFramework,
 } from './SubscriptionPool.js';
-import { isLocallyExecutable } from './SubscriptionPool.js';
+import { isLocallyExecutable, requiresOwnerRelogin } from './SubscriptionPool.js';
 
 /** The binding window for swap decisions: the 7-day window is the scarce one. */
 export interface SelectionOptions {
@@ -36,6 +37,8 @@ export interface SelectionOptions {
   softThresholdPct?: number;
   /** ISO 'now' for deterministic urgency scoring (tests pass a fixed clock). */
   nowMs?: number;
+  /** Restrict placement/headroom to accounts usable by this session framework. */
+  framework?: SubscriptionFramework;
 }
 
 const DEFAULT_SOFT_THRESHOLD = 90;
@@ -46,9 +49,12 @@ const DEFAULT_SOFT_THRESHOLD = 90;
  * threshold counts as pressure — the 5-hour limit blocks you independently of
  * the weekly (you can be locked out for hours with plenty of weekly headroom
  * left), so the binding constraint is whichever window is the most used. 0 when
- * there is no reading yet (unknown = treated as empty / still selectable).
+ * there is no reading yet (unknown = treated as empty / still selectable —
+ * deliberate FOR REACTIVE RESCUE; catastrophic as a proactive optimization
+ * input, which is why the anti-thrash validity gate exists on top:
+ * swap-continuity-antithrash §3.3 bound 0).
  */
-function bindingUtilization(snap: AccountQuotaSnapshot | null | undefined): number {
+export function bindingUtilization(snap: AccountQuotaSnapshot | null | undefined): number {
   if (!snap) return 0;
   const utils: number[] = [];
   if (snap.sevenDay) utils.push(snap.sevenDay.utilizationPct);
@@ -103,6 +109,7 @@ export function selectAccount(
   const eligible = accounts.filter(
     (a) =>
       isLocallyExecutable(a) &&
+      (opts.framework === undefined || a.framework === opts.framework) &&
       a.id !== excludeId &&
       bindingUtilization(a.lastQuota) < soft,
   );
@@ -136,10 +143,26 @@ export function selectAccount(
 export function poolHeadroom(
   accounts: SubscriptionAccount[],
   opts: SelectionOptions = {},
-): { placeable: boolean; weeklyPercent: number | null; fiveHourPercent: number | null; degraded: boolean } {
+): {
+  placeable: boolean;
+  weeklyPercent: number | null;
+  fiveHourPercent: number | null;
+  degraded: boolean;
+  /**
+   * The framework of the account the percentages describe (round-13 lessons).
+   * Carried so a consumer can tell "this account HAS a usage surface and the
+   * reading is merely absent" from "this framework has no usage surface at
+   * all" — the two cases warrant different shed behaviour, and conflating them
+   * changed job scheduling for agents that never opted into grok.
+   */
+  bestFramework?: SubscriptionFramework;
+} {
   const soft = opts.softThresholdPct ?? DEFAULT_SOFT_THRESHOLD;
   const eligible = accounts.filter(
-    (a) => isLocallyExecutable(a) && bindingUtilization(a.lastQuota) < soft,
+    (a) =>
+      isLocallyExecutable(a) &&
+      (opts.framework === undefined || a.framework === opts.framework) &&
+      bindingUtilization(a.lastQuota) < soft,
   );
   if (eligible.length === 0) {
     return { placeable: false, weeklyPercent: null, fiveHourPercent: null, degraded: false };
@@ -153,7 +176,7 @@ export function poolHeadroom(
   const weeklyPercent = clamp(best.lastQuota?.sevenDay?.utilizationPct);
   const fiveHourPercent = clamp(best.lastQuota?.fiveHour?.utilizationPct);
   const degraded = weeklyPercent === null && fiveHourPercent === null;
-  return { placeable: true, weeklyPercent, fiveHourPercent, degraded };
+  return { placeable: true, weeklyPercent, fiveHourPercent, degraded, bestFramework: best.framework };
 }
 
 /** Is this account at/over the soft pressure threshold on its binding window? */
@@ -166,7 +189,10 @@ export function accountAtPressure(
 
 // ── Swap orchestration ────────────────────────────────────────────
 
-/** Injected session-restart-with-resume (wraps SessionRefresh in prod). */
+/** Injected session-restart-with-resume (wraps SessionRefresh in prod).
+ *  Returning a bare boolean is back-compat; the object form additionally
+ *  surfaces the structured refusal code (rate_limited / session-busy / …) so
+ *  the anti-thrash observation layer can classify failures (§3.1 trigger 2). */
 export type RefreshFn = (opts: {
   sessionName: string;
   reason: string;
@@ -174,13 +200,40 @@ export type RefreshFn = (opts: {
   configHome: string;
   /** The account id to record on the resumed session. */
   accountId: string;
-}) => Promise<boolean>;
+  /** Work-gate caller class (swap-continuity-antithrash §4.2) — server-internal only (I11). */
+  callerClass?: 'proactive-swap' | 'reactive-swap';
+}) => Promise<boolean | { ok: boolean; code?: string }>;
 
 export interface SwapResult {
   swapped: boolean;
   /** The account swapped TO (null when no eligible alternate existed). */
   toAccountId: string | null;
   reason: string;
+}
+
+/**
+ * Anti-thrash hooks (swap-continuity-antithrash): observation of the REACTIVE
+ * path (I6 — never gates it) + the execute-time revalidation inputs for the
+ * PROACTIVE explicit-target funnel (§3.3). All optional — absent = today's
+ * behavior byte-for-byte.
+ */
+export interface QuotaSwapAntiThrashHooks {
+  /** Bound-0 validity check (reading PRESENT + FRESH) — §3.3. */
+  readingValid: (acct: SubscriptionAccount, nowMs: number) => boolean;
+  /** Live knobs for the revalidation arithmetic. */
+  getKnobs: () => { thresholdPct: number; targetHeadroomPct: number; minImprovementPct: number };
+  /** The session's CURRENT account id (source-identity check, R3-m3). */
+  resolveEffectiveAccountId: (
+    sessionName: string,
+    sourceWasUntagged: boolean,
+    sourceTrigger?: 'quota-pressure' | 'login-loss' | 'degradation',
+  ) => Promise<string | null>;
+  /** Observe an executed REACTIVE swap (dwell clock-start, hop alerts). */
+  onReactiveExecuted?: (args: { session: string; from: string; to: string; nowMs: number }) => void;
+  /** Observe a reactive execution failure (§3.6 `failed` rows, kind 'reactive'). */
+  onReactiveFailed?: (args: { session: string; from: string; to?: string; errorClass: string; nowMs: number }) => void;
+  /** Observe a rate-cap refusal of a REACTIVE swap — the stranded state (§3.1 trigger 2). */
+  onReactiveRateCapRefusal?: (session: string, nowMs: number) => void;
 }
 
 export interface QuotaAwareSchedulerConfig {
@@ -191,6 +244,8 @@ export interface QuotaAwareSchedulerConfig {
   /** Raised (deduped) when a session is at a wall with NO eligible alternate. */
   onNoAlternate?: (sessionName: string, exhaustedAccountId: string) => void;
   softThresholdPct?: number;
+  /** Anti-thrash observation + revalidation hooks (optional, additive). */
+  antiThrash?: QuotaSwapAntiThrashHooks;
   logger?: { log: (m: string) => void; warn: (m: string) => void };
 }
 
@@ -200,11 +255,24 @@ export class QuotaAwareScheduler {
     this.cfg = cfg;
   }
 
-  /** Pick the best account for a NEW session (proactive placement). */
-  placeNewSession(nowMs: number): SubscriptionAccount | null {
+  /**
+   * Pick the best account for a NEW session (proactive placement).
+   *
+   * `framework` is REQUIRED (grok-build spec §6.1, round-9 lessons). An account
+   * whose framework cannot report quota at all — grok-build, where no usage
+   * command exists — has `lastQuota === null` FOREVER, so `bindingUtilization`
+   * scores it as maximum headroom and it would win every cross-framework draw
+   * permanently. Every live selection path already passes a framework; making
+   * the parameter required closes the one entry point where a caller could
+   * omit it, so an unobservable-quota account only ever competes against other
+   * accounts of the SAME framework rather than out-ranking a Claude account
+   * that has a real reading.
+   */
+  placeNewSession(nowMs: number, framework: SubscriptionFramework): SubscriptionAccount | null {
     return selectAccount(this.cfg.listAccounts(), {
       softThresholdPct: this.cfg.softThresholdPct,
       nowMs,
+      framework,
     });
   }
 
@@ -219,35 +287,157 @@ export class QuotaAwareScheduler {
     sessionName: string;
     exhaustedAccountId: string;
     nowMs: number;
+    /**
+     * The funnel contract (swap-continuity-antithrash §3.3): an explicit
+     * `targetAccountId` means "the caller already ran the brake pipeline;
+     * REVALIDATE, never re-select". NO target means "reactive semantics:
+     * today's 90-threshold re-selection, drain-first scoring" — a future
+     * proactive-class caller that omits the target gets reactive semantics,
+     * never a silent brake bypass.
+     */
+    targetAccountId?: string;
+    callerClass?: 'proactive-swap' | 'reactive-swap';
+    /** Framework of the session being moved. Falls back to the exhausted account. */
+    framework?: SubscriptionFramework;
+    /** True when the evaluated source came from the default-login resolver. */
+    sourceWasUntagged?: boolean;
+    /** Level-triggered source condition. Login loss is revalidated at the same
+     * kill boundary as the untagged default-account identity. */
+    sourceTrigger?: 'quota-pressure' | 'login-loss' | 'degradation';
   }): Promise<SwapResult> {
-    const { sessionName, exhaustedAccountId, nowMs } = args;
-    const next = selectAccount(
-      this.cfg.listAccounts(),
-      { softThresholdPct: this.cfg.softThresholdPct, nowMs },
-      exhaustedAccountId,
-    );
-    if (!next) {
-      this.cfg.onNoAlternate?.(sessionName, exhaustedAccountId);
+    const { sessionName, exhaustedAccountId, nowMs, targetAccountId } = args;
+    const isProactive = targetAccountId !== undefined;
+    const callerClass = args.callerClass ?? (isProactive ? 'proactive-swap' : 'reactive-swap');
+    const accounts = this.cfg.listAccounts();
+    const sourceAccount = accounts.find((a) => a.id === exhaustedAccountId);
+    const framework = args.framework ?? sourceAccount?.framework;
+    if (framework === undefined) {
       this.cfg.logger?.warn(
-        `[QuotaAwareScheduler] ${sessionName}: account ${exhaustedAccountId} at limit, NO eligible alternate — left to existing back-off`,
+        `[QuotaAwareScheduler] ${sessionName}: source framework unknown for ${exhaustedAccountId} — refusing account selection`,
       );
-      return { swapped: false, toAccountId: null, reason: 'no-eligible-alternate' };
+      return { swapped: false, toAccountId: null, reason: 'source-framework-unknown' };
     }
-    const ok = await this.cfg.refreshFn({
-      sessionName,
-      reason: `quota-swap: ${exhaustedAccountId} → ${next.id}`,
-      configHome: next.configHome,
-      accountId: next.id,
-    });
+
+    let next: SubscriptionAccount | null;
+    if (isProactive) {
+      // ── Execute-time revalidation (§3.3, R4-m4) — refuse, never re-select ──
+      const at = this.cfg.antiThrash;
+      next = accounts.find((a) => a.id === targetAccountId) ?? null;
+      if (!next) {
+        return { swapped: false, toAccountId: targetAccountId!, reason: 'target-revalidation-failed' };
+      }
+      if (framework !== undefined && next.framework !== framework) {
+        return { swapped: false, toAccountId: next.id, reason: 'target-framework-mismatch' };
+      }
+      if (at) {
+        const k = at.getKnobs();
+        const ceiling = k.thresholdPct - k.targetHeadroomPct;
+        // 1. Target validity + ceiling (bound 0 + bound 1) on a fresh snapshot.
+        if (!at.readingValid(next, nowMs) || bindingUtilization(next.lastQuota) >= ceiling) {
+          return { swapped: false, toAccountId: next.id, reason: 'target-revalidation-failed' };
+        }
+        // 2. Source identity (R3-m3): a reactive swap that completed in the
+        // sub-tick window invalidates the intent — never a second kill.
+        const current = await at.resolveEffectiveAccountId(
+          sessionName,
+          args.sourceWasUntagged === true,
+          args.sourceTrigger,
+        );
+        if ((args.sourceWasUntagged === true && current !== exhaustedAccountId) ||
+            (args.sourceWasUntagged !== true && current !== null && current !== exhaustedAccountId)) {
+          return { swapped: false, toAccountId: next.id, reason: 'intent-stale' };
+        }
+        // 3. Source condition, fresh: either quota pressure still exists, or
+        // the exact owner-relogin-required episode still exists. A repaired
+        // login makes the intent stale before the session is killed.
+        const source = accounts.find((a) => a.id === exhaustedAccountId);
+        if (args.sourceTrigger === 'login-loss') {
+          if (!source || !requiresOwnerRelogin(source)) {
+            return { swapped: false, toAccountId: next.id, reason: 'intent-stale' };
+          }
+        } else {
+          if (!source || !isLocallyExecutable(source) || !at.readingValid(source, nowMs) || bindingUtilization(source.lastQuota) < k.thresholdPct) {
+            return { swapped: false, toAccountId: next.id, reason: 'intent-stale' };
+          }
+          // 4. Improvement delta, fresh (bound 2 at the actual kill point).
+          if (bindingUtilization(source.lastQuota) - bindingUtilization(next.lastQuota) < k.minImprovementPct) {
+            return { swapped: false, toAccountId: next.id, reason: 'target-revalidation-failed' };
+          }
+        }
+      }
+    } else {
+      // ── Reactive semantics — byte-identical to v1.3.722 (I6) ──
+      next = selectAccount(
+        accounts,
+        { softThresholdPct: this.cfg.softThresholdPct, nowMs, framework },
+        exhaustedAccountId,
+      );
+      if (!next) {
+        this.cfg.onNoAlternate?.(sessionName, exhaustedAccountId);
+        this.cfg.logger?.warn(
+          `[QuotaAwareScheduler] ${sessionName}: account ${exhaustedAccountId} at limit, NO eligible alternate — left to existing back-off`,
+        );
+        return { swapped: false, toAccountId: null, reason: 'no-eligible-alternate' };
+      }
+    }
+
+    let refreshOutcome: boolean | { ok: boolean; code?: string };
+    try {
+      refreshOutcome = await this.cfg.refreshFn({
+        sessionName,
+        reason: `${args.sourceTrigger === 'login-loss' ? 'login-loss-swap' : 'quota-swap'}: ${exhaustedAccountId} → ${next.id}`,
+        configHome: next.configHome,
+        accountId: next.id,
+        callerClass,
+      });
+    } catch (err) {
+      // §3.1/§3.6 fix-alongside: reactive execution failures were previously a
+      // silent discarded promise — now observed (failed rows, kind 'reactive')
+      // before the error propagates exactly as before.
+      if (!isProactive) {
+        this.cfg.antiThrash?.onReactiveFailed?.({
+          session: sessionName,
+          from: exhaustedAccountId,
+          to: next.id,
+          errorClass: err instanceof Error ? err.constructor.name : 'Error',
+          nowMs,
+        });
+      }
+      throw err;
+    }
+    const ok = typeof refreshOutcome === 'boolean' ? refreshOutcome : refreshOutcome.ok;
+    const code = typeof refreshOutcome === 'boolean' ? undefined : refreshOutcome.code;
     if (!ok) {
       this.cfg.logger?.warn(
-        `[QuotaAwareScheduler] ${sessionName}: swap to ${next.id} — refresh reported failure`,
+        `[QuotaAwareScheduler] ${sessionName}: swap to ${next.id} — refresh reported failure${code ? ` (${code})` : ''}`,
       );
-      return { swapped: false, toAccountId: next.id, reason: 'refresh-failed' };
+      if (!isProactive) {
+        if (code === 'rate_limited') {
+          // The one state where a session is stranded on a walled account with
+          // no further mechanical rescue this window (§3.1 trigger 2).
+          this.cfg.antiThrash?.onReactiveRateCapRefusal?.(sessionName, nowMs);
+        }
+        this.cfg.antiThrash?.onReactiveFailed?.({
+          session: sessionName,
+          from: exhaustedAccountId,
+          to: next.id,
+          errorClass: code ?? 'refresh-failed',
+          nowMs,
+        });
+      }
+      return { swapped: false, toAccountId: next.id, reason: code ?? 'refresh-failed' };
     }
     this.cfg.logger?.log(
       `[QuotaAwareScheduler] ${sessionName}: resumed on ${next.id} (was ${exhaustedAccountId}) — conversation preserved via --resume`,
     );
+    if (!isProactive) {
+      this.cfg.antiThrash?.onReactiveExecuted?.({
+        session: sessionName,
+        from: exhaustedAccountId,
+        to: next.id,
+        nowMs,
+      });
+    }
     return { swapped: true, toAccountId: next.id, reason: 'swapped-and-resumed' };
   }
 }

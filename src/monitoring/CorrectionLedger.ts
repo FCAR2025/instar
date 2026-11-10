@@ -3,8 +3,8 @@
  *
  * The conversational twin of FailureLedger. Where that ledger stores dev-process
  * failures, this stores the LESSON distilled from a moment the user had to
- * correct the agent — privacy-safe: ONLY the post-scrubbed `learning` +
- * `scrubbed_summary` + metadata ever land here. Raw conversation never persists.
+ * correct the agent. Ordinary corrections retain scrubbed learnings and metadata;
+ * failure callouts additionally retain bounded, scrubbed forensic evidence.
  *
  * Mirrors FailureLedger's discipline (spec §3.4):
  *  - dedupe-upsert keyed on `kind:normalizedLearningHash` so a recurring lesson
@@ -12,7 +12,10 @@
  *    never manufacture support.
  *  - `correction_occurrences` is a bounded forensic log (DEFAULT_MAX_OCCURRENCES_
  *    PER_KEY = 200, prune-in-transaction with the insert). The analyzer's
- *    distinct-day / distinct-topic counts are computed from this bounded table.
+ *    distinct-day / distinct-session counts are computed from this bounded table.
+ *  - `route_cluster_id` durably binds exact keys that were routed together so
+ *    lifecycle verification can observe sibling recurrence without rewriting
+ *    record identity.
  *  - indexes idx_corr_dedupe + idx_corr_detected (explicitly required).
  *  - toApiView() strips everything but scrubbed_summary + metadata — the
  *    /corrections API never serves raw `learning` text.
@@ -26,6 +29,9 @@
  * gate keys on (spec §3.5). llm_confidence is LLM-set + advisory only.
  */
 import Database from 'better-sqlite3';
+import type { FailureReplicationEmitter, FailureReplicaReader, FailureReplica } from '../core/FailureCalloutReplicatedStore.js';
+import { newFailureCase, advanceFailureCase, archiveFailureEpisode, type CorrectionSeverity, type FailureCase, type FailureEpisode } from './FailureCallout.js';
+import { initFailureInvestigationAdmission, readFailureInvestigationAdmission, claimFailureInvestigationAdmission, resumeFailureInvestigationAdmission, failureInvestigationAdmissionSummary, FAILURE_INVESTIGATION_MAX_ATTEMPTS, type FailureInvestigationAdmission, type FailureInvestigationClaim } from './FailureInvestigationAdmission.js';
 import { registerSqliteHandle } from '../core/SqliteRegistry.js';
 import type { Database as BetterSqliteDatabase } from 'better-sqlite3';
 import crypto from 'node:crypto';
@@ -42,11 +48,14 @@ export type CorrectionKind = 'infra-gap' | 'user-preference' | 'noise';
 export type CorrectionStatus =
   | 'open'         // recorded, not yet crossed the recurrence gate
   | 'acted-on'     // routed (feedback proposal / recordPreference / attention) + verify window open
-  | 'verified'     // dedupeKey did not recur within the verify window AND application persisted
+  | 'verified'     // no routed cluster member recurred AND application persisted
   | 'inconclusive' // recurred past maxReopens, or silence-only (never marked effective)
-  | 'reopened';    // recurred after acting; re-watching (bounded by maxReopens)
+  | 'reopened';    // a routed cluster member recurred; re-watching (bounded by maxReopens)
 
 export interface CorrectionRecord {
+  investigationAdmission?: FailureInvestigationAdmission;
+  severity?: CorrectionSeverity;
+  failureCase?: FailureCase;
   id: string;
   dedupeKey: string;
   kind: CorrectionKind;
@@ -69,14 +78,20 @@ export interface CorrectionRecord {
   routedVia?: string;          // 'feedback' | 'recordPreference' | 'attention'
   verifyWindowStart?: string;
   verifyWindowEnd?: string;
+  /** Durable identity shared by every record routed as one analyzer cluster. */
+  routeClusterId?: string;
   reopenCount: number;
   createdAt: string;
   updatedAt: string;
   version: number;
 }
 
-/** The shape served over HTTP — `learning` stripped, only scrubbed_summary + metadata. */
+/** HTTP shape: internal learning/session stripped; forensic context is detail-only. */
 export interface CorrectionRecordApiView {
+  investigationAdmission?: FailureInvestigationAdmission;
+  failureState?: FailureCase['state'];
+  severity?: CorrectionSeverity;
+  failureCase?: FailureCase;
   id: string;
   dedupeKey: string;
   kind: CorrectionKind;
@@ -98,6 +113,8 @@ export interface CorrectionRecordApiView {
 }
 
 export interface RecordCorrectionInput {
+  severity?: CorrectionSeverity;
+  failureContext?: unknown;
   kind: CorrectionKind;
   learning: string;
   scrubbedSummary: string;
@@ -110,6 +127,10 @@ export interface RecordCorrectionInput {
 
 export interface ListCorrectionFilter {
   kind?: CorrectionKind;
+  severity?: CorrectionSeverity;
+  unresolvedFailures?: boolean;
+  /** Admission-eligible failures only; applied before limit to avoid starvation. */
+  investigableFailures?: boolean;
   status?: CorrectionStatus;
   sinceMs?: number;
   /** Upper-bound (exclusive): detected_at < beforeMs (keyset pagination). */
@@ -117,9 +138,21 @@ export interface ListCorrectionFilter {
   limit?: number;
 }
 
+/** Immutable full chronology; FailureCase.history is only a bounded display. */
+export interface FailureEpisodeArchiveEntry {
+  version: number;
+  archivedAt: string;
+  episode: FailureEpisode;
+}
+
 export type CorrectionUpdateResult =
   | { ok: true; record: CorrectionRecord }
   | { ok: false; conflict: true; current?: CorrectionRecord }
+  | { ok: false; conflict: false; reason: string };
+
+export type CorrectionClusterUpdateResult =
+  | { ok: true; records: CorrectionRecord[] }
+  | { ok: false; conflict: true; current: CorrectionRecord[] }
   | { ok: false; conflict: false; reason: string };
 
 export interface CorrectionLedgerOptions {
@@ -166,6 +199,7 @@ const SCHEMA = [
      routed_via           TEXT,
      verify_window_start  TEXT,
      verify_window_end    TEXT,
+     route_cluster_id     TEXT,
      reopen_count         INTEGER NOT NULL DEFAULT 0,
      created_at           TEXT NOT NULL,
      updated_at           TEXT NOT NULL,
@@ -173,13 +207,14 @@ const SCHEMA = [
    )`,
   // Detected-at index for the analyzer's windowed scan + keyset pagination.
   `CREATE INDEX IF NOT EXISTS idx_corr_detected ON correction_records(detected_at)`,
-  // Bounded forensic log — feeds COUNT(DISTINCT day_bucket / topic_id) for the
+  // Bounded forensic log — feeds COUNT(DISTINCT day_bucket / session_id) for the
   // analyzer's diversity prongs without growing an unbounded set on the record.
   `CREATE TABLE IF NOT EXISTS correction_occurrences (
      id            INTEGER PRIMARY KEY AUTOINCREMENT,
      dedupe_key    TEXT NOT NULL,
      day_bucket    TEXT NOT NULL,
      topic_id      INTEGER,
+     session_id    TEXT,
      deterministic_weight INTEGER NOT NULL DEFAULT 0,
      detected_at   TEXT NOT NULL
    )`,
@@ -195,12 +230,33 @@ const SCHEMA = [
      machine_id TEXT PRIMARY KEY,
      next_seq   INTEGER NOT NULL DEFAULT 1
    )`,
+  `CREATE TABLE IF NOT EXISTS correction_failure_episodes (
+     correction_id TEXT NOT NULL,
+     version INTEGER NOT NULL,
+     archived_at TEXT NOT NULL,
+     episode_json TEXT NOT NULL,
+     PRIMARY KEY (correction_id, version)
+   )`,
 ];
 
 // ── CorrectionLedger ──────────────────────────────────────────────────
 
 export class CorrectionLedger {
   private db: BetterSqliteDatabase;
+  private failureReplication: FailureReplicationEmitter | null = null;
+  private failureReplicas: FailureReplicaReader | null = null;
+  setFailureReplicationEmitter(emitter: FailureReplicationEmitter | null): void { this.failureReplication = emitter; }
+  setFailureReplicaReader(reader: FailureReplicaReader | null): void { this.failureReplicas = reader; }
+  replicatedFailures(): FailureReplica[] { return this.failureReplicas?.all() ?? []; }
+  replicatedFailureEpisodes(id: string, machineId: string) { return this.failureReplicas?.episodes(id, machineId) ?? []; }
+  /** For the existing writer-agnostic reconciler: no limit/starvation and no replica re-emission. */
+  ownFailureSnapshots(): CorrectionRecord[] {
+    return (this.db.prepare('SELECT * FROM correction_records WHERE failure_case_json IS NOT NULL').all() as Record<string, unknown>[]).map(row => this.rowToRecord(row));
+  }
+  private emitFailure(record: CorrectionRecord | null): void {
+    if (!record?.failureCase) return;
+    try { this.failureReplication?.emitPut(record); } catch (error) { this.onError('failure-replication', error); }
+  }
   private readonly machineId: string;
   private readonly onError: (where: string, err: unknown) => void;
   private readonly maxOccurrencesPerKey: number;
@@ -227,8 +283,44 @@ export class CorrectionLedger {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     for (const ddl of SCHEMA) this.db.exec(ddl);
+    // Existing ledgers predate session-diversity and therefore have no
+    // occurrence-level session_id. Add it in place without re-identifying any
+    // correction record or changing dedupeKey. Historical NULLs deliberately
+    // fall back to correction_records.session_id in distinctCounts(); where
+    // even that provenance is absent, the row does not manufacture diversity.
+    const occurrenceColumns = this.db
+      .prepare(`PRAGMA table_info(correction_occurrences)`)
+      .all() as Array<{ name: string }>;
+    if (!occurrenceColumns.some((column) => column.name === 'session_id')) {
+      this.db.exec(`ALTER TABLE correction_occurrences ADD COLUMN session_id TEXT`);
+    }
+    const recordColumns = this.db
+      .prepare(`PRAGMA table_info(correction_records)`)
+      .all() as Array<{ name: string }>;
+    if (!recordColumns.some((column) => column.name === 'route_cluster_id')) {
+      this.db.exec(`ALTER TABLE correction_records ADD COLUMN route_cluster_id TEXT`);
+    }
+    if (!recordColumns.some(column => column.name === 'failure_case_json')) {
+      this.db.exec(`ALTER TABLE correction_records ADD COLUMN failure_case_json TEXT`);
+    }
+    initFailureInvestigationAdmission(this.db);
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_corr_dedupe_session
+         ON correction_occurrences(dedupe_key, session_id)`,
+    );
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_corr_route_cluster
+         ON correction_records(route_cluster_id)`,
+    );
     // Close-on-exit registry (SqliteRegistry.ts) — closed once at shutdown.
-    registerSqliteHandle(() => { try { this.db?.close(); } catch { /* already closed */ } });
+    registerSqliteHandle(() => {
+      try {
+        this.db?.close();
+      } catch {
+        // @silent-fallback-ok: shutdown cleanup is idempotent; an already-closed
+        // SQLite handle needs no recovery and must not mask the original exit.
+      }
+    });
   }
 
   /**
@@ -280,7 +372,7 @@ export class CorrectionLedger {
   /**
    * Record (or upsert) a distilled correction. A repeat on the same dedupeKey
    * increments occurrenceCount + logs a distinct occurrence (feeds the
-   * distinct-day / distinct-topic gates) rather than duplicating. Fail-open:
+   * distinct-day / distinct-session gates) rather than duplicating. Fail-open:
    * returns null on any storage error.
    */
   record(input: RecordCorrectionInput): CorrectionRecord | null {
@@ -295,10 +387,18 @@ export class CorrectionLedger {
         // Always log the occurrence (feeds COUNT(DISTINCT) diversity prongs).
         this.db
           .prepare(
-            `INSERT INTO correction_occurrences (dedupe_key, day_bucket, topic_id, deterministic_weight, detected_at)
-             VALUES (?, ?, ?, ?, ?)`,
+            `INSERT INTO correction_occurrences
+               (dedupe_key, day_bucket, topic_id, session_id, deterministic_weight, detected_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
           )
-          .run(dedupeKey, dayBucket, input.topicId ?? null, input.deterministicWeight, detectedAt);
+          .run(
+            dedupeKey,
+            dayBucket,
+            input.topicId ?? null,
+            input.sessionId ?? null,
+            input.deterministicWeight,
+            detectedAt,
+          );
 
         // Bounded forensic log — prune occurrence rows for this key beyond the
         // most-recent N. Safe: the analyzer's distinct counts are also bounded
@@ -356,12 +456,100 @@ export class CorrectionLedger {
         return row.id;
       });
 
-      const id = txn();
-      return this.get(id);
+      // Include context and lifecycle in the same transaction as the occurrence.
+      const recordTxn = this.db.transaction(() => {
+        const id = txn();
+        const existing = this.get(id)!;
+        if (input.severity === 'failure-callout' || existing.failureCase) {
+          const failure = existing.failureCase ?? newFailureCase(input.failureContext);
+          if (existing.occurrenceCount > 1) {
+            failure.history = archiveFailureEpisode(failure);
+            failure.state = 'reopened';
+            delete failure.verification;
+            if (input.failureContext) failure.context = newFailureCase(input.failureContext).context;
+          }
+          failure.updatedAt = now;
+          this.db.prepare('UPDATE correction_records SET failure_case_json=? WHERE id=?').run(JSON.stringify(failure), id);
+          this.appendFailureEpisode(id, existing.version, failure);
+        }
+        return id;
+      });
+      const saved = this.get(recordTxn());
+      this.emitFailure(saved);
+      return saved;
     } catch (err) {
       this.onError('record', err);
       return null;
     }
+  }
+
+  updateFailureCase(id: string, input: unknown, ifMatch: number): CorrectionUpdateResult {
+    const current = this.get(id);
+    if (!current) return { ok: false, conflict: false, reason: 'not-found' };
+    if (current.version !== ifMatch) return { ok: false, conflict: true, current };
+    const failure = advanceFailureCase(current.failureCase ?? newFailureCase({}), input);
+    const saved = this.db.transaction((): CorrectionUpdateResult => {
+      const result = this.db.prepare(`UPDATE correction_records SET failure_case_json=?, updated_at=?, version=version+1 WHERE id=? AND version=?`)
+        .run(JSON.stringify(failure), failure.updatedAt, id, ifMatch);
+      if (!result.changes) return { ok: false, conflict: true, current: this.get(id) ?? undefined };
+      this.appendFailureEpisode(id, ifMatch + 1, failure);
+      return { ok: true, record: this.get(id)! };
+    })();
+    if (saved.ok) this.emitFailure(saved.record);
+    return saved;
+  }
+
+  getFailureInvestigationAdmission(id: string): FailureInvestigationAdmission | undefined {
+    return readFailureInvestigationAdmission(this.db, id);
+  }
+
+  /** Check a pending launch receipt without exposing or rotating its token. */
+  validateFailureInvestigationClaim(id: string, token: unknown): boolean {
+    if (typeof token !== 'string' || !token || token.length > 128) return false;
+    return !!this.db.prepare(`SELECT 1 FROM correction_failure_investigation_admission admission
+      JOIN correction_records record ON record.id=admission.correction_id AND record.occurrence_count=admission.occurrence_count
+      WHERE record.id=? AND admission.claim_token=? AND record.failure_case_json IS NOT NULL
+      AND json_extract(record.failure_case_json, '$.state')!='verified'`).get(id, token);
+  }
+
+  claimFailureInvestigation(id: string, now = Date.now()): FailureInvestigationClaim {
+    const result = this.db.transaction(() => {
+      const claimed = claimFailureInvestigationAdmission(this.db, id, now);
+      if (claimed.admitted) {
+        const record = this.get(id)!;
+        this.appendFailureEpisode(id, record.version, record.failureCase!);
+      }
+      return claimed;
+    })();
+    if (result.admitted) this.emitFailure(this.get(id));
+    return result;
+  }
+
+  resumeFailureInvestigation(id: string, evidenceRef: string): FailureInvestigationAdmission {
+    const resumed = this.db.transaction(() => {
+      const admission = resumeFailureInvestigationAdmission(this.db, id, evidenceRef);
+      const record = this.get(id)!;
+      this.appendFailureEpisode(id, record.version, record.failureCase!);
+      return admission;
+    })();
+    this.emitFailure(this.get(id));
+    return resumed;
+  }
+
+  private appendFailureEpisode(id: string, version: number, failure: FailureCase): void {
+    const { history: _displayOnly, ...episode } = failure;
+    void _displayOnly;
+    this.db.prepare(`INSERT OR IGNORE INTO correction_failure_episodes (correction_id, version, archived_at, episode_json) VALUES (?, ?, ?, ?)`)
+      .run(id, version, failure.updatedAt, JSON.stringify(episode));
+  }
+
+  /** Latest first, exclusive version cursor. Earlier evidence is never pruned. */
+  listFailureEpisodes(id: string, beforeVersion?: number, limit = 100): FailureEpisodeArchiveEntry[] {
+    const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(limit, 1000)) : 100;
+    const rows = this.db.prepare(`SELECT version, archived_at, episode_json FROM correction_failure_episodes
+      WHERE correction_id = ?${beforeVersion === undefined ? '' : ' AND version < ?'} ORDER BY version DESC LIMIT ?`)
+      .all(...(beforeVersion === undefined ? [id, boundedLimit] : [id, beforeVersion, boundedLimit])) as Array<{ version: number; archived_at: string; episode_json: string }>;
+    return rows.map(row => ({ version: row.version, archivedAt: row.archived_at, episode: JSON.parse(row.episode_json) as FailureEpisode }));
   }
 
   get(id: string): CorrectionRecord | null {
@@ -378,6 +566,16 @@ export class CorrectionLedger {
     const where: string[] = [];
     const params: Record<string, unknown> = {};
     if (filter.kind) { where.push('kind = @kind'); params.kind = filter.kind; }
+    if (filter.severity) where.push(filter.severity === 'failure-callout' ? 'failure_case_json IS NOT NULL' : 'failure_case_json IS NULL');
+    if (filter.unresolvedFailures) where.push("failure_case_json IS NOT NULL AND json_extract(failure_case_json, '$.state') != 'verified'");
+    if (filter.investigableFailures) {
+      where.push("failure_case_json IS NOT NULL AND json_extract(failure_case_json, '$.state') != 'verified'");
+      where.push(`NOT EXISTS (SELECT 1 FROM correction_failure_investigation_admission admission
+        WHERE admission.correction_id=correction_records.id AND admission.occurrence_count=correction_records.occurrence_count
+        AND (admission.attempts>=@maxInvestigationAttempts OR admission.next_attempt_at>@admissionNow))`);
+      params.admissionNow = Date.now();
+      params.maxInvestigationAttempts = FAILURE_INVESTIGATION_MAX_ATTEMPTS;
+    }
     if (filter.status) { where.push('status = @status'); params.status = filter.status; }
     if (filter.sinceMs) { where.push('detected_at >= @since'); params.since = new Date(filter.sinceMs).toISOString(); }
     if (filter.beforeMs) { where.push('detected_at < @before'); params.before = new Date(filter.beforeMs).toISOString(); }
@@ -385,7 +583,7 @@ export class CorrectionLedger {
     const sql =
       `SELECT * FROM correction_records` +
       (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
-      ` ORDER BY detected_at DESC LIMIT ${limit}`;
+      ` ORDER BY ${filter.unresolvedFailures || filter.investigableFailures ? 'updated_at ASC' : 'detected_at DESC'} LIMIT ${limit}`;
     return (this.db.prepare(sql).all(params) as Record<string, unknown>[]).map((r) => this.rowToRecord(r));
   }
 
@@ -395,7 +593,7 @@ export class CorrectionLedger {
    */
   update(
     id: string,
-    patch: Partial<Pick<CorrectionRecord, 'status' | 'routedVia' | 'verifyWindowStart' | 'verifyWindowEnd' | 'reopenCount'>>,
+    patch: Partial<Pick<CorrectionRecord, 'status' | 'routedVia' | 'verifyWindowStart' | 'verifyWindowEnd' | 'routeClusterId' | 'reopenCount'>>,
     ifMatch: number,
   ): CorrectionUpdateResult {
     try {
@@ -404,7 +602,8 @@ export class CorrectionLedger {
       if (current.version !== ifMatch) return { ok: false, conflict: true, current };
       const map: Record<string, string> = {
         status: 'status', routedVia: 'routed_via', verifyWindowStart: 'verify_window_start',
-        verifyWindowEnd: 'verify_window_end', reopenCount: 'reopen_count',
+        verifyWindowEnd: 'verify_window_end', routeClusterId: 'route_cluster_id',
+        reopenCount: 'reopen_count',
       };
       const cols: string[] = [];
       const params: Record<string, unknown> = { id, ifMatch };
@@ -427,30 +626,105 @@ export class CorrectionLedger {
   }
 
   /**
-   * Distinct calendar days + distinct topics for the recurrence gate (spec §3.5).
-   * Computed from the bounded occurrences table. Restart-proof (keys on UTC
-   * day_bucket, NOT a session count instar's frequent restarts would inflate).
+   * Atomically transition every member of one analyzer-time cluster.
+   *
+   * All expected versions are checked before any row changes. A stale member
+   * therefore prevents the whole transition, which lets the driver durably
+   * retire the cluster before invoking an external side effect without leaving
+   * half the paraphrases open to route again.
+   */
+  updateCluster(
+    members: readonly { id: string; version: number }[],
+    patch: Partial<Pick<CorrectionRecord, 'status' | 'routedVia' | 'verifyWindowStart' | 'verifyWindowEnd' | 'routeClusterId' | 'reopenCount'>>,
+  ): CorrectionClusterUpdateResult {
+    const unique = [...new Map(members.map((member) => [member.id, member])).values()];
+    if (unique.length === 0) return { ok: false, conflict: false, reason: 'empty-cluster' };
+    try {
+      const txn = this.db.transaction((): CorrectionClusterUpdateResult => {
+        const current = unique
+          .map((member) => this.get(member.id))
+          .filter((record): record is CorrectionRecord => record !== null);
+        if (
+          current.length !== unique.length
+          || unique.some((member) => current.find((record) => record.id === member.id)?.version !== member.version)
+        ) {
+          return { ok: false, conflict: true, current };
+        }
+
+        const updated: CorrectionRecord[] = [];
+        for (const member of unique) {
+          const result = this.update(member.id, patch, member.version);
+          if (!result.ok) {
+            // This is unreachable on one synchronous SQLite connection after
+            // the preflight, but throwing preserves all-or-none semantics if
+            // the implementation changes.
+            throw new Error(`cluster transition lost OCC for ${member.id}`);
+          }
+          updated.push(result.record);
+        }
+        return { ok: true, records: updated };
+      });
+      return txn();
+    } catch (err) {
+      // @silent-fallback-ok: onError is the ledger's injected degradation
+      // reporter; the typed storage-error result keeps the cluster fail-closed.
+      this.onError('updateCluster', err);
+      return { ok: false, conflict: false, reason: 'storage-error' };
+    }
+  }
+
+  /**
+   * Distinct calendar days + sessions for one key or an analyzer-time cluster.
+   * Computed from the bounded occurrences table. The days prong remains
+   * restart-proof; the orthogonal preference prong counts genuine context-reset
+   * session ids instead of assuming the operator works across multiple topics.
+   *
+   * Historical occurrence rows created before session_id was added use the
+   * owning record's session_id as a conservative fallback. If neither is known,
+   * SQLite COUNT(DISTINCT ...) ignores NULL, biasing toward non-promotion.
    * `qualifying` only counts occurrences whose deterministic_weight ≥ threshold
    * (the code-determined provenance filter — an LLM-only-confident occurrence
    * never alone admits a record to the gate).
    */
-  distinctCounts(dedupeKey: string, weightThreshold = 0): {
+  distinctCounts(dedupeKeyOrKeys: string | readonly string[], weightThreshold = 0): {
     distinctDays: number;
     distinctTopics: number;
+    distinctSessions: number;
     qualifyingOccurrences: number;
   } {
+    const dedupeKeys = typeof dedupeKeyOrKeys === 'string'
+      ? [dedupeKeyOrKeys]
+      : [...new Set(dedupeKeyOrKeys)];
+    if (dedupeKeys.length === 0) {
+      return {
+        distinctDays: 0,
+        distinctTopics: 0,
+        distinctSessions: 0,
+        qualifyingOccurrences: 0,
+      };
+    }
+    const keyPlaceholders = dedupeKeys.map(() => '?').join(', ');
     const row = this.db
       .prepare(
-        `SELECT COUNT(DISTINCT day_bucket) AS days,
-                COUNT(DISTINCT topic_id)  AS topics,
-                COUNT(*)                  AS occ
-           FROM correction_occurrences
-          WHERE dedupe_key = @dedupeKey AND deterministic_weight >= @threshold`,
+        `SELECT COUNT(DISTINCT o.day_bucket) AS days,
+                COUNT(DISTINCT o.topic_id) AS topics,
+                COUNT(DISTINCT COALESCE(o.session_id, r.session_id)) AS sessions,
+                COUNT(*) AS occ
+           FROM correction_occurrences o
+           LEFT JOIN correction_records r ON r.dedupe_key = o.dedupe_key
+          WHERE o.dedupe_key IN (${keyPlaceholders})
+            AND o.deterministic_weight >= ?`,
       )
-      .get({ dedupeKey, threshold: weightThreshold }) as { days: number; topics: number; occ: number } | undefined;
+      .get(...dedupeKeys, weightThreshold) as {
+        days: number;
+        topics: number;
+        sessions: number;
+        occ: number;
+      } | undefined;
     return {
       distinctDays: row?.days ?? 0,
       distinctTopics: row?.topics ?? 0,
+      distinctSessions: row?.sessions ?? 0,
       qualifyingOccurrences: row?.occ ?? 0,
     };
   }
@@ -482,9 +756,20 @@ export class CorrectionLedger {
   }
 
   /** Strip `learning` (raw distilled text) — the ONLY shape allowed over HTTP (spec §3.4). */
-  static toApiView(record: CorrectionRecord): CorrectionRecordApiView {
-    const { learning: _internalLearning, sessionId: _internalSession, ...rest } = record;
-    void _internalLearning; void _internalSession;
+  static toApiView(record: CorrectionRecord, includeFailureContext = true): CorrectionRecordApiView {
+    const {
+      learning: _internalLearning,
+      sessionId: _internalSession,
+      routeClusterId: _internalRouteCluster,
+      ...rest
+    } = record;
+    void _internalLearning; void _internalSession; void _internalRouteCluster;
+    if (!includeFailureContext) {
+      const { failureCase, investigationAdmission, ...summary } = rest;
+      const admission = failureInvestigationAdmissionSummary(investigationAdmission);
+      return { ...summary, ...(failureCase ? { failureState: failureCase.state } : {}),
+        ...(admission ? { investigationAdmission: admission } : {}) };
+    }
     return { ...rest };
   }
 
@@ -494,6 +779,9 @@ export class CorrectionLedger {
 
   private rowToRecord(r: Record<string, unknown>): CorrectionRecord {
     return {
+      ...(r.failure_case_json ? { investigationAdmission: this.getFailureInvestigationAdmission(r.id as string) } : {}),
+      severity: r.failure_case_json ? 'failure-callout' : 'correction',
+      ...(r.failure_case_json ? { failureCase: JSON.parse(String(r.failure_case_json)) as FailureCase } : {}),
       id: r.id as string,
       dedupeKey: r.dedupe_key as string,
       kind: r.kind as CorrectionKind,
@@ -510,6 +798,7 @@ export class CorrectionLedger {
       routedVia: (r.routed_via as string) ?? undefined,
       verifyWindowStart: (r.verify_window_start as string) ?? undefined,
       verifyWindowEnd: (r.verify_window_end as string) ?? undefined,
+      routeClusterId: (r.route_cluster_id as string) ?? undefined,
       reopenCount: r.reopen_count as number,
       createdAt: r.created_at as string,
       updatedAt: r.updated_at as string,

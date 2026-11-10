@@ -34,6 +34,7 @@ beforeEach(() => {
   claudeHooksInstarDir = path.join(projectDir, '.claude', 'hooks', 'instar');
   fs.mkdirSync(scriptsDir, { recursive: true });
   fs.mkdirSync(claudeHooksInstarDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'config.json'), JSON.stringify({ messaging: [{ type: 'slack', enabled: true }] }));
 });
 
 afterEach(() => {
@@ -107,6 +108,7 @@ describe('secret-externalization survivability migration', () => {
     const current = [
       '#!/bin/bash',
       '# imessage-reply.sh — current version',
+      '# imessage-reply-feature: tone-reaction',
       'AUTH_TOKEN="${INSTAR_AUTH_TOKEN:-}"',
       'if [ -z "$AUTH_TOKEN" ] && [ -f ".instar/config.json" ]; then',
       '  AUTH_TOKEN=$(python3 -c "import json; v=json.load(open(\'.instar/config.json\')).get(\'authToken\',\'\'); print(v if isinstance(v, str) else \'\')" 2>/dev/null)',
@@ -139,10 +141,55 @@ describe('secret-externalization survivability migration', () => {
     expect(final).toContain('INSTAR_AUTH_TOKEN');
     expect(final).toContain('isinstance(v, str)');
   });
+
+  it('upgrades an auth-current slack-channel-context.sh that still reads config cwd-relative, then leaves it alone', () => {
+    const cwdRelative = [
+      '#!/bin/bash',
+      '# slack-channel-context.sh — auto-inject Slack channel history',
+      'AUTH="${INSTAR_AUTH_TOKEN:-}"',
+      'if [ -f ".instar/config.json" ]; then',
+      '  :',
+      'fi',
+    ].join('\n') + '\n';
+    const hookPath = path.join(claudeHooksInstarDir, 'slack-channel-context.sh');
+    fs.writeFileSync(hookPath, cwdRelative);
+
+    const first = runMigrate(makeMigrator());
+    const final = fs.readFileSync(hookPath, 'utf-8');
+    expect(final).toContain('CONFIG_FILE="${CLAUDE_PROJECT_DIR:-.}/.instar/config.json"');
+    expect(final).not.toContain('open(\'.instar/config.json\')');
+    expect(final).not.toContain("open('$CONFIG_FILE')");
+    expect(first.upgraded.some(u => u.includes('slack-channel-context.sh'))).toBe(true);
+
+    const second = runMigrate(makeMigrator());
+    expect(second.upgraded.some(u => u.includes('slack-channel-context.sh'))).toBe(false);
+  });
+
+  it('upgrades a slack-channel-context.sh that interpolates $CONFIG_FILE into Python source', () => {
+    // The round-1 shape: an absolute path with an apostrophe breaks the Python.
+    const interpolated = [
+      '#!/bin/bash',
+      '# slack-channel-context.sh — auto-inject Slack channel history',
+      'AUTH="${INSTAR_AUTH_TOKEN:-}"',
+      'CONFIG_FILE="${CLAUDE_PROJECT_DIR:-.}/.instar/config.json"',
+      'PORT=$(python3 -c "import json; print(json.load(open(\'$CONFIG_FILE\')).get(\'port\',\'\'))" 2>/dev/null)',
+    ].join('\n') + '\n';
+    const hookPath = path.join(claudeHooksInstarDir, 'slack-channel-context.sh');
+    fs.writeFileSync(hookPath, interpolated);
+
+    const first = runMigrate(makeMigrator());
+    const final = fs.readFileSync(hookPath, 'utf-8');
+    expect(final).not.toContain("open('$CONFIG_FILE')");
+    expect(final).toContain('open(sys.argv[1])');
+    expect(first.upgraded.some(u => u.includes('slack-channel-context.sh'))).toBe(true);
+
+    const second = runMigrate(makeMigrator());
+    expect(second.upgraded.some(u => u.includes('slack-channel-context.sh'))).toBe(false);
+  });
 });
 
 describe('migrateReplyScriptTo408: extended INSTAR_AUTH_TOKEN marker check', () => {
-  it('upgrades a slack-reply.sh that has 408 handling BUT lacks INSTAR_AUTH_TOKEN env-first', () => {
+  it('preserves an unknown slack-reply.sh and stages the auth-safe current candidate', () => {
     // Old shipped marker; has 408 (old upgrade marker); LACKS INSTAR_AUTH_TOKEN
     // → was previously stuck in "already up to date" branch and would silently
     // 403 forever after the agent's authToken got externalized.
@@ -162,8 +209,9 @@ describe('migrateReplyScriptTo408: extended INSTAR_AUTH_TOKEN marker check', () 
     const m = makeMigrator();
     runMigrate(m);
 
-    const final = fs.readFileSync(scriptPath, 'utf-8');
-    expect(final).toContain('INSTAR_AUTH_TOKEN');
-    expect(final).toContain('isinstance(v, str)');
+    expect(fs.readFileSync(scriptPath, 'utf-8')).toBe(broken);
+    const candidate = fs.readFileSync(`${scriptPath}.new`, 'utf-8');
+    expect(candidate).toContain('INSTAR_AUTH_TOKEN');
+    expect(candidate).toContain('isinstance(v, str)');
   });
 });

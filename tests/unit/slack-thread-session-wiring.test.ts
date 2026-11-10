@@ -42,7 +42,9 @@ describe('thread→session: the live message path consults the routing key', () 
   // Anchor on the shared slackInboundDispatch function — the actual channel→session
   // dispatch body (WS1.1 split it out of the onMessage closure so the owner-side
   // mesh bridge can replay it). The window reaches past the spawn/register block.
-  const handlerStart = SERVER_TS.indexOf('const slackInboundDispatch = async (message');
+  // (Anchor loosened when ownership-gated-spawn threaded the router verdict
+  // through the signature — it is now multi-line.)
+  const handlerStart = SERVER_TS.indexOf('const slackInboundDispatch = async (');
   const handlerEnd = SERVER_TS.indexOf('_slackInboundDispatch = slackInboundDispatch;', handlerStart);
   const handlerBlock = SERVER_TS.slice(handlerStart, handlerEnd > handlerStart ? handlerEnd : handlerStart + 14000);
 
@@ -56,7 +58,8 @@ describe('thread→session: the live message path consults the routing key', () 
   });
 
   it('the resume map is consulted + cleared on the routing key', () => {
-    expect(handlerBlock).toContain('getChannelResume(routingKey)');
+    // session-swap-any-conversation §3.1: the lookup also names the engine it may resume.
+    expect(handlerBlock).toContain('getChannelResume(routingKey,');
     expect(handlerBlock).toContain('removeChannelResume(routingKey)');
   });
 
@@ -78,13 +81,16 @@ describe('WS1.1 Slack dispatch-to-owner: inbound consults pool placement', () =>
   // The onMessage handler (distinct from slackInboundDispatch) must route the
   // inbound message through the SessionRouter BEFORE local dispatch — the exact
   // fix for "a Slack channel pinned to a peer machine still injected locally".
-  const onMsgStart = SERVER_TS.indexOf('slackAdapter.onMessage(async (message)');
+  const onMsgStart = SERVER_TS.indexOf('const slackRouteAndDispatch = async (');
   const onMsgEnd = SERVER_TS.indexOf('await slackAdapter.start();', onMsgStart);
   const onMsgBlock = SERVER_TS.slice(onMsgStart, onMsgEnd > onMsgStart ? onMsgEnd : onMsgStart + 6000);
 
   it('the onMessage handler exists and reaches slackInboundDispatch only after routing', () => {
     expect(onMsgStart).toBeGreaterThan(-1);
-    expect(onMsgBlock).toContain('await slackInboundDispatch(message)');
+    // ownership-gated-spawn threads the router verdict through the dispatch
+    // (the SpawnAdmission TOCTOU guard) — the call now carries a second arg.
+    expect(onMsgBlock).toContain('return dispatch(message, _slackAdmissionVerdict)');
+    expect(onMsgBlock).toContain('await slackRouteAndDispatch(message, slackDispatchOrHold)');
   });
 
   it('the handler consults the SessionRouter on the routing key (not bare channelId)', () => {
@@ -127,14 +133,19 @@ describe('thread→session: SessionManager carries the thread_ts', () => {
 });
 
 describe('thread→session: reply route resolves the routing key for promise tracking', () => {
-  const start = ROUTES_TS.indexOf("router.post('/slack/reply/:channelId'");
-  // 2400-char window: the route gained the messageKind threading block
-  // (outbound-jargon-filepath-gap §2.2 cross-channel single-sourcing), which
-  // pushed the resolveRoutingKey call past the previous 1600-char bound.
-  const block = ROUTES_TS.slice(start, start + 2400);
+  const start = ROUTES_TS.indexOf('const handleSlackReply = async');
+  // Bound the window to the ACTUAL /slack/reply route body (up to the next route
+  // registration) rather than a fixed char count — the delivery-id (§2.6/R8-M1
+  // Arm C) + messageKind blocks grew the handler and pushed the resolveRoutingKey
+  // call past every previous fixed bound (1600 → 2400). Slicing to the next
+  // `router.<verb>(` keeps the assertion route-scoped AND growth-proof.
+  const nextRouteRel = ROUTES_TS.slice(start + 40).search(/router\.(post|get|put|delete|patch)\(/);
+  const block = nextRouteRel >= 0
+    ? ROUTES_TS.slice(start, start + 40 + nextRouteRel)
+    : ROUTES_TS.slice(start);
   it('the reply route resolves the routing key when a thread_ts is present', () => {
     expect(start).toBeGreaterThan(-1);
-    expect(block).toContain('resolveRoutingKey(channelId, thread_ts');
+    expect(ROUTES_TS.slice(start, ROUTES_TS.indexOf("router.post('/slack/session-reply'", start))).toContain('resolveRoutingKey(channelId, thread_ts');
   });
 });
 
@@ -147,8 +158,8 @@ describe('thread→session: slack-reply.sh supports the optional thread_ts arg +
   it('the template carries the feature marker the migrator keys on', () => {
     expect(REPLY_SH).toContain('slack-reply-feature: thread-ts-arg');
   });
-  it('the migrator refreshes a deployed-but-stale slack-reply.sh lacking the feature marker', () => {
-    expect(MIGRATOR_TS).toContain('slack-reply-feature: thread-ts-arg');
-    expect(MIGRATOR_TS).toContain('featureMarker');
+  it('the migrator uses the shared SHA-provenance installer', () => {
+    expect(MIGRATOR_TS).toContain('ensureSlackReplyRelay');
+    expect(MIGRATOR_TS).toContain('SlackReplyRelayInstaller');
   });
 });

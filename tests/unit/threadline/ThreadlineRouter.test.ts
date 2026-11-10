@@ -273,6 +273,31 @@ describe('ThreadlineRouter', () => {
       expect(mockSpawnManager.evaluate).not.toHaveBeenCalled();
     });
 
+    // Local-route trust (docs/specs/a2a-local-route-trust.md): a local delivery
+    // (no relayContext) states the route-resolved level instead of `verified`.
+    it('grounds a local live-inject with opts.localTrustLevel, and with verified when absent', async () => {
+      const mk = () => ({
+        deliverToSession: vi.fn().mockResolvedValue({ success: true, phase: 'delivered', shouldRetry: false }),
+        checkInjectionSafety: vi.fn(),
+        formatInline: vi.fn(),
+        formatPointer: vi.fn(),
+      });
+      for (const [level, expected] of [['trusted', 'trusted'], [undefined, 'verified']] as const) {
+        const threadId = crypto.randomUUID();
+        threadResumeMap.save(threadId, makeEntry({ uuid: existingUuid, sessionName: 'live-sess' }));
+        const delivery = mk();
+        const r = new ThreadlineRouter(
+          mockRouter as any, mockSpawnManager as any, threadResumeMap, mockStore as any,
+          { localAgent: 'local-agent', localMachine: 'local-machine' }, null, delivery as any,
+        );
+        const result = await r.handleInboundMessage(makeEnvelope({ threadId }), undefined, level ? { localTrustLevel: level } : undefined);
+        expect(result.injected).toBe(true);
+        const body = delivery.deliverToSession.mock.calls[0][1].message.body as string;
+        expect(body).toContain(`[EXTERNAL MESSAGE — Trust: ${expected}]`);
+        expect(body).toContain(`[END EXTERNAL MESSAGE CONTEXT — Trust: ${expected}]`);
+      }
+    });
+
     it('falls back to resume when injection fails', async () => {
       const threadId = crypto.randomUUID();
       threadResumeMap.save(threadId, makeEntry({ uuid: existingUuid, sessionName: 'dead-sess' }));
@@ -602,6 +627,7 @@ describe('ThreadlineRouter', () => {
         approved: false,
         reason: 'Session limit reached',
         retryAfterMs: 60_000,
+        queued: true,
       } as SpawnResult);
 
       const threadId = crypto.randomUUID();
@@ -609,7 +635,10 @@ describe('ThreadlineRouter', () => {
 
       const result = await router.handleInboundMessage(envelope);
 
-      expect(result.handled).toBe(true);
+      expect(result.handled).toBe(false);
+      expect(result.accepted).toBe(true);
+      expect(result.delivered).toBe(false);
+      expect(result.queued).toBe(true);
       expect(result.error).toContain('Session limit reached');
       expect(result.spawned).toBeUndefined();
       expect(result.resumed).toBeUndefined();
@@ -652,7 +681,9 @@ describe('ThreadlineRouter', () => {
 
       const result = await router.handleInboundMessage(envelope);
 
-      expect(result.handled).toBe(true);
+      expect(result.handled).toBe(false);
+      expect(result.accepted).toBe(false);
+      expect(result.delivered).toBe(false);
       expect(result.error).toContain('Spawn system crashed');
     });
   });

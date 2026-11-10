@@ -28,6 +28,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { emailEquals } from './InUseAccountResolver.js';
 
 /** The on-disk schema version this module writes. Bumped only on a breaking shape change. */
 export const CREDENTIAL_LEDGER_SCHEMA_VERSION = 1;
@@ -51,7 +52,7 @@ export interface CredentialLedgerJournalEntry {
   /** Monotonic sequence within the ledger (== the version at write time). */
   seq: number;
   /** The operation this entry belongs to. */
-  op: 'seed' | 'swap' | 'set-default' | 'quarantine' | 'unquarantine' | 'restore';
+  op: 'seed' | 'swap' | 'set-default' | 'quarantine' | 'unquarantine' | 'restore' | 'reconcile';
   /** The phase of that operation (swap is multi-phase per §2.3; others are single-shot). */
   phase: 'begin' | 'staged' | 'exchanged' | 'verified' | 'done' | 'aborted';
   /** Slots this entry touched (ordered). */
@@ -175,7 +176,14 @@ export interface IdentityAuditReport {
 }
 
 const MAX_COMPLETED_JOURNAL = 50;
-const NON_CLAUDE_FRAMEWORKS = new Set(['codex-cli', 'gemini-cli', 'pi-cli']);
+// ROUND-22: `NON_CLAUDE_FRAMEWORKS = new Set(['codex-cli', 'gemini-cli', 'pi-cli'])`
+// stood here, listing three of the four non-Claude frameworks (grok-build absent).
+// It is DELETED rather than corrected because nothing read it — and that is the
+// point worth recording: a stale list with no consumer is harmless right up to the
+// moment it acquires one, and it acquires one by looking authoritative to the next
+// author. Correcting it would have preserved a trap; the honest state of an unused
+// constant is gone. If a non-Claude predicate is needed here later, derive it
+// (`f !== 'claude-code'` over the canonical union), do not re-enumerate.
 
 /** A claude-code account is the implicit default (framework undefined or 'claude-code'). */
 function isClaudeCodeAccount(a: LedgerPoolAccount): boolean {
@@ -317,15 +325,19 @@ export class CredentialLocationLedger {
   }
 
   /** Record (or re-point) `slot`'s tenant to `accountId`. Single-writer; bumps version. */
-  recordAssignment(slot: string, accountId: string, opts?: { verifiedAt?: string | null; op?: CredentialLedgerJournalEntry['op'] }): CredentialAssignment {
+  recordAssignment(slot: string, accountId: string, opts?: { verifiedAt?: string | null; op?: CredentialLedgerJournalEntry['op']; source?: string }): CredentialAssignment {
     this.assertMutable('recordAssignment');
     const at = this.now();
     const existing = this.store.assignments.find((a) => a.slot === slot);
-    // A slot's tenant changing means the previous tenant is no longer here — drop any stale
-    // assignment that claimed the SAME accountId in a different slot (one home per credential).
-    this.store.assignments = this.store.assignments.filter(
-      (a) => a.slot !== slot && a.accountId !== accountId,
-    );
+    // A slot's tenant changing means the previous tenant is no longer authoritative
+    // elsewhere. Preserve every enumerated SLOT, though: silently dropping the old
+    // slot made later repairs unable to address it. A duplicate claim is vacated to
+    // a tenant-less quarantine marker until a live probe/verified swap fills it.
+    this.store.assignments = this.store.assignments
+      .filter((a) => a.slot !== slot)
+      .map((a) => a.accountId === accountId
+        ? { ...a, accountId: '', lastVerifiedAt: null, quarantined: true }
+        : a);
     const assignment: CredentialAssignment = {
       slot,
       accountId,
@@ -334,7 +346,12 @@ export class CredentialLocationLedger {
       quarantined: false,
     };
     this.store.assignments.push(assignment);
-    this.bumpAndJournal({ op: opts?.op ?? 'swap', phase: 'done', slots: [slot], detail: `tenant=${accountId}` });
+    this.bumpAndJournal({
+      op: opts?.op ?? 'swap',
+      phase: 'done',
+      slots: [slot],
+      detail: `tenant=${accountId}${opts?.source ? ` source=${opts.source}` : ''}`,
+    });
     this.reindex();
     this.save();
     return assignment;
@@ -447,7 +464,7 @@ export class CredentialLocationLedger {
         continue;
       }
 
-      const matches = claudeAccounts.filter((a) => a.email && a.email === result.email);
+      const matches = claudeAccounts.filter((a) => emailEquals(a.email, result.email));
       if (matches.length === 1) {
         this.store.assignments.push({
           slot,
@@ -538,7 +555,7 @@ export class CredentialLocationLedger {
         continue;
       }
 
-      const matches = claudeAccounts.filter((a) => a.email && a.email === result.email);
+      const matches = claudeAccounts.filter((a) => emailEquals(a.email, result.email));
       if (matches.length === 1) {
         const matchId = matches[0].id;
         if (!existing.quarantined && existing.accountId === matchId) {

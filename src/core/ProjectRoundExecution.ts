@@ -34,12 +34,16 @@
  *   the runner.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { applyClaudeChildAuth } from './claudeChildAuth.js';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 
 import type { Initiative, InitiativeTracker, RoundStatus } from './InitiativeTracker.js';
 import { ProjectRoundLock } from './ProjectRoundLock.js';
 import { ProjectRoundWorktrees } from './ProjectRoundWorktrees.js';
+import { detectClaudePath } from './Config.js';
 import { SafeGitExecutor } from './SafeGitExecutor.js';
+import { withSyncOp } from './InFlightSyncOpMarker.js';
+import { hasCompleteMergedEvidence } from './ProjectRoundDerivation.js';
 
 /** Per-spec defaults. Tests dial both down to keep the suite fast. */
 export const DEFAULT_POLL_INTERVAL_MS = 60_000;
@@ -85,15 +89,46 @@ export interface RunRoundInput {
   maxResumeAttempts?: number;
 
   /**
-   * Test hook: shell out to verify per-item artifacts. Defaults to a
-   * real `gh pr view` shell-out via SafeGitExecutor. Tests inject a
-   * stub. The function returns the set of itemIds whose artifact
-   * is verified merged-on-main-with-CI-green.
+   * Seam for verifying per-item artifacts. Defaults to the REAL git-backed
+   * `verifyMergedItemsViaGit`; tests inject a stub.
+   *
+   * It returns the three-state verdict deliberately — `verified` /
+   * `regressed` / `unverifiable`. A flat `Set<string>` cannot express "I
+   * could not check", so every item merely absent from it reads as
+   * not-merged, and this runner would respawn a child to redo work that may
+   * already be done. See the verdict handling in `runRound` below.
+   *
+   * HISTORY: this defaulted to a no-op that returned an EMPTY SET
+   * unconditionally, documented in place as "production callers should pass
+   * a real one". No production caller ever did. The consequence was that the
+   * all-items-merged stop condition could never fire, `outcome: 'complete'`
+   * was unreachable, and a round whose items were all merged still spawned a
+   * child to redo them. The default is now the real verifier precisely so a
+   * caller cannot forget: a seam whose default silently reports "nothing
+   * verified" is indistinguishable, to its caller, from "nothing is merged".
    */
-  verifyMergedItems?: (childIds: string[]) => Promise<Set<string>>;
+  verifyMergedItems?: (childIds: string[]) => Promise<MergedVerificationResult>;
+
+  /**
+   * Canonical-main ref for the merge-base check. Defaults to the resolved
+   * canonical ref (see `resolveCanonicalMainRef`), which matters on a
+   * fork-origin agent home where `origin/main` does not contain the merge
+   * commit and every healthy item would otherwise read as regressed.
+   */
+  mergeBaseBranch?: string;
 }
 
-export type RoundOutcome = 'complete' | 'partially-complete' | 'failed' | 'halted';
+/**
+ * `unverifiable` is NOT a soft `partially-complete`. It means the runner could
+ * not establish whether the round's work is done, so it has no verdict to
+ * record and no basis to redo the work either.
+ */
+export type RoundOutcome =
+  | 'complete'
+  | 'partially-complete'
+  | 'failed'
+  | 'halted'
+  | 'unverifiable';
 
 export interface RunRoundResult {
   outcome: RoundOutcome;
@@ -125,7 +160,42 @@ export async function runRound(input: RunRoundInput, deps: RunRoundDeps): Promis
   const pollIntervalMs = input.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const sigtermGraceMs = input.sigtermGraceMs ?? DEFAULT_SIGTERM_GRACE_MS;
   const maxResumeAttempts = input.maxResumeAttempts ?? DEFAULT_MAX_RESUME_ATTEMPTS;
-  const verifyMergedItems = input.verifyMergedItems ?? defaultVerifyMergedItems(input.targetRepoPath);
+  /**
+   * The items that are GENUINELY uncheckable: absent from `verified` for a
+   * reason the runner could not establish, AND whose structured state says
+   * work may already have landed (a merge commit, or a `merged` claim whose
+   * evidence is incomplete).
+   *
+   * An ordinary pre-build item with no `mergeCommitOid` is also reported
+   * `unverifiable` by the git verifier, but that means nothing has landed yet.
+   * Splitting on structured state rather than the reason text keeps a reworded
+   * message from silently changing control flow.
+   *
+   * Defined once and used at BOTH decision points. The first draft of this
+   * change inlined it at the pre-spawn check only, and the post-exit check
+   * kept the old conflation — caught by the test that asserts a fresh round
+   * still spawns.
+   */
+  const uncheckable = (ids: string[], v: MergedVerificationResult): string[] =>
+    ids.filter((id) => {
+      const item = input.tracker.get(id);
+      if (!item) return false;
+      // A real negative is a verdict, not an evidence gap. Git exit 1 proves
+      // the recorded commit is not on canonical main, so rerunning is allowed
+      // even when the stale row predates today's richer evidence fields.
+      if (v.regressed.has(id)) return false;
+      // A plain pre-build item with no merge commit is ordinary unfinished
+      // work. A row that already CLAIMS `merged` without the evidence behind
+      // that claim is different: rerunning it could duplicate completed work.
+      if (item.pipelineStage === 'merged' && !hasCompleteMergedEvidence(item)) return true;
+      return v.unverifiable.has(id) && Boolean(item.mergeCommitOid);
+    });
+
+  const mergeBaseBranch = input.mergeBaseBranch ?? resolveCanonicalMainRef(input.targetRepoPath);
+  const verifyMergedItems =
+    input.verifyMergedItems ??
+    ((ids: string[]) =>
+      verifyMergedItemsViaGit(input.targetRepoPath, ids, input.tracker, mergeBaseBranch));
 
   const lock = new ProjectRoundLock({ stateDir: deps.stateDir });
 
@@ -198,8 +268,32 @@ export async function runRound(input: RunRoundInput, deps: RunRoundDeps): Promis
       }
 
       // Compute current stop condition: itemIds verified-merged.
-      const verified = await verifyMergedItems(lastItemIds);
-      if (lastItemIds.every((id) => verified.has(id))) {
+      const verdict = await verifyMergedItems(lastItemIds);
+      // "I could not check" is not "not done" — but neither is it a reason to
+      // stall a round that has simply not been worked yet.
+      //
+      // `verifyMergedItemsViaGit` reports `unverifiable` for BOTH of these:
+      //   (a) the item records no mergeCommitOid at all — nothing has landed
+      //       yet, which is the ordinary state of a fresh round. Spawning is
+      //       exactly right here.
+      //   (b) the item records a merge commit but git could not answer, OR the
+      //       item already claims `merged` while its evidence is incomplete.
+      //       Here the work may already be done, and spawning would redo it.
+      //
+      // They are told apart by STRUCTURED RECORD STATE, not by matching the
+      // reason text, which would make a reworded message silently change the
+      // control flow.
+      const uncheckableWithEvidence = uncheckable(lastItemIds, verdict);
+      if (uncheckableWithEvidence.length > 0) {
+        outcome = 'unverifiable';
+        unmergedItemIds = lastItemIds.filter((id) => !verdict.verified.has(id));
+        reason =
+          `could not verify ${uncheckableWithEvidence.length} item(s) whose records say work may ` +
+          `already be merged (${uncheckableWithEvidence.join(', ')}); refusing to respawn work that ` +
+          'may already be done, and recording no round verdict';
+        break;
+      }
+      if (lastItemIds.every((id) => verdict.verified.has(id))) {
         outcome = 'complete';
         mergedItemIds = [...lastItemIds];
         break;
@@ -238,14 +332,50 @@ export async function runRound(input: RunRoundInput, deps: RunRoundDeps): Promis
         break;
       }
 
+      // The child never started. Record it as a round failure that NAMES the
+      // cause, and do NOT spend a resume attempt: a binary that cannot be
+      // resolved or executed will not resolve on a retry, so relaunching would
+      // burn the attempt budget and report the wrong reason ("attempts
+      // exhausted") for a condition that is not about attempts at all.
+      // "Could not start" and "started and failed" are different facts and the
+      // round record must not render them the same.
+      if (exit.kind === 'spawn-failed') {
+        outcome = 'failed';
+        // Node's spawn errors already name the binary ("spawn claude ENOENT"),
+        // so the message alone is enough to diagnose without plumbing the
+        // resolved path — which would risk leaking an absolute home path.
+        reason = `could not start the autonomous child: ${exit.spawnError ?? 'unknown spawn error'}`;
+        unmergedItemIds = [...lastItemIds];
+        break;
+      }
+
       // Natural exit.
       if (exit.kind === 'exited' && exit.code === 0) {
         // Step 6: verify per-item artifacts.
-        const finalVerified = await verifyMergedItems(lastItemIds);
-        mergedItemIds = lastItemIds.filter((id) => finalVerified.has(id));
-        unmergedItemIds = lastItemIds.filter((id) => !finalVerified.has(id));
-        if (unmergedItemIds.length === 0) outcome = 'complete';
-        else outcome = 'partially-complete';
+        const final = await verifyMergedItems(lastItemIds);
+        const finalUncheckable = uncheckable(lastItemIds, final);
+        mergedItemIds = lastItemIds.filter(
+          (id) => final.verified.has(id) && !finalUncheckable.includes(id),
+        );
+        unmergedItemIds = lastItemIds.filter((id) => !mergedItemIds.includes(id));
+        if (finalUncheckable.length > 0) {
+          // At least one item records a merge commit the runner could not
+          // check, or claims merged without the full evidence contract.
+          // `partially-complete` asserts "this genuinely did not land",
+          // which that item cannot support — so no verdict is recorded.
+          //
+          // An item with no merge commit at all, by contrast, genuinely did
+          // not land after a clean child exit, and falls through to
+          // partially-complete below where it belongs.
+          outcome = 'unverifiable';
+          reason =
+            `child exited 0 but ${finalUncheckable.length} item(s) lacked complete, ` +
+            `checkable merge evidence (${finalUncheckable.join(', ')}); no round verdict recorded`;
+        } else if (unmergedItemIds.length === 0) {
+          outcome = 'complete';
+        } else {
+          outcome = 'partially-complete';
+        }
         break;
       }
 
@@ -316,12 +446,18 @@ async function recordOutcome(
 ): Promise<void> {
   const proj = tracker.get(projectId);
   if (!proj) return;
-  const map: Record<RoundOutcome, RoundStatus> = {
+  // `unverifiable` has NO status. Every other outcome is a verdict the runner
+  // actually reached; this one is the absence of one, so the round keeps the
+  // status it had and gets asked again later. Mapping it onto `failed` or
+  // `partially-complete` would record a conclusion nothing established — the
+  // precise move that made a no-op verifier look like a healthy answer.
+  const map: Record<Exclude<RoundOutcome, 'unverifiable'>, RoundStatus> = {
     complete: 'complete',
     'partially-complete': 'partially-complete',
     failed: 'failed',
     halted: 'failed',
   };
+  if (outcome === 'unverifiable') return;
   const newStatus = map[outcome];
   const completedAt = new Date().toISOString();
   const rounds = (proj.rounds ?? []).map((r, i) =>
@@ -335,13 +471,44 @@ async function recordOutcome(
 }
 
 interface ExitResult {
-  kind: 'exited' | 'set-changed' | 'halted';
+  kind: 'exited' | 'set-changed' | 'halted' | 'spawn-failed';
   code?: number | null;
   signal?: NodeJS.Signals | null;
+  /** Sanitized reason, present only when kind === 'spawn-failed'. */
+  spawnError?: string;
 }
 
+/**
+ * Spawn errors captured at the spawn site.
+ *
+ * `child_process.spawn` reports a failure to START (ENOENT, EACCES) by
+ * emitting `'error'` — NOT by emitting `'exit'`. Two consequences, and the
+ * second is the one that bites:
+ *
+ *   1. An unhandled `'error'` becomes a process-level uncaught exception.
+ *      `uncaughtExceptionPolicy` crashes by default on anything it does not
+ *      recognise — correctly, since an unknown exception is not safe to
+ *      swallow. So an unstartable child took the WHOLE agent server down.
+ *   2. Even with the crash averted, `'exit'` never fires, so a waiter that
+ *      listens only for `'exit'` waits forever for an event that cannot come.
+ *
+ * Capturing here — at the spawn site, in the same tick as the spawn — means
+ * the "a spawn failure never crashes the process" property does not depend on
+ * any caller remembering to attach a listener. The waiter separately consumes
+ * the error to turn it into a recorded round failure.
+ */
+const spawnFailures = new WeakMap<ChildProcess, Error>();
+
 function spawnAutonomousChild(input: RunRoundInput, itemIds: string[]): ChildProcess {
-  const cmd = input.spawnCommand ?? 'claude';
+  // Resolve the binary rather than trusting the server's PATH. The server runs
+  // under launchd, whose PATH routinely excludes the nvm/asdf/npm-global bin dir
+  // that actually holds `claude` — so a bare 'claude' resolves in the operator's
+  // terminal and ENOENTs in the server. `detectFrameworkBinary` already scans
+  // exactly those locations (its own comment records the 2026-05-31 session-spawn
+  // crash from this same cause); this callsite simply was not using it.
+  // Falls back to the bare name so a host where detection legitimately finds
+  // nothing behaves as before rather than failing earlier than it used to.
+  const cmd = input.spawnCommand ?? detectClaudePath() ?? 'claude';
   const args = input.spawnArgs ?? ['--skill', 'autonomous'];
   const workdir =
     input.initialWorkdir ??
@@ -357,13 +524,20 @@ function spawnAutonomousChild(input: RunRoundInput, itemIds: string[]): ChildPro
     cwd: workdir,
     detached: true, // critical — makes the child its own process group leader
     stdio: 'ignore',
-    env: {
+    env: applyClaudeChildAuth({
       ...process.env,
       INSTAR_PROJECT_ID: input.projectId,
       INSTAR_ROUND_INDEX: String(input.roundIndex),
       INSTAR_ROUND_ITEM_IDS: JSON.stringify(itemIds),
       INSTAR_STOP_CONDITION: 'all-items-merged-on-main',
-    },
+    }),
+  });
+  // Attach IMMEDIATELY — see spawnFailures above. Without a listener a failure
+  // to START is an unhandled 'error' event, which is a process-level uncaught
+  // exception, which kills the agent server. This listener exists so that
+  // property holds no matter what the caller does with the returned child.
+  child.on('error', (err: Error) => {
+    spawnFailures.set(child, err);
   });
   return child;
 }
@@ -389,9 +563,34 @@ async function waitForExitOrPollChange(
     });
   });
 
+  // A child that never STARTED emits 'error' and never emits 'exit', so the
+  // loop below would otherwise wait forever for an event that cannot arrive.
+  // Check the spawn-site capture first (the error may already have fired before
+  // this function attached anything), then listen for a later one.
+  // An error that ALREADY fired (captured at the spawn site) is answered before
+  // any waiting at all — read into its own local so the check below is not
+  // narrowed by this one.
+  const alreadyFailed = spawnFailures.get(child);
+  if (alreadyFailed) {
+    return { kind: 'spawn-failed', spawnError: alreadyFailed.message };
+  }
+  // Holder object rather than a bare `let`: the assignment happens inside a
+  // callback, which TypeScript's control-flow analysis cannot see.
+  const failure: { err?: Error } = {};
+  const spawnFailurePromise = new Promise<void>((resolve) => {
+    child.once('error', (err: Error) => {
+      failure.err = err;
+      resolve();
+    });
+  });
+
   while (!exited) {
-    // Wait either pollIntervalMs OR exit, whichever comes first.
-    await Promise.race([exitPromise, sleep(pollIntervalMs)]);
+    // Wait for exit, a spawn failure, OR the poll interval — whichever is first.
+    await Promise.race([exitPromise, spawnFailurePromise, sleep(pollIntervalMs)]);
+    const failedToStart = failure.err;
+    if (failedToStart) {
+      return { kind: 'spawn-failed', spawnError: failedToStart.message };
+    }
     if (exited) break;
 
     // Halt check.
@@ -448,50 +647,148 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Real `gh pr view`-backed merged-state verifier. For each child id,
- * looks up the child's `prNumber` + `mergeCommitOid` from the tracker
- * and runs `git merge-base --is-ancestor <oid> origin/main` to confirm
- * the merge is reachable. Tests inject a stub instead.
+ * Resolve the ref that actually holds canonical `main` for this checkout.
  *
- * For PR 7's scope, this default is intentionally simple: it only
- * confirms reachability of `mergeCommitOid` if the child has one.
- * Real CI-green checks via `gh pr view` ship in a follow-up (the
- * StageTransitionValidator already performs them for /advance — when
- * the merged-state reconciler wires up in the next PR, it'll call
- * the validator here too).
+ * On a fork-origin agent home `origin/main` does NOT contain the canonical
+ * merge commit, so a merge-base check against it reports every healthy item
+ * as regressed. Falls back to the documented `origin/main` when `gh` or the
+ * remote mapping is unavailable (canonical-origin installs).
+ *
+ * Lives here rather than in the server layer because BOTH consumers — the
+ * lazy reconciler in `routes.ts` and this round runner — need the same
+ * resolution, and a core module must not import from `server/`.
+ *
+ * READ-ONLY: `gh repo view` + `git remote -v` (the latter via
+ * SafeGitExecutor.readSync — `remote` is a READONLY_GIT_VERB, shape-checked
+ * to list/get-url only).
  */
-function defaultVerifyMergedItems(targetRepoPath: string): (childIds: string[]) => Promise<Set<string>> {
-  return async (_childIds: string[]) => {
-    const verified = new Set<string>();
-    // Best-effort no-op default — production callers should pass a
-    // real verifyMergedItems that calls StageTransitionValidator.
-    // The point of this default is to avoid a spurious shell-out
-    // during tests that didn't override it (rare; tests should
-    // override).
-    void targetRepoPath;
-    return verified;
-  };
+export function resolveCanonicalMainRef(repoPath: string): string {
+  const FALLBACK = 'origin/main';
+  try {
+    // `gh repo view` is a BLOCKING spawn and this runs inside the server
+    // process (the auto-advance poller calls runRound). It funnels through
+    // withSyncOp so the in-flight marker sees the stall instead of it looking
+    // like an unexplained event-loop freeze.
+    //
+    // In `routes.ts` this callsite sat on the chokepoint lint's frozen
+    // baseline — grandfathered, not blessed. Moving it into core made it a NEW
+    // violation, and the lint refused it. That refusal is the useful part: it
+    // stopped a pre-existing blocking hazard from spreading into a module the
+    // round runner calls on every pass.
+    const GH_ARGS = ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'];
+    const GH_OPTS = {
+      cwd: repoPath,
+      encoding: 'utf-8' as const,
+      stdio: ['ignore', 'pipe', 'ignore'] as ('ignore' | 'pipe')[],
+    };
+    // The wrap must sit on the SAME LINE as the spawn: the chokepoint lint is a
+    // deliberately lexical, same-line matcher (it documents that it cannot prove
+    // runtime wrapping — that is the marker's own unit test's job). A cheap
+    // signal, not an authority, so it is satisfied literally.
+    const ghRepo = withSyncOp(() => execFileSync('gh', GH_ARGS, GH_OPTS)).trim();
+    if (!ghRepo) return FALLBACK;
+    const remotesOut = SafeGitExecutor.readSync(['remote', '-v'], {
+      cwd: repoPath,
+      operation: 'ProjectRoundExecution.resolveCanonicalMainRef',
+      encoding: 'utf-8',
+    });
+    for (const line of remotesOut.split('\n')) {
+      // format: "<name>\t<url> (fetch)"
+      const m = /^(\S+)\s+(\S+)\s+\(fetch\)/.exec(line.trim());
+      if (!m) continue;
+      const [, name, url] = m;
+      if (url.includes(ghRepo) || url.includes(`${ghRepo}.git`)) {
+        return `${name}/main`;
+      }
+    }
+    return FALLBACK;
+  } catch { /* @silent-fallback-ok: resolving the canonical-main ref is best-effort — gh missing / not-a-gh-repo / git error falls back to the documented `origin/main` default (the prior behavior), which the merge-base gate then re-validates. Not a degradation: it's the conservative default this resolver exists to refine, not replace. */
+    return FALLBACK;
+  }
 }
 
-/** Helper exported so callers can wire a SafeGit-backed verifier. */
+/**
+ * Three-state outcome. `unverifiable` is NOT a soft `regressed`: it means the
+ * check could not be run at all, and collapsing the two is how a refusal becomes
+ * a fabricated factual claim (the defect `/projects/:id/advance` had fixed for
+ * itself in #1643 while this sibling kept it).
+ */
+export interface MergedVerificationResult {
+  /** Proven reachable from the canonical-main ref. */
+  verified: Set<string>;
+  /** git exited 1 — the documented, genuine "not an ancestor". */
+  regressed: Set<string>;
+  /** The question could not be answered; the caller must NOT infer either way. */
+  unverifiable: Map<string, string>;
+}
+
+/**
+ * Helper exported so callers can wire a SafeGit-backed verifier.
+ *
+ * This function was dead code in practice until 2026-07-26: it selects on
+ * `child.mergeCommitOid`, and the only path that could have written that field
+ * (`/projects/:id/advance`) validated the merge commit and then discarded it. So
+ * every child hit the `continue` and the caller saw an empty set — a regression
+ * detector that scanned nothing and reported nothing, which reads exactly like a
+ * clean bill of health. Three defects therefore sat here unexercised, all three
+ * already fixed in the advance path a few hundred lines away:
+ *
+ *   1. no `sourceTreeReadOk`, so SourceTreeGuard REFUSES this read against an
+ *      instar source tree (the #1641 defect);
+ *   2. a hardcoded `origin/main`, which on a dev-agent home is the agent's FORK,
+ *      not where merges land — so the correct answer is "unreachable";
+ *   3. a bodyless catch swallowing every error → not verified → the caller marks
+ *      the item `regressed`, i.e. "I could not check" rendered as "it was
+ *      reverted". (Described in words rather than shown as a literal: the
+ *      empty-catch ratchet counts occurrences in comments too, so quoting the
+ *      forbidden shape here fails the lint — a text matcher fooled by prose
+ *      describing the thing it forbids. Same trap is documented in
+ *      tests/unit/projects-advance-mergebase-wiring.test.ts.)
+ *
+ * Any one of those would have turned healthy merged items into false regressions
+ * the moment the evidence started being written. Fixed together, because writing
+ * the evidence is what arms this code path.
+ */
 export async function verifyMergedItemsViaGit(
   targetRepoPath: string,
   childIds: string[],
-  tracker: InitiativeTracker
-): Promise<Set<string>> {
+  tracker: InitiativeTracker,
+  /** Canonical-main ref. Callers on a fork-origin install MUST resolve and pass
+   *  the real one; the default preserves behaviour for canonical-origin installs. */
+  mergeBaseBranch: string = 'origin/main'
+): Promise<MergedVerificationResult> {
   const verified = new Set<string>();
+  const regressed = new Set<string>();
+  const unverifiable = new Map<string, string>();
   for (const id of childIds) {
     const child = tracker.get(id);
-    if (!child || !child.mergeCommitOid) continue;
+    if (!child) continue;
+    if (!child.mergeCommitOid) {
+      // No evidence on the record — that is not a regression, it is an item we
+      // cannot speak about. Naming it keeps the gap visible instead of silently
+      // folding it into a clean result.
+      unverifiable.set(id, 'no mergeCommitOid recorded on the item');
+      continue;
+    }
     try {
-      SafeGitExecutor.run(
-        ['merge-base', '--is-ancestor', child.mergeCommitOid, 'origin/main'],
-        { cwd: targetRepoPath, operation: 'ProjectRoundExecution.verifyMergedItemsViaGit' }
+      SafeGitExecutor.readSync(
+        ['merge-base', '--is-ancestor', child.mergeCommitOid, mergeBaseBranch],
+        {
+          cwd: targetRepoPath,
+          operation: 'ProjectRoundExecution.verifyMergedItemsViaGit',
+          stdio: ['ignore', 'ignore', 'ignore'],
+          sourceTreeReadOk: true,
+        }
       );
       verified.add(id);
-    } catch {
-      // Not an ancestor of origin/main — not verified.
+    } catch (err) {
+      const status = (err as { status?: unknown }).status;
+      if (status === 1) {
+        regressed.add(id); // git's documented exit 1 — the ONLY genuine negative
+      } else {
+        unverifiable.set(id, err instanceof Error ? err.message : String(err));
+      }
     }
   }
-  return verified;
+  return { verified, regressed, unverifiable };
 }

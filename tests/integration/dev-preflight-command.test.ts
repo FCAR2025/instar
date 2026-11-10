@@ -27,6 +27,8 @@ describe('dev preflight command integration', () => {
     const exitCode = await runDevPreflight({
       cwd: process.cwd(),
       runner,
+      // Pin the manager: the resolver probes the host, and CI has no pnpm.
+      lintCommandResolver: () => ({ command: 'pnpm', args: ['lint'] }),
       capabilityPrefixes: new Set(['capabilities']),
       diffProvider: () => '+router.post("/new-surface/create", handler);',
       output: {
@@ -47,6 +49,9 @@ describe('dev preflight command integration', () => {
         'tests/unit/capabilities-discoverability.test.ts',
         'tests/unit/CapabilityIndex.test.ts',
       ],
+      // Test-runner bound self-disable ledger check (spec §2.6(b)) — runs the
+      // same detector the pre-push hook uses, in --preflight mode.
+      ['node', 'scripts/pre-push-test-runner-selfdisable.mjs', '--preflight'],
     ]);
     expect(plainStdout).toContain('lint: PASS');
     expect(plainStdout).toContain('capabilities-discoverability/CapabilityIndex: PASS');
@@ -63,6 +68,8 @@ describe('dev preflight command integration', () => {
 
     const exitCode = await runDevPreflight({
       runner,
+      // Pin the manager: the resolver probes the host, and CI has no pnpm.
+      lintCommandResolver: () => ({ command: 'pnpm', args: ['lint'] }),
       diffProvider: () => '',
       output: { write: () => {}, error: () => {} },
     });

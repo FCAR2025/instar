@@ -10,8 +10,10 @@
  *   - a fetch failure drops the tick + keeps the prior paint (no exception escapes)
  */
 // @ts-nocheck — exercises the browser-native ESM module.
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createController } from '../../dashboard/subscriptions.js';
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -19,18 +21,26 @@ const flush = () => new Promise((r) => setTimeout(r, 0));
 function makeEls(doc: Document) {
   const accounts = doc.createElement('div');
   const pending = doc.createElement('div');
+  const matrix = doc.createElement('div');
+  const followMe = doc.createElement('div');
+  const profileProvision = doc.createElement('div');
   const root = doc.createElement('div');
+  root.appendChild(followMe);
+  root.appendChild(profileProvision);
+  root.appendChild(matrix);
   root.appendChild(accounts);
   root.appendChild(pending);
   doc.body.appendChild(root);
-  return { els: { accounts, pending }, root };
+  return { els: { accounts, pending, matrix, followMe, profileProvision }, root };
 }
 
 /** A scriptable fetch keyed by URL pathname; records abort signals. */
 function makeFetch() {
   const script: Record<string, { status?: number; body?: unknown; throw?: boolean }> = {};
   const signals: AbortSignal[] = [];
+  const calls: Array<{ url: string; init?: any }> = [];
   const fetchImpl = async (url: string, init?: { signal?: AbortSignal }) => {
+    calls.push({ url, init });
     if (init?.signal) signals.push(init.signal);
     const key = url.replace(/^https?:\/\/[^/]+/, '');
     const entry = script[key] ?? { status: 200, body: { enabled: true } };
@@ -41,7 +51,7 @@ function makeFetch() {
       json: async () => entry.body ?? {},
     };
   };
-  return { fetchImpl, script, signals };
+  return { fetchImpl, script, signals, calls };
 }
 
 const ACCOUNTS_OK = {
@@ -88,6 +98,54 @@ describe('Subscriptions tab controller (integration)', () => {
     expect(els.pending.querySelector('.sub-pending-code')!.textContent).toContain('7DAU-W4XJA');
   });
 
+  it('turns one operator click into the scoped autonomous repair approval request', async () => {
+    fx.script['/subscription-pool'] = { body: { ...ACCOUNTS_OK, accounts: [{ ...ACCOUNTS_OK.accounts[0], status: 'needs-reauth' }] } };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: { enabled: true, logins: [] } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: { enabled: true, episodes: [{ id: 'repair-1', accountId: 'a1', state: 'suggested' }] } };
+    fx.script['/subscription-relogin/repair-1/approve'] = { status: 202, body: { accepted: true } };
+    const c = ctl({ getOperatorSessionToken: () => 'scoped-human-proof' });
+    c._state.active = true;
+    await c.tick();
+    (els.accounts.querySelector('[data-relogin-action="approve"]') as HTMLElement).click();
+    await flush();
+    const approval = fx.calls.find((call) => call.url === '/subscription-relogin/repair-1/approve');
+    expect(approval?.init).toMatchObject({ method: 'POST' });
+    expect(approval?.init.headers['X-Instar-Operator-Session']).toBe('scoped-human-proof');
+    expect(approval?.init.body).toBe('{}');
+  });
+
+  it('does not send approval when the dashboard has no recent PIN-unlock proof', async () => {
+    fx.script['/subscription-pool'] = { body: { ...ACCOUNTS_OK, accounts: [{ ...ACCOUNTS_OK.accounts[0], status: 'needs-reauth' }] } };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: { enabled: true, logins: [] } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: { enabled: true, episodes: [{ id: 'repair-1', accountId: 'a1', state: 'suggested' }] } };
+    const requestUnlock = vi.fn();
+    const c = ctl({ requestUnlock }); c._state.active = true; await c.tick();
+    const button = els.accounts.querySelector('[data-relogin-action="approve"]') as HTMLElement;
+    button.click(); await flush();
+    expect(requestUnlock).toHaveBeenCalledTimes(1);
+    expect(button.textContent).toBe('Enter PIN, then try again');
+    expect(fx.calls.some((call) => call.url.endsWith('/approve'))).toBe(false);
+  });
+
+  it('no longer renders the obsolete "Create a dedicated sign-in profile" form', async () => {
+    // The agent provisions + signs in dedicated profiles itself (POST /playwright-profiles/provision
+    // stays; its route tests live in playwright-profile-routes.test.ts). The panel must not render
+    // the old human form, even when a legacy container element is handed to the controller.
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: { enabled: true, logins: [] } };
+    const c = ctl({ getOperatorSessionToken: () => 'scoped-human-proof' });
+    c._state.active = true;
+    await c.tick();
+    expect(els.accounts.textContent).toContain('personal');
+    expect(els.profileProvision.childElementCount).toBe(0);
+    expect(doc.querySelector('.sub-profile-create')).toBeNull();
+    expect(doc.body.textContent).not.toContain('Create a dedicated sign-in profile');
+    expect(fx.calls.some((call) => call.url === '/playwright-profiles/provision')).toBe(false);
+    const html = readFileSync(join(__dirname, '../../dashboard/index.html'), 'utf-8');
+    expect(html).not.toContain('subProfileProvision');
+    expect(html).not.toContain('Dedicated browser profiles');
+  });
+
   it('feature-dark (both enabled:false) → the disabled copy, no crash', async () => {
     fx.script['/subscription-pool'] = { body: { enabled: false, accounts: [] } };
     fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: { enabled: false, logins: [] } };
@@ -128,5 +186,494 @@ describe('Subscriptions tab controller (integration)', () => {
     expect(c._state.active).toBe(false);
     c.onVisible();
     expect(c._state.active).toBe(true);
+  });
+
+  // ── topic 29836 D1–D5: the matrix "Set up" flow through the SHIPPED controller ──
+
+  it('restart rehydrates a drifted cell and its durable pending flow; stale Active cannot overwrite drift', async () => {
+    const pool = {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', status: 'active', identityDrifted: true, machineId: 'm1', machineNickname: 'Laptop' },
+        // A duplicate stale observation reproduces the live overwrite regression.
+        { id: 'a1', email: 'a1@x.com', status: 'active', identityDrifted: false, machineId: 'm1', machineNickname: 'Laptop' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    };
+    const pending = { enabled: true, logins: [{
+      id: 'a1', machineId: 'm1', paneAlive: true, kind: 'url-code-paste',
+      verificationUrl: 'https://claude.com/oauth/renewed', expectedEmail: 'a1@x.com',
+      ttlExpiresAt: '2999-01-01T00:00:00Z',
+    }] };
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: pending };
+    fx.script['/subscription-pool?scope=pool'] = { body: pool };
+
+    const first = ctl(); first._state.active = true; await first.tick();
+    expect(els.matrix.querySelector('[data-cell-key="a1::m1"] .sub-matrix-signin')).toBeTruthy();
+
+    // A brand-new controller models a server/browser restart: no client transient
+    // or repairState survives. Durable pool drift + pending login reconstruct the cell.
+    const restarted = ctl(); restarted._state.active = true; await restarted.tick();
+    const cell = els.matrix.querySelector('[data-cell-key="a1::m1"]');
+    expect(cell.className).toContain('sub-matrix-in-progress');
+    expect(cell.textContent).toContain('Signing in');
+    expect(cell.querySelector('.sub-matrix-signin')).toBeTruthy();
+  });
+
+  it('a drifted cell without a pending flow is honest and PIN-actionable', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'active', identityDrifted: true, machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    const c = ctl(); c._state.active = true; await c.tick();
+    const cell = els.matrix.querySelector('[data-cell-key="a1::m1"]');
+    expect(cell.textContent).toContain('Needs sign-in');
+    expect(cell.querySelector('[data-matrix-setup]').textContent).toBe('Sign in');
+  });
+
+  it('turns one unlocked-dashboard click on a remote matrix cell into the exact autonomous repair request', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, scope: 'pool',
+      episodes: [{ id: 'repair-remote', accountId: 'a1', machineId: 'm2', state: 'suggested', remote: true }],
+    } };
+    fx.script['/subscription-relogin/repair-cell'] = { status: 202, body: { accepted: true } };
+    const c = ctl({ getOperatorSessionToken: () => 'scoped-human-proof' });
+    c._state.active = true;
+    await c.tick();
+    const button = els.matrix.querySelector('[data-matrix-relogin][data-machine-id="m2"]');
+    expect(button).toBeTruthy();
+    expect(button.textContent).toBe('Repair sign-in');
+    expect(els.accounts.querySelector('[data-relogin-action]')).toBeNull();
+    button.click();
+    await flush();
+    const call = fx.calls.find((entry) => entry.url === '/subscription-relogin/repair-cell');
+    expect(call?.init.headers['X-Instar-Operator-Session']).toBe('scoped-human-proof');
+    expect(JSON.parse(call?.init.body)).toEqual({ accountId: 'a1', machineId: 'm2', episodeId: 'repair-remote', action: 'approve' });
+    expect(els.matrix.querySelector('.sub-matrix-pin')).toBeNull();
+  });
+
+  it('opens the PIN overlay when a locked dashboard repair is tapped', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, scope: 'pool',
+      episodes: [{ id: 'repair-remote', accountId: 'a1', machineId: 'm2', state: 'failed', remote: true }],
+    } };
+    const requestUnlock = vi.fn();
+    const c = ctl({ requestUnlock });
+    c._state.active = true;
+    await c.tick();
+
+    const button = els.matrix.querySelector('[data-matrix-relogin][data-machine-id="m2"]');
+    button.click();
+
+    expect(requestUnlock).toHaveBeenCalledTimes(1);
+    expect(els.matrix.textContent).toContain('Enter your dashboard PIN, then tap Repair sign-in once.');
+    expect(fx.calls.some((entry) => entry.url === '/subscription-relogin/repair-cell')).toBe(false);
+  });
+
+  it('reopens the PIN overlay when repair proof expires at the server', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, scope: 'pool',
+      episodes: [{ id: 'repair-remote', accountId: 'a1', machineId: 'm2', state: 'failed', remote: true }],
+    } };
+    fx.script['/subscription-relogin/repair-cell'] = { status: 401, body: { error: 'operator proof expired' } };
+    const requestUnlock = vi.fn();
+    const c = ctl({ getOperatorSessionToken: () => 'expired-proof', requestUnlock });
+    c._state.active = true;
+    await c.tick();
+
+    const button = els.matrix.querySelector('[data-matrix-relogin][data-machine-id="m2"]');
+    button.click();
+    await flush();
+
+    expect(requestUnlock).toHaveBeenCalledTimes(1);
+    expect(els.matrix.textContent).toContain('Enter your dashboard PIN, then tap Repair sign-in once.');
+    expect(button.hasAttribute('disabled')).toBe(false);
+  });
+
+  it('a newer Active pool poll removes a durable failed repair instead of offering an invalid retry', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, scope: 'pool',
+      episodes: [{ id: 'repair-old', accountId: 'a1', machineId: 'm2', state: 'failed', remote: true }],
+    } };
+    const c = ctl(); c._state.active = true; await c.tick();
+    expect(els.matrix.querySelector('[data-repair-action="retry"]')).toBeTruthy();
+
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'active', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    await c.tick();
+    const cell = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(cell.textContent).toContain('Active');
+    expect(cell.textContent).not.toContain('Sign-in repair stopped safely');
+    expect(cell.querySelector('[data-matrix-relogin]')).toBeNull();
+  });
+
+  it('self-heals a retry race when the server reports that the account is already active', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, scope: 'pool',
+      episodes: [{ id: 'repair-old', accountId: 'a1', machineId: 'm2', state: 'failed', remote: true }],
+    } };
+    fx.script['/subscription-relogin/repair-cell'] = {
+      status: 409, body: { error: 'retry-revalidation-refused:account-not-needs-reauth' },
+    };
+    const c = ctl({ getOperatorSessionToken: () => 'scoped-human-proof' });
+    c._state.active = true; await c.tick();
+    const button = els.matrix.querySelector('[data-repair-action="retry"]');
+    fx.script['/subscription-pool?scope=pool'] = { body: {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'active', machineId: 'm2', machineNickname: 'Mini' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    } };
+    button.click();
+    await flush(); await flush();
+    expect(els.matrix.textContent).not.toContain('retry-revalidation-refused');
+    expect(els.matrix.querySelector('[data-cell-key="a1::m2"]')!.textContent).toContain('Active');
+    expect(els.matrix.querySelector('[data-repair-action="retry"]')).toBeNull();
+  });
+
+  it('self-heals the account-card retry race without encouraging another invalid retry', async () => {
+    fx.script['/subscription-pool'] = { body: {
+      ...ACCOUNTS_OK,
+      accounts: [{ ...ACCOUNTS_OK.accounts[0], status: 'needs-reauth' }],
+    } };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-relogin?scope=pool'] = { body: {
+      enabled: true, episodes: [{ id: 'repair-local', accountId: 'a1', state: 'failed' }],
+    } };
+    fx.script['/subscription-relogin/repair-local/retry'] = {
+      status: 409, body: { error: 'retry-revalidation-refused:account-not-needs-reauth' },
+    };
+    const c = ctl({ getOperatorSessionToken: () => 'scoped-human-proof' });
+    c._state.active = true; await c.tick();
+    const button = els.accounts.querySelector('[data-relogin-action="retry"]');
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    button.click();
+    await flush(); await flush();
+    expect(els.accounts.textContent).not.toContain('retry-revalidation-refused');
+    expect(els.accounts.textContent).not.toContain('Couldn’t start — try again');
+    expect(els.accounts.querySelector('[data-relogin-action]')).toBeNull();
+    expect(els.accounts.textContent).toContain('Active');
+  });
+
+  const POOL_SCOPE = {
+    enabled: true,
+    accounts: [
+      { id: 'a1', email: 'headley.justin@gmail.com', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+      { id: 'aX', email: 'ax@x.com', status: 'active', machineId: 'm2', machineNickname: 'Mini' },
+    ],
+    pool: { selfMachineId: 'm1', failed: [] },
+    scope: 'pool',
+  };
+  const NO_PENDING = { enabled: true, logins: [] };
+  const START_CELL_OK = {
+    status: 201,
+    body: {
+      verificationUrl: 'https://claude.com/oauth/authorize?code=true&client_id=x',
+      loginId: 'a1', machineId: 'm2', kind: 'url-code-paste',
+      expectedEmail: 'headley.justin@gmail.com',
+      ttlExpiresAt: new Date(Date.parse('2026-06-07T00:00:00Z') + 12 * 60_000).toISOString(),
+      notice: 'Heads up: this provider may show an extra verification step.',
+    },
+  };
+
+  function scriptMatrixHappyPath() {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool?scope=pool'] = { body: POOL_SCOPE };
+    fx.script['/subscription-pool/matrix/start-cell'] = START_CELL_OK;
+  }
+
+  async function openCellToSignIn(c: any) {
+    await c.tick();
+    const setup = els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]');
+    expect(setup).toBeTruthy();
+    setup.click();
+    const pin = els.matrix.querySelector('.sub-matrix-pin');
+    pin.value = '123456';
+    els.matrix.querySelector('[data-matrix-confirm]').click();
+    await flush();
+    // The attempt now exists server-side — subsequent pending reads include it (as the
+    // real server would after start-cell), so the reconciler sees a live attempt.
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = {
+      body: {
+        enabled: true,
+        logins: [{
+          id: 'a1', label: 'Justin', kind: 'url-code-paste', machineId: 'm2', machineNickname: 'Mini',
+          paneAlive: true, expectedEmail: 'headley.justin@gmail.com',
+          verificationUrl: START_CELL_OK.body.verificationUrl, ttlExpiresAt: START_CELL_OK.body.ttlExpiresAt,
+          notice: START_CELL_OK.body.notice,
+        }],
+      },
+    };
+    return els.matrix.querySelector('[data-cell-key="a1::m2"]');
+  }
+
+  it('D1: a poll tick mid-PIN-entry does NOT clobber the open cell (the exact screenshot defect)', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    await c.tick();
+    const setup = els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]');
+    setup.click();
+    const pin = els.matrix.querySelector('.sub-matrix-pin');
+    expect(pin).toBeTruthy();
+    pin.value = '12'; // the operator is mid-typing…
+    await c.tick();   // …and the 30s poll fires
+    const pinAfter = els.matrix.querySelector('.sub-matrix-pin');
+    expect(pinAfter).toBe(pin); // the SAME node — not a rebuilt copy, not a "Set up" button
+    expect(pinAfter.value).toBe('12');
+    expect(els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]')).toBeNull();
+  });
+
+  it('D1: an UNTYPED but open PIN entry also survives the poll (the episode marker holds, no race with typing speed)', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    await c.tick();
+    els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]').click();
+    expect(els.matrix.querySelector('.sub-matrix-pin')).toBeTruthy();
+    await c.tick(); // poll before the operator types ANYTHING
+    expect(els.matrix.querySelector('.sub-matrix-pin')).toBeTruthy(); // still a PIN entry, not a button
+  });
+
+  it('D1 (Back): the operator can back out of PIN entry — the hold releases and the cell restores', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    await c.tick();
+    els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]').click();
+    els.matrix.querySelector('[data-matrix-collapse]').click();
+    expect(els.matrix.querySelector('[data-matrix-setup][data-account-id="a1"][data-machine-id="m2"]')).toBeTruthy();
+    expect(els.matrix.querySelector('.sub-matrix-pin')).toBeNull();
+  });
+
+  it('D2+D3(a): Confirm renders the COMPLETE in-cell flow (expected-account warning + link + code input + TTL + notice + Cancel) and it survives polls', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    expect(cell.querySelector('.sub-matrix-expected').textContent).toContain('must show headley.justin@gmail.com');
+    expect(cell.querySelector('a.sub-matrix-signin').getAttribute('href')).toContain('code=true');
+    expect(cell.querySelector('.sub-matrix-notice').textContent).toContain('extra verification step');
+    expect(cell.querySelector('[data-matrix-cancel]')).toBeTruthy();
+    const code = cell.querySelector('.sub-matrix-code-input');
+    code.value = 'ABC'; // mid-paste…
+    await c.tick();     // …poll fires
+    expect(els.matrix.contains(code)).toBe(true); // the code step is NOT swapped for "◷ Signing in…"
+    expect(code.value).toBe('ABC');
+  });
+
+  it('D1 (merge arm): while the cell is held, the poll still refreshes the TTL countdown in place', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    const ttl = cell.querySelector('[data-ttl-expires]');
+    expect(ttl.textContent).toBe('Link expires in 12m');
+    nowMs += 5 * 60_000; // five minutes pass
+    await c.tick();
+    expect(cell.querySelector('[data-ttl-expires]')).toBe(ttl); // same node (merged, not rebuilt)
+    expect(ttl.textContent).toBe('Link expires in 7m');
+  });
+
+  it('D4: a validated code-submit flips the cell to an unmistakable success, then active+just-verified once the pool read catches up — plus a durable ✓ Done card', async () => {
+    scriptMatrixHappyPath();
+    fx.script['/subscription-pool/follow-me/submit-code'] = {
+      status: 201, body: { enabled: true, outcome: 'validated', email: 'headley.justin@gmail.com' },
+    };
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    cell.querySelector('.sub-matrix-code-input').value = 'GOOD-CODE';
+    cell.querySelector('[data-matrix-code-submit]').click();
+    await flush();
+    expect(cell.textContent).toContain('All set');
+    expect(cell.textContent).toContain('headley.justin@gmail.com');
+    expect(cell.getAttribute('class')).toContain('sub-matrix-just-verified');
+    // The pool read now shows the account active on m2 → the rebuilt cell keeps the ceremony.
+    fx.script['/subscription-pool?scope=pool'] = {
+      body: {
+        ...POOL_SCOPE,
+        accounts: [...POOL_SCOPE.accounts, { id: 'a1', email: 'headley.justin@gmail.com', status: 'active', machineId: 'm2', machineNickname: 'Mini' }],
+      },
+    };
+    await c.tick();
+    const rebuilt = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(rebuilt.getAttribute('class')).toContain('sub-matrix-active');
+    expect(rebuilt.getAttribute('class')).toContain('sub-matrix-just-verified');
+    expect(rebuilt.textContent).toContain('just set up');
+    // And the pending panel carries the explicit completed card — not a vanished line.
+    const done = els.pending.querySelector('.sub-pending-done');
+    expect(done).toBeTruthy();
+    expect(done.textContent).toContain('headley.justin@gmail.com is now set up on Mini');
+  });
+
+  it('D3: a held code-submit names BOTH accounts in the cell and refuses the enrollment', async () => {
+    scriptMatrixHappyPath();
+    fx.script['/subscription-pool/follow-me/submit-code'] = {
+      status: 200,
+      body: { enabled: true, outcome: 'held', reason: 'email-mismatch', expected: 'headley.justin@gmail.com', got: 'justin@sagemindai.io' },
+    };
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    cell.querySelector('.sub-matrix-code-input').value = 'WRONG-ACCT-CODE';
+    cell.querySelector('[data-matrix-code-submit]').click();
+    await flush();
+    expect(cell.textContent).toContain('justin@sagemindai.io');
+    expect(cell.textContent).toContain('headley.justin@gmail.com');
+    expect(cell.querySelector('.sub-matrix-setup').textContent).toBe('Retry');
+    // The held presentation persists across the next poll (transient, not a blink).
+    await c.tick();
+    const rebuilt = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(rebuilt.getAttribute('class')).toContain('sub-matrix-held');
+    expect(rebuilt.textContent).toContain('justin@sagemindai.io');
+    // And the panel shows the explicit failure card.
+    expect(els.pending.querySelector('.sub-pending-failed')).toBeTruthy();
+  });
+
+  it('D5: a pane-dead code-submit flips the cell to the explicit needs-restart state', async () => {
+    scriptMatrixHappyPath();
+    fx.script['/subscription-pool/follow-me/submit-code'] = {
+      status: 409,
+      body: { code: 'pane-dead', error: "this sign-in's window is no longer running on its machine, so it can't take a code — start the sign-in again from the dashboard grid" },
+    };
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    cell.querySelector('.sub-matrix-code-input').value = 'ORPHAN-CODE';
+    cell.querySelector('[data-matrix-code-submit]').click();
+    await flush();
+    const rebuilt = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(rebuilt.getAttribute('class')).toContain('sub-matrix-broken');
+    expect(rebuilt.textContent).toContain('Sign-in needs a restart');
+    expect(rebuilt.querySelector('.sub-matrix-setup').textContent).toBe('Retry');
+  });
+
+  it('a dead-flow submit says expired with a fresh sign-in ready, never a raw failed status', async () => {
+    scriptMatrixHappyPath();
+    fx.script['/subscription-pool/follow-me/submit-code'] = {
+      status: 409,
+      body: {
+        code: 'login-expired-fresh-ready',
+        error: 'that code belonged to an expired sign-in — a fresh sign-in is ready now',
+        freshLogin: { id: 'a1', status: 'pending', verificationUrl: 'https://claude.com/oauth/fresh' },
+      },
+    };
+    const c = ctl();
+    c._state.active = true;
+    const cell = await openCellToSignIn(c);
+    cell.querySelector('.sub-matrix-code-input').value = 'STALE-CODE';
+    cell.querySelector('[data-matrix-code-submit]').click();
+    await flush();
+    await flush();
+
+    const rebuilt = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(rebuilt.textContent).not.toContain('Couldn’t submit the code');
+    expect(rebuilt.textContent).not.toContain('failed (409)');
+    expect(rebuilt.textContent).toMatch(/sign in|sign-in/i);
+  });
+
+  it('D4 (expiry): an episode whose pending login vanishes without an outcome resolves to the explicit expired state — never a silent revert to "Set up"', async () => {
+    scriptMatrixHappyPath();
+    const c = ctl();
+    c._state.active = true;
+    await openCellToSignIn(c); // episode open (start-cell succeeded)
+    // Server-side the attempt expired away: no pending login anymore, still not active.
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    await c.tick();
+    const cell = els.matrix.querySelector('[data-cell-key="a1::m2"]');
+    expect(cell.getAttribute('class')).toContain('sub-matrix-expired');
+    expect(cell.textContent).toContain('Sign-in link expired');
+    expect(cell.querySelector('.sub-matrix-setup').textContent).toBe('Retry');
+    // The panel carries the explicit expired card.
+    const failed = els.pending.querySelector('.sub-pending-failed');
+    expect(failed).toBeTruthy();
+    expect(failed.textContent).toContain('expired');
+  });
+
+  it('D1 (pending panel): a half-typed code in the panel survives the poll; D5: a dead-pane row is not submittable', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool?scope=pool'] = { body: POOL_SCOPE };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = {
+      body: {
+        enabled: true,
+        logins: [
+          { id: 'a1', label: 'Justin', kind: 'url-code-paste', machineId: 'm2', machineNickname: 'Mini', paneAlive: true, expectedEmail: 'headley.justin@gmail.com', verificationUrl: 'https://claude.com/oauth', ttlExpiresAt: '2026-06-07T00:12:00Z' },
+          { id: 'zombie', label: 'Ghost', kind: 'url-code-paste', machineId: 'm2', machineNickname: 'Mini', paneAlive: false, verificationUrl: 'https://claude.com/oauth', ttlExpiresAt: '2026-06-07T00:12:00Z' },
+        ],
+      },
+    };
+    const c = ctl();
+    c._state.active = true;
+    await c.tick();
+    // D5: the dead-pane row is an explicit can't-finish card with NO code input.
+    const zombieRow = els.pending.querySelector('.sub-pending-failed');
+    expect(zombieRow.textContent).toContain('can’t finish');
+    expect(zombieRow.querySelector('.sub-pending-code-input')).toBeNull();
+    // D1: type into the LIVE row's code input, then poll — the typed state survives.
+    const input = els.pending.querySelector('.sub-pending-code-input');
+    input.value = 'HALF-TY';
+    await c.tick();
+    expect(els.pending.contains(input)).toBe(true);
+    expect(input.value).toBe('HALF-TY');
+  });
+
+  it('D1 (follow-me Approve card): a half-typed PIN on the Approve card survives the poll', async () => {
+    fx.script['/subscription-pool'] = { body: ACCOUNTS_OK };
+    fx.script['/subscription-pool/pending-logins?scope=pool'] = { body: NO_PENDING };
+    fx.script['/subscription-pool/follow-me/scan'] = {
+      body: { offered: [{ accountId: 'a1', targetMachineId: 'm2', machineNickname: 'Mini', accountLabel: 'personal', agents: ['fp-a', 'fp-b'], expiryText: 'expires soon' }] },
+    };
+    const c = ctl();
+    c._state.active = true;
+    await c.tick();
+    const pin = els.followMe.querySelector('.sub-followme-pin');
+    expect(pin).toBeTruthy();
+    pin.value = '12';
+    await c.tick();
+    expect(els.followMe.contains(pin)).toBe(true);
+    expect(pin.value).toBe('12');
   });
 });

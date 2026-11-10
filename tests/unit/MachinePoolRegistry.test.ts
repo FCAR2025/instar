@@ -88,6 +88,24 @@ describe('MachinePoolRegistry', () => {
     });
   }
 
+  it('records monotonic live receipts only for non-coarse heartbeats', () => {
+    let mono = 10;
+    const reg = new MachinePoolRegistry({
+      listMachines: () => machines,
+      clockSkewToleranceMs: 300_000,
+      failoverThresholdMs: 60_000,
+      now: () => 1_000,
+      monoNow: () => mono,
+    });
+    reg.recordHeartbeat({ machineId: 'm_a', coarseHeartbeat: true });
+    expect(reg.lastLiveReceiptMono('m_a')).toBeUndefined();
+    reg.recordHeartbeat({ machineId: 'm_a' });
+    expect(reg.lastLiveReceiptMono('m_a')).toBe(10);
+    mono = 20;
+    reg.recordHeartbeat({ machineId: 'm_a', coarseHeartbeat: true });
+    expect(reg.lastLiveReceiptMono('m_a')).toBe(10);
+  });
+
   it('liveness uses routerReceivedAt (router clock), not self-reported time', () => {
     let now = 1_000_000;
     const reg = mk(() => now);
@@ -134,6 +152,88 @@ describe('MachinePoolRegistry', () => {
     reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now).toISOString() });
     expect(reg.clockSkewStatus('m_a')).toBe('ok');
     expect(reg.isPlacementEligible('m_a')).toBe(true);
+  });
+
+  // ── COARSE heartbeat (file-based, git-synced) must NOT drive the clock-skew FSM ──
+  // Regression suite for the permanent false-positive quarantine (live Laptop↔Mini,
+  // 2026-06-30): refreshPool fed each peer's 30-min-old file `lastHeartbeatAt` into
+  // the 5-min clock-skew check, stranding the peer in suspect-clock-removed forever.
+  describe('coarse heartbeat (clock-skew abstention)', () => {
+    it('a coarse beat with a STALE timestamp never quarantines (the fix)', () => {
+      let now = 1_000_000;
+      const onQ = vi.fn();
+      const reg = mk(() => now, onQ);
+      // Two consecutive coarse beats, each 30 min stale (would be divergent if live).
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString(), coarseHeartbeat: true });
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString(), coarseHeartbeat: true });
+      expect(reg.clockSkewStatus('m_a')).toBe('ok');
+      expect(reg.isPlacementEligible('m_a')).toBe(true);
+      expect(onQ).not.toHaveBeenCalled();
+    });
+
+    it('the LIVE path still quarantines a stale-timestamp peer (no regression)', () => {
+      let now = 1_000_000;
+      const onQ = vi.fn();
+      const reg = mk(() => now, onQ);
+      // Same stale timestamps but NOT marked coarse → the live FSM still fires.
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString() });
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString() });
+      expect(reg.clockSkewStatus('m_a')).toBe('suspect-clock-removed');
+      expect(onQ).toHaveBeenCalledTimes(1);
+    });
+
+    it('interleaved fresh-live + stale-coarse beats stay eligible (the exact Laptop↔Mini bug)', () => {
+      let now = 1_000_000;
+      const onQ = vi.fn();
+      const reg = mk(() => now, onQ);
+      // The real scenario: PeerPresencePuller fresh beats interleave with refreshPool's
+      // 30s coarse file beats. Before the fix, the coarse beat re-diverged the FSM so the
+      // fresh beats never reached the 2 clean beats to re-admit → permanent quarantine.
+      for (let i = 0; i < 6; i++) {
+        reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now).toISOString() }); // fresh live
+        now += 1000;
+        reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString(), coarseHeartbeat: true }); // stale coarse
+        now += 1000;
+      }
+      expect(reg.clockSkewStatus('m_a')).toBe('ok');
+      expect(reg.isPlacementEligible('m_a')).toBe(true);
+      expect(onQ).not.toHaveBeenCalled();
+    });
+
+    it('a coarse beat still refreshes liveness (online)', () => {
+      let now = 1_000_000;
+      const reg = mk(() => now);
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString(), coarseHeartbeat: true });
+      expect(reg.getCapacity('m_a')!.online).toBe(true); // liveness from routerReceivedAt, unaffected
+    });
+
+    it('a coarse stale beat does not stomp a fresher live selfReportedLastSeen', () => {
+      let now = 1_000_000;
+      const reg = mk(() => now);
+      const freshIso = new Date(now).toISOString();
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: freshIso }); // live, fresh
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now - 1_800_000).toISOString(), coarseHeartbeat: true }); // coarse, older
+      expect(reg.getCapacity('m_a')!.selfReportedLastSeen).toBe(freshIso); // fresher live ts preserved
+    });
+
+    it('a coarse beat does not falsely re-admit a genuinely quarantined peer', () => {
+      let now = 1_000_000;
+      const reg = mk(() => now);
+      // Quarantine via live divergent beats.
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now + 600_000).toISOString() });
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now + 600_000).toISOString() });
+      expect(reg.clockSkewStatus('m_a')).toBe('suspect-clock-removed');
+      // A coarse in-tolerance beat must NOT count toward re-admission (it abstains).
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now).toISOString(), coarseHeartbeat: true });
+      now += 1000;
+      reg.recordHeartbeat({ machineId: 'm_a', selfReportedLastSeen: new Date(now).toISOString(), coarseHeartbeat: true });
+      expect(reg.clockSkewStatus('m_a')).toBe('suspect-clock-removed'); // still quarantined — only LIVE clean beats re-admit
+    });
   });
 
   it('getCapacities returns every known machine; unseen machine is offline + ok', () => {

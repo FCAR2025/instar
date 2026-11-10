@@ -2,6 +2,10 @@
  * Express middleware — JSON parsing, CORS, auth, error handling.
  */
 
+import { memoryReplyChannel, memorySessionAllows } from './memorySessionGuard.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
+import type { SessionTokenRecord } from '../users/MemoryPrivacy.js';
+import { THREADLINE_MCP_DEADLINES } from '../core/threadlineMcpSpawn.js';
 import type { Request, Response, NextFunction } from 'express';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
@@ -48,7 +52,17 @@ export function duplicateResponseGuard(req: Request, res: Response, next: NextFu
   next();
 }
 
+/** The skill-driven sign-in helper's code route: token-authed, loopback-only, never CORS-enabled. */
+export const RELOGIN_HELPER_CODE_PATH = /^\/subscription-relogin\/[A-Za-z0-9._:-]{1,160}\/code$/;
+
 export function corsMiddleware(req: Request, res: Response, next: NextFunction): void {
+  // The sign-in helper's code route sends NO CORS headers, so no browser page can reach it
+  // cross-origin (spec skill-driven-signin-repair §5). A preflight gets a bare refusal.
+  if (RELOGIN_HELPER_CODE_PATH.test(req.path)) {
+    if (req.method === 'OPTIONS') { res.sendStatus(403); return; }
+    next();
+    return;
+  }
   // Restrict CORS to localhost origins only — this is a local management API
   const origin = req.headers.origin;
   if (origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
@@ -117,8 +131,100 @@ export function _resetDeprecationLogCache(): void {
  *   the backward-compatibility deprecation window with a deduped log
  *   line. See spec docs/specs/telegram-delivery-robustness.md § Layer 1b.
  */
-export function authMiddleware(authToken?: string | (() => string | undefined), agentId?: string) {
+/**
+ * Token-only Bearer compare, extracted from the authenticated branch of
+ * `GET /health` so both it and the `/threadline/peers/health?scope=pool` read
+ * use ONE comparison (copying auth logic is how comparisons drift). Reads ONLY
+ * the `Authorization` header — never a query-string token, which would land in
+ * fan-out URLs and logs. No `authToken` configured ⇒ true (an install with no
+ * token has no secret to guard — the same posture `/health` has always had).
+ * The `X-Instar-AgentId` mismatch rule is NOT part of this helper; callers that
+ * need it apply it separately (`/health` never did).
+ */
+/**
+ * The ONLY `/threadline/*` routes the bearer gate lets through. Each is a
+ * peer-protocol or self-mint surface that enforces its own authentication in
+ * the handler:
+ *   - GET  /threadline/health            — peer discovery probe (identity card)
+ *   - POST /threadline/handshake/hello   — Ed25519 handshake, step 1
+ *   - POST /threadline/handshake/confirm — Ed25519 handshake, step 2
+ *   - POST /threadline/messages/receive  — Threadline-Relay token + signature
+ *   - POST /threadline/threads/backfill  — Threadline-Relay token + signature
+ *   - GET  /threadline/blobs/:id         — Threadline-Relay token + signature
+ *   - POST /threadline/secrets/request   — loopback-only self-mint (sealed handoff)
+ * Matching is EXACT (method + full path), never a prefix: `/threadline/healthz`
+ * or `/threadline/health/anything` is NOT public. Exported so the template
+ * auth lint can mirror it without re-deriving it.
+ */
+export const THREADLINE_PUBLIC_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
+  { method: 'GET', path: '/threadline/health' },
+  { method: 'POST', path: '/threadline/handshake/hello' },
+  { method: 'POST', path: '/threadline/handshake/confirm' },
+  { method: 'POST', path: '/threadline/messages/receive' },
+  { method: 'POST', path: '/threadline/threads/backfill' },
+  { method: 'POST', path: '/threadline/secrets/request' },
+];
+
+/** `/threadline/blobs/:id` — one path segment, nothing after it. */
+const THREADLINE_PUBLIC_BLOB_ROUTE = /^\/threadline\/blobs\/[^/]+$/;
+
+/** True iff this exact (method, path) is one of the public Threadline routes above. */
+export function isThreadlinePublicRoute(method: string, reqPath: string): boolean {
+  const m = method.toUpperCase();
+  if (m === 'GET' && THREADLINE_PUBLIC_BLOB_ROUTE.test(reqPath)) return true;
+  return THREADLINE_PUBLIC_ROUTES.some((r) => r.method === m && r.path === reqPath);
+}
+
+export function bearerMatches(req: { headers: Record<string, unknown> }, authToken: string | undefined): boolean {
+  if (!authToken) return true;
+  const header = req.headers.authorization;
+  if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false;
+  const token = header.slice(7);
+  const ha = createHash('sha256').update(token).digest();
+  const hb = createHash('sha256').update(authToken).digest();
+  return timingSafeEqual(ha, hb);
+}
+
+export function authMiddleware(
+  authToken?: string | (() => string | undefined),
+  agentId?: string,
+  /**
+   * The `/mcp/threadline` admission (docs/specs/threadline-mcp-local-http.md D2):
+   * the per-agent local secret, loopback only, no Origin / forwarding headers.
+   * Writes its own refusal and returns false, or returns true to continue. When
+   * absent the route is refused (401) — fail closed, never the agent token.
+   */
+  localMcpGate?: (req: Request, res: Response) => boolean,
+  /**
+   * Mobile device keys (docs/specs/mobile-device-keys.md): a request carrying device headers
+   * is judged only by them. Returns 'none' (no device headers / gate off), 'ok' (authenticated,
+   * principal set) or 'refused' (already answered).
+   */
+  deviceAuth?: (req: Request, res: Response) => 'none' | 'ok' | 'refused',
+  /**
+   * Memory privacy (docs/specs/memory-privacy.md §5): looks up a session token. A
+   * session token never counts as the agent's token; it reaches only the routes in
+   * memorySessionGuard. When absent, session tokens are refused like any bad token.
+   */
+  memorySessionLookup?: (token: string) => SessionTokenRecord | null,
+  /** Told when a scoped session's reply went out. A record only, after the response. */
+  memorySessionReplied?: (session: SessionTokenRecord) => void,
+) {
   return (req: Request, res: Response, next: NextFunction): void => {
+    // Threadline MCP over local HTTP — ONE exact-path rule, FIRST: before the
+    // no-token-configured skip (so an install with no agent token still protects
+    // it) and before the agent-id check (a mismatched id cannot change the
+    // outcome). On this path the local secret replaces the agent token; the
+    // agent token alone is refused. Never a prefix match.
+    if (req.path === '/mcp/threadline') {
+      if (!localMcpGate) {
+        res.status(401).json({ error: 'threadline-mcp-local-secret-required' });
+        return;
+      }
+      if (localMcpGate(req, res)) next();
+      return;
+    }
+
     // Resolve the token per-request so runtime rotation takes effect
     // immediately (a getter is re-read on every request).
     const resolvedToken = typeof authToken === 'function' ? authToken() : authToken;
@@ -153,12 +259,56 @@ export function authMiddleware(authToken?: string | (() => string | undefined), 
       return;
     }
 
+    // Console ticket redeem (docs/specs/mobile-console-device-signin.md §3.3): the single-use
+    // ticket in the body IS the auth, checked in the handler. Exact method + path only.
+    if (req.path === '/dashboard/console-ticket' && req.method === 'POST') {
+      next();
+      return;
+    }
+
+    // A recommended service's confirm page (docs/specs/recommended-services.md, Yes): a phone holds
+    // no token. Reading shows only public catalog text, and a yes needs the single-use token and
+    // the operator's PIN, both checked in the handler. Exact path shape and methods only.
+    if ((req.method === 'GET' || req.method === 'POST') && /^\/recommended-services\/[a-z][a-z0-9-]{0,63}\/confirm$/.test(req.path)) {
+      next();
+      return;
+    }
+
+    // Mobile pairing (docs/specs/mobile-pairing-link.md): the redeem and the self-probe
+    // ping are public by exact path+method; mint and devices stay behind the bearer gate.
+    if ((req.path === '/mobile/pairing-codes/redeem' && req.method === 'POST')
+      || (req.path === '/mobile/pairing-codes/ping' && req.method === 'GET')) {
+      next();
+      return;
+    }
+
+    // Mobile device keys: device-signed requests are judged by their signature and an exact
+    // allowlist, never by a bearer token, and never reach /internal/*.
+    if (deviceAuth && req.headers['x-instar-device'] !== undefined) {
+      if (req.path.startsWith('/internal/')) { res.status(403).json({ error: 'device-not-allowed' }); return; }
+      const verdict = deviceAuth(req, res);
+      if (verdict === 'ok') { next(); return; }
+      if (verdict === 'refused') return;
+    }
+
+    // Whether this connection may unlock: a yes/no the console asks before it
+    // shows a PIN box. Carries no credential and changes nothing.
+    if (req.path === '/dashboard/unlock-check' && req.method === 'GET') {
+      next();
+      return;
+    }
+
     // Message relay endpoints use their own auth (agent tokens / machine-HMAC),
     // not the general API bearer token. Auth is enforced in the route handlers.
     // /a2a/inbox is the same-machine a2a transport — callers hold the TARGET
     // agent's per-agent token (from AgentRegistry), not the API bearer token,
     // so the inbox route enforces `verifyAgentToken` in its handler.
-    if (req.path === '/messages/relay-agent' || req.path === '/messages/relay-machine' || req.path === '/a2a/inbox') {
+    if (
+      req.path === '/messages/relay-agent'
+      || req.path === '/messages/relay-machine'
+      || req.path === '/a2a/inbox'
+      || req.path === '/a2a/apprenticeship/cycles'
+    ) {
       next();
       return;
     }
@@ -177,10 +327,20 @@ export function authMiddleware(authToken?: string | (() => string | undefined), 
       return;
     }
 
-    // Threadline protocol endpoints use their own auth (relay tokens + Ed25519 signatures).
-    // Handshake and health endpoints are unauthenticated by design.
-    // Authenticated threadline endpoints enforce Threadline-Relay auth in route handlers.
-    if (req.path.startsWith('/threadline/')) {
+    // Threadline PEER-PROTOCOL endpoints carry their own auth (the Ed25519
+    // handshake, the Threadline-Relay token + signature, or loopback-only) and
+    // are reached by OTHER agents, which never hold this agent's bearer — so
+    // they are exempt here by EXACT route (method + path), never by prefix.
+    // Every other /threadline/* route is this agent's OWN control surface
+    // (send a message as me, discover, bind a hub topic, change bridge config,
+    // read my conversations) and needs the bearer like any other route. Until
+    // 2026-10-27 the whole prefix was exempt, so an unauthenticated POST over
+    // the public tunnel reached `/threadline/relay-send`'s field validation
+    // (fb-829a7161-942): anyone with the tunnel URL could send Threadline
+    // messages under the agent's identity. Prefix exemptions are how that
+    // happens; the allowlist below is the fix. Keep the lint in
+    // tests/unit/job-template-auth-lint.test.ts in step with it.
+    if (isThreadlinePublicRoute(req.method, req.path)) {
       next();
       return;
     }
@@ -213,9 +373,36 @@ export function authMiddleware(authToken?: string | (() => string | undefined), 
       // Fall through to the standard bearer check below.
     }
 
+    // Skill-driven sign-in helper code route: the per-episode token in X-Relogin-Helper-Token IS
+    // the auth, enforced (with loopback-only) in the route handler. POST only.
+    if (req.method === 'POST' && RELOGIN_HELPER_CODE_PATH.test(req.path)) {
+      next();
+      return;
+    }
+
     // Secret drop routes — the token in the URL IS the auth.
     // GET serves the form, POST receives the submission. Both are user-facing.
     if (req.path.startsWith('/secrets/drop/')) {
+      next();
+      return;
+    }
+
+    // Memory privacy owner recovery: the one-time token in the URL is the auth, and it
+    // can only point this agent at a Claude binary the server already measured.
+    if (/^\/memory-privacy\/fix\/[A-Za-z0-9_-]{43}$/.test(req.path)) {
+      next();
+      return;
+    }
+
+    // Dynamic-MCP operator-approval TAP pages — opened by the operator's BROWSER,
+    // which carries no Bearer token (the operator has the dashboard PIN, not the
+    // agent token). Same posture as Secret Drop: the opaque single-use requestId in
+    // the URL gates the GET page (renders the change, never the nonce), and the POST
+    // submit is PIN-gated by checkMandatePin inside the handler. The Bearer middleware
+    // would otherwise 401 the page before it ever renders. Scoped to `/mcp/approve/<id>`
+    // (trailing slash) so the agent-only `/mcp/approve` (exact) + `/mcp/approval-link`
+    // + `/mcp/load|offload|session` stay Bearer-gated.
+    if (req.path.startsWith('/mcp/approve/')) {
       next();
       return;
     }
@@ -232,6 +419,29 @@ export function authMiddleware(authToken?: string | (() => string | undefined), 
     const header = req.headers.authorization;
     if (!header || !header.startsWith('Bearer ')) {
       res.status(401).json({ error: 'Missing or invalid Authorization header' });
+      return;
+    }
+
+    if (header.startsWith('Bearer mps_')) {
+      const session = memorySessionLookup?.(header.slice(7)) ?? null;
+      if (!session) {
+        res.status(401).json({ error: 'Invalid session token' });
+        return;
+      }
+      if (!memorySessionAllows(req.method, req.path, session)) {
+        res.status(403).json({ error: 'not-available-to-this-session' });
+        return;
+      }
+      res.locals.memorySession = session;
+      const replyChannel = memoryReplyChannel(req.method, req.path);
+      if (replyChannel) {
+        res.once('finish', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) return;
+          featureEvidence.record('memoryPrivacy', { kind: 'fired', reason: 'reply delivered', context: { channel: replyChannel, audience: session.audience.kind } });
+          try { memorySessionReplied?.(session); } catch { /* @silent-fallback-ok — a lost note reads as no reply, which shows on the ladder */ }
+        });
+      }
+      next();
       return;
     }
 
@@ -412,11 +622,123 @@ export const PARITY_PASS_TIMEOUT_MS = 360_000;
 export const POOL_TRANSFER_TIMEOUT_MS = 75_000;
 
 /**
+ * The phone's session controls (docs/specs/mobile-native-session-controls.md) wait on a dashboard route
+ * called over loopback, so each budget has to outlast that route's own: a move reads the machines (up to
+ * 12 s) and then the transfer (75 s), and the rest get past the default 30 s a door switch, a close or a
+ * new session can take.
+ */
+export const MOBILE_SESSION_MOVE_TIMEOUT_MS = POOL_TRANSFER_TIMEOUT_MS + 15_000;
+export const MOBILE_SESSION_ACTION_TIMEOUT_MS = 45_000;
+
+/**
+ * `POST /corrections/analyze` awaits correction meaning grouping (one model
+ * call per uncached candidate pair, bounded by `DEFAULT_RUN_BUDGET_MS` = 240 s
+ * in JevCorrectionGrouping.ts, plus up to one 60 s referee call already in
+ * flight at the deadline) before routing. Under the 30 s default the job's
+ * request would 408 while the handler kept routing, and the job could never
+ * check what was routed. Budget = run budget + referee + slack.
+ */
+export const CORRECTIONS_ANALYZE_TIMEOUT_MS = 330_000;
+
+/**
  * Slack added on top of a configured parity-source TOTAL fetch budget when
  * deriving the parity-pass/import-dryrun route budgets: the route does the full
  * live fetch PLUS server-side compare/import work after it.
  */
 export const PARITY_ROUTE_SLACK_MS = 60_000;
+
+/**
+ * ── Account-follow-me cross-machine sign-in: the BUDGET CHAIN ──────────────
+ *
+ * A single "Set up" tap on the Subscriptions grid nests FOUR budgets. Each
+ * outer one must strictly exceed everything it wraps, or a dumb timer kills a
+ * still-legitimate operation and REPLACES the handler's honest, classified
+ * outcome (`502 login-did-not-start / retryable`, `409 cannot-resolve-email`,
+ * `201 reused`) with a bare "Request timeout" the operator cannot act on:
+ *
+ *   L1  POST /subscription-pool/matrix/start-cell   (fronting machine, this map)
+ *   L2  ├─ mandate delivery over the mesh           (FOLLOWME_MANDATE_DELIVERY_BUDGET_MS)
+ *       └─ relay fetch → the target's enroll/start  (followMeRelayFetchMs)
+ *   L3     POST /subscription-pool/follow-me/enroll/start  (TARGET machine, this map)
+ *   L4       FrameworkLoginDriver.drive() pane scrape      (remoteScrapeTimeoutMs)
+ *
+ * Shipped state (2026-08-20, reported by the operator as "Couldn't start:
+ * Request timeout" on a cross-machine cell): L1 and L3 both inherited the 30s
+ * DEFAULT while L2's relay was hard-coded to 40s and L4 was configured to
+ * 180s. So the outermost budget was the SMALLEST — the inversion fired on every
+ * cross-machine tap slower than 30s, which on a Cloudflare-routed peer is the
+ * normal case, not the edge case.
+ *
+ * This is the SAME "408 while the handler keeps running" failure class that
+ * OUTBOUND_MESSAGING_TIMEOUT_MS, PARITY_PASS_TIMEOUT_MS and
+ * POOL_TRANSFER_TIMEOUT_MS each already exist to prevent. It recurred here
+ * because those three were fixed as individual constants, so a NEW nested route
+ * had nothing to inherit. Deriving the whole chain from one source — and
+ * asserting the ordering in a test — is what makes the fix structural instead
+ * of a fourth spot-fix waiting for a fifth.
+ */
+
+/** Mesh bound on `deliverMandateToMachine` (commands/server.ts `timeoutMs: 15_000`).
+ *  Mirrored here because start-cell spends it BEFORE its relay fetch begins. */
+export const FOLLOWME_MANDATE_DELIVERY_BUDGET_MS = 15_000;
+
+/** Driver default when `remoteScrapeTimeoutMs` is unset (FrameworkLoginDriver). */
+export const FOLLOWME_DEFAULT_SCRAPE_TIMEOUT_MS = 60_000;
+
+/** Spawn + artifact-parse + store-write the target does AROUND the pane scrape. */
+export const FOLLOWME_ENROLL_START_SLACK_MS = 30_000;
+
+/** Slack so the relay fetch outlives the target ROUTE it is waiting on. */
+export const FOLLOWME_RELAY_SLACK_MS = 10_000;
+
+/** Slack so start-cell's route budget outlives mandate delivery + its relay. */
+export const FOLLOWME_START_CELL_SLACK_MS = 10_000;
+
+/**
+ * Budget for the two SIMPLE fronting relays (`follow-me/submit-code`,
+ * `follow-me/cancel`). Their target-side work never drives a login — it types a
+ * code into a live pane (bounded by the identity oracle's own 10s) or kills one
+ * — so they keep the fixed 40s relay fetch and need only a route budget above
+ * it. submit-code is the one that MUST NOT 408: a verification code is
+ * single-use, so a timeout there leaves the operator unable to tell whether
+ * their one shot was spent.
+ */
+export const FOLLOWME_SIMPLE_RELAY_FETCH_MS = 40_000;
+export const FOLLOWME_SIMPLE_RELAY_ROUTE_MS = 60_000;
+
+export interface FollowMeBudgets {
+  /** L4 — the pane-scrape budget actually in force on the target. */
+  scrapeMs: number;
+  /** L3 — route budget for the target's `follow-me/enroll/start`. */
+  enrollStartRouteMs: number;
+  /** L2 — the fronting machine's relay fetch to that route. */
+  relayFetchMs: number;
+  /** L1 — route budget for `matrix/start-cell`. */
+  startCellRouteMs: number;
+}
+
+/**
+ * Derive the whole chain from the ONE operator-tunable value
+ * (`multiMachine.accountFollowMe.remoteScrapeTimeoutMs`), so widening the scrape
+ * budget for a slow remote widens every budget above it instead of silently
+ * re-inverting the chain. Strict `<` ordering is asserted in the unit test.
+ */
+export function resolveFollowMeBudgets(remoteScrapeTimeoutMs?: number): FollowMeBudgets {
+  const scrapeMs =
+    typeof remoteScrapeTimeoutMs === 'number' &&
+    Number.isFinite(remoteScrapeTimeoutMs) &&
+    remoteScrapeTimeoutMs > 0
+      ? remoteScrapeTimeoutMs
+      : FOLLOWME_DEFAULT_SCRAPE_TIMEOUT_MS;
+  const enrollStartRouteMs = scrapeMs + FOLLOWME_ENROLL_START_SLACK_MS;
+  const relayFetchMs = enrollStartRouteMs + FOLLOWME_RELAY_SLACK_MS;
+  const startCellRouteMs =
+    relayFetchMs + FOLLOWME_MANDATE_DELIVERY_BUDGET_MS + FOLLOWME_START_CELL_SLACK_MS;
+  return { scrapeMs, enrollStartRouteMs, relayFetchMs, startCellRouteMs };
+}
+
+/** Past HOLDER_MEDIA_DEADLINE_MS (300 s), so the stream's own limit always ends first. */
+export const MOBILE_MEDIA_TIMEOUT_MS = 330_000;
 
 /**
  * The production per-path request-timeout overrides. Exported as the single
@@ -432,8 +754,13 @@ export const PARITY_ROUTE_SLACK_MS = 60_000;
  * live 2026-06-05: 600s/page configured, 360s route → four concurrent passes).
  * The constant stays the floor; the derived budget never shrinks below it.
  */
-export function buildRequestTimeoutOverrides(opts?: { paritySourceTotalTimeoutMs?: number }): Record<string, number> {
+export function buildRequestTimeoutOverrides(opts?: {
+  paritySourceTotalTimeoutMs?: number;
+  followMeRemoteScrapeTimeoutMs?: number;
+  defaultTimeoutMs?: number;
+}): Record<string, number> {
   const configuredTotal = opts?.paritySourceTotalTimeoutMs;
+  const followMe = resolveFollowMeBudgets(opts?.followMeRemoteScrapeTimeoutMs);
   const parityBudgetMs = typeof configuredTotal === 'number' && Number.isFinite(configuredTotal) && configuredTotal > 0
     ? Math.max(PARITY_PASS_TIMEOUT_MS, configuredTotal + PARITY_ROUTE_SLACK_MS)
     : PARITY_PASS_TIMEOUT_MS;
@@ -444,7 +771,13 @@ export function buildRequestTimeoutOverrides(opts?: { paritySourceTotalTimeoutMs
     '/whatsapp/send': OUTBOUND_MESSAGING_TIMEOUT_MS,
     '/imessage/reply': OUTBOUND_MESSAGING_TIMEOUT_MS,
     '/imessage/validate-send': OUTBOUND_MESSAGING_TIMEOUT_MS,
+    // A file from another machine has its own 300 s limit, and a 408 under the stream would leave
+    // its slot held. Uploads and purge keep the agent's configured default.
+    '/mobile/media': Math.max(MOBILE_MEDIA_TIMEOUT_MS, opts?.defaultTimeoutMs ?? 30_000),
+    '/mobile/media/uploads': opts?.defaultTimeoutMs ?? 30_000,
+    '/mobile/media/purge': opts?.defaultTimeoutMs ?? 30_000,
     '/spec/conformance-check': SPEC_REVIEW_TIMEOUT_MS,
+    '/corrections/analyze': CORRECTIONS_ANALYZE_TIMEOUT_MS,
     '/cutover-readiness/parity-pass': parityBudgetMs,
     // The import dry-run does the same full live source fetch as a parity pass
     // (plus an in-memory import + gate, which is fast) — same budget.
@@ -455,6 +788,30 @@ export function buildRequestTimeoutOverrides(opts?: { paritySourceTotalTimeoutMs
     // WS1.2: the deterministic transfer awaits the owner-side drain (≤ drain
     // bound + the 50s remote-call cap) synchronously — see POOL_TRANSFER_TIMEOUT_MS.
     '/pool/transfer': POOL_TRANSFER_TIMEOUT_MS,
+    '/mobile/sessions/move': MOBILE_SESSION_MOVE_TIMEOUT_MS,
+    '/mobile/sessions/door': MOBILE_SESSION_ACTION_TIMEOUT_MS,
+    '/mobile/sessions/close': MOBILE_SESSION_ACTION_TIMEOUT_MS,
+    '/mobile/sessions/new': MOBILE_SESSION_ACTION_TIMEOUT_MS,
+    '/mobile/sessions/default': MOBILE_SESSION_ACTION_TIMEOUT_MS,
+    // Account-follow-me cross-machine sign-in chain — see the FollowMeBudgets
+    // block above. These four entries are what stop the outermost budget from
+    // being the smallest one in the stack.
+    //
+    // NOTE the prefix matcher is longest-prefix over `path` OR `path + '/'`, and
+    // the target-side submit-code/cancel routes are PARAMETERISED
+    // (`/follow-me/enroll/:id/submit-code`), so they sit UNDER the
+    // '/subscription-pool/follow-me/enroll' prefix and inherit the enroll-start
+    // budget. That is deliberate: the target-side completion runs the S7 email
+    // gate and must not 408 mid-add either.
+    '/subscription-pool/follow-me/enroll': followMe.enrollStartRouteMs,
+    '/subscription-pool/matrix/start-cell': followMe.startCellRouteMs,
+    '/subscription-pool/follow-me/submit-code': FOLLOWME_SIMPLE_RELAY_ROUTE_MS,
+    '/subscription-pool/follow-me/cancel': FOLLOWME_SIMPLE_RELAY_ROUTE_MS,
+    // Threadline long waits (docs/specs/threadline-mcp-local-http.md "Bounds",
+    // deadline 4): relay-send's reply wait is capped at 300 s and the MCP route
+    // answers by 320 s; the generic 30 s cut-off 408'd every wait past it.
+    '/threadline/relay-send': THREADLINE_MCP_DEADLINES.middlewareMs,
+    '/mcp/threadline': THREADLINE_MCP_DEADLINES.middlewareMs,
   };
 }
 
@@ -526,17 +883,65 @@ function verifyViewSignature(viewPath: string, sig: string, authToken: string): 
  * and restricts resource loading to trusted sources.
  */
 export function dashboardSecurityHeaders(req: Request, res: Response, next: NextFunction): void {
-  if (req.path === '/dashboard' || req.path.startsWith('/dashboard/')) {
+  // Express routes match case-insensitively (`/Dashboard/legacy` reaches the legacy page), so the
+  // headers must too (dashboard-console-default-and-pair-page round 2).
+  const p = req.path.toLowerCase();
+  if (p === '/dashboard' || p.startsWith('/dashboard/')) {
     res.header('X-Frame-Options', 'DENY');
     res.header('X-Content-Type-Options', 'nosniff');
-    res.header(
-      'Content-Security-Policy',
-      "default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' cdn.jsdelivr.net; connect-src 'self'",
-    );
+    const host = req.get('host') ?? '';
+    const desktopConnect = /^[A-Za-z0-9.:[\]-]+$/.test(host)
+      ? `connect-src 'self' ws://${host} wss://${host}` : "connect-src 'self'";
+    res.header('Content-Security-Policy',
+      p === '/dashboard/desktop.html' || p === '/dashboard/desktop.js'
+        ? `default-src 'none'; script-src 'self'; style-src 'self'; img-src blob: 'self'; ${desktopConnect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+        : "default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' cdn.jsdelivr.net; connect-src 'self'");
     res.header('Referrer-Policy', 'no-referrer');
   }
   next();
 }
+
+/**
+ * #1441 — dashboard static assets must never outlive a deploy.
+ *
+ * Before #1441, express.static served `Cache-Control: public, max-age=0`, which
+ * Cloudflare's edge overrode with a multi-hour browser TTL for .js/.css, so a fresh
+ * index.html met a stale glance.js and a tab went blank for up to 4h after a deploy.
+ * #1441 switched everything to `no-cache`, believing Cloudflare honors it.
+ *
+ * Measured 2026-10-30 through the named tunnel (echo-studio.dawn-tunnel.dev): it
+ * honors `no-cache` for HTML (passes through, `cf-cache-status: DYNAMIC`) but still
+ * REWRITES it to `max-age=14400` for .js and .css (`cf-cache-status: REVALIDATED`),
+ * while `no-store` passes through untouched (`BYPASS`). The operator's phone then
+ * kept a 4h-old console.css after a release and the new maturation board rendered
+ * unstyled. So scripts and stylesheets get `no-store`: every load re-downloads them
+ * (a few hundred KB over the agent's own tunnel), and a release reaches the screen
+ * at once. Pages keep `no-cache` with ETag revalidation. ES modules import each
+ * other by bare relative path, so a version query on the page's links alone could
+ * not reach them — the header has to be right on every module.
+ *
+ * Runs via `express.static({ setHeaders })` (it wins over serve-static's own
+ * header) and is called directly for the index.html `res.sendFile` routes.
+ */
+// E2E-PAIRING: EXEMPT — static header helper; covered by the unit and integration static-serving suites, no route added.
+const NO_STORE_ASSET_RE = /\.(?:m?js|css)$/i;
+
+export function dashboardCacheControl(res: Response, filePath?: string): void {
+  res.setHeader('Cache-Control', filePath && NO_STORE_ASSET_RE.test(filePath) ? 'no-store' : 'no-cache');
+}
+
+/**
+ * The `express.static` options for the dashboard directory — exported so the
+ * AgentServer wiring and its integration test exercise the SAME object (no drift).
+ * `setHeaders` applies {@link dashboardCacheControl} (with the served file's path)
+ * after serve-static would set its own header, so it is the final Cache-Control;
+ * etag/lastModified stay on for cheap 304 revalidation of pages.
+ */
+export const DASHBOARD_STATIC_OPTIONS = {
+  etag: true,
+  lastModified: true,
+  setHeaders: dashboardCacheControl,
+} as const;
 
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction): void {
   const message = err instanceof Error ? err.message : String(err);

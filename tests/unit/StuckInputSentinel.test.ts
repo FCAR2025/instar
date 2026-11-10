@@ -22,6 +22,7 @@ type StubManager = {
   listRunningSessions: ReturnType<typeof vi.fn>;
   tmuxSessionExists: ReturnType<typeof vi.fn>;
   captureOutput: ReturnType<typeof vi.fn>;
+  captureOutputAnsi: ReturnType<typeof vi.fn>;
   fireStuckInputRecovery: ReturnType<typeof vi.fn>;
   getStrandedDraftMarker: ReturnType<typeof vi.fn>;
   clearStrandedDraftMarker: ReturnType<typeof vi.fn>;
@@ -34,10 +35,15 @@ type StubManager = {
  * @param markers per-session stranded-draft marker record. When a session has a
  *   codex marker, the sentinel uses MARKER-based detection (isMarkerStuckAtPrompt
  *   over the pane) instead of the generic `❯`-prompt reader.
+ * @param ansiPanes per-session ANSI (`capture-pane -e`) frames for the F2
+ *   ghost-text gate. Defaults to the plain pane — a frame with no SGR codes
+ *   renders nothing dim, so the gate classifies the text as 'real' and the
+ *   legacy recovery behavior is preserved.
  */
 function buildStubManager(
   panes: Record<string, string | (() => string)>,
   markers: Record<string, { marker: string; framework: string }> = {},
+  ansiPanes: Record<string, string | (() => string)> = {},
 ): StubManager {
   const liveMarkers = new Map(Object.entries(markers).map(([k, v]) => [k, { ...v, injectedAt: 0 }]));
   return {
@@ -47,7 +53,11 @@ function buildStubManager(
       const p = panes[name];
       return typeof p === 'function' ? p() : p;
     }),
-    fireStuckInputRecovery: vi.fn(),
+    captureOutputAnsi: vi.fn((name: string) => {
+      const a = ansiPanes[name] ?? panes[name];
+      return typeof a === 'function' ? a() : a;
+    }),
+    fireStuckInputRecovery: vi.fn().mockReturnValue({ status: 'attempted' }),
     getStrandedDraftMarker: vi.fn((name: string) => liveMarkers.get(name)),
     clearStrandedDraftMarker: vi.fn((name: string) => { liveMarkers.delete(name); }),
     strandedDraftMarkerSessions: vi.fn(() => [...liveMarkers.keys()]),
@@ -164,6 +174,20 @@ describe('StuckInputSentinel — tick lifecycle', () => {
     // No fake timers — we drive ticks manually via .tick().
   });
 
+  it('does not synchronously probe idle Codex sessions without a tracked draft', () => {
+    const mgr = buildStubManager({ 'echo-codex': EMPTY_PROMPT_PANE });
+    mgr.listRunningSessions.mockReturnValue([
+      { tmuxSession: 'echo-codex', framework: 'codex-cli' },
+    ]);
+    const sentinel = buildSentinel(mgr);
+
+    sentinel.tick();
+
+    expect(mgr.tmuxSessionExists).not.toHaveBeenCalled();
+    expect(mgr.captureOutput).not.toHaveBeenCalled();
+    expect(mgr.fireStuckInputRecovery).not.toHaveBeenCalled();
+  });
+
   it('does NOT fire on the first observation of stuck text', () => {
     const mgr = buildStubManager({ 'echo-A': STUCK_PANE_IDLE });
     const sentinel = buildSentinel(mgr);
@@ -186,6 +210,20 @@ describe('StuckInputSentinel — tick lifecycle', () => {
     expect(mgr.fireStuckInputRecovery).toHaveBeenCalledTimes(1);
     expect(mgr.fireStuckInputRecovery).toHaveBeenCalledWith('echo-A', 0);
     expect(sentinel.getRecordForTest('echo-A')?.attempts).toBe(1);
+  });
+
+  it('does not consume a rung when the durable recovery primitive refuses', () => {
+    const mgr = buildStubManager({ 'echo-A': STUCK_PANE_IDLE });
+    mgr.fireStuckInputRecovery.mockReturnValue({ status: 'refused', reason: 'attempt-arm-refused' });
+    const sentinel = buildSentinel(mgr);
+
+    sentinel.tick();
+    sentinel.tick();
+    sentinel.tick();
+
+    expect(mgr.fireStuckInputRecovery).toHaveBeenCalledTimes(2);
+    expect(mgr.fireStuckInputRecovery.mock.calls.map(c => c[1])).toEqual([0, 0]);
+    expect(sentinel.getRecordForTest('echo-A')?.attempts).toBe(0);
   });
 
   it('escalates across ticks: Enter (0) → Enter (1) → C-m (2) → Enter-sleep-Enter (3)', () => {

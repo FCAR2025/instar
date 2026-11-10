@@ -45,6 +45,10 @@ describe('Route validation edge cases', () => {
 
   beforeAll(() => {
     project = createTempProject();
+    project.state.saveSession({
+      id: 'test-output-session', name: 'test-session', tmuxSession: 'test-test-session',
+      status: 'running', startedAt: new Date().toISOString(),
+    });
     mockSM = createMockSessionManager();
     const server = new AgentServer({
       config: fakeConfig,
@@ -87,6 +91,32 @@ describe('Route validation edge cases', () => {
           model: 'gemini-2.5-flash',
         });
       expect(res.status).not.toBe(400);
+    });
+
+    it('accepts codex-cli GPT-5.6 + GPT-6 family model values', async () => {
+      // Request count is deliberately unchanged (this file sits at the spawn
+      // rate-limit budget — adding a 4th request 429s and cascades into the
+      // tests after it), so this samples the HTTP path end-to-end. Per-id
+      // coverage for the FULL list is asserted against the route's own
+      // spawnModelAllowlist in topicProfileValidation.test.ts, which needs no
+      // HTTP request per id.
+      for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra']) {
+        // Session name must be dot-free (SESSION_NAME_RE) — the model id has dots.
+        const name = `test-codex-${model.replace(/\./g, '-')}`;
+        const res = await request(app)
+          .post('/sessions/spawn')
+          .send({ name, prompt: 'hello', framework: 'codex-cli', model });
+        // NOT 400 = the model passed the codex allowlist (may be 201/500 downstream).
+        expect(res.status).not.toBe(400);
+      }
+    });
+
+    it('rejects a made-up codex-cli model value (fail-closed)', async () => {
+      const res = await request(app)
+        .post('/sessions/spawn')
+        .send({ name: 'test-fake-codex', prompt: 'hello', framework: 'codex-cli', model: 'gpt-9.9-fake' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('model');
     });
 
     it('rejects name over 200 characters', async () => {

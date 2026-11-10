@@ -43,6 +43,165 @@ export interface DevGatedFeature {
 }
 
 export const DEV_GATED_FEATURES: DevGatedFeature[] = [
+  { name: 'notificationSelectivity', configPath: 'notifications.selectivity.enabled', description: 'Observe automated notification dispositions on development agents; fleet remains dark until operator enable.', justification: 'Structural provenance only, dry-run by default, reply floors preserved. Echo enforcement is explicitly authorized by the current operator directive; other agents retain the approved staged flip.' },
+  {
+    name: 'scriptRunners',
+    configPath: 'jobs.scriptRunners.enabled',
+    description: 'Script runners (job-cost-reduction §5.1): the converted built-in jobs run their shipped Node script instead of opening a model session; omitted ⇒ live on a development agent, every converted job runs its body as a session on the fleet.',
+    justification: 'Each script calls the same local endpoint its session body called, under the same claim and lock-file trust; an untrusted script records failed and starts nothing. Setting enabled:false or listing a slug in disabledSlugs restores the session path live at the next trigger. No credential or state mutation beyond what the session already did; it removes spend.',
+  },
+  {
+    name: 'scriptTriageJev',
+    configPath: 'jobs.scriptTriage.jev.enabled',
+    description: 'Jev triage of script-job results (job-cost-reduction §5.6.2): a scrubbed, clamped summary of a non-bare script run is sent to TypeSafe for routine / needs-session; omitted ⇒ live on a development agent, dark on the fleet (F12).',
+    justification: 'Advisory only: the deterministic floor (critical anomaly or a second consecutive failure) still starts a session whatever Jev answers, and every Jev failure falls to that floor. Inert without the vault typesafe_api_key; daily call cap; sessions are bounded by the triage caps and cooldown.',
+  },
+  {
+    name: 'machineMaintenance',
+    configPath: 'machineMaintenance.enabled',
+    description: 'Machine self-maintenance, watch-only (docs/specs/machine-self-maintenance.md): a nightly paper drain records what a scheduled restart would have done and how long work takes to yield.',
+    justification: 'Cannot act: it holds no restart path and no yield method, its OS commands are an allowlist of fixed probes, and a source lint fails the build if that changes. It writes its own audit logs and host-level rehearsal and wedge records. The wedge sampler (Part E, dry-run) adds one bounded judge call per wedge condition (at most 6 per 24 h, host maintainer only) and an operator notice that is OFF unless machineMaintenance.wedgeRestart.dryRunNotice is true.',
+  },
+  {
+    name: 'workAdmission',
+    configPath: 'monitoring.workAdmission.enabled',
+    description: 'Overload admission (trustworthy-machine-load Part C): closes this machine to new automatic work while its own multi-signal load verdict is saturated/impaired, keeps one host-wide recovery slot for an operator session, advertises the state so placement skips it.',
+    justification: 'Ships dryRun:true: the state machine, audit and advert run on the real verdict feed but nothing is refused and peers keep placing work here until a deliberate dryRun:false. Even live it only DEFERS automatic work (jobs retry, inbound messages stay in the durable queue) and always leaves an operator session a slot; no LLM, no spend, no kills, no credential or state mutation.',
+  },
+  {
+    name: 'overloadShed',
+    configPath: 'monitoring.overloadShed.enabled',
+    description: 'Overload shed (trustworthy-machine-load Part D): once this machine has refused new work for 3 minutes, proposes moving one existing Telegram conversation at a time to a healthy machine through the ownership reconciler, and drives started transfers to claim or abort independently of pins.',
+    justification: 'Ships dryRun:true: it logs each move it WOULD make and proposes nothing, and it also proposes nothing while overload admission itself is in dry-run. Even live, a move is a cooperative ownership transfer (the reconciler in its own dry-run performs no CAS), pinned topics and topics with a live autonomous run are never moved, and a breaker caps it at 2 moves per hour with 2 tries per topic per episode; no LLM, no spend, no kills.',
+  },
+  {
+    name: 'identityReannounce',
+    configPath: 'multiMachine.identityReannounce.enabled',
+    description: 'Challenge-bound machine signing-key recovery with recovery-key continuity and exact epochs.',
+    justification: 'Ships dryRun:true; peer evaluation and quarantine are exercised but no trust anchor changes until deliberately promoted. Deterministic fail-closed authority, bounded attempts, no LLM or spend.',
+  },
+  {
+    name: 'observedEndpoints',
+    configPath: 'multiMachine.observedEndpoints.enabled',
+    description: 'Local-first direct source-address corroboration for VM/WSL peers that cannot self-advertise their host route.',
+    justification: 'Ships dryRun:true; requires full mesh signature verification, 3 observations over 30 minutes, no forwarded headers/shared egress, rotation quarantine, and signed dial-back before promotion.',
+  },
+  {
+    name: 'recoveryKeyEscrow',
+    configPath: 'multiMachine.recoveryKeyEscrow.enabled',
+    description: 'Keychain-only escrow for the per-machine recovery signing key.',
+    justification: 'Ships dryRun:true and never mints on a file-key-backed store. The private key stays sealed outside .instar/machine and signs only domain-separated rotations.',
+  },
+  {
+    name: 'undatedActionResurfacer',
+    configPath: 'evolutionActions.undatedResurfacer.enabled',
+    description: 'Bounded resurfacing for pending high/critical evolution actions that have no due date.',
+    justification: 'Ships dryRun:true: the development agent exercises the real action-store selection, durable ledger, pool-agreed-state-owner + serving-lease gate, and metrics while emitting no Attention item. A handoff away from the ledger owner pauses rather than resetting cooldown state; missing or divergent latest authenticated owner adverts from any registered peer refuse visibly. Live mode is structurally capped at one idempotent item per four-hour run with a 14-day per-row cooldown and three-raise terminal disposition rung; no LLM, spend, action mutation, or unbounded retry.',
+  },
+  {
+    name: 'feedbackFactoryProcessing',
+    configPath: 'feedbackFactory.processing.enabled',
+    description: 'Canonical feedback clustering pass over the operated store.',
+    justification: 'Local bounded JSONL projection only; no external action, spend, or product-resolution authority.',
+  },
+  {
+    name: 'toneGateAdvisoryMigration',
+    configPath: 'toneGate.advisoryMigration',
+    description:
+      'Outbound tone-gate representation rules resolve as overridable nudges (with a recorded reason) instead of terminal blocks; the self-stop family and the deterministic credential wall stay hard.',
+    justification:
+      'Takes LESS action, not more — it removes blocking authority rather than adding it, and is self-limiting: the advisory disposition is withdrawn back to a block whenever the override could not be recorded. No external action, no spend, and the rollback is a config flag.',
+  },
+  {
+    name: 'feedbackFactoryDrain',
+    configPath: 'feedbackFactory.drain.enabled',
+    description: 'Canonical feedback readiness/outbox drain cadence.',
+    justification: 'Bounded local SQLite transitions with durable leases and metrics; fleet stays dark and consumer promotion is separate.',
+  },
+  {
+    name: 'feedbackFactoryConsumer',
+    configPath: 'feedbackFactory.consumer.enabled',
+    description: 'Feedback work handoff into user-visible Initiative tasks.',
+    justification: 'Ships dryRun:true; development agents exercise the exact state machine without canonical queue or Initiative mutation until operator promotion.',
+  },
+  {
+    name: 'feedbackFactoryTriage',
+    configPath: 'feedbackFactory.triage.enabled',
+    description: 'Frontier-model work/hold/ignore triage of feedback Initiatives within deterministic floors, with a ranked work queue and a daily operator action list.',
+    justification: 'Inert until the operator approves the triage authority with the dashboard PIN; every disposition is reversible (hold/ignore pause the Initiative, never archive), ignore ships in shadow until a separate PIN approval, model calls are capped per day and pause on subscription quota, and it never writes cluster or report status or takes an external action.',
+  },
+  {
+    name: 'feedbackFactoryExecute',
+    configPath: 'feedbackFactory.execute.enabled',
+    description: 'Feedback executor: confined build sessions turn top-ranked feedback work items into pull requests that merge only at the exact head the repository owner approves.',
+    justification: 'Ships dryRun:true (evaluates admission and records the attempt it would start, spawning and pushing nothing). Live, every session and every command that runs attempt code is OS-sandboxed (no network, no credentials, no reads outside the workspace) behind a must-fail/must-succeed canary before each attempt; trusted code alone pushes, from its own clone, refusing tooling paths and secret-shaped content; merges happen only at the exact head the repository owner approved, and the executor refuses to run while the agent itself could act as that approver unless a PIN-bound acceptance exists.',
+  },
+  {
+    name: 'mutualSsh',
+    configPath: 'multiMachine.mutualSsh.enabled',
+    description: 'Mutual SSH-subsystem bootstrap and continuous proof: dedicated Instar-only keys, restricted subsystem admissions, and source-local A→B/B→A evidence.',
+    justification: 'Ships dryRun:true and fleet-dark. The dev canary generates only dedicated keys beneath Instar state and computes would-admit/would-probe evidence; it never touches personal SSH state or accepts a peer session until an explicit dryRun:false flip. No shell, exec, forwarding, SFTP, passwords, or public wildcard bind exists.',
+  },
+  {
+    name: 'peerExecution',
+    configPath: 'multiMachine.peerExecution.enabled',
+    description: 'Install mutually verified peer client keys into this agent home for standing peer-machine execution.',
+    justification: 'Ships dryRun:true and fleet-dark. Authority requires fresh bidirectional MachineAuth proof at the current pairing epoch; writes are restricted to the agent-home authorized_keys.',
+  },
+  {
+    name: 'proactiveSwapLoginLoss',
+    configPath: 'subscriptionPool.proactiveSwap.loginLoss.enabled',
+    description: 'Login-loss extension for the existing live-session proactive account-swap funnel.',
+    justification: 'Ships dryRun:true and fleet-dark. On a development agent it only records the exact would-swap while retaining target freshness, work-in-flight, dwell, breaker, cycle-cap, and kill-boundary source revalidation; a real session refresh requires an explicit dryRun:false promotion.',
+  },
+  {
+    name: 'proactiveSwapDefaultSlotRepoint',
+    configPath: 'subscriptionPool.proactiveSwap.defaultSlotRepoint.enabled',
+    description: 'Q3-safe pre-limit rescue for untagged sessions by re-pointing the existing default credential slot instead of changing a live session binding.',
+    justification: 'Ships dryRun:true and fleet-dark. On a development agent it selects the exact freshest eligible same-framework account and records the intended default-slot flip, but performs no credential write while dryRun holds. Live actuation requires an explicit dryRun:false promotion and delegates to the existing CredentialSwapExecutor set-default path, retaining its dark gate, single-mover funnel, identity checks, audit scrubber, and cooldown. It never changes a session binding.',
+  },
+  {
+    name: 'ownershipGatedSpawn',
+    configPath: 'multiMachine.sessionPool.ownershipGatedSpawn.enabled',
+    description: 'SpawnAdmission — the binding-verdict seam at every conversation-bound session-creating callsite (ownership-gated-spawn-and-judgment-within-floors §3.1, Layer A; the Ownership-Gated Side Effects standard). Consults resolveOwnershipSafe (tri-state, non-throwing) and the router verdict (TOCTOU consumption) before Telegram cold-spawn/respawn + Slack inbound/recovery spawns; never a bootleg local copy of an owned-elsewhere conversation.',
+    justification: 'Ships dryRun:true for owner-dark/error rows. The narrow enforceLiveOwner arm binds only a verified live OTHER owner when durable inbound custody is live; this prevents a bootleg local copy without prematurely graduating the stale-owner ladder. No custody, pool-dark, single-machine, unowned, owner-dark, and registry-error paths retain their existing allow/dry-run behavior. Fleet remains dark through resolveDevAgentGate. Fail direction on registry error is TOWARD the spawn (reachability wins), bounded by a code-constant breaker. No LLM call, no spend, no egress.',
+  },
+  {
+    name: 'standDown',
+    configPath: 'monitoring.standDown.enabled',
+    description: 'Duplicate-session stand-down (docs/specs/duplicate-session-standdown.md) — cooperative quiescence for the LOSING copy when one conversation is live on two machines: a PreToolUse `*` muzzle stops it starting new tool calls, the two conversational send funnels refuse its outbound sends with 409, and the bounded drained-close retires it once corroborated drain is established.',
+    justification: 'Ships dryRun:true (the canary): on a dev agent producers register entries and BOTH enforcement halves log would-block/would-refuse verdicts while blocking and refusing NOTHING; real enforcement needs a deliberate dryRun:false on named soak evidence. It is the LESS destructive replacement for a terminate primitive round-4 review rejected — it never kills a session, never blocks a read (Read/Glob/Grep/TodoWrite are always allowed), and the drained-close crosses exactly three named keep-reasons behind a corroborated drain predicate while never crossing protected/active-subagent/structural-long-work/the uninspectable reasons. Every uncertainty fails toward RELEASE (reachability wins) and the hook fails OPEN on every error path, so a broken guard can never freeze a session. Registration REFUSES (escalating to the operator) when the duplicate holds contested real work. No LLM call, no spend, no egress; single-machine agents never produce an entry.',
+  },
+  {
+    name: 'duplicateReconciler',
+    configPath: 'multiMachine.sessionPool.duplicateReconciler.enabled',
+    description: 'Duplicate-session reconciler (same spec §3.2, Layer B) — a 60s lease-holder tick that detects the SAME conversation live on ≥2 machines, determines the intended owner from evidence (pin → admissible epoch → registered live run → escalate), converges the OWNERSHIP RECORD via the existing CAS + fencing, confirms peer echo, and lets the existing gated closeout close the non-owner copy. Never a new killer.',
+    justification: 'Ships dryRun:true (the dry-run canary): on a dev agent the reconciler runs detection + intended-owner determination and LOGS every convergence write it WOULD make (logs/duplicate-reconciler.jsonl), but lands NO CAS and triggers NO closeout while dryRun holds — real convergence needs a deliberate dryRun:false. Doubly inert on the fleet: it refuses to arm on the fleet-default in-memory ownership store (substrate-not-ready, §3.2.0) regardless of flags. All ambiguity (both-run, epoch-vs-run contradiction, 409) escalates to ONE attention item rather than acting. P17 per-tick caps + P19 per-topic breaker bound every path. No LLM call, no spend, no egress.',
+  },
+  {
+    name: 'judgmentArbiters',
+    configPath: 'multiMachine.sessionPool.judgmentArbiters.enabled',
+    description: 'J1 (owner-dark rung timing) + J2 (duplicate survivor) LLM arbiters inside deterministic floors (same spec §3.4 — the first live Judgment Within Floors instances). Increment 3 ships them SHADOW (decide-and-log); Increment 4 lets them act only after shadow evidence beats the static policy.',
+    justification: 'Ships dryRun:true AND shadowMode:true (double canary): the arbiters decide-and-log to the judgment-provenance log but every runtime path takes the deterministic floor default while either flag holds. The floors are complete without them (Increment 2 runs deterministic-only), so an arbiter failure/timeout/nonsense answer degrades to the same static behavior. Bounded per-episode invocation caps; rides buildIntelligenceProvider as non-gating traffic (spawn-cap + attribution + bench obligations enforced by the existing ratchets).',
+  },
+  {
+    name: 'commitmentCustodyTransfer',
+    configPath: 'multiMachine.sessionPool.commitmentCustodyTransfer.enabled',
+    description: 'Record-level commitment custody transfer after a duplicate-reconciled/topic-moved closeout (same spec §3.2.4a — Increment 2b): the owner machine mints a successor commitment (existing POST /commitments, idempotent externalKey custody:<topic>:<origin-id>), and on ACK the origin machine terminal-supersedes its record (superseded-by-ownership-move) through its own single-writer CAS — a promise to the user is never silently dropped.',
+    justification: 'Ships dryRun:true (the dry-run canary): the custody path computes + logs the successor mint and supersede it WOULD perform, but mutates nothing while dryRun holds. While the flag is dark/unavailable, an open-commitment duplicate is NOT auto-closed — it escalates (custody-transfer-unavailable), the safe degradation, so no promise can be lost by the flag being off. The supersede verb is fenced to a VERIFIED successor (externalKey + owner machineId + authenticated mesh-read existence check) — no bare Bearer caller can terminal-supersede a live commitment. Idempotent on externalKey; no-ACK leaves origin records untouched + escalates once.',
+  },
+  {
+    name: 'sessionPoolFailoverRunner',
+    configPath: 'multiMachine.sessionPool.failoverRunner.enabled',
+    description: 'SessionPoolFailoverRunner boot-wiring (Multi-Machine Session Pool §Rollout, Track H) — the in-agent PRODUCER of a real failover-E2E green. A DEPLOYED dev agent had no green of its OWN, so its sessionPool stayed at "shadow" forever (the merged store is written only by CI). On a slow cadence the runner runs the REAL merged two-node failover E2E (tests/e2e/sessionpool-failover-two-node.test.ts) as a bounded subprocess and records its verdict HONESTLY (green→green, red→red, THROW→record nothing) so the StageAdvancer/driver have a self-earned proof to promote.',
+    justification: 'Ships dryRun:true (the dry-run canary): a recorded green PROMOTES the agent\'s sessionPool stage (real authority), so while dryRun holds the runner points at a SIDE result store the promotion path NEVER reads — the check runs live and the would-record verdict is captured for the soak, but nothing StageAdvancer promotes on is written until a deliberate dryRun:false. A throwing check still records NOTHING in either mode (an infra/availability error is not a failover verdict — never a fabricated green promotion or red demotion). Doubly inert on the fleet: enabled OMITTED → resolveDevAgentGate resolves it dark, and the whole session-pool layer is itself dark unless the stage advances past "dark". The heavy two-server E2E runs on a slow cadence (default 1h, floored at 60s — never a hot loop) behind an in-flight re-entrancy guard, and a deployed agent with no source/vitest yields ranToCompletion:false → the check throws → the runner records nothing (honest degrade). Bounded subprocess timeout; no LLM call, no spend, no egress beyond the local vitest run.',
+  },
+  {
+    name: 'hubIntent',
+    configPath: 'threadline.hubIntent.enabled',
+    description: 'LLM-with-context hub-intent recognizer (docs/specs/keyword-intent-conversions-1-and-3.md, Conversion #3) — replaces the anchored "open this"/"tie this to <topic>" regexes that SWALLOWED the message before the agent saw it (a misread silently EATS a real message — the highest-care conversion). Decides "is this hub message a bind command?" via HubIntentClassifier over the message + recent conversation, guardrailed by a structured topic-id enum for the tie target; the downstream bindHubConversation binder is unchanged.',
+    justification: 'Ships dryRun:true (the dry-run canary): on a dev agent the classifier RUNS the full LLM decision loop and LOGS would-swallow vs would-pass to logs/hub-intent.jsonl, but the onTopicMessage hub intercept ALWAYS falls through (the message passes to the agent, never swallowed) while dryRun holds — real swallowing needs a deliberate dryRun:false. Fail-OPEN: every uncertainty (no provider, breaker open, timeout, unparseable/schema-violating output, tie target not in enum, low confidence) passes the message through. One bounded fast-tier LLM call per candidate hub message (gated behind a cheap no-hub-signal pre-filter); no destructive action, no egress beyond the shared IntelligenceProvider. Same dogfooding posture as topicProfiles / the move-intent exemplar (PR #1367).',
+  },
   {
     name: 'agentOwnedFollowthrough',
     configPath: 'commitments.agentOwnedFollowthrough.enabled',
@@ -50,10 +209,28 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     justification: 'Ships dryRun:true (the dry-run canary): on a dev agent the owner-gate + governor + reconciler run the full decision loop and AUDIT/log every suppression/dead-letter/close they WOULD make, but PromiseBeacon.emitUserSend STILL sends and the governor/reconciler mutate nothing while dryRun holds (verified at emitUserSend §4.2 + reconcileGraveyard/maybeReconcileGraveyard dryRun branches). No spend, no destructive action, no egress while the canary holds; real suppression/closes need a deliberate dryRun:false. Same dogfooding posture as topicProfiles / credential-repointing.',
   },
   {
+    name: 'promiseReview',
+    configPath: 'commitments.promiseReview.enabled',
+    description: 'Promise review (docs/specs/promise-review-and-priority.md): the promise-review job reviews the agent\'s own open promises every 6 h and keeps / prioritizes / delivers / archives each through POST /commitments/review/apply.',
+    justification: 'Ships closureDryRun:true: on a dev agent keep/prioritize stamp live (they close nothing), while deliver/archive are validated and audited as would-apply and close nothing until a deliberate closureDryRun:false. Even live, every closure needs a written reason plus server-checked evidence, is capped (15/run, 60/day), audited to logs/promise-review.jsonl and reopenable for 30 days; nothing is ever deleted and the job never messages anyone. Spend: one sonnet session per 6 h only when enough rows are due (gate). Kill switch read live.',
+  },
+  {
+    name: 'biasToAction',
+    configPath: 'monitoring.biasToAction.enabled',
+    description: 'Standing-authorization signal for B17_FALSE_BLOCKER (BIAS-TO-ACTION-SPEC) — feeds the outbound tone gate a VERIFIED-operator, non-forwarded, in-window grant so "re-asking for authority you already hold" is recognized as the false blocker it is.',
+    justification: 'SIGNAL-ONLY and OBSERVE-ONLY (observeOnly defaults true): on a dev agent the resolver runs and records a would-fire to logs/bias-to-action.jsonl (uid HASH + ask-phrase token, never a raw quote), but the grant is NOT attached to the gate context so NO verdict can change and no message is ever altered. It can never flip a B1–B7/B15 leak HOLD. No spend, no egress, no destructive action while observe-only holds; live B17 firing needs a deliberate observeOnly:false. Same dogfooding posture as topicProfiles / agentOwnedFollowthrough.',
+  },
+  {
     name: 'standbyHonestyTiers',
     configPath: 'monitoring.standbyHonestyTiers.enabled',
     description: "Tier1/Tier2 standby honest-stuck classification — surface the REAL reason a live-but-failing session is silent (rate-limited / policy-wedge / context-wedge / context-too-long) instead of 'actively working'.",
     justification: "Signal-only — only changes the standby MESSAGE TEXT; never gates, blocks, initiates recovery, spends, or egresses. Reuses the existing tail-gated classifyStuckSignature and defers to the same one-voice recovery-ownership checks Tier 3 already honors. Flag-OFF = Tier1/2 byte-identical to today.",
+  },
+  {
+    name: 'durableOutputScrub',
+    configPath: 'monitoring.durableOutputScrub.enabled',
+    description: 'Durable-Output Hygiene Standard §2 (Layer B — "What Persists Must Be Clean") — the DurableOutputScrubber: a deterministic credential-SPAN scrub over LLM output at durable-output persistence chokepoints (session summaries wired first), config-gated + dark-first.',
+    justification: 'Ships dryRun:true (the dry-run canary): on a dev agent the scrubber COMPUTES the redaction and records would-redact metrics (feature key durable-output-scrub — COUNTS/kind/offset only, NEVER the matched bytes, so the soak telemetry can never itself be the leak), but returns the ORIGINAL text so NO durable content is mutated while dryRun holds (verified at DurableOutputScrubber.scrub/scrubRecord dryRun branches — applied:false, input returned unchanged). A real redaction (which destroys the matched span by design) needs a deliberate dryRun:false — the OPERATOR\'s endpoint decision on the dev-soak packet (Frontloaded Decision #4), never a fleet default. Pure deterministic regex floor (no LLM, no spawn-cap slot, no egress, no third-party spend); every failure path fails SAFE-toward-redaction (a scrub throw / oversize withholds the field under a typed marker, never persists raw bytes). Same dogfooding posture as topicProfiles / credentialRepointing.',
   },
   {
     name: 'growthAnalyst',
@@ -66,6 +243,18 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     configPath: 'multiMachine.coherenceJournal.enabled',
     description: 'Cross-machine coherence journal.',
     justification: 'Append-only local journal of content-free lifecycle events; no egress, no spend, no destructive action.',
+  },
+  {
+    name: 'ropeRecoveryProbe',
+    configPath: 'multiMachine.meshTransport.recoveryProbeEnabled',
+    description: 'U4.3 traffic-independent rope-health recovery probe — rides the lease-pull tick, sends pinned signed bogus-uid canary probes to dead mesh ropes and feeds the typed result into the ONE health authority (PeerEndpointResolver.recordResult), so a healed rope closes in minutes instead of staying presumed-dead (the week-long Tailscale strand).',
+    justification: 'Ships recoveryProbeDryRun:true (the dry-run canary): dry-run SENDS real probes — harmless by the typed-refusal payload contract (a signed bogus-uid deliverMessage the peer answers with not-router/sender-rejected; nothing can ever be injected) — but never mutates the HealthRecord. The only user-facing egress is the DEDUPED escalate-once attention item per (peer, kind, episode) — bounded, episode-keyed output, the same posture as the degradationLadderNeverSilent precedent already in this registry — so it is safe AND runnable live-on-dev rather than an action-bearing DARK_GATE_EXCLUSIONS case. P19 Eternal-Sentinel floor (15 min) bounds a permanently-dead rope in BOTH modes; no spend, no destructive action.',
+  },
+  {
+    name: 'ropeHealthAlerts',
+    configPath: 'monitoring.ropeHealth.enabled',
+    description: 'U4.5 rope-health alerts — the in-server RopeHealthMonitor: a bounded 30s evaluation loop over the U4.3 resolver snapshot with deterministic sleep-aware classification (ok/degraded/peer-offline/urgent), episode-deduped HIGH partition alerts, Tailscale key-expiry warnings, GET /mesh/rope-health, and the rope-health-digest daily job.',
+    justification: 'The urgent tier auto-posts HIGH attention items, which normally pushes a feature into DARK_GATE_EXCLUSIONS\' action-bearing category. This takes the OTHER branch deliberately (R-r2-6): the only egress is EPISODE-DEDUPED (ONE HIGH item per (machine-pair, episode); an already-open split-brain item wins and suppresses it), SLEEP-GATED (the mesh-independent git-synced heartbeat discriminator kills the lid-close false-alarm class by construction — a sleeping machine stops writing heartbeats, so it classifies peer-offline, never urgent), and it is OPERATOR-MANDATED partition alerting — the silent-partition gap is the incident class the operator directed this project to close. Same bounded-escalation posture as the degradationLadderNeverSilent precedent already in this registry. No spend (deterministic classifier, zero LLM), no destructive action; the digest job logs only until digestTopicId is set.',
   },
   {
     name: 'warmSessionA2A',
@@ -128,6 +317,12 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     justification: 'The session value lives in PROCESS MEMORY ONLY — never written to any log/config/temp file, never passed as a CLI argv (handed to bw only via the child BW_SESSION env), and NEVER placed on the multiMachine.secretSync path (machine-local). It is held warm only while a checklist run is in flight and carries a TTL + idle-expiry, so the standing-privilege window is minimal. The master password stays operator-held; no new on-disk secret is introduced. The dev agent is the controlled blast radius where this matures before any fleet flip.',
   },
   {
+    name: 'attributionPaperTrail',
+    configPath: 'attribution.enabled',
+    description: 'Attribution paper trail — statements credited to a person resolve to the logged message, in notes, messages and a daily report (attribution-paper-trail).',
+    justification: 'Ships in mode record: on a dev agent it writes its own ledger and report, refuses nothing, holds nothing and never edits a note. Spend is the agent\'s own subscription inside fixed budgets of 200 and 300 model calls a day plus 40 a run.',
+  },
+  {
     name: 'topicProfiles',
     configPath: 'topicProfiles.enabled',
     description: 'Topic Profile — per-topic model/thinking/framework pins (TOPIC-PROFILE-SPEC).',
@@ -144,6 +339,18 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     configPath: 'playwrightRegistry.enabled',
     description: 'Playwright profile↔accounts registry + boot awareness + activate.',
     justification: 'Stores vault secret NAMES only (never values) + browser-profile metadata; reads are advisory signal; the only destructive op (activate: MCP-config rewrite + session restart) ships dryRun:true and is reversible; dev-dogfooded.',
+  },
+  {
+    name: 'conversationFollowThrough',
+    configPath: 'conversationIdentity.followThrough.enabled',
+    description: 'Durable conversation identity — the §5 deliverToConversation funnel\'s minted-id (id<0) DELIVERY arm (durable-conversation-identity §9). The registry/journal/eager-mint FOUNDATION is always-on and NOT gated here; only delivery rides this gate.',
+    justification: 'Delivery is externally visible, so the block ships dryRun:true even live-on-dev: the id<0 arm returns typed §5.1 non-deliveries + would-deliver audit lines (never success-shaped) until a deliberate dryRun:false flip for the live proof. Zero consumers ride the funnel in increment 1, so enabling is inert until the §6.1 proof-consumer increment; no spend, no destructive action, no egress while dry.',
+  },
+  {
+    name: 'actionClaimSlack',
+    configPath: 'messaging.actionClaim.slack.enabled',
+    description: 'Slack follow-through generalization — the /action-claim/observe registration lane for NEGATIVE (minted Slack) conversation ids (spec: slack-followthrough-generalization §8.1). Registration only; follow-through DELIVERY rides the separate conversationIdentity.followThrough gate.',
+    justification: 'SIGNAL-ONLY: registration fires AFTER the Slack reply already went out (the Stop hook runs at turn end) — it can never block/delay/rewrite a message. Ships messaging.actionClaim.slack.dryRun:true even live-on-dev: the observe route runs the full classify + §7 bind-verify + would-register decision and appends a logs/action-claim-observe.jsonl audit line, but performs NO record() until a deliberate dryRun:false for the live proof. A minted-id write is §7 fail-closed (a foreign/unauthenticated caller is refused); the shared per-topic cap + 6h expiry bound the durable surface. The master messaging.actionClaim.enabled must be on for the Stop hook to POST at all. No spend, no destructive action, no egress while dry. Same dogfooding posture as conversationFollowThrough.',
   },
   {
     name: 'prHandLease',
@@ -182,16 +389,34 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     justification: 'Coordinates between the operator\'s OWN machines only — no external egress; when dark/single-machine the election returns "speak" unconditionally (byte-for-byte today\'s behavior) and never engages below 2 online machines; a verdict only WITHHOLDS a duplicate send (the safe direction), never fabricates one. No destructive action, no third-party spend. Operator directive 2026-06-13 topic 13481.',
   },
   {
+    name: 'writeAdmission',
+    configPath: 'multiMachine.writeAdmission.enabled',
+    description: 'Standby-write reconciliation — ownership-scoped write admission + typed refusal (docs/specs/standby-write-reconciliation.md). Replaces the blanket lease-boolean standby guard with a per-domain, synchronous in-memory admission decision.',
+    justification: 'Ships dryRun:true even on dev (FD-7 telemetry pattern): the layer only EVALUATES and logs would-verdicts while the legacy blanket guard keeps enforcing — zero authority, zero behavior change, no egress, no spend. Refusal authority is double-latched behind dryRun:false AND the wave-2 inventory constant (WRITE_SURFACE_INVENTORY_COMPLETE, §9.14), so live-on-dev soak is observe-only by construction. Single-machine agents are a strict no-op (every domain admits).',
+  },
+  {
     name: 'ws13Reconcile',
     configPath: 'multiMachine.seamlessness.ws13Reconcile',
     description: 'WS1.3 ownership reconcile — bounded pin/owner convergence (cooperative transfer→claim while the owner lives; force only with owner-death evidence + quorum).',
     justification: 'Coordinates between the operator\'s OWN machines only — no external egress; its in-component dryRun sub-knob (ws13DryRun) stays a plain hardcoded default true, so live-on-dev runs the reconcile loop but LOGS intended CAS actions without performing them (no destructive CAS) exactly as the rollout ladder intends; strict single-machine no-op inside the module. No third-party spend. Operator directive 2026-06-13 topic 13481.',
   },
   {
+    name: 'ws13PinReplicate',
+    configPath: 'multiMachine.seamlessness.ws13PinReplicate',
+    description: 'Cross-machine reconciler convergence Fix #2 — replicate the user PIN (move-intent) as a `topic-pin-record` so the OWNING machine reads it (HLC-ordered, advisory, validated known+online) and starts the cooperative transfer. Sub-flag of WS1.3, independently rollback-able during soak.',
+    justification: 'Coordinates between the operator\'s OWN machines only — no external egress; a replicated pin is ADVISORY move-intent that can only trigger the owner\'s OWN cooperative transfer (owner-gated FSM action), NEVER a force-claim/seat-steal (the force-claim decision is gated on death-evidence + quorum from machine liveness, never on the pin — a stale/corrupt pin cannot manufacture death evidence); rides the existing WS2 replicated-record machinery (HLC ordering, tombstone, quarantine); when dark the topic-pin emitter is a strict no-op (the store-enable entry is absent) and the reconciler reads no advisory pins; strict single-machine no-op (no peers). No destructive action, no third-party spend. Cross-machine reconciler convergence fix 2026-06-30.',
+  },
+  {
     name: 'ws41DurableAck',
     configPath: 'multiMachine.seamlessness.ws41DurableAck',
     description: 'WS4.1 durable operator-bound /ack across machines — a pooled-attention ack whose owner is briefly offline is persisted with the authenticated operator principal and re-delivered when the owner returns.',
     justification: 'Coordinates between the operator\'s OWN machines only — no external egress; the persisted intent is bound to the AUTHENTICATED operator and the owner REVALIDATES at apply time (a stale resolve against a since-escalated item is rejected — current state wins); when dark the routes 503 and the precedence guard is inert; strict single-machine no-op (no peers). No destructive action, no third-party spend. Operator directive 2026-06-13 topic 13481.',
+  },
+  {
+    name: 'passkeys',
+    configPath: 'passkeys.enabled',
+    description: 'Agent-held Google passkeys (spec agent-held-google-passkey): grants, issuer set, passkey-cell mandate receiver, and the later enrollment/health surfaces.',
+    justification: 'Inert without grants; a grant is written only by the dashboard-PIN route or a verified passkey-cell mandate from a confirmed issuer, and enrollment is operator-initiated. No external egress or spend from the flag itself. Dev-live is the Rung 2 dogfooding decision (FD16, operator-ratified 2026-09-22).',
   },
   {
     name: 'accountFollowMe',
@@ -208,8 +433,8 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
   {
     name: 'ws43JournalLease',
     configPath: 'multiMachine.seamlessness.ws43JournalLease',
-    description: 'WS4.3 journal-lease cutover — job claims upgrade from the best-effort AgentBus broadcast to a durable, epoch-fenced lease over the replicated journal (the JobLeaseCutoverGate guarantees the two mechanisms are NEVER both live for a job set).',
-    justification: 'Coordinates between the operator\'s OWN machines only — no external egress. The dryRun sub-flag (ws43JournalLeaseDryRun) is ALSO omitted from ConfigDefaults and resolves COHERENTLY with this flag at the consumer (dev → live, fleet → dry-run) so live-on-dev actually exercises the lease path. A genuine live cutover engages ONLY when the flag resolves live AND the pool is flag-coherent (≥2 machines all advertising not-dry-run), so a single-machine dev agent never half-migrates (strict no-op). Job-claim coordination on durable local/replicated state — no destructive/irreversible write, no third-party spend. Operator directive 2026-06-13 topic 13481.',
+    description: 'WS4.3 planned journal-lease cutover — currently held on the legacy AgentBus path by a code-owned readiness floor until peer claim receive and pool-authoritative acquisition are implemented.',
+    justification: 'Coordinates between the operator\'s OWN machines only — no external egress. The dryRun sub-flag (ws43JournalLeaseDryRun) remains omitted from ConfigDefaults and resolves coherently with the development-agent flag, but neither value can bypass the code-owned readiness floor. A local lease file and flag-coherent peers cannot arbitrate concurrent claims. The pool continues using the legacy path until a shared authority and receive wiring are proven. Operator directive 2026-06-13 topic 13481.',
   },
   {
     name: 'ws44PoolLinks',
@@ -288,12 +513,44 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
       'Signal-only local recorder + ONE deduped attention item; reads git status/diff + lsof read-only; no egress, no spend, no destructive action. The optional preservation is a NON-destructive patch write (git diff → a state-dir file) behind an off-by-default preserveWork sub-flag — it never mutates the worktree, its index, or any ref.',
   },
   {
+    name: 'externalHogSentinel',
+    configPath: 'monitoring.externalHogSentinel.enabled',
+    description:
+      'External-hog zombie auto-kill sentinel (CMT-1901, /external-hog) — surfaces any sustained external CPU hog and auto-kills one narrow class (orphaned Electron editor extension-host wrappers). The intelligence (zombie-classify) decides kill/leave/alert WITHIN a mechanical veto-only safety floor.',
+    justification:
+      "This is a 4th process-killer, and its three siblings (sessionReaper/agentWorktreeReaper/mcpProcessReaper) are DARK_GATE_EXCLUSIONS as destructive — so it is admissible to DEV_GATED_FEATURES ONLY on the credentialRepointing-style ground that the `enabled` gate makes SCAN/CLASSIFY/LOG live while the KILL itself stays doubly-held: `dryRun: true` (the canary — live-on-dev scans, classifies, and LOGS would-kills but kills NOTHING) AND, orthogonally, a PIN-written armed marker (armEpoch > lastDisarmEpoch) that no config write, PATCH, strip-migration, or restart can produce. Live killing needs BOTH a deliberate dryRun:false AND a fresh PIN arm. A kill executes iff floor_pass && classifier==='kill'; the mechanical floor is veto-only (it can only BLOCK a kill, never trigger one) and the numeric kill-gate knobs are read-time clamped to code minimums so they can only ever act inside the owner-dead allowlist envelope. Every failure path fails SAFE (missing/unparseable signal → alert-never-kill; decider unavailable → no kill). Same dogfooding posture as topicProfiles / credentialRepointing.",
+  },
+  {
+    name: 'staleOwnerRelease',
+    configPath: 'multiMachine.sessionPool.staleOwnerRelease.enabled',
+    description:
+      'U4.2 stale-owner release (docs/specs/u4-2-stale-owner-release.md) — the CMT-1786 auto-failover: the serving-lease holder force-claims a provably-dead owner\'s topics behind the §2.2 evidence bar (death + all-transport disproof + quorum + claimant self-proof + side-effect recency), with the replicated topic-claim-annotation carrying budgets/suspensions/refusals across lease movement.',
+    justification:
+      'Ships dryRun:true (the dry-run canary): on a dev agent the evidence pass, probes, decision trace (logs/stale-owner-release.jsonl) and GET /pool/stale-owner-release all run LIVE, but the engine logs would-claims and NEVER lands a force-claim CAS while dryRun holds — zero authority moves; graduation past dry-run is gated on the spec §5 quantified soak (≥5 operator-corroborated would-claims, zero wrong) PLUS the emission-fence + observer-staleness prerequisites. Additionally subordinate to multiMachine.sessionPool being live AND ≥2 registered machines (strict no-op otherwise). Probes are read-only authenticated handshakes to the operator\'s OWN machines — no external egress, no spend, no destructive action while the canary holds. Same dogfooding posture as topicProfiles / credentialRepointing.',
+  },
+  {
+    name: 'selfDeferralGuard',
+    configPath: 'monitoring.selfDeferralGuard.enabled',
+    description:
+      'Turn-End Self-Deferral Guard (Phase A / shadow; docs/specs/turn-end-self-deferral-guard.md) — the UnjustifiedStopGate authority offers an allow-class U_SELF_DEFERRAL classification on every turn-end (B17 "within your own means") and RECORDS it as shadow telemetry in widened StopGateDb columns, with the last ≤3 user turns as bounded, fail-open conversational context.',
+    justification:
+      'OBSERVE-ONLY by construction — Phase A blocks NOTHING (no continue, no exit 2, no block path; §3.2 makes U_SELF_DEFERRAL an ALLOW-class verdict that can never produce a block, and §3.5 leaves the router block gate untouched). The `enabled` gate only switches whether the authority OFFERS the rule + four output fields in its prompt and whether the route records the self-deferral columns; OFF = the base stop-gate runs byte-identical (no U_SELF_DEFERRAL in the prompt, no columns recorded). ZERO new LLM calls (one added allow-rule label + four fields on the SINGLE existing evaluate() call), zero destructive action, zero egress. The transcript tail-read is bounded (reverse read, ≤256KB, ≤3 user turns, per-turn char clamp) and fail-open (any missing/unreadable/malformed transcript → empty context, contextTurns:0, never throws, never delays turn-end). Same dogfooding posture as topicProfiles.',
+  },
+  {
     name: 'strandedTopicSentinel',
     configPath: 'monitoring.strandedTopicSentinel.enabled',
     description:
       'Stranded-inbound detector (stranded-inbound-self-heal) — surfaces a Telegram/Slack topic whose owner machine is online-by-heartbeat but unable to serve (quota-walled or adapter-disconnected) while a healthy machine holds the lease, so inbound is silently dead for that topic. Raises ONE aggregated attention item per (owner-machine, stranding window).',
     justification:
       'PURE SIGNAL — its sole output is an advisory attention item; it MUTATES NOTHING (no ownership CAS, no pin write, no session kill, no direct user message). Lease-holder is the sole actor and a single-machine agent is a strict no-op, so across machines exactly one raises the item (no duplicate-voice). Synchronous + LLM-free + acquires NO spawn-cap slot (asserted by test); reads only the in-memory ownership cache + the replicated heartbeat pool view, with an explicit fail-closed staleness bound (every uncertainty — missing field, stale beat, underivable scope, pool view unavailable — routes to SKIP, never manufactures a strand). It can only ever ADD an attention item, already bounded by the existing AttentionTopicGuard flood ceiling. No egress beyond the operator-facing item, no spend, no destructive action. Runs live (no destructive write warrants a dry-run) on dev / dark on fleet. Auto-failover is a tracked v2 with named prerequisites.',
+  },
+  {
+    name: 'machineCoherence',
+    configPath: 'monitoring.machineCoherence.enabled',
+    description:
+      'Machine-coherence guard (machine-coherence-guard, roadmap 4.1 F4/P0-1) \u2014 the pool-wide version/flag/protocol/manifest skew EVALUATOR + episode/alarm machinery. Detects the F4 class (a dev-gated mesh feature resolving LIVE on one of the agent\u2019s machines and DARK on another silently halves a cross-machine guarantee) and raises ONE deduped episode-scoped attention item from exactly ONE elected machine. NOTE: only the evaluator/alarm ride this gate \u2014 the \u00a73.2 advert EMISSION ships live unconditionally (M3).',
+    justification:
+      'SIGNAL-ONLY \u2014 it never blocks, equalizes, or restarts anything; its sole output is one episode-scoped attention item (and the \u00a74.2.1 fix is operator-approval-gated per episode, never autonomous). Fully deterministic (Tier 0, no LLM call, no spend), no egress beyond the existing signed mesh reads, fails toward silence on evaluator error. Ships dryRun:true even on dev (dry-run FIRST: counters record would-raise, NO item) with the D7 soak criterion gating each rollout rung; single-machine agents are a strict no-op at every layer.',
   },
   {
     name: 'yieldSafety',
@@ -328,10 +585,42 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     justification: 'Ships dryRun-first (the component code-defaults dryRun:true): on the dev agent the gate makes the reconcile loop + GET /autonomous/liveness LIVE but it only LOGS "would respawn" until a deliberate dryRun:false flip — zero spawns, zero spend while dark/dryRun. Live, its only action is a bounded (P19 cap), lease-gated, operator-stop-respecting, quota-gated respawn of a run the run-state file already says should be alive — the strictly-safe direction. Never blocks/rewrites a message. Routes 503 when off.',
   },
   {
+    name: 'singleMachineFailoverGap',
+    configPath: 'monitoring.singleMachineFailoverGap.enabled',
+    description: 'Single-machine failover-gap detector (increment 2) — raises ONE deduped HIGH attention item when this agent is single-machine (no online mesh peer) WHILE it has active autonomous runs (the "no failover target for active autonomous work" gap; the 2026-07-22 Codey overnight loss).',
+    justification: 'SIGNAL-ONLY — it never blocks, provisions a peer, or touches a session; its sole output is ONE deduped attention item. Fully deterministic (Tier 0, no LLM call, no spend), no egress beyond the existing machine-pool + autonomous-run-state reads it already has, fails toward silence on any tick error. Ships dryRun:true even on dev (dry-run FIRST: counters record would-raise, NO item raised) until a deliberate dryRun:false flip; single-machine-with-no-active-work is a strict no-op inside tick(). Routes 503 when off.',
+  },
+  {
+    name: 'missingLoginSession',
+    configPath: 'monitoring.missingLoginSession.enabled',
+    description: 'Missing-login-session detector (increment 2) — raises ONE deduped HIGH attention item when a live session is running on an account whose local login has gone missing (subscription-pool identity drift owner-relogin-required / missing-local-login; the 2026-07-22 justin-gmail silent auth-death).',
+    justification: 'SIGNAL-ONLY — it never swaps accounts, re-logins, or touches a session; its sole output is ONE deduped attention item. Fully deterministic (Tier 0, no LLM call, no spend), no egress beyond the existing subscription-pool + running-session reads it already has, fails toward silence on any tick error. Ships dryRun:true even on dev (dry-run FIRST: counters record would-raise, NO item raised) until a deliberate dryRun:false flip; no-drift-under-a-live-session is a strict no-op inside tick(). Routes 503 when off.',
+  },
+  {
     name: 'autonomousHeartbeat',
     configPath: 'monitoring.autonomousHeartbeat.enabled',
     description: 'AutonomousProgressHeartbeat — hedged, change-gated, sparse liveness backstop for an autonomous run gone silent-to-user while output is still moving (autonomous-progress-heartbeat spec).',
     justification: 'Dev-gated under the Maturation Path standard. CAN send a user-facing Telegram line, so it does not ship LIVE on dev: its persisted ConfigDefaults default is `dryRun: true` (the route + tick run, but the final send is swapped for a "would emit" log, gated on the SAME cooldown/budget as live — no per-tick flood). So enabling on dev makes only the READ surface + dry-run observation live; an actual send requires a deliberate `dryRun: false` after the dev soak. Signal-only (never gates/blocks/rewrites); every predicate fails CLOSED on uncertainty; bounded by a long user-silence gate + a corroborated recent-output-change + per-topic cooldown + widening per-run backoff + a hard per-run cap + the shared one-voice ProxyCoordinator lease. No spend (no LLM), no destructive action.',
+  },
+  {
+    name: 'goalRealignment',
+    configPath: 'monitoring.goalRealignment.enabled',
+    description: 'Periodic Goal Re-Alignment Phase 1 — durable operator-priority ledger plus dry-run alignment reviewer and authenticated pull surface.',
+    justification: 'Ships structurally dry-run: computes and logs evidence-linked verdicts but has no injection, attention, planner-write, blocking, or external-action seam. Intake/review calls are change-gated, background-queued, metered reflector traffic; unchanged digest+focus means zero new model calls. Local durable state is permission-restricted and credential-scrubbed.',
+  },
+  {
+    name: 'autonomousThroughputFloor',
+    configPath: 'monitoring.throughputFloor.enabled',
+    description: 'Bounded pull/audit view of project-PR movement and manager outbound silence for autonomous runs.',
+    justification: 'Fleet-dark and structurally read-only. It performs bounded Git/GitHub/history reads, persists only a machine-local observation baseline and read breaker, appends scrubbed audit rows, and exposes authenticated status. It has no attention, notification, dispatch, remediation, or autonomous-action seam.',
+  },
+  {
+    name: 'dashboardLiveInsights',
+    configPath: 'dashboard.liveInsights.enabled',
+    description:
+      'Dashboard Live-LLM-Insights (docs/specs/dashboard-live-insights.md) — the per-page Insight Strip: a plain-English headline + supporting lines over a dashboard page\'s own data, an LLM insight routed through the shared nature-router (FAST lane, model selection from the benchmark-derived chains), cached per page (TTL) + awareness-only. Powers GET /insights, GET /insights/:page, GET /insights/status.',
+    justification:
+      'Awareness-ONLY read surface: the insight OBSERVES and PHRASES — it carries ZERO action authority (no field it emits can arm a door, send a message, or mutate state; every drill-in is a plain deep-link gated by that tab\'s own controls). Ships dryRun:true (the spend canary): on a dev agent the routes are live and the DETERMINISTIC per-page one-liner floor renders, but the LLM layer is INERT (logs "would generate", spends nothing) until a deliberate dryRun:false. The LLM call rides the shared IntelligenceRouter funnel (host spawn-cap + circuit breaker + feature_metrics attribution under component DashboardInsightEngine — Token-Audit Completeness), is generated ON VIEW + snapshot-fingerprint-CACHED (never a background poll, never per-poll re-spend), non-gating, and DEGRADES to the deterministic floor on any failure/timeout/unparseable output (never blocks the page, never fabricates). Page data is untrusted → the call is injection-exposed so a non-injection door is never chosen. Routes 503 when dark. Same dogfooding posture as topicProfiles / growthAnalyst.',
   },
   {
     name: 'failureLearning',
@@ -413,7 +702,49 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     name: 'stateSyncTopicOperator',
     configPath: 'multiMachine.stateSync.topicOperator.enabled',
     description: 'WS2.6 cross-machine topic-operator replication — the THIRD PII kind (multi-machine-replicated-store-foundation).',
-    justification: 'Replicates the verified-operator binding between the operator\'s OWN machines only; THE LOAD-BEARING SAFETY INVARIANT (Know Your Principal): a replicated record is UNTRUSTED peer data and is NEVER the authoritative answer to "who is my verified operator?" — only the LOCAL authenticated setOperator binds it; recordKey is sha256(topicId+verified-uid), never a content-name; tombstoned unbinds; fully reversible (rollback-unmerge); no external egress, no destructive write, no spend. Runs live AND dryRun:false on dev. Operator directive 2026-06-13 topic 13481.',
+    justification: 'Replicates the verified-operator binding between the operator\'s OWN machines only; THE LOAD-BEARING SAFETY INVARIANT (Know Your Principal): a replicated record is UNTRUSTED peer data and is NEVER the authoritative answer to "who is my verified operator?" — only the LOCAL authenticated setAuthenticatedOperator binds it; recordKey is sha256(topicId+verified-uid), never a content-name; tombstoned unbinds; fully reversible (rollback-unmerge); no external egress, no destructive write, no spend. Runs live AND dryRun:false on dev. Operator directive 2026-06-13 topic 13481.',
+  },
+  {
+    name: 'jevSignalLive',
+    configPath: 'intelligence.jevSignalLive.enabled',
+    description: 'Jev as a live advisory input to the tone gate\'s B1–B7 artefact signals (jev-signal-live.md): confident Jev answers decide a kind, unsure/missing answers and every failure fall back to the deterministic detectors.',
+    justification: 'Advisory input only — takes effect only where the tone gate\'s advisory migration makes B1–B7 overridable and decision-quality recording is live (so the route never hardens the advisory); never a new block; the deterministic degraded floor and the credential wall are untouched. Inert without the vault typesafe_api_key (only the dev agent holds one). Reuses the shadow\'s single Jev call (no extra calls while the shadow runs; after its soak, one Jev call per reviewed message), the Luna referee stays bound to the shadow\'s soak, text is secret-scrubbed before egress, the wait is bounded at timeoutMs+250ms, and a vendor-down breaker returns to the detector path. No destructive action.',
+  },
+  {
+    name: 'jevMemoryPicker',
+    configPath: 'intelligence.jevMemoryPicker.enabled',
+    description: 'Jev ranks the Claude Code memory index (MEMORY.md) against a session\'s opening topic at session start (jev-memory-picker.md); shadow mode (the default) only logs which lines it would add past the positional load cut.',
+    justification: 'Signal only — it chooses which already-saved index lines are offered to a session and cannot block, send or change anything; in shadow mode it changes nothing. Inert without the vault typesafe_api_key (only the dev agent holds one). One bounded Jev call per session start, only when the index overflows the load cut, under a daily call cap and at most 2 in flight; text is secret-scrubbed before egress; every failure is today\'s load. No destructive action.',
+  },
+  {
+    name: 'jevCorrectionShadow',
+    configPath: 'intelligence.jevCorrectionShadow.enabled',
+    description: 'Jev correction-detector shadow (jev-correction-shadow.md): for each inbound user message, asks Jev whether it is a correction, a standing preference, neither, or cannot tell, and logs a content-free row beside the correction sentinel\'s Layer-0 verdict.',
+    justification: 'Log-only — changes nothing the correction sentinel records, delivers nothing, and no decision path reads the log. Inert without the vault typesafe_api_key (only the dev agent holds one). Never awaited on the message seam; the message and the previous agent message are secret-scrubbed before egress; bounded by a fetch timeout, two calls in flight and a daily call cap (~$0.0001 per check), metered in feature metrics, kill switch read live. No destructive action.',
+  },
+  {
+    name: 'jevCorrectionFeedSentinel',
+    configPath: 'intelligence.jevCorrectionShadow.feedSentinel',
+    description: 'Jev correction live input (jev-correction-live.md): a correction or standing preference Jev flags and Layer 0 missed is handed to the Correction & Preference Learning Sentinel as a learning signal (desk notes opening "From <agent>" and agent-signed messages excluded).',
+    justification: 'Signal into an existing authority-bounded pipeline: the sentinel\'s own distill can still call it noise, and the unchanged recurrence gate (4 occurrences, 2 days, 2 sessions) decides whether anything becomes a preference — which is itself an advisory, enveloped hint. Delivers nothing, blocks nothing. Inert unless the shadow is on and the sentinel is constructed; rides the sentinel\'s own LlmQueue daily cap, per-topic rate ceiling and load-shedding; kill switch read live. No destructive action.',
+  },
+  {
+    name: 'correctionMeaningGrouping',
+    configPath: 'monitoring.correctionLearning.meaningGrouping.enabled',
+    description: 'Correction meaning grouping (correction-meaning-grouping.md): before the recurrence gate, the correction analyzer asks Jev whether two same-kind records that share some words state the same core rule (GPT-6 Luna decides unsure pairs), and uses those answers as complete-link grouping edges beside word overlap.',
+    justification: 'Signal into an existing authority-bounded pipeline: complete-link grouping (every pair inside a group must match) and the unchanged recurrence gate (4 occurrences, 2 days, 2 sessions) decide; a learned preference is itself an advisory, enveloped hint. Runs only inside the off-by-default correction-analyzer job. Inert without the vault typesafe_api_key; learning text is secret-scrubbed before egress; each pair is asked once (cached), bounded by per-run call caps, a run time budget and fetch timeouts, metered in feature metrics; every failure falls back to word overlap. Kill switch read live. No destructive action.',
+  },
+  {
+    name: 'jevCirclesShadow',
+    configPath: 'intelligence.jevCirclesShadow.enabled',
+    description: 'Jev "going in circles" shadow (jev-circles-shadow.md): every 5 tool actions per session, asks Jev the measured five-label question over the last 15 actions and logs a content-free would-nudge row.',
+    justification: 'Log-only — delivers nothing to any session, user or topic and no decision path reads the log. Inert without the vault typesafe_api_key (only the dev agent holds one). Reads only the session\'s own transcript (path shape-checked), secret-scrubs the window before egress, bounded by a fetch timeout, two calls in flight and a daily call cap (~$0.0001 per check), metered in feature metrics, kill switch read live. No destructive action.',
+  },
+  {
+    name: 'jevLoadAssessment',
+    configPath: 'intelligence.jevLoadAssessment.enabled',
+    description: 'Model assessment of machine load (trustworthy-machine-load B4): when a machine\'s own load verdict and the outside view disagree, or its readings contradict, Jev (Luna referee when unsure) labels it; the label is graded 15 min later against what happened.',
+    justification: 'Advisory and log-only — no placement, admission, shed, attention or message path reads its output. Asks only on the serving-lease holder, once per machine per 10-30 min, one call at a time under a fetch timeout and a daily cap of 200, metered; inert without the vault typesafe_api_key. Sends only load numbers, a machine nickname and fixed words, secret-scrubbed. Kill switch read live. No destructive action.',
   },
   {
     name: 'degradationLadderBackoff',
@@ -455,6 +786,155 @@ export const DEV_GATED_FEATURES: DevGatedFeature[] = [
     configPath: 'monitoring.degradedTmuxGuard.enabled',
     description: 'tmux Event-Loop Resilience (C) — the DegradedTmuxGuard: a signal-only watcher that raises ONE deduped agent-health Attention item when the shared tmux server is degraded (slow sync calls / event-loop stalls). NEVER kills the shared socket.',
     justification: 'Observe-and-escalate only. Bounded by construction — a fixed-capacity O(1) modulo-write ring (never an unbounded array), load-gated (suppressed above a 1-min-load-per-core threshold so a busy multi-agent box does not false-fire) and N-cycle corroborated before any escalation. Signal vs Authority: the ONLY automated action is ONE deduped, NORMAL-priority agent-health Attention item; any actual tmux refresh is an explicit operator Y/N, never auto-performed. Registered in GUARD_MANIFEST with a pure in-memory getter (no I/O on the guard-status read). No spend, no egress beyond the operator-facing dedup line, no destructive action.',
+  },
+  {
+    name: 'swapContinuity',
+    configPath: 'subscriptionPool.swapContinuity.enabled',
+    description: 'Swap-continuity in-flight work gate (swap-continuity-antithrash §4) — every session-killing mutation (proactive/reactive account swap, agent/API refresh) consults the SwapWorkGate at the SessionRefresh funnel: a proactive swap DEFERS over in-flight work (ceiling-dropped, never forced), a reactive swap gets a bounded ≤120s grace then proceeds WITH the F3 mitigations (enumerated killed subagents + re-injected unanswered inbound), an interactive refresh gets a structured session-busy refusal + force.',
+    justification: 'Ships dryRun:true (the dry-run canary): on a dev agent the gate probes and LOGS every would-defer/would-refuse/would-mitigate verdict but changes NOTHING — every refresh kills exactly as today until a deliberate dryRun:false. The gate itself is deterministic structural-state math (pane footer / child process / subagent registry — Tier 0, no LLM), bounded on every edge (30-min deferral ceiling, 120-s reactive grace, force override, recovery-class exemption), and its uncertainty direction only ever DELAYS an optimization — it can never kill work, spend, or egress. Same dogfooding posture as topicProfiles / agentOwnedFollowthrough.',
+  },
+  {
+    name: 'provenanceUniformSeam',
+    configPath: 'provenance.uniformSeam.enabled',
+    description: 'LLM-Decision Quality Meter uniform provenance seam (docs/specs/llm-decision-quality-meter.md §5.7) — the router-settlement side write that records each ENROLLED LLM decision (a ~250-byte decision_quality row always; a provenance JSONL row per the census volume valve) so per-decision-point right/wrong/unknown grading has parents. Read surface: GET /decision-quality (503 when the seam resolves off). dryRun defaults TRUE even on dev — metadata-only would-write logs, ALL durable writes suppressed — until a deliberate dryRun:false flip after the would-write soak.',
+    justification: 'observe-only side write at the router-settlement seam; never gates/blocks/delays the decision call; no egress, no spend, no destructive action; failure is catch-logged.',
+  },
+  {
+    name: 'correctionClassReview',
+    configPath: 'monitoring.correctionClassReview.enabled',
+    description: 'Record-time correction → standards/process class review and bounded durable-outcome drain.',
+    justification: 'Ships dryRun:true: dev agents exercise classification and would-route auditing, but create no Initiative, Action, Attention item, or blocking refusal until a deliberate dryRun:false. Bounded retries, per-tick/open-artifact caps, shared IntelligenceProvider attribution, scrubbedSummary-only egress, and no direct standards/memory writes.',
+  },
+  {
+    name: 'completionClaimVerification',
+    configPath: 'monitoring.completionClaimVerification.enabled',
+    description: 'Dark general factual-claim observation, deterministic cheap verification, and scrubbed local benchmark corpus.',
+    justification: 'Observe-only v1: never blocks, rewrites, delays, sends, corrects, or authorizes. Every bounded Claude-authored response is eligible; unsupported capacity/PR facts stay unverifiable, uncertainty floors only round upward, provider-bound data is scrubbed under a same-origin door policy, and all corpus rows are automation-ineligible.',
+  },
+  {
+    name: 'classReviewStateSync',
+    configPath: 'multiMachine.stateSync.classReview.enabled',
+    description: 'Unified correction ClassReview lifecycle reach across the agent machine pool.',
+    justification: 'Ships dryRun:true: dev agents exercise record serialization and merge decisions without applying peer state. Replicates only scrubbed closed-enum lifecycle fields and observations, never raw correction learning; no external egress beyond the operator-owned encrypted mesh.',
+  },
+  {
+    name: 'a2aInboundIdLedger',
+    configPath: 'threadline.inboundIdLedger.enabled',
+    description: 'Durable A2A inbound message-id ledger: records receipt + hand-off per (sender, id); a verified no-reply row suppresses a resend, every other resend is delivered with a resent-copy notice.',
+    justification: 'Fails toward a labelled duplicate, never a loss: a database error, cooldown, full unverified namespace or unkeyed message delivers with no row; only a verified no-reply row suppresses; peer answers only word a notice. Machine-local SQLite with bounded retention, no LLM, no spend, no outbound messages.',
+  },
+  {
+    name: 'a2aBackupRoutes',
+    configPath: 'threadline.backupRoutes.enabled',
+    description: 'A2A backup routes: a relay fall-through after a local POST carries the same id, the local thread and a resend mark; a fingerprint-addressed send goes to a same-machine agent whose live health shows that fingerprint and a connected relay.',
+    justification: 'Sends nothing new and stores nothing: the mark only changes the receiver notice wording (over-marking is the safe direction), and the fingerprint branch falls to the relay path used today on any doubt (no match, two ports, absent/different fingerprint, relay not connected, credential). Stateless per send, no LLM, no spend.',
+  },
+  {
+    name: 'a2aRelayForward',
+    configPath: 'threadline.relayForward.enabled',
+    description: 'A2A cross-machine route: a relay standby forwards a send once, over the signed mesh, to my machine that holds the relay connection; a reply on a topic-bound thread is typed into that topic\'s live session on whichever of my machines has it.',
+    justification: 'Every failure degrades to behaviour that exists today: a forward that did not execute is the same 503, the holder\'s verdict is transcribed and never upgraded, a timeout is `unconfirmed`, and a reply that cannot be injected is the existing visible Telegram post — a topic-bound reply never spawns a session on the holder. Only my own registered machines can send the two verbs (signed, recipient-bound, nonce-guarded), credential sends never cross, nothing new is stored, one attempt with no retry or queue, no LLM, no spend.',
+  },
+  {
+    name: 'a2aLocalRouteTrust',
+    configPath: 'threadline.localRouteTrust.enabled',
+    description: 'Local-route trust: the same-machine A2A route resolves the sender\'s trust level from the trust manager and applies the relay gate\'s operation-permission check, instead of handling every sender as verified.',
+    justification: 'Ships dryRun:true: a dev agent resolves and LOGS would-refuse verdicts and counts them on the authed /health, and delivers every message exactly as today. Refusing needs a deliberate dryRun:false. Reads in-memory trust profiles only: no writes, no LLM, no spend, no outbound messages; with no trust manager wired it is a counted no-op.',
+  },
+  {
+    name: 'a2aLocalRouteSignature',
+    configPath: 'threadline.localRouteSignature.enabled',
+    description: 'Local-route signed envelope: the same-machine A2A route verifies the sender\'s Ed25519 signature against the key held for its name, instead of taking the name in the request body on faith.',
+    justification: 'Ships dryRun:true: a dev agent verifies each inbound same-machine envelope, LOGS would-refuse verdicts and counts them on the authed /health, and delivers every message exactly as today. Refusing needs a deliberate dryRun:false. Writes no file and no durable state (the first-contact key cache, replay cache and counters are in memory). Its only outbound traffic is one loopback GET of a same-machine peer\'s /threadline/health when a SIGNED envelope arrives from a name with no key on record (at most 2.5 s on that request, five tries per peer per process). No LLM, no spend, no messages.',
+  },
+  {
+    name: 'telegramIngressLifelineSecret',
+    configPath: 'telegramIngress.lifelineSecret.enforce',
+    description: 'Lifeline ingress secret: the two internal Telegram routes refuse a request that does not carry the secret only the lifeline and the server hold, instead of trusting any caller with the ordinary Bearer token to name the sender.',
+    justification: 'No message is refused without proof: the guard refuses no message until the running lifeline has sent the valid secret at least once (persisted), so a lifeline still on older code has its messages accepted and counted; for its first 24 hours it is handled exactly as before, after that its messages are still delivered (without a sender identity) and only its button taps are refused. A refused request has had no effect (the check precedes every effect), a current lifeline re-reads the secret and otherwise holds the message in its durable queue with no drop budget burned, backs off (one minute doubling to fifteen) and tells the user once it has been refused for ten minutes. An unreadable server secret still delivers messages (without sender trust). Restart-signal writes are on a persisted 12 h / 24 h budget. Exact constant-time credential compare: no LLM, no spend; the only new outbound message is that one fixed lifeline notice per episode. bypass:true in the config file is the live full rollback.',
+  },
+  {
+    name: 'a2aPeerDarkNotice',
+    configPath: 'threadline.peerDarkNotice.enabled',
+    description: 'Honest sender-side reporting of a send that stays queued: a per-peer `dark` classification on the delivery ledger, a `peerDark` object + worded deliveryOutcome on a send to a dark peer, and ONE per-peer attention item (deterministic id, pool-scope raise/resolve, 12 h cooldown) through the reworked A2ARedeliverySentinel after the awake machine has healed its own side.',
+    justification: 'Ships dryRun:true: on a dev agent the sentinel runs the full dark pass and LOGS would-raise / would-sentence rows to logs/a2a-peer-dark.jsonl, but raises no item and changes no deliveryOutcome until a deliberate dryRun:false. Reads the local SQLite ledger and the presence map only (no inline discover, no new relay calls); the self-heal re-arms an already-built relay client and runs one discover on the awake machine only. Signal-only: never gates a send; a local relay outage collapses to ONE aggregated item; no LLM, no spend.',
+  },
+  {
+    name: 'a2aRelayUnknownSenderTrust',
+    configPath: 'threadline.relayUnknownSenderTrust.enabled',
+    description: 'Relay unknown-sender trust: a relay message from a sender whose keys this agent does not hold is judged at the trust level the trust manager holds for its fingerprint, with the relay gate\'s operation table, instead of being passed as verified; a new fingerprint profile is no longer created at verified.',
+    justification: 'Ships dryRun:true: a dev agent resolves and LOGS would-refuse verdicts and counts them on the authed /health, and delivers every message exactly as today (the legacy verified profile is still created). Refusing and the untrusted profile default need a deliberate dryRun:false. Reads in-memory trust profiles only: no new writes, no LLM, no spend, no outbound messages.',
+  },
+  {
+    name: 'blockerLifecycleLedger',
+    configPath: 'monitoring.blockerLifecycleLedger.enabled',
+    description: 'Raw blocker lifecycle timing ledger and bounded summary/trend read surfaces.',
+    justification: 'Observe-only and machine-local: records already-persisted commitment lifecycle events into a bounded SQLite ledger; no LLM spend, outbound messages, autonomous action, scalar score, or gating authority. Routes are reads and pool scope only proxies bounded per-origin results.',
+  },  {
+    name: 'maturationLadder',
+    configPath: 'maturation.ladder.enabled',
+    description: 'The measured path to default-on: per-rung thresholds for every switched-off feature, evidence reads, D7 scoring and raising to the review (GET /maturation/ladder).',
+    justification: 'Measures and raises only: it reads logs off the event loop, adds in-memory subjects to the existing scorer, and records commitments with no beacon. It never moves a feature by itself; POST /maturation/moves applies only a decision the review model made, behind floors that can only refuse. No LLM spend, no outbound messages. Raising needs maturation.ladder.reviewTopic, unset by default.',
+  },
+  {
+    name: 'maturationBoard',
+    configPath: 'maturationBoard.enabled',
+    description: 'Read-only maturation board: every maturing feature with its review verdict, live owner facts, follow-ups and recorded dates (GET /maturation/board, /dashboard/maturation/).',
+    justification: 'Read-only and advisory (authority none): joins review files and existing owners at request time; stores nothing, writes nothing, no LLM spend, no outbound messages, no gating. Pool scope only proxies bounded per-machine projections.',
+  },
+  {
+    name: 'queuePace',
+    configPath: 'queuePace.enabled',
+    description: 'Queue pace: an hourly arrivals-vs-completions ledger for every work queue (feedback sorting, feedback fixes, maturation fixes, promises, self-improvement items), with a plain verdict and the reason a queue is behind (GET /queue-pace, the console Pace card).',
+    justification: 'Measure-only: reads existing owner stores (never writes to them), appends its own bounded ledger and tick rows, no LLM spend, no outbound messages while notices.dryRun holds (the default). The only acting part, the triage pace tuner, has its OWN explicit flag queuePace.tuner.enabled (default false, never dev-gated, dry-run by default), so this gate cannot start extra ticks.',
+  },
+  {
+    name: 'ecosystemIdeas',
+    configPath: 'ecosystemIdeas.enabled',
+    description: 'Ecosystem idea pipeline: a weekly review of similar projects that checks each idea against our own source and goals and ranks it. Advice only; it builds nothing and contacts no one. Reads outside text only through frameworks that pass a must-fail file-read probe.',
+    justification: 'Signal only: it gates no running agent and writes only its own ledger. Spend is capped per run and paused at the quota threshold. The one blocking piece, the adoption lint, runs on a development step.',
+  },
+  {
+    name: 'mobilePairing',
+    configPath: 'mobilePairing.enabled',
+    description: 'Mobile pairing links and device keys: a one-time instar.sh link adds this agent to the Instar iPhone app; each phone gets its own owner-confirmed, individually revocable key (POST /mobile/pairing-codes, public redeem over the named tunnel, device-signed confirm/status, GET /mobile/devices, revoke), and operator chat from the app (POST /mobile/chat/:topicId).',
+    justification: 'Phones never receive the API token or an operator session and may only make a fixed allowlist of signed requests (the one non-idempotent entry, chat, is made idempotent by requestId and never binds the topic operator); a phone becomes active only with a code sent privately to the owner. Dark on the fleet until the development-agent live proof passes.',
+  },
+  {
+    name: 'desktopGuidedSetup',
+    configPath: 'remoteDesktop.guidedSetup.enabled',
+    description: 'Guided Remote Desktop setup (docs/specs/desktop-guided-setup.md): a per-machine Set up flow on the Desktop page and in the app, driven by each machine\'s live check.',
+    justification: 'Every action needs a press behind the dashboard PIN session; nothing runs by itself. A paired machine can claim a machine with no front, so it stays dark on the fleet until proven on the development agent.',
+  },
+  {
+    name: 'mobilePairingNative',
+    configPath: 'mobilePairing.native.enabled',
+    description: 'Native app conversations (docs/specs/mobile-native-conversations.md): the iPhone app starts, lists, reads and writes conversations stored by Instar itself (POST/GET /mobile/conversations, POST /mobile/chat/app/:key, its messages/events reads), the agent answers through app-reply.sh (POST /app/session-reply), and every app message is stored with its device signature and this machine\'s signed receipt, checked against a replicated, machine-signed device-key ledger (originVerified in history). The store and the ledger replicate to every machine whenever this is on.',
+    justification: 'Device-signed only, behind the existing device allowlist; every mutation is idempotent by requestId; messages are persisted before dispatch and delivery is never claimed without a recorded outcome. Off ⇒ the new routes answer 503 and the Telegram chat route is unchanged. Dark on the fleet until the development-agent live proof passes.',
+  },
+  {
+    name: 'mobilePairingNativeMedia',
+    configPath: 'mobilePairing.native.media.enabled',
+    description: 'Media in app conversations (docs/specs/mobile-native-chat-media.md): the iPhone app uploads photos, videos, voice notes and files in signed chunks and sends them into a native conversation, the session receives local paths, the agent replies with files through app-reply.sh --file, and the phone\'s signature covers each file\'s hash.',
+    justification: 'Device-signed only, behind the existing allowlist; the server decides a file\'s type from its bytes and serves everything non-executable; reply files are confined to three roots and scanned by the existing credential wall; every admission is capped and a free-disk floor protects the machine. Off ⇒ the media routes answer 503, nothing is copied, and what is stored stays. Dark on the fleet until the development-agent live proof passes.',
+  },
+  {
+    name: 'mobilePairingMultiRoute',
+    configPath: 'mobilePairing.multiRoute.enabled',
+    description: 'Several routes per agent for the Instar iPhone app (docs/specs/mobile-multi-route.md): a paired phone\'s signature is accepted on any of this machine\'s proven own names (Cloudflare tunnel hostname, Tailscale HTTPS name), GET /mobile/routes lists them, and a boot step maps tailscale serve HTTPS 443 to the agent port when 443 has no serve config.',
+    justification: 'Own names come only from local configuration and are proven by the per-process pairing ping (echoed Host, local-TLS arrival, no sibling claim); a request is accepted only on a still-configured own name that arrived through this machine\'s own TLS front, and a captured signature names its exact host. Probes are bounded (one in flight, 3 s, backoff to 15 min, breaker after 8). The serve step never overwrites an existing 443 config. Switching it off restores the single paired host exactly.',
+  },
+  {
+    name: 'mobilePairingOwnerPresence',
+    configPath: 'mobilePairing.ownerPresence.enabled',
+    description: 'Remote Desktop with Face ID and the Dashboard PIN page on the owner\'s phone (docs/specs/mobile-owner-presence-pin.md): a fresh presence-key signature over a single-use, purpose-bound challenge mints a desktop-only, phone-bound 15-minute session (POST /mobile/desktop-unlock) or reveals the dashboard PIN this server compares against (POST /mobile/dashboard-pin/reveal).',
+    justification: 'The desktop session is narrower than the PIN unlock: accepted only by the desktop routes, re-checked against the phone on every use, cleared on a PIN change, and the phone never holds the API token. The reveal is owner-phone only, never returns a placeholder, and needs the owner\'s private chat, which is told (without the PIN) at most once per phone per 10 minutes while every reveal is audited. Bearer, MSP and shared phones are refused; every use and refusal is audited. Dark on the fleet until the development-agent live proof and a physical-phone check pass.',
+  },
+  {
+    name: 'mobilePairingPermissionActions',
+    configPath: 'mobilePairing.permissionActions.enabled',
+    description: 'Face ID-confirmed permission writes from the owner\'s phone (docs/specs/mobile-native-permissions.md): approve or decline a waiting authorization request held on this machine, and turn a feature switch on or off, each with a fresh presence-key signature over a single-use challenge bound to the device, Host and exact action (POST /mobile/permissions/challenge, /requests/:id/approve|decline, /features/:id).',
+    justification: 'No authority beyond the PIN-confirmed console: the action runs the console\'s own approve, deny and operator-switch code; the bearer is refused; it needs an active owner phone, a configured dashboard PIN, local TLS or loopback, the phone\'s Secure Enclave presence key and a 60-second single-use challenge naming the exact action (an approve also names the proposal\'s hash). Every write and refusal is audited. Switching it off stops the writes at once (re-checked live); the read-only lists stay. Dark on the fleet until the development-agent live proof passes.',
   },
 ];
 
@@ -499,11 +979,41 @@ export interface DarkGateExclusion {
 }
 
 export const DARK_GATE_EXCLUSIONS: DarkGateExclusion[] = [
+  { configPath: 'notifications.selectivity.digest.enabled', category: 'optional-integration', reason: 'A daily digest is an explicit operator notification preference, never an automatic development-agent opt-in.' },
   // ── destructive — kills/deletes on a heuristic; off + dry-run for EVERYONE ──
   {
     configPath: 'monitoring.sessionReaper.enabled',
     category: 'destructive',
     reason: 'kills idle sessions; off+dry-run for everyone',
+  },
+  // ── action-bearing — real-money authority; dark for EVERYONE until an explicit
+  //    operator enable (routing-control-room-spend-alerts FD-16: Increments B and D
+  //    are the documented action-bearing exclusion cases). Even when enabled, every
+  //    door stays deny-by-default until a per-door operator PIN go-live. ──
+  {
+    configPath: 'remoteDesktop.enabled',
+    category: 'action-bearing',
+    reason: 'full human display and input access to the logged-in host requires an explicit local operator enable even on development agents',
+  },
+  {
+    configPath: 'routingSpend.money.enabled',
+    category: 'action-bearing',
+    reason: 'real-dollar spending authority (metered-door money gate + PIN caps/arming); dark for everyone incl. dev agents until an explicit operator enable — FD-16',
+  },
+  {
+    configPath: 'monitoring.windowRunLiveness.cadenceExecutor.enabled',
+    category: 'action-bearing',
+    reason: 'injects autonomous checkpoint prompts and sends operator-facing Telegram synthesis reports; requires an explicit per-agent rollout choice',
+  },
+  {
+    configPath: 'autonomousSessions.codexTaskContinuation.enabled',
+    category: 'action-bearing',
+    reason: 'automatically continues bounded Codex turns through the Stop hook; requires an explicit per-agent rollout choice',
+  },
+  {
+    configPath: 'subscriptionPool.assistedRelogin.enabled',
+    category: 'action-bearing',
+    reason: 'submits provider credentials and mutates a live Claude login; dark for everyone including development agents until reviewed approval and a disposable-identity canary',
   },
   {
     configPath: 'monitoring.agentWorktreeReaper.enabled',
@@ -526,6 +1036,11 @@ export const DARK_GATE_EXCLUSIONS: DarkGateExclusion[] = [
     reason: 'spawns full-tool Opus fix sessions; ongoing spend',
   },
   {
+    configPath: 'autonomousSessions.codexTaskContinuation.enabled',
+    category: 'cost-bearing',
+    reason: 'continues bounded autonomous Codex turns and therefore consumes model capacity; explicit opt-in even on development agents',
+  },
+  {
     configPath: 'monitoring.resumeQueue.enabled',
     category: 'cost-bearing',
     reason: 'drainer spawns sessions + makes LLM calls; ships enabled+dryRun code-default, dev agent flips dryRun locally (reap-notify spec)',
@@ -537,19 +1052,14 @@ export const DARK_GATE_EXCLUSIONS: DarkGateExclusion[] = [
   },
   // ── structural-stub — no runtime consumer wired; a gate would assert dead behavior ──
   {
-    configPath: 'cartographer.conformanceAudit.llmEnrichment.enabled',
-    category: 'structural-stub',
-    reason: 'no LLM pipeline wired; dark stub',
-  },
-  {
-    configPath: 'cartographer.subtreeNav.llmRerank.enabled',
-    category: 'structural-stub',
-    reason: 'no LLM pipeline wired; dark stub',
-  },
-  {
     configPath: 'monitoring.agentSleep.enabled',
     category: 'structural-stub',
     reason: 'sleep/respawn mechanism is a later slice; not wired',
+  },
+  {
+    configPath: 'prGate.classClosure.enabled',
+    category: 'structural-stub',
+    reason: 'class-closure gate increment 1 is CI-only report-only tooling (scripts/class-closure-lint.mjs) read at build time, NOT a runtime server feature — resolveDevAgentGate does not apply; enabled:false + dryRun:true is the intended report-only ship state (spec rollout step 1), enforcing is a later opt-in; no runtime consumer wired (route/escalator are increment 3), repo-gated no-op off the maintainer repo',
   },
   // ── optional-integration — opt-in per deployment ──
   {
@@ -566,6 +1076,11 @@ export const DARK_GATE_EXCLUSIONS: DarkGateExclusion[] = [
     configPath: 'multiMachine.sessionPool.holdForStability.enabled',
     category: 'optional-integration',
     reason: 'hold-for-stability policy; trails inboundQueue one rollout stage behind (operator discipline)',
+  },
+  {
+    configPath: 'multiMachine.sessionPool.ownershipCheckedSpawn.enabled',
+    category: 'optional-integration',
+    reason: 'G3 lease-gated spawn (MESH-SELF-HEAL-SPEC §3.3) — spawn iff holding the fenced awake-lease, else forward to holder; stops the duplicate-session harm. Dark→dry-run→dev-live→fleet, live-verified on the real Mini+Laptop pair before enablement.',
   },
   // (the 7 multiMachine.stateSync.* memory stores — preferences, relationships,
   //  learnings, knowledge, evolutionActions, userRegistry, topicOperator — MOVED to
@@ -598,6 +1113,12 @@ export const DARK_GATE_EXCLUSIONS: DarkGateExclusion[] = [
     configPath: 'multiMachine.leaseSelfHeal.soloCaptainHold.enabled',
     category: 'action-bearing',
     reason: 'multi-transport-mesh-comms Layer 3 — when enabled, a preferred stationary captain RETAINS the awake lease (a live authority change) instead of self-suspending when its sole peer is presumed-gone by liveness-silence. Ships hard-dark on EVERY agent because it changes who-is-awake under partition; preferred-awake + liveness gated; MUST be live-verified on the real Mini+Laptop pair (physically sever the peer, then return it at a higher epoch and assert one-tick stand-down) before enablement. Off ⇒ renew() is byte-for-byte the legacy self-fence. Opt-in per agent after soak. Spec: docs/specs/multi-transport-mesh-comms.md.',
+  },
+  {
+    configPath: 'multiMachine.leaseSelfHeal.preferredCaptainHandback.enabled',
+    category: 'action-bearing',
+    reason:
+      'U4.4 lease hand-back (docs/specs/u4-4-lease-handback.md, R-r2-4) — when enabled, the serving lease is HANDED BACK to the F4 preferred captain (a live authority change: claim-before-release via a holder-signed single-use consent token). Ships hard-dark on EVERY agent (dev included) like its F2/F3/L3 siblings because it moves who-is-awake; MUST be live-verified on the real Mini+Laptop pair (fail over, heal, watch the hand-back fire at a clean boundary, canary-verify ingress) before any enablement, then dev-dry-run → dev-live → fleet. dryRun:false is additionally boot-refused unless pollFollowsLease is live (the lease/ingress-split chokepoint). Documented Maturation-Path exception.',
   },
   {
     configPath: 'threadline.a2aCheckIn.enabled',

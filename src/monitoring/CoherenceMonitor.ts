@@ -18,6 +18,7 @@
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomInt } from 'node:crypto';
 import type { LiveConfig } from '../config/LiveConfig.js';
 import type { ComponentHealth } from '../core/types.js';
 import { ProcessIntegrity } from '../core/ProcessIntegrity.js';
@@ -501,7 +502,9 @@ export class CoherenceMonitor extends EventEmitter {
       for (let i = lines.length - 1; i >= 0 && agentMessages.length < 50; i--) {
         try {
           const entry = JSON.parse(lines[i]);
-          if (!entry.fromUser && entry.text) {
+          // New automation rows are structurally excluded. Legacy rows have no
+          // provenance and retain the pre-migration behavior.
+          if (!entry.fromUser && entry.provenance !== 'automation' && entry.text) {
             agentMessages.push({ text: entry.text, timestamp: entry.timestamp });
           }
         } catch { /* skip malformed lines */ }
@@ -583,7 +586,7 @@ export class CoherenceMonitor extends EventEmitter {
           });
         } else {
           // Self-correct: generate a PIN
-          const newPin = String(Math.floor(100000 + Math.random() * 900000));
+          const newPin = String(randomInt(100000, 1000000));
           liveConfig.set('dashboardPin', newPin);
           results.push({
             name: 'readiness-dashboard-pin',

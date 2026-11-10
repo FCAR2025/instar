@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
 import {
   buildInteractiveLaunch,
   buildHeadlessLaunch,
@@ -41,6 +42,26 @@ const STUB_BINS: Record<string, string> = {
   'codex-cli': '/opt/homebrew/bin/codex',
   'gemini-cli': '/opt/homebrew/bin/gemini',
   'pi-cli': '/opt/homebrew/bin/pi',
+  'grok-build': '/Users/stub/.grok/bin/grok',
+};
+
+/**
+ * Frameworks whose lanes DELIBERATELY refuse until an opt-in / follow-up lands
+ * (grok-build spec §4.3). The matrix's job is "no SILENT drop", not "every lane
+ * is open" — a gated lane must throw its NAMED error, and the interactive lane
+ * must build once the gate is satisfied. Encoding the refusal keeps the audit
+ * honest instead of deleting the framework from the matrix.
+ */
+const GATED_LANES: Record<string, { interactive?: RegExp; headless?: RegExp; interactiveOpts?: Record<string, unknown> }> = {
+  'grok-build': {
+    interactive: /grok-interactive-ungated/,
+    // headless: OPENED 2026-08-16 on an operator decision. This lane used to
+    // refuse every grok job with `grok-headless-cwd-ungated`; the bound moved to
+    // the spawn site and now fires only when the cwd is an instar source
+    // checkout (`grok-headless-source-tree`), which this argv-rendering matrix
+    // does not exercise. The INTERACTIVE gate is unchanged and still asserted.
+    interactiveOpts: { grokInteractiveOptIn: true },
+  },
 };
 function binaryPathFor(framework: IntelligenceFramework): string {
   const bin = STUB_BINS[framework];
@@ -50,9 +71,18 @@ function binaryPathFor(framework: IntelligenceFramework): string {
 
 describe('framework arg-rendering matrix (audit completeness) — codex-instar Item 9', () => {
   describe.each(ALL_SUPPORTED_FRAMEWORKS)('framework=%s', (framework) => {
+    const gate = GATED_LANES[framework];
+
     it('produces a non-empty interactive launch spec with argv starting at the binary path', () => {
+      if (gate?.interactive) {
+        // The gate must refuse by NAME before the opt-in…
+        expect(() =>
+          buildInteractiveLaunch(framework, { binaryPath: binaryPathFor(framework) }),
+        ).toThrow(gate.interactive);
+      }
       const spec = buildInteractiveLaunch(framework, {
         binaryPath: binaryPathFor(framework),
+        ...(gate?.interactiveOpts ?? {}),
       });
       expect(spec).toBeDefined();
       expect(Array.isArray(spec.argv)).toBe(true);
@@ -62,6 +92,16 @@ describe('framework arg-rendering matrix (audit completeness) — codex-instar I
     });
 
     it('produces a non-empty headless launch spec with argv starting at the binary path', () => {
+      if (gate?.headless) {
+        // A CLOSED lane must refuse by name — never silently produce a spec.
+        expect(() =>
+          buildHeadlessLaunch(framework, {
+            binaryPath: binaryPathFor(framework),
+            prompt: 'hello world',
+          }),
+        ).toThrow(gate.headless);
+        return;
+      }
       const spec = buildHeadlessLaunch(framework, {
         binaryPath: binaryPathFor(framework),
         prompt: 'hello world',
@@ -75,14 +115,31 @@ describe('framework arg-rendering matrix (audit completeness) — codex-instar I
 
     it('routes the prompt string into the headless argv (no silent drop)', () => {
       const distinctivePrompt = 'codex-instar-audit-item-9-marker';
+      if (gate?.headless) {
+        expect(() =>
+          buildHeadlessLaunch(framework, {
+            binaryPath: binaryPathFor(framework),
+            prompt: distinctivePrompt,
+          }),
+        ).toThrow(gate.headless);
+        return;
+      }
       const spec = buildHeadlessLaunch(framework, {
         binaryPath: binaryPathFor(framework),
         prompt: distinctivePrompt,
       });
-      // The prompt should appear somewhere in argv. Frameworks have
-      // different positions (-p for Claude, positional for Codex), so we
-      // just check presence rather than position.
-      expect(spec.argv.some(a => a.includes(distinctivePrompt))).toBe(true);
+      // The invariant is DELIVERY, not location: the prompt must reach the
+      // framework rather than being silently dropped. Frameworks differ in how
+      // — `-p` for Claude, positional for Codex, and a private `--prompt-file`
+      // for grok, which deliberately keeps prompts off argv because `ps` exposes
+      // a command line to every local principal. So follow the file when the
+      // framework hands one over, and check presence rather than position.
+      const pfIdx = spec.argv.indexOf('--prompt-file');
+      const delivered =
+        pfIdx >= 0
+          ? fs.readFileSync(spec.argv[pfIdx + 1]!, 'utf8').includes(distinctivePrompt)
+          : spec.argv.some(a => a.includes(distinctivePrompt));
+      expect(delivered).toBe(true);
     });
   });
 
@@ -106,15 +163,30 @@ describe('framework arg-rendering matrix (audit completeness) — codex-instar I
     // a new framework gets one builder but not the other — the silent skew
     // codex-instar audit Item 9 worried about.
     for (const framework of ALL_SUPPORTED_FRAMEWORKS) {
+      const gate = GATED_LANES[framework];
+      // A registered builder either BUILDS or refuses with its named gate
+      // error; what it must never do is fall through silently.
       expect(() =>
-        buildInteractiveLaunch(framework, { binaryPath: binaryPathFor(framework) }),
-      ).not.toThrow();
-      expect(() =>
-        buildHeadlessLaunch(framework, {
+        buildInteractiveLaunch(framework, {
           binaryPath: binaryPathFor(framework),
-          prompt: 'x',
+          ...(gate?.interactiveOpts ?? {}),
         }),
       ).not.toThrow();
+      if (gate?.headless) {
+        expect(() =>
+          buildHeadlessLaunch(framework, {
+            binaryPath: binaryPathFor(framework),
+            prompt: 'x',
+          }),
+        ).toThrow(gate.headless);
+      } else {
+        expect(() =>
+          buildHeadlessLaunch(framework, {
+            binaryPath: binaryPathFor(framework),
+            prompt: 'x',
+          }),
+        ).not.toThrow();
+      }
     }
   });
 });

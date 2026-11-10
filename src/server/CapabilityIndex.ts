@@ -28,6 +28,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { SafeGitExecutor } from '../core/SafeGitExecutor.js';
 import { resolveDevAgentGate } from '../core/devAgentGate.js';
+import { browserCapability } from '../core/linuxBrowserProvision.js';
 import { activeAutonomousJobs, DEFAULT_MAX_CONCURRENT_AUTONOMOUS } from '../core/AutonomousSessions.js';
 import type { SecretDrop } from './SecretDrop.js';
 import type { RouteContext } from './routes.js';
@@ -56,6 +57,30 @@ export interface CapabilityEntry {
 // ── Top-level capability entries ─────────────────────────────────────────
 
 export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
+  {
+    key: 'channelRegistry',
+    prefixes: ['/channels'],
+    description: 'Which peer-to-peer channels exist and which are usable right now, with the evidence for each verdict.',
+    build: () => ({ configured: true, endpoints: ['GET /channels'] }),
+  },
+  {
+    key: 'memoryPrivacy',
+    prefixes: ['/memory-privacy'],
+    description: 'Whether memory is kept per person and per place on this agent, who the owner is, and whether the sandbox runs here.',
+    build: () => ({ configured: true, endpoints: ['GET /memory-privacy', 'GET /memory-privacy/fix/:token', 'POST /memory-privacy/fix/:token'] }),
+  },
+  {
+    key: 'teamPeople',
+    prefixes: ['/team'],
+    description: 'Who can reach this agent, how, and what each person can see. The owner\'s phone gives access; the agent can only take it away.',
+    build: () => ({ configured: true, endpoints: ['GET /team/people', 'GET /team/people?scope=pool', 'POST /team/people/:personKey/lower', 'GET /mobile/team/people', 'GET /mobile/team/context', 'GET /mobile/team/activity', 'POST /mobile/team/invites', 'POST /mobile/team/grants', 'POST /mobile/team/off', 'POST /mobile/team/restore', 'POST /mobile/team/memory-privacy'] }),
+  },
+  {
+    key: 'capabilityRegistry',
+    prefixes: ['/capability-registry'],
+    description: 'Local capability registry read surface; dark until explicitly enabled.',
+    build: ({ ctx }) => ({ configured: resolveDevAgentGate((ctx.config as any).capabilityRegistry?.enabled, ctx.config), endpoints: ['GET /capability-registry', 'GET /capability-registry/health'] }),
+  },
   // E2E-PAIRING: EXEMPT — capability classification metadata only (no new endpoint
   // behavior); the subscription-pool routes already have integration + e2e tests
   // (P1.1–P2.1), and the capabilities-discoverability unit lint is the coverage for
@@ -65,7 +90,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'subscriptionPool',
     prefixes: ['/subscription-pool'],
-    description: 'Subscription & Auth Standard — a multi-account subscription pool (N logins of the same provider) with live per-account quota (5h + weekly utilization + reset dates, measured burn), reset-date-optimal account selection, a hard session-continuity guarantee (a session that hits its account quota resumes on another account via --resume, never dies), proactive PRE-LIMIT swap (move a session off an account before it walls, at a lag-aware threshold — covers untagged sessions on the default login), and a mobile-first enrollment wizard (start a login, surface the public code/URL, auto-reissue an expired code). The registry stores login LOCATION (config home), never tokens. Backs the dashboard Subscriptions tab. Single-account pools are a no-op; auto-swap of live sessions is opt-in (subscriptionPool.autoSwapOnRateLimit reactive; subscriptionPool.proactiveSwap pre-limit).',
+    description: 'Subscription & Auth Standard — a multi-account subscription pool (N logins of the same provider) with live per-account quota (5h + weekly utilization + reset dates, measured burn), reset-date-optimal account selection, a hard session-continuity guarantee (a session that hits its account quota resumes on another account via --resume, never dies), proactive PRE-LIMIT swap (move a session off an account before it walls, at a lag-aware threshold — tagged sessions only; untagged ones are reached by the default-slot repoint and the usage-wall rescue), and a mobile-first enrollment wizard (start a login, surface the public code/URL, auto-reissue an expired code). The registry stores login LOCATION (config home), never tokens. Backs the dashboard Subscriptions tab. Single-account pools are a no-op. Usage-wall rescue is ON by default with 2+ usable accounts (subscriptionPool.wallRescue.enabled): a session at its account usage wall, tagged or untagged, moves to an account with room, and new sessions are tagged with a pool account; swapping on a server throttle stays opt-in (subscriptionPool.autoSwapOnRateLimit) and the pre-limit swap is opt-in (subscriptionPool.proactiveSwap).',
     build: ({ ctx }) => ({
       configured: !!ctx.subscriptionPool,
       accounts: ctx.subscriptionPool ? ctx.subscriptionPool.size() : 0,
@@ -86,9 +111,35 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'POST /subscription-pool/proactive-swap/check',
         'POST /subscription-pool/enroll',
         'GET /subscription-pool/pending-logins',
+        'POST /subscription-pool/enroll/:id/cancel',
         'POST /subscription-pool/enroll/:id/complete',
         'POST /subscription-pool/enroll/reissue-expired',
       ],
+    }),
+  },
+  {
+    key: 'subscriptionRelogin',
+    prefixes: ['/subscription-relogin'],
+    description: 'Bounded Claude Code and Codex sign-in repair. A corroborated open authentication incident becomes one exact account/profile repair; approval mode uses one operator click, while unattended mode requires an exact identity allowlist plus configured evidence floors. Secrets never enter prompts, logs, or API responses, and success requires verified identity, authenticated use, pool activation, and closure of the exact source incident. On macOS the browser step can be done by one short-lived agent session following /subscription-signin section 3 (navigation agent-session), which posts the Claude code to a loopback, per-episode-token code route; that path honors unattended mode exactly like the others. A failed repair (not a safety refusal or operator cancel) retries itself slowly while the incident stays open: 6 h, then 24 h apart, at most 3 times; the episode carries nextAttemptAt.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.subscriptionRelogin,
+      mode: ctx.config.subscriptionPool?.assistedRelogin?.enabled === true
+        ? (ctx.config.subscriptionPool.assistedRelogin.dryRun === true
+          ? 'observe'
+          : (ctx.config.subscriptionPool.assistedRelogin.mode ?? 'approval'))
+        : 'off',
+      endpoints: [
+        'GET /subscription-relogin',
+        'POST /subscription-relogin/configure',
+        'GET /subscription-relogin/:episodeId/events',
+        'POST /subscription-relogin/repair-cell',
+        'POST /subscription-relogin/:episodeId/approve',
+        'POST /subscription-relogin/:episodeId/approve-with-mandate',
+        'POST /subscription-relogin/:episodeId/cancel',
+        'POST /subscription-relogin/:episodeId/retry',
+        'POST /subscription-relogin/:episodeId/code',
+      ],
+      navigation: ctx.config.subscriptionPool?.assistedRelogin?.navigation ?? 'default',
     }),
   },
   {
@@ -108,6 +159,28 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     }),
   },
   {
+    key: 'duplicateSessionStandDown',
+    prefixes: ['/standdown'],
+    description: 'Duplicate-session stand-down (docs/specs/duplicate-session-standdown.md) — when one conversation has live sessions on two machines, the losing copy is asked to go quiet instead of being killed: a PreToolUse hook blocks new tool calls (reads stay open), its sends to the conversation are refused 409 standing-down, and a bounded drained-close retires it once corroborated quiet. Registry First: "why did my tool call get blocked / my send get a 409 / my other copy go quiet?" → GET /standdown (?scope=pool merges machines); an expired (frozen) episode is released ONLY by the operator (dashboard-PIN route). Dev-gated dark on the fleet, dryRun-first even on dev (monitoring.standDown); single-machine agents are a strict no-op; 503 when dark.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.standDownRegistry,
+      endpoints: ['GET /standdown', 'GET /standdown?scope=pool', 'POST /standdown/evaluate', 'POST /standdown/:sessionName/operator-release'],
+    }),
+  },
+  {
+    key: 'remoteDesktop',
+    prefixes: ['/desktop'],
+    description: 'Native operator remote desktop on the registered machine pool. The operator opens the designated front at /dashboard/desktop.html, enters the existing dashboard PIN, chooses a ready target, and can Stop immediately. A target may be online even when its screen helper lacks a GUI session, display, or permission. The PIN proves dashboard credential possession, not independent human identity. Locked-screen access is off everywhere until a macOS version has recorded crash and Stop proofs: GET /desktop/locked/status reads it (?scope=pool for every machine; passwordReadiness names, per client, why a password could not be typed once locked, null meaning ready), POST /desktop/locked/settings is the PIN route, and POST /desktop/locked/disable stops it. Registry First: GET /desktop/diagnostics reports this machine’s own probe signals with Bearer auth, including whether a Mac permission belongs to the helper itself (screenGrant/inputGrant: own) or only to what started the process tree (inherited); POST /desktop/request-permission shows macOS’s prompts to a person at that Mac and grants nothing itself; GET /desktop/availability reports the designated front’s local admission, and the PIN-scoped front /desktop/targets lists the pool.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.directDesktopAccess,
+      endpoints: ['GET /desktop/setup', 'GET /desktop/setup/:machineId', 'POST /desktop/setup/:machineId',
+        'GET /desktop/diagnostics', 'POST /desktop/request-permission', 'GET /desktop/availability', 'GET /desktop/targets', 'POST /desktop/requests',
+        'GET /desktop/locked/status', 'POST /desktop/locked/settings', 'POST /desktop/locked/disable',
+        'GET /desktop/requests/:id', 'GET /desktop/requests/:id/displays', 'POST /desktop/requests/:id/ticket',
+        'POST /desktop/requests/:id/revoke', 'WebSocket /desktop-stream'],
+    }),
+  },
+  {
     key: 'guardPosture',
     prefixes: ['/guards'],
     description: 'Guard Posture (GUARD-POSTURE-ENDPOINT-SPEC) — read every machine\'s safety-guard flags with HONEST verification-graded states: on-confirmed (live runtime confirms) / on-unverified (config-on only, grey not green) / on-stale (dead tick loop) / on-dry-run (watching but toothless) / off classified dark-default vs diverged-from-default (the load-shed signature — the only off that alerts) / diverged-pending-restart (disk edit not yet live) / errored / missing (expected runtime never registered) / off-runtime-divergent (runtime contradicts an on-config — the in-memory load-shed class). ?scope=pool accounts for EVERY registered machine by name (classified failure rows, never silent omission); the Machines tab shows last-known posture with age even for a dark peer (heartbeat piggyback + durable store). Read-only, always-on (deliberately no enabled gate — an off-switch on the guard-visibility surface would itself be an invisible disabled guard). When asked "are my guards on?" / "why didn\'t the watchdog fire on machine X?" / after any incident load-shed → read this, never guess. To re-enable a guard via PATCH /config, send the guard\'s FULL config block (one-level-deep merge erases sibling tuning).',
@@ -116,6 +189,166 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
       runtimeEnriched: !!ctx.guardRegistry,
       pool: !!ctx.listPoolMachines,
       endpoints: ['GET /guards', 'GET /guards?scope=pool'],
+    }),
+  },
+  {
+    key: 'agentIdentity',
+    prefixes: ['/agent-identity'],
+    description: 'Agent identity across machines (a2a-single-agent-identity §1–§2): one agent, one routing fingerprint, on every machine. A joined or rebuilt machine ADOPTS the identity its siblings publish (signed observe/request mesh verbs, sealed to its registry key, reachable-agree + local-memory pin) and never mints one; a paired machine with no identity boots identity-not-provisioned (relay not attempted, lease yielded only to a live provisioned sibling, ONE agent-identity-missing item naming the refusal and the lever). GET /agent-identity/audit is the key-free audit (?scope=pool merges every online machine); POST /agent-identity/reload re-reads THIS machine\'s own disk and rebuilds its relay client (local effect only, carries no key, 429 inside 60 s). The continuous coherence check (one formula, every 5 min, self = disk AND connectedAs) is read on GET /threadline/health → identityCoherence; the lease holder raises ONE agent-identity-split item per episode. Replacing an EXISTING identity is the agent\'s action after the operator\'s yes: `instar identity adopt --from <sibling>` on that machine. Always on; a single machine reads cannot-tell.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.agentIdentity,
+      posture: ctx.agentIdentity?.notProvisioned() ? 'identity-not-provisioned' : 'provisioned',
+      endpoints: ['GET /agent-identity/audit', 'GET /agent-identity/audit?scope=pool', 'POST /agent-identity/reload', 'GET /threadline/health (identityCoherence)'],
+    }),
+  },
+  {
+    key: 'judgmentProvenance',
+    prefixes: ['/judgment-provenance'],
+    description: 'Judgment-call decision provenance (ownership-gated-spawn-and-judgment-within-floors §3.5 + llm-decision-quality-meter §5.2 — the Decision Provenance & Outcome Review standard). Every judgment call the ownership layer makes (SpawnAdmission verdicts, duplicate-reconciler intended-owner determinations) AND every ENROLLED LLM decision the router-settlement seam records (correlation-id-keyed, content-class-enveloped, volume-class-valved) is durably logged — machine-local under .instar/state/judgment-provenance/ (0700/0600, gitignored, backup-excluded, 14-day retention, NEVER HTTP-served raw: a hardcoded NEVER_SERVED_PREFIXES deny in the file routes covers read/download/edit/link incl. symlink evasion). GET /judgment-provenance serves REDACTED rows only (write-time credential-shape scrub + omission of the machine-local full context); ?limit / ?sinceHours filter; ?scope=pool merges peers\' redacted rows as clamped untrusted data. The log is constructed UNCONDITIONALLY at boot on every agent, single-machine included (FD9) — a 503 here means construction FAILED (see server log), never "single-machine so not built". When asked "why did the system decide machine X owns this conversation?" / "what did the duplicate healer see?" / "what context did that gate judge?" → read this, never guess.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.judgmentProvenance,
+      endpoints: ['GET /judgment-provenance', 'GET /pool/duplicate-reconciler', 'GET /pool/ownership-view'],
+    }),
+  },
+  {
+    key: 'decisionQuality',
+    // P10: the /decision-quality routes are now registered in routes.ts
+    // (GET /decision-quality + POST /decision-quality/grade-pass), so the
+    // discoverability lint's "every declared prefix exists as a route" invariant
+    // holds with this prefix present (structure, not memory, closed the gap).
+    prefixes: ['/decision-quality'],
+    description: 'LLM-Decision Quality Meter (llm-decision-quality-meter §5.5 — ACT-1193/ACT-1194): the QUALITY meter beside the cost meter — per LLM decision-point over a window: decisions made, outcomes known, grade distribution (right/wrong/unknown/expired), grade-by-rule/rung/evidence-strength breakdowns (proof-like vs heuristic never conflated; insufficient-evidence marker below the minimum sample), attribution columns (model/framework/prompt_id), census debt (wired/pending/exempt + pending-ref-dead + wired-but-silent + exempt-but-active + wired-but-no-grader flags), and the honest counters (orphanOutcomes/joinMiss/droppedByBudget + the four annotation-rejection classes). GET /decision-quality is the read surface (Bearer; pure indexed SQLite; ?sinceHours; ?scope=pool merges MACHINE-TAGGED rows — per-machine framework routing makes per-machine quality genuinely distinct data); its separate directJobSupervision section reports content-free per-call Jev/replacement records, missing script-run journal rows, and independent outcome grades from JobSupervisionStore, with routerEnrollment:pending. It does not enroll direct calls into the router meter or enable Jev decisions. POST /decision-quality/grade-pass runs ONE bounded deterministic grading pass (cursor keyset, idempotent, zero LLM spend — the hourly llm-decision-grading job template drives it, ships enabled:true). Both routes 503 when the seam is DARK on this agent (provenance.uniformSeam resolves off — dev-gated: LIVE on a development agent, DARK on the fleet; dryRun defaults TRUE even on dev) — say so honestly rather than guessing. When the operator asks "is this gate performing / does it need a bigger model or a prompt change?" → read the meter, never guess.',
+    build: ({ ctx }) => ({
+      configured: resolveDevAgentGate(ctx.config.provenance?.uniformSeam?.enabled, ctx.config),
+      dryRun: ctx.config.provenance?.uniformSeam?.dryRun !== false,
+      endpoints: ['GET /decision-quality', 'POST /decision-quality/grade-pass'],
+    }),
+  },
+  {
+    key: 'benchmarkDivergence',
+    prefixes: ['/benchmark-divergence'],
+    description: 'Benchmark-Divergence Detector (benchmark-divergence-detector — Increment A of the benchmark-feedback loop; parent standard Decision Provenance & Outcome Review): the observe-only detector comparing each enrolled decision point\'s REAL per-model grade-rate (quality-meter settled grades over a rolling matured-day window, pool-collected across every machine on the serving-lease holder) against the benchmark\'s PREDICTED pass-rate from the git-tracked mirror — CI-aware on BOTH sides (Wilson half-widths, so a 10-case battery cannot manufacture divergence), precondition-FIRST (a stale/missing mirror or a drifted/unverifiable prompt template suppresses divergent AND aligned — a stale benchmark never blames or credits a model), direction-split (divergent-better leads with "is the grade-rate inflated?", never "promote this model"). Every finding is advisory:true (Signal vs. Authority) and content-free (correlation-id POINTERS into the meter, never raw decision context). GET /benchmark-divergence is the read surface (Bearer; ?scope=pool merges peers\' clamped findings, questions regenerated locally); POST /benchmark-divergence/analyze triggers one lease-gated, rate-limited, idempotent pass (the daily benchmark-divergence-analysis job template drives it, ships enabled:false); GET /benchmark-divergence/rollup-aggregates is the peer collection route (serving peer clamps the range). All three 503 when the detector is DARK on this agent (benchmarkDivergence resolves off — dev-gated: LIVE-in-dryRun on a development agent, DARK on the fleet) — say so honestly rather than guessing. When the operator asks "is the benchmark still right about model X?" / "why does this gate underperform its bench score?" → read the findings, never guess.',
+    build: ({ ctx }) => ({
+      configured: resolveDevAgentGate(ctx.config.benchmarkDivergence?.enabled, ctx.config),
+      dryRun: ctx.config.benchmarkDivergence?.dryRun !== false,
+      endpoints: [
+        'GET /benchmark-divergence',
+        'POST /benchmark-divergence/analyze',
+        'GET /benchmark-divergence/rollup-aggregates',
+      ],
+    }),
+  },
+  {
+    key: 'conversationIdentity',
+    prefixes: ['/conversations'],
+    description: 'Durable Conversation Identity (durable-conversation-identity §8) — the read-only registry surface behind channel-agnostic conversation ids. Every conversation has ONE durable numeric identity: a Telegram topic IS its positive id (pass-through, never registered); a non-Telegram conversation (Slack channel/thread) is minted a stable NEGATIVE id at first inbound, so durable state (commitments, memory, notices) can attach to it and survive restarts. A negative topicId anywhere in state is a minted conversation id, not an error. GET /conversations lists entries + the alias table; GET /conversations/:id resolves one id (unknown negative → honest 404 "never minted on this machine"); GET /conversations/resolve?key=…|?sessionKey=… is the forward lookup that mints NOTHING; GET /conversations/health carries entry counts, origins, quarantine + snapshot-suspension state, and the growth tripwire. Recording is always-on foundation (kill-switch: conversationIdentity.recording.enabled=false degrades to legacy in-memory hashing); DELIVERY to minted ids is dev-gated (conversationIdentity.followThrough, dryRun-first). When asked "what is this negative topic id?" / "which Slack conversation is -N?" → read /conversations/:id, never guess.',
+    build: () => ({
+      configured: true,
+      endpoints: [
+        'GET /conversations',
+        'GET /conversations/:id',
+        'GET /conversations/resolve',
+        'GET /conversations/health',
+      ],
+    }),
+  },
+  {
+    key: 'doorwayRegistry',
+    prefixes: ['/doorways'],
+    description: 'Doorway/Model Knowledge Registry (DOORWAY-MODEL-KNOWLEDGE-REGISTRY-SPEC §D5) — the read-only merged map from each doorway (Claude Code, Codex, Gemini, a paid API key, …) to the top models it can currently reach: canonical topModels (git-tracked, with pricing — authoritative for routing) overlaid with this machine\'s read-validated live reachability. D5 two-state contract: 200 with scanState:"never-run" (registry present, no scan yet — live fields reachable:null/probeStatus:"never-scanned") then 200 merged once a scan runs; 503 code:"registry-unavailable-no-instar-source" (a non-instar-source install carries no manifest) or code:"registry-corrupt" (present but unparseable) — never a fabricated empty map. The recurring doorway-scan job that keeps it current ships OFF by default (job manifest enabled:false; maintenance.doorwayScan tunes it). When asked "what models can I reach?" / "is my model map current?" / "which doorways are live?" → read GET /doorways, don\'t guess.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /doorways'],
+    }),
+  },
+  {
+    key: 'maturationLadder',
+    prefixes: ['/maturation'],
+    description: 'Maturation ladder (docs/specs/feature-maturation-ladder.md) — every switched-off feature with its rung, next rung and numbers now vs target. Numbers raise a feature to the recurring review, whose model decides; POST /maturation/moves applies that decision behind floors that can only refuse.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /maturation/ladder', 'GET /maturation/moves', 'POST /maturation/moves', 'POST /maturation/moves/:moveId/revert', 'POST /maturation/evidence'],
+    }),
+  },
+  {
+    key: 'queuePace',
+    prefixes: ['/queue-pace'],
+    description: 'Queue pace (docs/specs/queue-pace.md) — an hourly arrivals-vs-completions ledger for every work queue (feedback sorting, feedback fixes, maturation fixes, promises, self-improvement items) with a plain 7-day verdict (falling-behind / catching-up / holding / shrinking-by-exits / unknown / owner-not-serving) and, for a queue that is behind, the named reason (person / quota / cap / worker / unknown). GET /queue-pace (?scope=pool merges every machine) returns per-queue inflowPerDay, outflowPerDay, exitedPerDay, open, daysToClear, bottleneck, coverage and tuner state. Dev-gated measure-only (queuePace.enabled); 503 when dark. The triage pace tuner has its own flag queuePace.tuner.enabled (default false, dry-run). When asked "are we keeping up with feedback / promises / action items?" → read this, don\'t guess.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /queue-pace'],
+    }),
+  },
+  {
+    key: 'recommendedServices',
+    prefixes: ['/recommended-services'],
+    description: 'Recommended outside services (docs/specs/recommended-services.md) — the catalog (benefit, what leaves the machine, cost, account, backup and its status, whether it is available) and the saved yes or no for each service, replicated across machines where machine sync is on (the route reports `replicating`). Offers are not live yet, and the route reports what they wait for (`migrationComplete`, `firstResult`). A no needs the dashboard PIN.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /recommended-services', 'POST /recommended-services/:id/no', 'GET /recommended-services/:id/confirm', 'POST /recommended-services/:id/confirm', 'POST /recommended-services/:id/verify'],
+    }),
+  },
+  {
+    key: 'ecosystemIdeas',
+    prefixes: ['/ecosystem-ideas'],
+    description: 'Ecosystem idea pipeline (docs/specs/ecosystem-idea-pipeline.md) — a weekly review of similar projects: each idea checked against our source and goals, ranked into bands. Advice only. 503 when dark or with no source roots.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /ecosystem-ideas', 'GET /ecosystem-ideas/:id/evidence', 'POST /ecosystem-ideas/tick', 'POST /ecosystem-ideas/plan', 'POST /ecosystem-ideas/commit', 'POST /ecosystem-ideas/projects/retry', 'POST /ecosystem-ideas/:id/adoption', 'POST /ecosystem-ideas/:id/outcome'],
+    }),
+  },
+  {
+    key: 'mobilePairing',
+    prefixes: ['/mobile'],
+    description: 'Mobile pairing links and device keys (docs/specs/mobile-pairing-link.md, docs/specs/mobile-device-keys.md) — a one-time instar.sh link adds this agent to the Instar iPhone app. The phone registers its own Secure Enclave key; the owner receives a 6-digit code privately in Telegram and types it into the app; only then does the phone become active. Phones never receive the API token or an operator session and may only make a fixed list of signed requests. POST /mobile/pairing-codes (Bearer) mints the link; public POST /mobile/pairing-codes/redeem registers the pending phone over the named tunnel; POST /mobile/device/confirm and GET /mobile/device are device-signed; GET /mobile/devices (?scope=pool) lists phones; POST /mobile/devices/:id/revoke revokes one. POST /mobile/chat/:topicId (device-signed only, docs/specs/mobile-operator-chat.md) delivers an app message into a topic through the same inbound path as the owner\'s Telegram message, idempotent by requestId; GET /telegram/topics/:topicId/messages?scope=pool reads that topic across machines. Push (docs/specs/mobile-push.md): POST /mobile/device/push registers a phone\'s APNs token, hub posts notify phones directly through Apple (no item text), GET /mobile/attention/:id gives the phone the title, POST /mobile/push/notify carries the trigger between machines, GET /mobile/push is the status. Without a Telegram owner (docs/specs/mobile-native-conversations.md §4.4, with native conversations on), redeem answers {status: pending, approval: dashboard} and the code is shown only to a dashboard PIN session on GET /mobile/pairing-approvals (POST /mobile/pairing-approvals/:id/decline declines); the phone is recorded approvedVia dashboard-pin. Approve instead of a code (docs/specs/mobile-pairing-approve.md): the owner taps Approve on the private Telegram message (verified owner tap, private chat only), or POST /mobile/pairing-approvals/:id/approve from a dashboard PIN session (dashboard-path phones only), or an owner phone uses GET /mobile/pairing-requests and POST /mobile/pairing-requests/:id/challenge|approve|decline with Face ID (approvedVia owner-phone); redeem and GET /mobile/device tell the waiting phone confirmWith, fingerprint and expiresAt; the code still works; off switch mobilePairing.approve.enabled. Every agent reply in an app conversation also sends one push ("New reply", §4.7), Telegram or not. Dev-gated (mobilePairing.enabled, chat also mobilePairing.chat.enabled); 503 when dark. Native Schedule, Promises and Machines (docs/specs/mobile-native-ops-screens.md): GET /mobile/jobs, GET /mobile/commitments, GET /mobile/machines — read-only trimmed summaries of the console\'s Schedule, Promises and Machines pages for an owner phone (device-signed) or the bearer token; an MSP phone gets 403 owner-phone-required.',
+    build: () => ({
+      configured: true,
+      endpoints: ['POST /mobile/pairing-codes', 'POST /mobile/pairing-codes/redeem', 'GET /mobile/pairing-codes/ping', 'GET /mobile/devices', 'GET /mobile/device', 'POST /mobile/device/confirm', 'POST /mobile/devices/:id/revoke', 'POST /mobile/chat/:topicId', 'POST /mobile/device/push', 'GET /mobile/attention/:id', 'POST /mobile/push/notify', 'GET /mobile/push', 'GET /mobile/pairing-approvals', 'POST /mobile/pairing-approvals/:id/decline', 'POST /mobile/pairing-approvals/:id/approve', 'GET /mobile/pairing-requests', 'POST /mobile/pairing-requests/:id/challenge', 'POST /mobile/pairing-requests/:id/approve', 'POST /mobile/pairing-requests/:id/decline', 'GET /mobile/jobs', 'GET /mobile/commitments', 'GET /mobile/machines'],
+    }),
+  },
+  {
+    key: 'appConversations',
+    prefixes: ['/app'],
+    description: 'Native app conversations (docs/specs/mobile-native-conversations.md) — the Instar iPhone app starts, lists, reads and writes conversations stored by Instar itself, with no messaging service configured. Device-signed: POST/GET /mobile/conversations, PATCH/DELETE /mobile/conversations/:key, POST /mobile/chat/app/:key (idempotent by requestId; persisted with its device-signature fields before dispatch), GET /mobile/chat/app/:key/messages (browse backwards) and /events (sync). Open session: GET /mobile/conversations/session?ref=<app:<uuid> | telegram:<topicId> | Slack conversationKey> (device-signed only, read-only) answers {active, sessionName, startedAt, framework, machineNickname, dashboardUrl, reason, ownerMachine}: the session driving that conversation on this machine and a dashboard link (<pairing origin>/dashboard?session=<name>, no token or PIN; the dashboard asks for its PIN), or active:false with a plain reason (no session yet, or the machine that runs it). Native session screen (docs/specs/mobile-native-session-screen.md): an OWNER phone may also GET /sessions/:name/output (pane text, credentials redacted) and POST /sessions/:name/input {text} (plain text only, durable replay record, logged without text in logs/mobile-session-input.jsonl) for sessions running on this machine; Bearer requests to the same paths are unchanged. A session spawned for an app conversation sees messages tagged [app:<id> "<title>" from <owner>] and answers with app-reply.sh, which posts to POST /app/session-reply (bind-token scoped; 409 not-owner unless this machine owns the conversation). Each app message is stored with the phone\'s signature and this machine\'s signed receipt; history rows (and a device\'s read of GET /telegram/topics/:topicId/messages, joined by eventId) carry originVerified: verified / redacted / failed / unknown / none, checked against the device-key ledger (machine-signed, append-only, never pruned) and the machine signing-key history. The conversation store and the ledger replicate to every machine. Dev-gated (mobilePairing.native.enabled); 503 when dark. Media (docs/specs/mobile-native-chat-media.md, mobilePairing.native.media.enabled): POST /mobile/media/uploads, PUT .../chunks/:index, GET /mobile/media/uploads/:id, GET /mobile/media/:sha256?ref= (ref is app:<uuid>, telegram:<topicId>, or the conversationKey a Slack history read returns, served only by the machine that lists that conversation), POST /mobile/media/purge; sessions see [image:…], [document:…], [video:…], [voice:…] paths, open earlier files with GET /app/media-path/:attachmentId (app-media-path), and reply with files through app-reply.sh --file. Every machine copies every file an event it holds references, over the signed app-media-pull mesh verb, keeping a copy only when its SHA-256 matches; a download of a file still copying answers 202 fetching, a dispatch waits up to 60 s and otherwise says [file still copying: …] then [file now available: …], and /health?scope=pool → appMediaPool shows every machine (singleCopyBlobs, unrecoverableBlobs). A reply notification carries only the message id; the phone fetches GET /mobile/chat/app/:key/preview/:messageId (device, its notification read token, or the agent token) for the first 100 characters or a "sent a photo" phrase. Slack from the app (§4.9): where Slack is configured and mobilePairing.slackOwnerUserId is set, GET /mobile/conversations also lists Slack channels and threads (platform slack, id = the negative durable conversation id); GET /mobile/chat/slack/:conversationId/messages reads their history (slack-messages.jsonl, the in-memory ring and app-sent messages from the store, with originVerified) and POST /mobile/chat/slack/:conversationId sends as the operator through the Slack inbound dispatch, stored first with a v2 machine receipt that signs the canonical Slack key, then mirrored into the channel as "📱 <owner> (from the app): …". Owner id unset ⇒ 503 slack-owner-unset; no Slack ⇒ 503 slack-not-configured. Files from the app into Telegram and Slack (chat-media §4.9, media on): an upload may name telegram:<topicId> or a Slack conversationKey as its conversationRef, and POST /mobile/chat/:topicId and POST /mobile/chat/slack/:conversationId accept the same signed attachments as an app conversation; the message is stored as a media-message under telegram:<topicId> or the Slack key, the session receives the file lines with paths, and the mirror uploads the files (Telegram: sendPhoto/sendVideo/sendVoice/sendDocument or one sendMediaGroup through the origin outbox, a file above 50,000,000 bytes mirrored as "📱 <owner> sent <name> (too large for Telegram; open it in the app)"; Slack: the v2 file upload into the channel or thread). A failed mirror answers mirror: "failed" and never repeats the dispatch. Media off ⇒ 400 media-target-unsupported as before.',
+    build: () => ({
+      configured: true,
+      endpoints: ['POST /mobile/conversations', 'GET /mobile/conversations', 'PATCH /mobile/conversations/:key', 'DELETE /mobile/conversations/:key', 'POST /mobile/chat/app/:key', 'GET /mobile/chat/app/:key/messages', 'GET /mobile/chat/app/:key/events', 'GET /mobile/chat/app/:key/preview/:messageId', 'GET /mobile/chat/slack/:conversationId/messages', 'POST /mobile/chat/slack/:conversationId', 'POST /app/session-reply', 'POST /mobile/media/uploads', 'PUT /mobile/media/uploads/:uploadId/chunks/:index', 'GET /mobile/media/uploads/:uploadId', 'GET /mobile/media/:sha256', 'POST /mobile/media/purge', 'GET /app/media-path/:attachmentId'],
+    }),
+  },
+  {
+    key: 'attribution',
+    prefixes: ['/attribution'],
+    description: 'Attribution paper trail (docs/specs/attribution-paper-trail.md) — a statement credited to a person points at the logged message it came from, or says it has no source. Answers "who said this, and how did it change?". A write gate on notes, a nudge on sends, a ledger of every wording and a daily report that writes nothing to any note. Live on development agents, dark on the fleet (503). `record` refuses nothing; `enforce` is opt-in.',
+    build: () => ({
+      configured: true,
+      endpoints: ['POST /attribution/check', 'GET /attribution/resolve', 'GET /attribution/find', 'GET /attribution/trace', 'GET /attribution/status', 'POST /attribution/audit'],
+    }),
+  },
+  {
+    key: 'overloadShed',
+    prefixes: ['/overload-shed'],
+    description: 'Overload shed (docs/specs/trustworthy-machine-load-and-mesh-floor.md Part D) — moves EXISTING conversations off a machine that has stayed overloaded: once this machine has refused new work for 3 minutes it proposes moving one Telegram conversation at a time to a healthy machine (live evidence under 2 min, verdict ok, room after reservations), through the ownership reconciler; pinned topics and topics with a live autonomous run stay. Breaker 2 moves/hour, 2 tries per topic per episode. GET /overload-shed reports enabled/dryRun, overloadedSince, isSource, liveMove, reservations, movesLastHour and counters (proposed, wouldMove, claimed, expired, breakerHeld). Dev-gated + dry-run first (monitoring.overloadShed); 503 when dark. When asked "why did my conversation move machines / why is this overloaded machine still holding work?" → read this, don\'t guess.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /overload-shed', 'POST /session-pool/rebalance-proof', 'POST /session-pool/rebalance-proof/probe', 'GET /session-pool/rebalance-proof/:runId'],
+    }),
+  },
+  {
+    key: 'machineMaintenance',
+    prefixes: ['/machine-maintenance'],
+    description: 'Machine self-maintenance (docs/specs/machine-self-maintenance.md), WATCH-ONLY: every night a paper drain records what a scheduled restart would have done on this machine, which of the closed delays and safety holds read true, and how long each kind of work took to reach its own yield point. It cannot restart anything or stop any work (canRestart:false, canStopWork:false). GET /machine-maintenance reports uptime, due, the next window, the host drain record, delays, safety holds, declared work kinds, lastRehearsal and the evidence gate, plus browserCare: the normal-Chrome browsers this agent opened (ledger) and which of them the 15-minute sweep WOULD close and why it kept the rest (dry-run, canClose:false; macOS only, null elsewhere). GET /machine-maintenance/lock-state is the honest lock reading: lockState unlocked/locked/screensaver-or-display-sleep/unknown/not-applicable with every input (session flag, password policy, lock shield, screensaver, display sleep) beside it; unknown means unknown, never locked. Part E wedge detection, DRY-RUN, rides the same status as `wedge` (null where not wired): the evidence families (F1 GUI path, F2 process table, F3 stuck dialog, F4 agent symptoms) sampled every 10 min (2 min while any is positive) on the host maintainer only, the candidate window (same two families positive at 3+ observations over 20 min; a negative resets; a gap over 6 min restarts), the judge\'s proposal (leave/gentle/restart-next-window/restart-now) recorded only with the rungs it WOULD run, forcedDueAt, and brakes; actuation not-built, canRestart false; unknown families stay unknown; audit logs/machine-maintenance.jsonl. Both take ?scope=pool: every online machine\'s state tagged with machineId/machineNickname, unreadable machines in pool.failed with a reason (offline, not-enabled, route-missing, peer-unreachable, ...), read-only (authority none). 503 when dark (machineMaintenance, dev-agent gated). When asked "what would a nightly restart do here?", "is this machine due?", "is this machine wedged?", "is that Mac really locked?" or "which browsers did you leave open?" read this, never guess.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /machine-maintenance', 'GET /machine-maintenance/lock-state'],
+    }),
+  },
+  {
+    key: 'workAdmission',
+    prefixes: ['/work-admission'],
+    description: 'Overload admission (docs/specs/trustworthy-machine-load-and-mesh-floor.md Part C) — each machine protects its own resources: when its own multi-signal load verdict is saturated/impaired it CLOSES to new automatic work (scheduled jobs, helper sessions, placement of new conversations; the work waits and retries, nothing is dropped, running conversations keep going), reopens after 5 consecutive good samples, and keeps ONE host-wide recovery slot free so an operator session can always start. GET /work-admission reports enabled/dryRun/enforced, acceptingWork, lastVerdict, the recovery slot (cap/inUse) and counters (closes, reopens, refused, wouldRefuse, recoverySlotGrants). Dev-gated + dry-run first (monitoring.workAdmission): in dry-run it logs would-refuse and refuses nothing; 503 when dark. When asked "why didn\'t a job run / is this machine taking work?" → read this, don\'t guess.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /work-admission'],
     }),
   },
   {
@@ -128,12 +361,186 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     }),
   },
   {
+    key: 'selfActionGovernor',
+    prefixes: ['/self-action-governor'],
+    description: 'Unified self-action backpressure — the SelfActionGovernor (docs/specs/unified-self-action-backpressure.md, Increment B). ONE in-process admission chokepoint every registered self-triggered action (reaper age-kill, external-hog kill, proactive account-swap, beacon notify/liveness) rides via admit(), keyed on a controller id: per-target + census-scaled total count ceilings, rate buckets, P19 brakes, a bounded coalescing queue, durable admission state that survives restarts (a crash/bounce never refills a runaway loop\'s count budget), and an ALWAYS-ALLOW audited principal lane (a human action always wins). Ships OBSERVE-ONLY on every class (records would-deny verdicts, blocks nothing); the per-class enforce flip is the operator\'s later FD8 action. GET /self-action-governor is a lock-free scrubbed read of per-class mode/counters/deciding-sub-mechanism aggregates (`?scope=pool` merges pool-shared class counters across machines). Kill switch: intelligence.selfActionGovernor.emergencyDisable (read live; the flip itself is audited + surfaced). When asked "why did my respawn get held / my swap get queued / my notify get folded?" → read this route\'s per-class reasons.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.selfActionGovernor,
+      endpoints: ['GET /self-action-governor'],
+    }),
+  },
+  {
+    key: 'testRunnerLimiter',
+    prefixes: ['/test-runner-limiter'],
+    description: 'Test-Runner Concurrency Bound — the spawn cap\'s sibling for vitest roots (docs/specs/test-runner-concurrency-bound.md). A per-machine ticket counter bounds how many test SUITES run at once across every actor on the host (full suites one-at-a-time by default; small targeted runs get a roomier ≤6-slot lane, each clamped to ≤4 workers) — the structural answer to the 2026-07-02 test-storm load-stall kill cascade. Uses the host-resolved posture (dry-run or enforcing); GET reports the current mode. GET /test-runner-limiter reports cap/targetedCap/posture/ttlSignalArmed/mergeGatePriority.active, suiteWaiters (waiting full suites, next first — an ordinary suite that has waited 15 min goes ahead of merge-gate work), live holders per lane, per-lane saturation, admitted-open (lock-wedge) runs, the recent event tail, and a skip-reason histogram — cap + posture resolve through the SAME resolvers the chokepoint uses (env → host tuning file → code default), never from config (no-lie constraint). POST /test-runner-limiter/prune is the recovery lever: forces a full reclaim pass (dead/reused-pid + TTL-expired holders) instead of hand-editing the holders JSON. When asked "why is my test run waiting?" / "did the limiter block something?" / a git push rejected that might be CONTENTION not red tests → read the GET route first. Kill switch: env INSTAR_HOST_TEST_SEMAPHORE=off (config intelligence.testRunnerCap is NOT the chokepoint lever).',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /test-runner-limiter', 'POST /test-runner-limiter/prune'],
+    }),
+  },
+  {
     key: 'multiMachinePool',
-    prefixes: ['/pool'],
+    prefixes: ['/pool', '/machines'],
     description: 'Multi-Machine Session Pool status — which machine holds the router + every machine\'s nickname, hardware, online status, load, and clock-skew. Backs the Machines dashboard tab and "where is this running?" / "move this to <nickname>". Single-machine until >1 paired.',
     build: ({ ctx }) => ({
       configured: !!ctx.machinePoolRegistry,
-      endpoints: ['GET /pool', 'PATCH /pool/machines/:id'],
+      endpoints: ['GET /pool', 'PATCH /pool/machines/:id', 'GET /machines/ssh-health'],
+    }),
+  },
+  {
+    key: 'machineIdentityRecovery',
+    prefixes: ['/identity-recovery', '/identity-changes'],
+    description: 'Machine identity continuity after local key loss: keychain-escrowed recovery roots, bounded challenge/claim re-announcement, corroboration and quarantine, sticky revocation, non-authoritative endpoint telemetry, and an attributable identity-change ledger. First root establishment is pairing-code-only; later operator fanout requires a pinned recovery-root grant. Registry First: read GET /identity-recovery and GET /identity-changes before explaining a peer authentication failure or signing-key change.',
+    build: ({ ctx }) => ({
+      configured: !!ctx.identityStore && !!ctx.identityReannounce,
+      endpoints: [
+        'GET /identity-recovery',
+        'GET /identity-changes',
+        'POST /identity-recovery/quarantines/:id/approve',
+        'POST /identity-recovery/quarantines/:id/deny',
+        'POST /identity-recovery/rotations/:machineId/:epoch/ack',
+      ],
+    }),
+  },
+  {
+    key: 'singleMachineFailoverGap',
+    // The route lives under the already-claimed '/pool' top-level prefix (owned
+    // by the multiMachinePool entry), so this dedicated awareness entry claims
+    // NO new top-level prefix — it surfaces GET /pool/failover-gap via endpoints
+    // instead (mirrors the other /pool/* sub-feature entries + the empty-prefix
+    // precedent). Claiming '/pool/failover-gap' trips capabilities-discoverability:
+    // that test extracts TOP-LEVEL prefixes, so 'pool/failover-gap' is a dead entry.
+    prefixes: [],
+    description: 'Single-machine failover-gap detector — status snapshot for the "no failover target for active autonomous work" guard (single-machine WHILE active autonomous runs → ONE deduped HIGH attention item). Dev-gated dark on the fleet (503 when off); signal-only.',
+    build: ({ ctx }) => ({
+      configured: !!(ctx.getSingleMachineFailoverGap?.() ?? null),
+      endpoints: ['GET /pool/failover-gap'],
+    }),
+  },
+  {
+    key: 'missingLoginSession',
+    // The route lives under the already-claimed '/pool' top-level prefix (owned
+    // by the multiMachinePool entry), so this dedicated awareness entry claims
+    // NO new top-level prefix — it surfaces GET /pool/missing-login via endpoints
+    // instead (mirrors the other /pool/* sub-feature entries + the empty-prefix
+    // precedent). Claiming '/pool/missing-login' trips capabilities-discoverability:
+    // that test extracts TOP-LEVEL prefixes, so 'pool/missing-login' is a dead entry.
+    prefixes: [],
+    description: 'Missing-login-session detector — status snapshot for the "a live session is running on an account whose local login has gone missing" guard (drift under a live session → ONE deduped HIGH attention item). Dev-gated dark on the fleet (503 when off); signal-only.',
+    build: ({ ctx }) => ({
+      configured: !!(ctx.getMissingLoginSession?.() ?? null),
+      endpoints: ['GET /pool/missing-login'],
+    }),
+  },
+  {
+    key: 'mobileCapacityScreens',
+    // The routes live under the '/mobile' prefix already claimed by the mobilePairing entry, so this
+    // awareness entry claims no new top-level prefix (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Accounts, What thinking costs and Resource usage screens for the Instar iPhone app (docs/specs/mobile-native-capacity-screens.md): GET /mobile/accounts (subscription accounts across the machines that answer: signed in or needing sign-in per machine, usage windows with reset times), GET /mobile/spend?window=today|week|month (recorded pay-per-use cost across machines with its basis, this machine\'s paid-route limits, conversation token totals), GET /mobile/resources (CPU and memory for the agent, its server and sessions on this machine). Read-only trimmed summaries for an owner phone (device-signed, ownerOnly) or the bearer token; an MSP phone gets 403 owner-phone-required.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/accounts', 'GET /mobile/spend', 'GET /mobile/resources'],
+    }),
+  },
+  {
+    key: 'mobilePlansPeopleScreens',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Plans, What I\'ve learned about you and Other agents screens for the Instar iPhone app (docs/specs/mobile-native-plans-people.md): GET /mobile/plans (projects and initiatives across the machines that answer: what needs the owner, what is moving, idle or finished), GET /mobile/learned (the learned preferences and the scrubbed corrections still being watched), GET /mobile/agents (other agents by claimed name with pairing state and delivery health, plus this machine\'s channel registry verdicts). Read-only trimmed summaries for an owner phone (device-signed, ownerOnly) or the bearer token; an MSP phone gets 403 owner-phone-required.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/plans', 'GET /mobile/learned', 'GET /mobile/agents'],
+    }),
+  },
+  {
+    key: 'mobilePhonesMessagesScreens',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Messages to you and Insights screens for the Instar iPhone app (docs/specs/mobile-native-phones-messages.md): GET /mobile/messages (whether replies are held and why, grouped by conversation with fixed reason words, expired and unconfirmed sends, recording readiness, across the machines that answer) and GET /mobile/insights (each insight page\'s headline, lines and numbers, read cached-only so no model call is started). Read-only trimmed summaries for an owner phone (device-signed, ownerOnly) or the bearer token; ?scope=local answers this machine only. An active owner phone may also remove another phone on its machine through POST /mobile/devices/:id/revoke.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/messages', 'GET /mobile/insights'],
+    }),
+  },
+  {
+    key: 'mobileSecretsScreen',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Passwords & keys screen for the Instar iPhone app (docs/specs/mobile-native-secrets.md): GET /mobile/secrets (what\'s waiting on each machine that answers, this machine\'s key names, vault and sync state; names only, never a value, length, token or Secret Drop link; owner phone or bearer).',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/secrets'],
+    }),
+  },
+  {
+    key: 'mobileSessionControls',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'The Instar iPhone app\'s session screen controls (docs/specs/mobile-native-session-controls.md): GET /mobile/sessions/controls (machine, door, model and why each can or cannot change), GET /mobile/sessions/new-options, GET /mobile/sessions/history (secrets removed), POST /sessions/:name/key (the keys tray and Stop) and POST /sessions/:name/attachments for owner phones; POST /mobile/sessions/door/:topic, /move/:topic, /close/:id, /new and /default, each with Face ID over a single-use challenge behind mobilePairing.permissionActions. Every control runs the dashboard\'s own route, so its rules stay in force. Sessions on another machine go through the machine the phone reached (pool-token /mobile/sessions/relay/:name/* routes), and typing obeys that machine\'s dashboard.poolStream.allowRemoteInput. Engine and model switching works for every conversation (docs/specs/session-swap-any-conversation.md): the door route takes a conversation reference (telegram:N, app:<key>, slack:<team>:<channel>[:<thread>], or a bare topic id), GET /sessions rows carry conversationRef, and /topic-profile/:key accepts app:<key>; moving machines is still Telegram-only, and a Slack conversation stays with the machine that holds the Slack connection (POST /pool/transfer refuses it, 409 slack-stays-with-connection).',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/sessions/controls', 'GET /mobile/sessions/new-options', 'GET /mobile/sessions/history', 'POST /sessions/:name/key', 'POST /sessions/:name/attachments', 'POST /mobile/sessions/door/:conversation', 'POST /mobile/sessions/move/:topic', 'POST /mobile/sessions/close/:id', 'POST /mobile/sessions/new', 'POST /mobile/sessions/default'],
+    }),
+  },
+  {
+    key: 'mobileSecretsWrites',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Ask for a password or key and cancel a request from the Instar iPhone app (docs/specs/mobile-native-secrets-writes.md): POST /mobile/secrets/requests and POST /mobile/secrets/requests/<key>/cancel. Owner phone only, each confirmed with Face ID over a single-use challenge, behind mobilePairing.permissionActions. The phone never receives the token or the Secret Drop link; the link is collected in the console.',
+    build: () => ({
+      configured: true,
+      endpoints: ['POST /mobile/secrets/requests', 'POST /mobile/secrets/requests/:key/cancel'],
+    }),
+  },
+  {
+    key: 'mobileOwnerPresence',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Remote Desktop with Face ID and the Dashboard PIN page for the owner\'s phone (docs/specs/mobile-owner-presence-pin.md): POST /mobile/desktop-unlock/challenge and POST /mobile/desktop-unlock mint a desktop-only, phone-bound 15-minute session after a fresh presence-key (Face ID / passcode) signature; POST /mobile/dashboard-pin/challenge and POST /mobile/dashboard-pin/reveal show the dashboard PIN this machine compares against and tell the owner privately. Owner phone only; the bearer is refused. Dev-gated (mobilePairing.ownerPresence.enabled).',
+    build: () => ({
+      configured: true,
+      endpoints: ['POST /mobile/desktop-unlock/challenge', 'POST /mobile/desktop-unlock', 'POST /mobile/dashboard-pin/challenge', 'POST /mobile/dashboard-pin/reveal'],
+    }),
+  },
+  {
+    key: 'mobilePermissionsScreens',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Permission slips and What I\'m allowed to do screens for the Instar iPhone app (docs/specs/mobile-native-permissions.md): GET /mobile/permissions/slips (waiting authorization requests and active slips, across the machines that answer) and GET /mobile/permissions/features (feature switches, this machine\'s plus other machines read-only) for an owner phone or the bearer token. The owner phone alone may approve or decline a waiting request held on this machine and switch a feature, each with a fresh presence-key (Face ID / passcode) signature over a single-use challenge bound to the exact action: POST /mobile/permissions/challenge, /mobile/permissions/requests/:id/approve, /mobile/permissions/requests/:id/decline, /mobile/permissions/features/:id. The bearer is refused on every write. Writes are dev-gated (mobilePairing.permissionActions.enabled).',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/permissions/slips', 'GET /mobile/permissions/features', 'POST /mobile/permissions/challenge', 'POST /mobile/permissions/requests/:id/approve', 'POST /mobile/permissions/requests/:id/decline', 'POST /mobile/permissions/features/:id'],
+    }),
+  },
+  {
+    key: 'mobileProposalsInsideScreens',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Proposals and How I\'m doing inside screens for the Instar iPhone app (docs/specs/mobile-native-proposals-inside.md): GET /mobile/proposals (proposed fixes waiting, across the machines that answer; dismissing stays in the console) and GET /mobile/inside (recent records, repeating problems, checks on my own claims and correction reviews, for each machine that answers). Read-only; an owner phone or the bearer token.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/proposals', 'GET /mobile/inside'],
+    }),
+  },
+  {
+    key: 'mobileConsolePagesScreens',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'Native Ideas, Pace, Development, Maturation and Files screens for the Instar iPhone app (docs/specs/mobile-native-console-pages.md): read-only, owner phone or bearer, each built from the console route it mirrors.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/ideas', 'GET /mobile/pace', 'GET /mobile/development', 'GET /mobile/maturation', 'GET /mobile/files', 'GET /mobile/files/read'],
+    }),
+  },
+  {
+    key: 'mobileHealthIssues',
+    // Under the '/mobile' prefix already claimed by mobilePairing (the empty-prefix precedent above).
+    prefixes: [],
+    description: 'What a degraded /health means for the person (docs/specs/mobile-health-issues.md): each reason sorted into user-affecting, internal or unclassified from a declared table, with plain words and a next step, and the quick actions on each one (docs/specs/health-quick-actions.md): hide for a while, hide from me, or ignore completely, undoable from the Hidden list. Owner phone or bearer. /health keeps its shape; only an ignored problem stops counting in it.',
+    build: () => ({
+      configured: true,
+      endpoints: ['GET /mobile/health-issues', 'POST /mobile/health-issues/choices', 'POST /mobile/health-issues/choices/undo', 'POST /mobile/attention/:id/choice'],
     }),
   },
   {
@@ -153,7 +560,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'greenPrAutoMerge',
     prefixes: ['/green-pr-automerge'],
-    description: 'Green-PR auto-merge watcher (green-pr-automerge-enforcement + mergerunner-auto-arm-handoff) — lands a green, mergeable, non-held PR this agent authored, surviving session death (Phase 7 becomes machinery). Default mergeStrategy:auto ARMS GitHub native auto-merge and hands the wait off to GitHub (confirmed on a later reconciliation tick); mergeStrategy:admin is the legacy synchronous poll+merge. Off fleet-wide (deliberate-fleet-default), armed per dev agent with expectedGhLogin, repo-gated. Pool-visible rollback kill-switch (Bearer) that ALSO --disable-autos in-flight armed merges; PIN-gated re-arm + pool-disarm; conversational-hold assist (a HOLD also disables an armed PR — a label alone does NOT). GET reports armedCount + armed[]. Null on installs with no analyzable instar repo + safe-merge, or when disabled.',
+    description: 'Green-PR auto-merge watcher (green-pr-automerge-enforcement + mergerunner-auto-arm-handoff) — lands a green, mergeable, non-held PR this agent authored, surviving session death (Phase 7 becomes machinery). Default mergeStrategy:auto ARMS GitHub native auto-merge and hands the wait off to GitHub (confirmed on a later reconciliation tick); mergeStrategy:admin is the legacy synchronous poll+merge. Off fleet-wide (deliberate-fleet-default), armed per dev agent with expectedGhLogin, repo-gated. Pool-visible rollback kill-switch (Bearer) that ALSO --disable-autos in-flight armed merges; PIN-gated re-arm + pool-disarm; an agent-class stop (claimed when pulled) is released by the agent through POST /release once a PR citing its marker is in the running release, while any other stop stays PIN-only; conversational-hold assist (a HOLD also disables an armed PR — a label alone does NOT). GET reports armedCount + armed[]. Null on installs with no analyzable instar repo + safe-merge, or when disabled.',
     build: ({ ctx }) => ({
       configured: !!ctx.greenPrAutoMerger,
       endpoints: [
@@ -161,6 +568,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'POST /green-pr-automerge/tick',
         'POST /green-pr-automerge/rollback',
         'POST /green-pr-automerge/enable',
+        'POST /green-pr-automerge/release',
         'POST /green-pr-automerge/hold',
         'POST /green-pr-automerge/pool-disarm',
       ],
@@ -169,11 +577,19 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'parallelWork',
     prefixes: ['/parallel-work'],
-    description: 'Parallel-Work Awareness — a cross-topic read index over the Topic-Intent layer: every topic, its current focus, high-specificity tags, and whether a session is live on it. Lets the agent see what all its hands are doing across topics/sessions (the overlap-councilor read surface; the proactive ParallelWorkSentinel is Phase B, ships dark). Signal-only; never gates.',
+    description: 'Parallel-Work Awareness — a cross-topic read index over the Topic-Intent layer PLUS action-derived activity notes (CMT-810): every topic, its current focus, high-specificity tags, its lastAction (the concrete action it last claimed or asked the operator to approve — written automatically by the action-claim observer the moment the turn finishes), and whether a session is live on it. Lets the agent see what all its hands are doing across topics/sessions before advising the operator (the overlap-councilor read surface; the proactive ParallelWorkSentinel is Phase B, dev-gated, with a verifiable runtime at /parallel-work/sentinel). Signal-only; never gates.',
     build: ({ ctx }) => ({
       configured: !!ctx.parallelActivityIndex,
-      endpoints: ['GET /parallel-work/activities'],
+      actionNotes: !!ctx.topicActionNotes,
+      sentinelConstructed: !!ctx.parallelWorkSentinel,
+      endpoints: ['GET /parallel-work/activities', 'GET /parallel-work/sentinel'],
     }),
+  },
+  {
+    key: 'workQueue',
+    prefixes: ['/work-queue'],
+    description: 'Unified work-intake registry — deterministic ranked read of active work; dev-agent gated while fleet rollout is dark.',
+    build: ({ ctx }) => ({ configured: !!ctx.workQueue, endpoints: ['GET /work-queue', 'POST /work-queue/rescore'] }),
   },
   {
     key: 'autonomousHeartbeat',
@@ -182,6 +598,15 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     build: ({ ctx }) => ({
       enabled: resolveDevAgentGate(ctx.config.monitoring?.autonomousHeartbeat?.enabled, ctx.config),
       endpoints: ['GET /autonomous-heartbeat'],
+    }),
+  },
+  {
+    key: 'goalRealignment',
+    prefixes: ['/goal-realignment'],
+    description: 'Periodic Goal Re-Alignment Phase 1 ("see it") — sender-verified operator messages flow through a deterministic candidate inbox and checkpointed extraction outbox into an append-only durable priority ledger. A cadence-shaped, content-addressed reflector compares active-run focus with the durable digest and logs evidence-linked aligned/drifting/diverged/indeterminate verdicts. Dry-run only: no injection, attention, blocking, planner write, or state-file mutation. GET /goal-realignment exposes the ledger, aging candidates, counters, and last verdict; dev-gated dark on the fleet.',
+    build: ({ ctx }) => ({
+      enabled: resolveDevAgentGate(ctx.config.monitoring?.goalRealignment?.enabled, ctx.config),
+      endpoints: ['GET /goal-realignment'],
     }),
   },
   {
@@ -234,7 +659,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'apprenticeshipProgram',
     prefixes: ['/apprenticeship'],
-    description: 'Apprenticeship Program — instance registry + lifecycle gates for onboarding agent frameworks. Each onboarding is a tracked instance (overseer / mentor / mentee). The retro-gate refuses starting an instance without a valid prior retro-harvest; the doc-as-required-artifact gate refuses completing one without its lessons captured. Gates are structural preconditions on objective artifacts; verdicts audited to logs/apprenticeship-decisions.jsonl.',
+    description: 'Apprenticeship Program — instance registry, evidence-backed independence ladder, and lifecycle gates for onboarding agent frameworks. Each onboarding is a tracked instance (overseer / mentor / mentee). Ladder transitions are adjacent, require evidence, and retain append-only history. Gate and ladder verdicts are audited to logs/apprenticeship-decisions.jsonl.',
     build: ({ ctx }) => ({
       configured: !!ctx.apprenticeshipProgram || !!ctx.apprenticeshipCycleStore,
       endpoints: [
@@ -243,11 +668,15 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'GET /apprenticeship/instances/:id/role-coverage',
         'GET /apprenticeship/cycles',
         'GET /apprenticeship/cycles/overdue',
+        'GET /apprenticeship/cycles/integrity',
         'GET /apprenticeship/cycles/:id',
         'POST /apprenticeship/instances',
         'POST /apprenticeship/instances/:id/transition',
+        'POST /apprenticeship/instances/:id/rung-transition',
         'POST /apprenticeship/instances/:id/can-start',
         'POST /apprenticeship/instances/:id/can-complete',
+        'POST /apprenticeship/instances/:id/matrix-acceptance/enumerate',
+        'POST /apprenticeship/instances/:id/matrix-acceptance',
         'POST /apprenticeship/cycles',
         'POST /apprenticeship/cycles/:id/close',
       ],
@@ -410,6 +839,18 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     },
   },
   {
+    key: 'browser',
+    prefixes: ['/browser'],
+    description: 'The browser this agent always has: ready, installing, not-built or broken, each with a next step',
+    build: ({ ctx }) => ({
+      ...browserCapability(ctx.config.stateDir),
+      endpoints: [
+        'GET /browser/state — this machine\'s browser state and next step; check it before saying a browser task cannot be done',
+        'POST /browser/linux/install — after the operator says yes, install the driver\'s packages on this machine',
+      ],
+    }),
+  },
+  {
     key: 'secrets',
     prefixes: ['/secrets'],
     description:
@@ -427,7 +868,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'DELETE /secrets/pending/:token — cancel a pending request',
       ],
       retrievalHint:
-        'ALWAYS retrieve via `node .instar/scripts/secret-drop-retrieve.mjs TOKEN field-name` (use `--names` to discover fields). It streams the value to stdout and NEVER prints the response body. Raw curl against /secrets/retrieve dumps the secret into the Bash tool transcript — do not use it.',
+        'A website password for the agent\'s Linux Chrome: request it with `browserHost` (shown on the form), then, with the password box focused, `XD_PROFILE=<id> node .instar/scripts/secret-drop-retrieve.mjs TOKEN field-name --browser`; it goes straight into the box, is not stored, and nothing else can read it. Otherwise ALWAYS retrieve via `node .instar/scripts/secret-drop-retrieve.mjs TOKEN field-name` (use `--names` to discover fields). It streams the value to stdout and NEVER prints the response body. Raw curl against /secrets/retrieve dumps the secret into the Bash tool transcript — do not use it.',
     }),
   },
   {
@@ -460,10 +901,11 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'evolution',
     prefixes: ['/evolution'],
-    description: 'Evolution proposals + learnings + gaps + actions',
+    description: 'Evolution proposals, learnings, gaps and actions. Soft total retention targets preserve open work; finished memory remains in the full-content archive. Read /evolution/retention for pressure/coverage and /evolution/archive for paginated local memory including peer copies.',
     build: ({ ctx }) => ({
       enabled: !!ctx.evolution,
       subsystems: ['proposals', 'learnings', 'gaps', 'actions'],
+      endpoints: ['GET /evolution/retention', 'GET /evolution/archive'],
     }),
   },
   {
@@ -620,12 +1062,12 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   },
   {
     key: 'commitments',
-    prefixes: ['/commitments'],
+    prefixes: ['/commitments', '/blocker-lifecycle'],
     description: 'CommitmentTracker — lifecycle for agent promises',
     build: () => ({
       enabled: true,
       endpoints: [
-        'GET /commitments — list commitments (filterable)',
+        'GET /commitments — list commitments (filterable: ?status=active, ?scope=mesh, ?priority=high|normal|low|unset)',
         'GET /commitments/:id — fetch a single commitment',
         'POST /commitments — open a new commitment',
         'PATCH /commitments/:id — update status/details',
@@ -633,6 +1075,52 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'POST /commitments/:id/withdraw — withdraw the commitment',
         'POST /commitments/:id/resume — resume a paused commitment',
         'GET /commitments/active-context — assemble active-commitment context',
+        'GET /commitments/review/queue — promises due for the agent\'s own review (?peek=1 for the job gate)',
+        'POST /commitments/review/apply — apply a promise-review batch through the evidence/caps floor',
+        'POST /commitments/:id/reopen — undo a closure the promise review made (30-day window)',
+        'GET /blocker-lifecycle/summary — raw per-origin blocker timing plus deliverable-completion count',
+        'GET /blocker-lifecycle/trend — raw per-origin blocker timing plus completion-count direction',
+      ],
+    }),
+  },
+  {
+    key: 'windowLifecycle',
+    prefixes: ['/window-lifecycle'],
+    description: 'Window lifecycle obligation ledger — Echo build-lane authority compiled from the live tenets and window charter. It re-queries production evidence and executor registries, enforces lifecycle transitions and closure, exposes native-adapter admission, waiver/rollback/re-enable controls, and records signed shadow-enforcement maturation evidence. GET /window-lifecycle reports the authoritative ledger and closure evaluation; mutating routes are Echo-scoped and fail closed.',
+    build: ({ ctx }) => ({
+      configured: ctx.config.projectName === 'echo',
+      endpoints: [
+        'GET /window-lifecycle',
+        'GET /window-lifecycle/enforcement',
+        'POST /window-lifecycle/compile',
+        'POST /window-lifecycle/evidence',
+        'POST /window-lifecycle/evaluate',
+        'POST /window-lifecycle/tick',
+        'POST /window-lifecycle/transition',
+        'POST /window-lifecycle/native-admission',
+        'POST /window-lifecycle/waiver',
+        'POST /window-lifecycle/rollback',
+        'POST /window-lifecycle/reenable',
+        'POST /window-lifecycle/enforcement/record-shadow',
+        'POST /window-lifecycle/enforcement/graduate',
+        'POST /window-lifecycle/enforcement/off',
+        'POST /window-lifecycle/remediation/:obligationId/resolve',
+      ],
+    }),
+  },
+  {
+    key: 'windowRunLiveness',
+    prefixes: ['/window-run-liveness'],
+    description: 'Authoritative five-predicate autonomous-window liveness plus an explicitly enabled durable cadence executor. The executor consumes server-minted work receipts for distinct 30-minute intervals and independently delivers due 3-hour Telegram synthesis; it never labels narration as progress. Missing predicates revoke active, permit at most one durable bounded recovery, and then settle loudly to stalled/failed.',
+    build: ({ ctx }) => ({
+      configured: ctx.config.projectName === 'echo' && resolveDevAgentGate(ctx.config.monitoring?.windowRunLiveness?.enabled, ctx.config),
+      endpoints: [
+        'GET /window-run-liveness',
+        'POST /window-run-liveness/register',
+        'POST /window-run-liveness/tick',
+        'POST /window-run-liveness/work-advance',
+        'GET /window-run-liveness/cadence',
+        'POST /window-run-liveness/cadence/tick',
       ],
     }),
   },
@@ -645,8 +1133,8 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
       endpoints: [
         'POST /semantic/remember — store a memory',
         'GET /semantic/recall/:id — fetch a memory by id',
-        'GET /semantic/search?q=... — semantic search',
-        'GET /semantic/search/hybrid?q=... — hybrid (vector + keyword) search',
+        'GET /semantic/search/hybrid?q=... — RECALL BY MEANING (vector + keyword). Use this one: it returns nearest neighbours, so a miss is a real absence.',
+        'GET /semantic/search?q=... — LITERAL keyword match only (SQLite FTS5). Zero results means "no literal match in the tokens you tried", NOT "this does not exist".',
         'POST /semantic/connect — link two memories',
         'GET /semantic/explore/:id — graph traversal from a memory',
         'POST /semantic/verify/:id — mark a memory verified',
@@ -683,6 +1171,30 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     }),
   },
   {
+    key: 'codexTaskContinuation',
+    prefixes: ['/continuation'],
+    description: 'Bounded Codex continuation — explicit per-topic task ledgers keep ordinary work moving and, behind a separate dark gate, truthfully carry pre-admission autonomous preparation without claiming the run is active. Operator stop, ownership mismatch, malformed state, lock contention, or audit failure all fail toward normal stop.',
+    build: ({ ctx }) => ({
+      enabled: (ctx.liveConfig?.get(
+        'autonomousSessions.codexTaskContinuation',
+        ctx.config.autonomousSessions?.codexTaskContinuation,
+      ) ?? ctx.config.autonomousSessions?.codexTaskContinuation)?.enabled === true,
+      endpoints: [
+        'GET /continuation/:topic/status',
+        'POST /continuation/start',
+        'POST /continuation/:topic/renew',
+        'POST /continuation/:topic/complete',
+        'POST /continuation/:topic/stop',
+        'POST /continuation/stop-all',
+        'POST /continuation/decide',
+        'POST /autonomous/preparation/start — begin a bounded inactive preparation carrier',
+        'POST /autonomous/preparation/:topic/recover — move a live carrier to recovering',
+        'POST /autonomous/preparation/:topic/promote — retire only after independent active admission',
+        'POST /autonomous/preparation/:topic/terminalize — retire a failed inactive preparation',
+      ],
+    }),
+  },
+  {
     key: 'geminiCapacity',
     prefixes: ['/gemini'],
     description: 'Gemini capacity — live view of whether Gemini calls are currently deferred by the capacity policy (quota/rate-limit) and for how long. The escalation monitor (observe-only, ships OFF behind monitoring.geminiCapacityEscalation) raises one attention item per long block. Read-only.',
@@ -700,7 +1212,19 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     build: () => ({
       enabled: true,
       endpoints: [
-        'GET /metrics/features — per-feature rollup (calls, tokens incl. tokensCached, fired/no-op, fire-rate, p50/p95 latency, wait-stats) + feature×model breakdown (byModel, totals.byModel), per-framework usageCoverage, unlabeled token/call shares; ?sinceHours= / ?feature= filters',
+        'GET /metrics/features — per-feature rollup (calls, tokens incl. tokensCached, fired/no-op/unclassified, nullable fire/error rates with evidence markers, p50/p95 latency, wait-stats) + feature×model breakdown (byModel, totals.byModel), per-framework usageCoverage, unlabeled token/call shares; ?sinceHours= / ?feature= filters',
+      ],
+    }),
+  },
+  {
+    key: 'routingSpend',
+    prefixes: ['/routing-spend'],
+    description: 'Routing Control Room spend VIEW (Increment A) — READ-ONLY reporting: the immutable token record priced ON READ against a reviewed price manifest, plus every metered paid-door key with its caps and honest not-live/$0 state. Gates nothing, books nothing (the money ledger + O(1) gate + PIN cap controls are Increment B). Dev-gated (live on a development agent, dark on the fleet).',
+    build: () => ({
+      enabled: true,
+      endpoints: [
+        'GET /routing-spend/summary — priced spend rollup per door/model + totals; ?grain=hour|day|month|total, ?sinceHours=; honest $0/not-live-yet + loud unpricedTokens',
+        'GET /routing-spend/caps — every metered key with its caps + committed ($0 in Increment A) + goLiveState (not-live)',
       ],
     }),
   },
@@ -724,9 +1248,9 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     build: ({ ctx }) => ({
       enabled: !!ctx.topicOperatorStore,
       endpoints: [
-        'POST /topic-operator — bind a topic operator from the AUTHENTICATED sender { topicId, platform?, uid (required), displayName? }; a blank uid is refused (a content name is never accepted)',
-        'GET /topic-operator — all bound operators (names + uids)',
-        'GET /topic-operator/:topicId — one topic\'s verified operator, or null when unbound',
+        'POST /topic-operator — record a manual operator assertion { topicId, platform?, uid (required), displayName? }; inspectable, but NEVER verified authentication evidence',
+        'GET /topic-operator — verified operators plus separately labelled raw bindings',
+        'GET /topic-operator/:topicId — one topic\'s verified operator (or null) plus its raw binding for inspection',
         'GET /topic-operator/session-context?topicId=N — the <topic-operator> session-start injection block ({ present:false } when unbound)',
       ],
     }),
@@ -784,7 +1308,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
   {
     key: 'feedbackInbox',
     prefixes: ['/feedback-inbox'],
-    description: 'Feedback-inbox drainer (feedback-factory-migration Q2b, Option-B receiving end) — read-only status of the cloud Blob-inbox → durable canonical FeedbackStore mover on the operated machine. Ships dark (feedbackFactory.receiverPersistence.enabled + Blob token env required); 503 when dark.',
+    description: 'Feedback-inbox drainer (feedback-factory-migration Q2b, Option-B receiving end) — read-only status of the cloud Blob-inbox → durable canonical FeedbackStore mover on the operated machine. Ships dark (feedbackFactory.receiverPersistence.enabled required; runs only on the operated host; Blob token from env FEEDBACK_INBOX_BLOB_TOKEN, else vault key feedback_inbox_blob_token); 503 when dark.',
     build: ({ ctx }) => ({
       enabled: !!ctx.inboxDrainer,
       endpoints: [
@@ -801,6 +1325,37 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
       endpoints: [
         'GET /feedback-factory/stats — { total, byStatus, clusterCount, dispatchCount, lastWriteAt } over the canonical store (read-only)',
         'POST /feedback-factory/process — TRIGGER one clustering pass over the canonical store (appends local JSONL; idempotent + forward-only) → { processed, metrics, stats }',
+      ],
+    }),
+  },
+  {
+    key: 'feedbackTriage',
+    // Routes live under /feedback-factory (claimed by feedbackFactoryProcessing); this entry surfaces the triage block.
+    prefixes: [],
+    description: 'Feedback TRIAGE (docs/specs/feedback-triage-and-execution.md) — a registered frontier-model authority decides work/hold/ignore for each feedback work item (with severity, priority and a reason) inside deterministic floors; hold/ignore pause the Initiative (never archive), ignore runs in shadow until a separate PIN approval. Dev-gated dark (feedbackFactory.triage) — LIVE on a development agent, 503 on the fleet; inert until the operator approves the triage authority on the dashboard Feedback Drain tab. The executor is its own entry (feedbackExecute).',
+    build: ({ ctx }) => ({
+      enabled: !!ctx.feedbackTriage,
+      endpoints: [
+        'GET /feedback-factory/triage/queue — work items in rank order { rank, initiativeId, title, summary, severity, priority, executionState, prLink }',
+        'GET /feedback-factory/triage/summary — counts by disposition/reason, authority state, last tick, self-heal/quota/brake state, floors fired today, rule-default agreement, calls used, ignoreLiveRecommended',
+        'POST /feedback-factory/triage/tick — owner-only, single-flight, rate-limited; 202 { runId } (409 naming the owner elsewhere)',
+        'GET /feedback-factory/triage/authority/proposal — the server-computed triage authority the operator approves with the dashboard PIN',
+        'POST /feedback-factory/triage/plan — render a PIN-bound operator action (ignore-live, accept-approver-dependence, publish-secret-shape); the commit route needs the dashboard PIN',
+      ],
+    }),
+  },
+  {
+    key: 'feedbackExecute',
+    // Routes live under /feedback-factory (claimed by feedbackFactoryProcessing); this entry surfaces the executor block.
+    prefixes: [],
+    description: 'Feedback EXECUTOR (docs/specs/feedback-triage-and-execution.md §4) — turns the top-ranked triage work items into pull requests through OS-sandboxed Claude Code build sessions (no network, no credentials, no reads outside the attempt workspace; a must-fail/must-succeed canary before every attempt). Trusted code re-verifies the fix confined, refuses tooling-path and secret-shaped changes, publishes from its own clone, and merges ONLY the exact head the repository owner approved (safe-merge --auto --match-head-commit). Refuses to run while the agent itself could act as the approver unless a PIN-bound acceptance exists. Dev-gated (feedbackFactory.execute), dry-run first; 503 without a source checkout.',
+    build: ({ ctx }) => ({
+      enabled: !!ctx.feedbackExecute,
+      endpoints: [
+        'GET /feedback-factory/execute/status — availability + reason (approver-not-independent / auto-merge-disabled / profile-unenforceable / deps-unavailable / dry-run), attempt counts, limits, canary and dependency-cache state',
+        'POST /feedback-factory/execute/tick — owner-only, single-flight, rate-limited; 202 { runId } (409 naming the owner elsewhere; 503 when it refuses to run)',
+        'POST /feedback-factory/execute/stop — the operator\'s stop for one item (disarms an armed merge); POST /feedback-factory/execute/release — let a parked item be tried again',
+        'POST /feedback-factory/execute/revoke-acceptance — withdraw the approver-dependence acceptance (reduces authority; Bearer)',
       ],
     }),
   },
@@ -860,6 +1415,22 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
     }),
   },
   {
+    key: 'dashboardLiveInsights',
+    prefixes: ['/insights'],
+    description: 'Dashboard Live-LLM-Insights — the per-page Insight Strip: a plain-English headline + supporting lines over a dashboard page\'s own data, an LLM insight routed through the shared nature-router (FAST lane), cached + awareness-only (never gates, never mutates)',
+    build: ({ ctx }) => ({
+      // DEV-GATED: resolve through the funnel so the capability report matches the
+      // construction gate — LIVE on a dev agent, DARK on the fleet.
+      enabled: resolveDevAgentGate(ctx.config.dashboard?.liveInsights?.enabled, ctx.config),
+      endpoints: [
+        'GET /insights — every registered page\'s Insight Strip (the cross-page digest surface)',
+        'GET /insights/:page — one page\'s Insight Strip',
+        'GET /insights/status — content-free posture (enabled/dryRun/ttl/pageCount)',
+      ],
+      hint: 'Dev-gated dark (dashboard.liveInsights.enabled); routes 503 when dark. dryRun:true (dev default) serves the deterministic floor; a deliberate dryRun:false activates the LLM insight. Point the user at the dashboard Insights tab, not curl.',
+    }),
+  },
+  {
     key: 'failureLearning',
     prefixes: ['/failures'],
     description: 'Failure-Learning Loop — instar dev-process failure forensics (which spec/tool produced a failure; what process gaps recur)',
@@ -891,6 +1462,21 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
         'POST /corrections/analyze — 3-pronged recurrence gate + closed-loop tick (driven by the off-by-default correction-analyzer job); response includes routed.overflow + routed.rateLimited',
       ],
       hint: 'Ships OFF; when disabled these routes 503. The session-start hook fetches /preferences/session-context on every boot and injects the <auto-learned-preference> block. The /corrections API never serves raw learning text. The Preferences dashboard tab is the human read surface (plain-language preferences + scrubbed corrections).',
+    }),
+  },
+  {
+    key: 'correctionClassReview',
+    prefixes: ['/class-reviews'],
+    description: 'Correction Class Review — durable record-time standards/process review and outcome tracking for every captured correction, independent of recurrence scoring.',
+    build: ({ ctx }) => ({
+      enabled: resolveDevAgentGate(ctx.config.monitoring?.correctionClassReview?.enabled, ctx.config),
+      endpoints: [
+        'GET /class-reviews — scrubbed review lifecycle and backlog health',
+        'GET /class-reviews/:dedupeKey — exact correction-correspondent review artifact',
+        'POST /class-reviews/backfill — bounded recovery sweep (requires X-Instar-Request)',
+        'PATCH /class-reviews/:dedupeKey/outcome — operator-PIN disposition of one standards/process arm',
+      ],
+      hint: 'Development-gated, dry-run first, and fleet-dark. The intelligence pass may propose but cannot ratify standards. Correction recurrence remains an independent consumer.',
     }),
   },
   {
@@ -1025,6 +1611,7 @@ export const CAPABILITY_INDEX: readonly CapabilityEntry[] = [
             'GET /coherence/health — coherence evolution dashboard',
             'GET /review/health — reviewer health and anomaly detection',
             'POST /review/canary — run canary tests with known-bad messages',
+            'POST /review/canary-battery/run — run the daily context-laundering canary battery (503 while the conversational-context feature is dark)',
           ]
         : [],
     }),
@@ -1146,8 +1733,8 @@ const FEATURE_GUIDE_TRIGGERS: ReadonlyArray<{ context: string; action: string }>
   { context: 'Agent learns a lesson, discovers a pattern, or user teaches something worth remembering', action: 'Add it to the Playbook manifest (instar playbook add). Context items persist across sessions and get assembled based on triggers. This is more structured than MEMORY.md — items have triggers, scores, and lifecycle management.' },
   { context: 'Session context feels stale or irrelevant', action: 'Run instar playbook evaluate to score items, decay stale ones, and deduplicate. Then check instar playbook status.' },
   { context: 'Another agent wants to share context', action: 'Use instar playbook mount to import their manifest with integrity verification. Only global-scoped items are accepted.' },
-  { context: 'User mentions other AI agents, wants to collaborate with other agents, or asks about multi-agent communication', action: 'Check if Threadline relay is enabled (GET /threadline/status). If not enabled, explain: you have the ability to connect to a secure agent network where you can discover and message other AI agents in real time. Offer to enable it conversationally. If enabled, use threadline_discover and threadline_send.' },
-  { context: 'User asks what you can do, your features, or capabilities you have not used yet', action: 'Include Threadline relay in your capability overview if not yet enabled. Explain it lets you join a network of agents for real-time secure communication — available but waiting for their go-ahead.' },
+  { context: 'User mentions other AI agents, wants to collaborate with other agents, or asks about multi-agent communication', action: 'Read GET /threadline/status and lead with agent.state and agent.throughMachine. A standby may have its local relay intentionally off while the agent is reachable through a holder. If state is unknown, say unknown; do not infer the agent is off from local config. Use threadline_discover and threadline_send when the agent is reachable.' },
+  { context: 'User asks what you can do, your features, or capabilities you have not used yet', action: 'Read GET /capabilities and /threadline/status. Describe Threadline from agent.state; a standby local setting does not determine the agent capability.' },
 ];
 
 // ── Internal-only prefixes (intentionally NOT surfaced in /capabilities) ──
@@ -1160,7 +1747,15 @@ const FEATURE_GUIDE_TRIGGERS: ReadonlyArray<{ context: string; action: string }>
  * here — never both, never neither.
  */
 export const INTERNAL_PREFIXES: ReadonlyArray<{ prefix: string; reason: string }> = [
+  { prefix: 'memory-picker', reason: 'Jev memory picker (jev-memory-picker spec) — POST /memory-picker/session-context is the session-start hook\'s call (and its compaction twin); dev-gated, shadow by default (503 when off); the agent learns it via the CLAUDE.md awareness card, not /capabilities' },
+  { prefix: 'jev-correction', reason: 'Jev correction-detector shadow (jev-correction-shadow spec) — GET /jev-correction/summary reads a dark, log-only research instrument comparing Jev with the correction sentinel\'s Layer-0 detector; the agent learns it via the CLAUDE.md awareness card, not /capabilities, until the soak decides whether Jev should feed the sentinel' },
+  { prefix: 'load-assessment', reason: 'Model assessment of machine load (trustworthy-machine-load B4) — GET /load-assessment/summary reads an advisory, log-only instrument (dev-gated); the agent learns it via the CLAUDE.md awareness card, not /capabilities, until the soak decides whether its labels should inform reports' },
+  { prefix: 'jev-circles', reason: 'Jev "going in circles" shadow (jev-circles-shadow spec) — GET /jev-circles/summary reads a dark, log-only research instrument; the agent learns it via the CLAUDE.md awareness card, not /capabilities, until the soak decides whether a nudge is worth building' },
+  { prefix: 'jev-audit', reason: 'Jev job-completion audit (jev-job-supervision spec) — POST /jev-audit/batch is the cadence trigger the jev-completion-audit built-in job calls; ships dark (503 unless constructed; inert without an enabled soak); the agent learns it via the CLAUDE.md awareness card, not /capabilities, and it has no read surface by design' },
+  { prefix: 'mcp', reason: 'Dynamic MCP Lifecycle (DYNAMIC-MCP-LIFECYCLE-SPEC) — ships dark/experimental behind sessions.dynamicMcp.enabled (the routes 503 when off); the agent learns it via the CLAUDE.md awareness section, not /capabilities, until it matures past dark' },
+  { prefix: 'users', reason: 'POST /users/allow-test-identity (silent-loss-refusal-conservation §2.D) — a dashboard-PIN-gated route that mints a signed allow-marker for a legitimate user whose id collides with a known test-identity marker; operator/support-only, not an agent-invokable conversational capability' },
   { prefix: 'a2a', reason: 'same-machine agent-to-agent transport — peers discover each other via AgentRegistry, not /capabilities' },
+  { prefix: 'gate', reason: 'operator/internal admission-check namespace; POST /gate/between-window-admission validates W27 charter-opening evidence packages and is not a user/agent-invokable runtime capability' },
   { prefix: 'health', reason: 'basic liveness check, no auth' },
   { prefix: 'ping', reason: 'synchronous noop, used by tunnel/lifeline probes' },
   { prefix: 'whoami', reason: 'internal identity probe (sentinel/relay layer 1c)' },
@@ -1201,6 +1796,7 @@ export const INTERNAL_PREFIXES: ReadonlyArray<{ prefix: string; reason: string }
   { prefix: 'usher', reason: 'operator-only observability — the mid-task re-surface signal pull surface + its precision metrics; signal-only, the agent-facing payoff is the future gated injection (rung 5), not a discoverable endpoint' },
   { prefix: 'rate-limit', reason: 'operator-only rate-limit-sentinel observability — agent-facing surface is the sentinel’s own notices' },
   { prefix: 'action-claim', reason: 'internal Stop-hook ingest for the action-claim follow-through sentinel (dark by default, messaging.actionClaim.enabled) — the hook posts here; the agent-facing payoff is the silent follow-through commitment, not a discoverable endpoint' },
+  { prefix: 'completion-claim', reason: 'internal dark Claim Verification Stop-hook ingest and privacy-thresholded observational audit; it has no outbound authority' },
   { prefix: 'slack', reason: 'surfaced via messaging adapters' },
   { prefix: 'whatsapp', reason: 'surfaced via messaging adapters' },
   { prefix: 'flows', reason: 'surfaced inside `evolution` subsystems' },
@@ -1217,8 +1813,11 @@ export const INTERNAL_PREFIXES: ReadonlyArray<{ prefix: string; reason: string }
   { prefix: 'sessions', reason: 'operator/dashboard session surface (listing/streaming/refresh stay dashboard-facing). ONE agent-facing verb exists — POST /sessions/:name/remote-close, the relayed operator close (REMOTE-SESSION-CLOSE-SPEC §2.4) — surfaced via the CLAUDE.md template (Multi-Machine Session Pool section) rather than graduating the prefix: a deliberate pass, no new top-level prefix.' },
   { prefix: 'worktrees', reason: 'AgentWorktreeReaper read-only report (reclaimable stale worktrees) — operational observability the agent READS, like /sessions/reap-log; not a user-invokable capability' },
   { prefix: 'processes', reason: 'McpProcessReaper read-only report (reclaimable leaked MCP-server procs + per-proc keep/reap verdict) — operational observability the agent READS, like /worktrees/agent-reaper; not a user-invokable capability' },
+  { prefix: 'codex-arm-sweeper', reason: 'CodexArmSessionSweeper read-only status (posture + killed/kept/error counts + last kills for the orphaned instar-codex-arm-* tmux sessions codexHookArm leaks) — operational observability the agent READS, like /worktrees/agent-reaper and /processes/mcp-reaper; not a user-invokable capability' },
   { prefix: 'orphaned-work', reason: 'OrphanedWorkSentinel read-only snapshot (agent worktrees with uncommitted work whose owning session died — the silent-uncommitted-death backstop) — operational observability the agent READS, like /worktrees/agent-reaper; dev-gated dark, 503 on the fleet; not a user-invokable capability' },
+  { prefix: 'external-hog', reason: 'ExternalHogSentinel status (GET) + the PIN-gated arm / Bearer disarm (POST) for the external-hog zombie auto-kill sentinel — operational observability the agent READS + an operator PIN action, like /green-pr-automerge; dev-gated dark, 503 on the fleet; surfaced via the CLAUDE.md agent-awareness section, not a user-invokable capability' },
   { prefix: 'playwright-profiles', reason: 'dev-gated Playwright profile↔accounts registry; surfaced to agents via the CLAUDE.md template + the session-start boot block (503 on the fleet), not /capabilities — same class as intelligence/topic-profile' },
+  { prefix: 'passkeys', reason: 'agent-held Google passkeys (spec agent-held-google-passkey §3.2–§3.4, §5.1) — dashboard-PIN-gated operator levers (grant / revoke / issuer-add / issuer-remove / revert-method / exclude-peer / include-peer), the reads of this machine\'s grants + issuers (GET /passkeys/grants), revoke outbox (GET /passkeys/outbox, POST /passkeys/outbox/tick), the per-cell view + pool read path (GET /passkeys[?scope=pool], GET /passkeys/pool-state, POST /passkeys/pool-state/tick, GET /passkeys/admission), cell health + the one digest (GET /passkeys/health, POST /passkeys/health/outcome, POST /passkeys/health/digest/refresh, PIN POST /passkeys/attest-google-removed), the operator-triggered cold proof (PIN POST /passkeys/prove — §3.8) and the signed passkey-cell mandate receiver (POST /passkeys/cell-action, signature + expected-issuer set + nonce ledger are the authority); dev-gated (503 on the fleet), surfaced via the Playwright Profile Registry CLAUDE.md bullet, not /capabilities — same class as playwright-profiles' },
   { prefix: 'pr-leases', reason: 'dev-gated parallel-hand PR-push lease (stops two of my own sessions racing one branch); a PreToolUse git-push guard consults it and the CLAUDE.md template documents it — internal coordination machinery, 503 on the fleet, not a user-invokable capability' },
   { prefix: 'sleep', reason: 'SleepController read-only verdict (agent hard-sleep decision + which guard holds it awake) — operational observability the agent READS; not a user-invokable capability' },
   { prefix: 'gemini-loop', reason: 'GeminiLoopRunner (need-gem-002) multi-turn loop-driver — the dark, developmentAgent-gated mechanism the apprenticeship machinery uses to drive a Gemini mentee across turns. 503 on the fleet (dark); not a general user-invokable capability yet. Reclassify under apprenticeshipProgram if/when it graduates live.' },
@@ -1227,8 +1826,10 @@ export const INTERNAL_PREFIXES: ReadonlyArray<{ prefix: string; reason: string }
   { prefix: 'identity', reason: 'identity files surfaced via the top-level `identity` field of the response' },
   { prefix: 'hooks', reason: 'hook listing surfaced via the top-level `hooks` field of the response' },
   { prefix: 'threadline', reason: 'surfaced via discovery (threadline-relay feature)' },
-  { prefix: 'mesh', reason: 'machine-to-machine MeshRpc transport (§L0 Session Pool) — Ed25519-signed, recipient-bound peer commands; never an agent/user capability' },
-  { prefix: 'session-pool', reason: 'session-pool rollout-gate E2E results (§Rollout) — operator observability for a dark feature, not a conversational capability' },
+  { prefix: 'mesh', reason: 'machine-to-machine MeshRpc transport (§L0 Session Pool) — Ed25519-signed, recipient-bound peer commands; never an agent/user capability. (GET /mesh/rope-health — U4.5 rope-health read surface — shares this prefix; it is agent-surfaced via the CLAUDE.md template proactive trigger + the rope-health-digest job rather than discovery.)' },
+  { prefix: 'mesh-selfheal', reason: 'G3 lease-gated-spawn promotion-evidence surface (MESH-SELF-HEAL-SPEC §3.3) — read-only soak ledger (would-have-prevented-duplicate / would-have-cleared-stale-binding + promotion recommendation) the agent READS for the dark-feature graduation loop; operational observability like /worktrees/agent-reaper, not a user-invokable capability' },
+  { prefix: 'session-pool', reason: 'session-pool rollout control/observability (§Rollout) — the signed E2E results (GET /session-pool/e2e-results), the read-only readiness report (GET /session-pool/readiness), failover-runner status, and evidence-gated one-step promotion lever (POST /session-pool/promote); promotion remains explicitly off by default and ceiling-bounded' },
+  { prefix: 'write-admission', reason: 'standby-write reconciliation status surface (docs/specs/standby-write-reconciliation.md P2-6/F9) — read-only per-domain admission counters + recent typed refusals + the event-loop-lag gauge the agent READS to answer "are writes hanging or being refused?"; dev-gated dark (503 on the fleet, dry-run first) and agent-surfaced via the CLAUDE.md "Write Admission" awareness section rather than discovery — operational observability like /mesh-selfheal and /worktrees/agent-reaper, not a user-invokable capability' },
 ];
 
 // ── Public helpers ───────────────────────────────────────────────────────

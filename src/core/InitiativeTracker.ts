@@ -1,3 +1,5 @@
+import { validGenericMeasurement } from '../monitoring/MeasurementContractVersion.js';
+import { hasMeasurementBinding, type GenericMeasurementContract } from '../monitoring/MeasurementSubject.js';
 /**
  * InitiativeTracker — persists and queries multi-phase, long-running work.
  *
@@ -44,6 +46,7 @@ import type {
   WaitJson,
 } from '../tasks/task-flow-types.js';
 import { TaskFlowError } from '../tasks/task-flow-types.js';
+import type { MaturationOutcomeContract } from '../monitoring/MaturationOutcome.js';
 
 export type InitiativePhaseStatus = 'pending' | 'in-progress' | 'done' | 'blocked';
 
@@ -77,6 +80,44 @@ export type InitiativeKind = 'task' | 'project';
  *  GRADUATED-FEATURE-ROLLOUT-SPEC §4.2-4.3. */
 export type RolloutStage = 'dark' | 'dry-run' | 'live' | 'default-on';
 
+export type MaturationMetricSource = 'blocker-summary' | 'blocker-trend' | 'feature-summary';
+export type MaturationMetricDirection = 'at-least' | 'at-most';
+
+export interface MaturationMetricContract {
+  id: string;
+  source: MaturationMetricSource;
+  sourceRef: string;
+  direction: MaturationMetricDirection;
+  threshold: number;
+  minSamples: number;
+}
+
+export interface MaturationEvaluationContract {
+  cadenceHours: number;
+  evidenceMaxAgeHours: number;
+  metrics: MaturationMetricContract[];
+  /** Optional recorded outcome/baseline evidence; never a promotion authority. */
+  outcome?: MaturationOutcomeContract;
+}
+
+export type MaturationLadderRung = 'test-agent-live' | 'dev-agent-live' | 'fleet';
+export type RolloutAccountingDisposition = 'active' | 'composed' | 'excluded';
+
+/** Complete rollout-accounting row. Active rows derive rung from the observed
+ * flag; composed/excluded rows are intentionally rung-null and never gain a
+ * control seam of their own. */
+export interface RolloutAccountingInfo {
+  disposition: RolloutAccountingDisposition;
+  sourcePrNumber: number;
+  rung: MaturationLadderRung | null;
+  ownerFeatureId?: string;
+  exclusionReason?: string;
+  evidenceSource?: { type: 'log-filter' | 'endpoint'; ref: string; filter?: string };
+  graduationCriterion?: string;
+  maturationEvaluation?: MaturationEvaluationContract;
+  maturationContractError?: 'invalid-json' | 'oversized' | 'invalid-shape' | 'unknown-source-ref';
+}
+
 /** Typed rollout metadata for a ships-staged feature task. Operational criteria
  *  live here (typed), NOT in free-form phase summaries. */
 export interface RolloutInfo {
@@ -89,6 +130,11 @@ export interface RolloutInfo {
   evidenceSource?: { type: 'log-filter' | 'endpoint'; ref: string; filter?: string };
   /** Human-readable promotion gate (e.g. "≥2wk + ≥3 genuinely-idle would-reaps"). */
   promotionCriteria?: string;
+  /** D7: bounded numeric contract evaluated on the shared blocker-lifecycle
+   * metrics substrate. Evaluation is advisory and never advances this track. */
+  maturationEvaluation?: MaturationEvaluationContract;
+  /** Preserve malformed declared measurement metadata instead of calling it absent. */
+  maturationContractError?: RolloutAccountingInfo['maturationContractError'];
   /** Near-silent edge dedupe: last time a needs-user line was surfaced for this track. */
   lastDigestNotifiedAt?: string;
 }
@@ -211,6 +257,11 @@ export interface Initiative {
   /** Post-ship rollout track (ships-staged features). Present only when the
    *  feature matures behind a flag. Stage is derived from observing flagPath. */
   rollout?: RolloutInfo;
+  rolloutAccounting?: RolloutAccountingInfo;
+  measurement?: GenericMeasurementContract;
+  /** Immutable exact-key link from the feedback-drain outbox. One work key may
+   *  identify at most one Initiative task; semantic matching never substitutes. */
+  feedbackWorkKey?: string;
 
   // Project-only fields (only meaningful when `kind === 'project'`):
   rounds?: InitiativeRound[];
@@ -258,6 +309,10 @@ export interface InitiativeCreateInput {
   ciCheckedAt?: string;
   driftCheck?: boolean;
   rollout?: RolloutInfo;
+  rolloutAccounting?: RolloutAccountingInfo;
+  measurement?: GenericMeasurementContract;
+  /** Immutable exact-key link from the feedback-drain outbox. */
+  feedbackWorkKey?: string;
   rounds?: InitiativeRound[];
   sourceDocs?: string[];
   autoAdvance?: boolean;
@@ -299,6 +354,8 @@ export interface InitiativeUpdateInput {
   unskippedAt?: string | null;
   driftCheck?: boolean;
   rollout?: RolloutInfo | null;
+  rolloutAccounting?: RolloutAccountingInfo | null;
+  measurement?: GenericMeasurementContract | null;
   rounds?: InitiativeRound[];
   sourceDocs?: string[];
   autoAdvance?: boolean;
@@ -311,6 +368,16 @@ export interface InitiativeUpdateInput {
   awaitingReconciliation?: InitiativeConflictPatch[];
   driftPromptTemplateVersion?: number;
 }
+
+/**
+ * Every field `update()` reads, as the route's allowlist (PATCH /initiatives/:id refuses any
+ * other field instead of answering 200 for a change it did not make). The Record type makes
+ * the compiler fail when a field is added to InitiativeUpdateInput but not here, or the reverse.
+ */
+const INITIATIVE_UPDATE_FIELD_SET: Record<keyof InitiativeUpdateInput, true> = {
+  title: true, description: true, status: true, nextCheckAt: true, needsUser: true, needsUserReason: true, blockers: true, links: true, ifMatch: true, kind: true, parentProjectId: true, pipelineStage: true, specPath: true, prNumber: true, mergeCommitOid: true, ciCheckedAt: true, skippedAt: true, skippedBy: true, skippedReason: true, unskippedAt: true, driftCheck: true, rollout: true, rolloutAccounting: true, measurement: true, rounds: true, sourceDocs: true, autoAdvance: true, telegramTopicId: true, ownerMachineId: true, targetRepoPath: true, unacknowledgedAdvanceCount: true, firstLaunchAckAt: true, lastAckedRoundIndex: true, awaitingReconciliation: true, driftPromptTemplateVersion: true,
+};
+export const INITIATIVE_UPDATE_FIELDS: readonly string[] = Object.freeze(Object.keys(INITIATIVE_UPDATE_FIELD_SET));
 
 /**
  * Thrown by `update()` when the caller supplied `ifMatch` and it didn't
@@ -353,7 +420,7 @@ export class InvalidParentProjectError extends Error {
 export interface DigestItem {
   initiativeId: string;
   title: string;
-  reason: 'stale' | 'needs-user' | 'next-check-due' | 'ready-to-advance';
+  reason: 'stale' | 'needs-user' | 'next-check-due' | 'ready-to-advance' | 'feedback-summary';
   detail: string;
 }
 
@@ -405,6 +472,7 @@ function rejectNullCreateInput(input: InitiativeCreateInput): void {
     'mergeCommitOid',
     'ciCheckedAt',
     'driftCheck',
+    'feedbackWorkKey',
     'rounds',
     'sourceDocs',
     'autoAdvance',
@@ -918,6 +986,12 @@ export class InitiativeTracker {
     return this.list().find((i) => i.prNumber === prNumber);
   }
 
+  /** Exact feedback-outbox lookup. Uses list() so TaskFlow remains authoritative. */
+  findByFeedbackWorkKey(feedbackWorkKey: string): Initiative | undefined {
+    if (!feedbackWorkKey) return undefined;
+    return this.list({ kind: 'task' }).find((i) => i.feedbackWorkKey === feedbackWorkKey);
+  }
+
   get(id: string): Initiative | undefined {
     if (this.isTaskFlowEnabled()) {
       const fid = this.findFlowIdForInitiative(id);
@@ -935,6 +1009,14 @@ export class InitiativeTracker {
     return this.initiatives.get(id);
   }
 
+  private validateMeasurementOwner(initiative: Initiative): void {
+    const featureContract=initiative.rolloutAccounting?.maturationEvaluation??initiative.rollout?.maturationEvaluation;
+    if(hasMeasurementBinding(featureContract)) throw new Error('Generic target bindings belong in measurement metadata, not a feature rollout contract');
+    if (initiative.measurement === undefined) return;
+    if (initiative.rollout || initiative.rolloutAccounting) throw new Error('An initiative must choose measurement or rollout ownership; clear the previous owner atomically');
+    if (!validGenericMeasurement(initiative.measurement, initiative.id)) throw new Error('Measurement requires a valid target-scoped contract with outcome, quality safeguard and baseline');
+  }
+
   async create(input: InitiativeCreateInput): Promise<Initiative> {
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(input.id)) {
       throw new Error('Initiative id must be lowercase kebab-case, 1–63 chars');
@@ -943,6 +1025,14 @@ export class InitiativeTracker {
       throw new Error('Initiative must have at least one phase');
     }
     rejectNullCreateInput(input);
+    if (input.feedbackWorkKey !== undefined) {
+      if (!/^feedback-work:[a-zA-Z0-9._:-]{1,180}$/.test(input.feedbackWorkKey)) {
+        throw new Error('feedbackWorkKey must be a bounded feedback-work key');
+      }
+      if (this.findByFeedbackWorkKey(input.feedbackWorkKey)) {
+        throw new Error(`Initiative feedbackWorkKey "${input.feedbackWorkKey}" already exists`);
+      }
+    }
     if (this.isTaskFlowEnabled()) {
       if (this.findFlowIdForInitiative(input.id)) {
         throw new Error(`Initiative "${input.id}" already exists`);
@@ -993,6 +1083,8 @@ export class InitiativeTracker {
     if (input.ciCheckedAt !== undefined) initiative.ciCheckedAt = input.ciCheckedAt;
     if (input.driftCheck !== undefined) initiative.driftCheck = input.driftCheck;
     if (input.rollout !== undefined) initiative.rollout = input.rollout;
+    if (input.rolloutAccounting !== undefined) initiative.rolloutAccounting = input.rolloutAccounting;
+    if (input.feedbackWorkKey !== undefined) initiative.feedbackWorkKey = input.feedbackWorkKey;
     if (input.rounds !== undefined) initiative.rounds = input.rounds;
     if (input.sourceDocs !== undefined) initiative.sourceDocs = input.sourceDocs;
     if (input.autoAdvance !== undefined) initiative.autoAdvance = input.autoAdvance;
@@ -1003,6 +1095,8 @@ export class InitiativeTracker {
       initiative.driftPromptTemplateVersion = input.driftPromptTemplateVersion;
     }
 
+    if (input.measurement !== undefined) initiative.measurement = input.measurement;
+    this.validateMeasurementOwner(initiative);
     this.initiatives.set(initiative.id, initiative);
     let result: Initiative;
     if (this.isTaskFlowEnabled()) {
@@ -1098,6 +1192,9 @@ export class InitiativeTracker {
     if (input.rollout !== undefined) {
       next.rollout = input.rollout === null ? undefined : input.rollout;
     }
+    if (input.rolloutAccounting !== undefined) {
+      next.rolloutAccounting = input.rolloutAccounting === null ? undefined : input.rolloutAccounting;
+    }
     if (input.rounds !== undefined) next.rounds = input.rounds;
     if (input.sourceDocs !== undefined) next.sourceDocs = input.sourceDocs;
     if (input.autoAdvance !== undefined) next.autoAdvance = input.autoAdvance;
@@ -1124,6 +1221,9 @@ export class InitiativeTracker {
     if (input.driftPromptTemplateVersion !== undefined) {
       next.driftPromptTemplateVersion = input.driftPromptTemplateVersion;
     }
+
+    if (input.measurement !== undefined) next.measurement = input.measurement === null ? undefined : input.measurement;
+    this.validateMeasurementOwner(next);
 
     // Bump version on every successful write.
     next.version = currentVersion + 1;
@@ -1328,6 +1428,8 @@ export class InitiativeTracker {
     if (this.isTaskFlowEnabled()) this.refreshCacheFromTaskFlow();
     const items: DigestItem[] = [];
     const nowMs = now.getTime();
+    let feedbackActive = 0;
+    let feedbackReady = 0;
     for (const initiative of this.initiatives.values()) {
       if (initiative.status !== 'active') continue;
 
@@ -1354,6 +1456,16 @@ export class InitiativeTracker {
         }
       }
 
+      // Feedback-linked Initiatives are ranked by feedback triage; they never flood the digest
+      // with per-item ready-to-advance/stale flags (docs/specs/feedback-triage-and-execution.md §2).
+      if (initiative.feedbackWorkKey) {
+        feedbackActive++;
+        const cur = initiative.phases[initiative.currentPhaseIndex];
+        const prev = initiative.currentPhaseIndex > 0 ? initiative.phases[initiative.currentPhaseIndex - 1] : undefined;
+        if (prev?.status === 'done' && cur?.status === 'pending') feedbackReady++;
+        continue;
+      }
+
       const current = initiative.phases[initiative.currentPhaseIndex];
       const previous = initiative.currentPhaseIndex > 0
         ? initiative.phases[initiative.currentPhaseIndex - 1]
@@ -1378,6 +1490,15 @@ export class InitiativeTracker {
           detail: `No movement in ${days} days.`,
         });
       }
+    }
+    if (feedbackActive > 0) {
+      items.push({
+        initiativeId: 'feedback-triage-queue',
+        title: 'Feedback work items',
+        reason: 'feedback-summary',
+        detail: `${feedbackActive} active feedback work item${feedbackActive === 1 ? '' : 's'} (${feedbackReady} past triage). ` +
+          'Ranked in the feedback triage queue: dashboard Feedback Drain tab, or GET /feedback-factory/triage/queue.',
+      });
     }
     return { generatedAt: now.toISOString(), items };
   }

@@ -171,6 +171,41 @@ describe('ContextWedgeSentinel E2E — WIRED into server.ts (dead-code guard)', 
   });
 });
 
+// ── Regression (2026-09-21): the shipped config must not spin the scan loop ──
+// Real timers, production cfg shape: `{ enabled, tickIntervalMs: wedgeCfg.tickIntervalMs,
+// confirmWindowMs: wedgeCfg.confirmWindowMs }` with the shipped `{ enabled: true }`.
+// The buggy build captured every live session's pane roughly every millisecond
+// (hundreds of captures in this window); the fixed build waits its 20s period.
+describe('ContextWedgeSentinel E2E — shipped config does not busy-loop', () => {
+  it('a started sentinel with undefined timing performs no scan inside its first 20s', async () => {
+    let captures = 0;
+    const surface: SentinelSessionSurface = {
+      captureOutput: () => { captures++; return 'working normally'; },
+      isSessionAlive: () => true,
+      sendKey: () => true,
+      listRunningSessions: () => [{ tmuxSession: 'live-a' }, { tmuxSession: 'live-b' }],
+    };
+    const wedgeCfg: { enabled: boolean; tickIntervalMs?: number; confirmWindowMs?: number } = { enabled: true };
+    const sentinel = new ContextWedgeSentinel(
+      buildContextWedgeDeps({
+        sessions: surface,
+        escalate: async () => {},
+        autoRecovery: { enabled: false, dryRun: true },
+        freshRespawn: async () => true,
+      }),
+      { enabled: wedgeCfg.enabled, tickIntervalMs: wedgeCfg.tickIntervalMs, confirmWindowMs: wedgeCfg.confirmWindowMs },
+    );
+    sentinel.start();
+    try {
+      await new Promise(r => setTimeout(r, 300));
+      expect(captures).toBe(0);
+      expect(sentinel.effectiveTiming).toEqual({ tickIntervalMs: 20_000, confirmWindowMs: 45_000 });
+    } finally {
+      sentinel.stop();
+    }
+  });
+});
+
 // ── AUP-rejection family (signature 2, 2026-06-05 EXO incident) ──────────────
 
 const AUP_ERROR_LINE =
@@ -242,6 +277,9 @@ describe('Fresh-respawn API lever — WIRED into routes.ts (dead-code guard)', (
   });
 
   it('routes.ts forwards fresh to refreshSession', () => {
-    expect(routesSrc).toMatch(/refreshSession\(\{ sessionName, followUpPrompt, reason, fresh \}\)/);
+    // swap-continuity-antithrash §4.5 added the work-gate `force` flag to the
+    // same call — the guard now asserts the current call shape (fresh still
+    // forwarded, force pinned to a strict boolean).
+    expect(routesSrc).toMatch(/refreshSession\(\{ sessionName, followUpPrompt, reason, fresh, force: force === true \}\)/);
   });
 });

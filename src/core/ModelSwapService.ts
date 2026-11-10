@@ -88,6 +88,19 @@ export interface ModelSwapServiceDeps {
   topicProfileConsult?: (
     session: Session,
   ) => { suppressEscalation: boolean; baselineModel: string | null } | null;
+  /**
+   * swap-continuity-antithrash §4.2/Q5 — the SUBAGENT leg of the idle check.
+   * A session at an idle prompt CAN carry live background subagents; the
+   * pane-only check would swap under them (the F3 footer blind spot). Only
+   * consulted when `getConfig().subagentIdleLeg === true` (concrete default
+   * false — dark; spec §10 rung 3a). Returns the leg state:
+   *  - 'active'        → live subagents ⇒ refuse (retryable, like not-idle)
+   *  - 'idle'          → affirmatively no live subagents ⇒ proceed
+   *  - 'absent'        → no claudeSessionId to probe (R5-M1: behaves like a
+   *                      failed probe — refuse, never a blind swap)
+   *  - 'indeterminate' → probe failed ⇒ refuse (fail-closed, Security-F6 shape)
+   */
+  subagentLegProbe?: (session: Session) => 'active' | 'idle' | 'absent' | 'indeterminate';
   /** Canary attempts/cadence — injectable for tests. */
   canaryAttempts?: number;
   canaryIntervalMs?: number;
@@ -159,7 +172,16 @@ export function paneConfirmsModel(tail: string | null, modelId: string): boolean
     const version = m[2].split('-').filter(Boolean).slice(0, 2).join('.');
     alternatives.push(escapeRe(version ? `${family} ${version}` : family));
   }
-  const ack = new RegExp(`set model to[^\\n]*\\b(?:${alternatives.join('|')})\\b`, 'i');
+  // The trailing `(?![.\-]\d)` is load-bearing: a shorter version is a literal
+  // PREFIX of a longer one, and `\b` sits between the digit and the separator, so
+  // without it "Set model to Fable 5.1" CONFIRMS a swap to `claude-fable-5` — the
+  // pane says 5.1, the ledger records 5, and the session's recorded model + cost
+  // attribution are silently wrong. Dormant until a `-N` sibling existed; live the
+  // moment `claude-fable-5-1` became pinnable (2026-09-06). It rejects only a
+  // VERSION continuation (a separator followed by a digit), so a sentence-ending
+  // "Set model to Fable 5." still confirms — the false-negative direction is the
+  // safe one for this function, but a needless one is still a bug.
+  const ack = new RegExp(`set model to[^\\n]*\\b(?:${alternatives.join('|')})\\b(?![.\\-]\\d)`, 'i');
   return tail.split('\n').some(line => {
     if (line.includes('/model')) return false; // echo of our injected input
     return ack.test(line);
@@ -285,6 +307,18 @@ export class ModelSwapService {
     const tail = this.deps.sessions.captureMeaningfulTail(session.tmuxSession, 8);
     if (!paneIdleWithEmptyInput(tail)) {
       return this.refuse(session.name, tier, 'not-idle');
+    }
+
+    // SUBAGENT idle leg (swap-continuity-antithrash §4.2/Q5 — dark behind
+    // `subagentIdleLeg`, concrete default false): a pane-idle session with
+    // live background subagents is NOT idle; refusal is retryable exactly
+    // like `not-idle`. 'absent'/'indeterminate' refuse per R5-M1 (an
+    // unreadable leg is never a license to swap under live work).
+    if (cfg.subagentIdleLeg && this.deps.subagentLegProbe) {
+      const leg = this.deps.subagentLegProbe(session);
+      if (leg !== 'idle') {
+        return this.refuse(session.name, tier, `not-idle-subagents:${leg}`);
+      }
     }
 
     // §7/§8 cost gates — only escalations consume budget/lease; a swap back

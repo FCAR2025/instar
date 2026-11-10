@@ -19,6 +19,7 @@ import {
   setFeatureMetricsRecorder,
 } from '../../src/core/CircuitBreakingIntelligenceProvider.js';
 import { LlmCircuitBreaker } from '../../src/core/LlmCircuitBreaker.js';
+import { CODEX_CHATGPT_FALLBACK_MODEL } from '../../src/providers/adapters/openai-codex/models.js';
 
 let fixtureDir: string;
 let prevEnv: string | undefined;
@@ -87,6 +88,51 @@ afterEach(() => {
 });
 
 describe('exec-json mode (default)', () => {
+  it('self-heals a retired model through the real exec-json spawn path', async () => {
+    const calls = path.join(fixtureDir, 'fallback-calls.txt');
+    const script = path.join(fixtureDir, 'retired-model.sh');
+    fs.writeFileSync(script, `#!/bin/sh
+OUTFILE=""
+MODEL=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "--output-last-message" ]; then OUTFILE="$a"; fi
+  if [ "$PREV" = "--model" ]; then MODEL="$a"; fi
+  PREV="$a"
+done
+cat > /dev/null
+echo "$MODEL" >> "${calls}"
+if [ "$MODEL" != "${CODEX_CHATGPT_FALLBACK_MODEL}" ]; then
+  echo "Error 400: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account." >&2
+  exit 1
+fi
+printf '%s' 'RECOVERED-JSON' > "$OUTFILE"
+exit 0
+`, { mode: 0o755 });
+    const provider = new CodexCliIntelligenceProvider({ codexPath: script });
+
+    await expect(provider.evaluate('p', { model: 'gpt-5.5' })).resolves.toBe('RECOVERED-JSON');
+    // Asserted against the CONSTANT, not a literal: the floor moves every time
+    // OpenAI retires a model (three times so far), and a hardcoded name here
+    // silently re-breaks this mechanism test on each move.
+    expect(fs.readFileSync(calls, 'utf-8').trim().split('\n')).toEqual([
+      'gpt-5.5',
+      CODEX_CHATGPT_FALLBACK_MODEL,
+    ]);
+  });
+
+  it('noLocalTools disables the local tools for that call only (docs/specs/ecosystem-idea-pipeline.md §1)', async () => {
+    const provider = new CodexCliIntelligenceProvider({ codexPath: writeFakeCodex() });
+    await provider.evaluate('plain call', { attribution: { component: 'test' } });
+    expect(readArgv()).not.toContain('--disable');
+    await provider.evaluate('outside text', { noLocalTools: true, attribution: { component: 'test' } });
+    const argv = readArgv();
+    expect(argv[argv.indexOf('--disable') + 1]).toBe('shell_tool');
+    expect(argv).toContain('unified_exec');
+    expect(argv).toContain('mcp_servers={}');
+    expect(argv).toContain('read-only');
+  });
+
   it('passes --json + absolute --output-last-message, keeps ALL hygiene args, moves the prompt to stdin', async () => {
     const provider = new CodexCliIntelligenceProvider({ codexPath: writeFakeCodex() });
     const usages: Array<{ inputTokens: number; outputTokens: number; cachedTokens?: number }> = [];
@@ -172,27 +218,44 @@ exit 0
     );
   });
 
+  // Live 2026-10-14: eight feedback-readiness calls failed as "Codex CLI error (exec --json,
+  // exit 1)" and nothing else — in --json mode codex reports the cause on STDOUT (an `error`
+  // event or `turn.failed`), and stderr is empty. The cause was only recoverable four days
+  // later from the rollout files. The thrown Error now carries the LAST such message, bounded.
+  it('carries the last error/turn.failed message from the event stream into the thrown Error, bounded', async () => {
+    const script = path.join(fixtureDir, 'ratelimited.sh');
+    const filler = 'x'.repeat(1_000);
+    fs.writeFileSync(
+      script,
+      `#!/bin/sh
+cat > /dev/null
+echo '{"type":"error","message":"Codex is ignoring 2 unrecognized configuration settings. Check for typos or deprecated settings."}'
+echo '{"type":"turn.started"}'
+echo '{"type":"turn.failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests ${filler}"}}'
+exit 1
+`,
+      { mode: 0o755 },
+    );
+    const provider = new CodexCliIntelligenceProvider({ codexPath: script });
+    const err = await provider.evaluate('p').then(() => null, (e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toMatch(/^Codex CLI error \(exec --json, exit 1\) — last event: exceeded retry limit, last status: 429 Too Many Requests/);
+    expect(err!.message).not.toContain('unrecognized configuration'); // the LAST event, not the first warning
+    expect(err!.message.length).toBeLessThan(400); // bounded: the 1000-char tail is cut
+  });
+
   it('cleans up the per-call out-dir on success', async () => {
-    // Snapshot the PRE-EXISTING out-dirs first — other tests in this file (and
-    // other codex test files in the shared vitest pool) legitimately leave
-    // out-dirs on their error/timeout paths, and they share os.tmpdir(). The
-    // assertion must be scoped to the out-dir THIS call created, not the global
-    // population (the old <10s-mtime heuristic flaked when a sibling test ran
-    // within the window).
-    const listOutDirs = (): Set<string> =>
-      new Set(
-        fs
-          .readdirSync(os.tmpdir())
-          .filter((n) => n.startsWith('instar-codex-out-'))
-          .map((n) => path.join(os.tmpdir(), n)),
-      );
-    const before = listOutDirs();
     const provider = new CodexCliIntelligenceProvider({ codexPath: writeFakeCodex() });
     await provider.evaluate('p');
-    // Only NEW out-dirs (created by THIS call) must be gone — pre-existing ones
-    // from sibling tests are not this test's concern.
-    const newLeftovers = [...listOutDirs()].filter((p) => !before.has(p));
-    expect(newLeftovers).toEqual([]);
+    // The fake CLI records the exact output file this call received. Assert
+    // cleanup of that directory; concurrent processes also use os.tmpdir().
+    const argv = readArgv();
+    const outputFlag = argv.indexOf('--output-last-message');
+    expect(outputFlag).toBeGreaterThanOrEqual(0);
+    const outputFile = argv[outputFlag + 1];
+    expect(outputFile).toBeTruthy();
+    expect(path.basename(path.dirname(outputFile!))).toMatch(/^instar-codex-out-/);
+    expect(fs.existsSync(path.dirname(outputFile!))).toBe(false);
   });
 });
 
@@ -303,4 +366,117 @@ i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
     expect(errorRow!.tokensCached).toBe(300);
     expect(errorRow!.framework).toBe('codex-cli');
   }, 20000);
+});
+
+// ── codex 0.144 shutdown-linger regression (2026-07-09) ─────────────────────
+//
+// codex 0.144 `exec --json` emits agent_message + turn.completed, then LINGERS
+// ~16-30s before writing --output-last-message and exiting. Instar's 30s
+// timeout used to kill the ALREADY-COMPLETED process → the call was recorded as
+// an error (many WITH usage, since turn.completed had been parsed). The fix
+// settles on the terminal turn using the structured agent_message event as the
+// result, reaping the lingering child. This is the ~92% internal-call failure.
+describe('codex 0.144 shutdown-linger — early terminal settle', () => {
+  /**
+   * Fake codex 0.144: emits the agent_message + turn.completed events, then
+   * LINGERS (sleep) WITHOUT writing --output-last-message — proving the result
+   * is sourced from the structured event, not the (not-yet-written) file. The
+   * lingering sleep far exceeds the provider's timeout; the fix must settle
+   * long before it.
+   */
+  function writeLingerFakeCodex(resultText = 'EVENT-RESULT'): string {
+    const p = path.join(fixtureDir, 'linger-codex.sh');
+    fs.writeFileSync(
+      p,
+      `#!/bin/sh
+cat > /dev/null
+printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"${resultText}"}}'
+printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":90,"output_tokens":8,"total_tokens":128}}'
+# shutdown-linger: NEVER write the --output-last-message file; sleep past the timeout.
+sleep 30
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    return p;
+  }
+
+  it('settles from the agent_message event (not the deferred file) and returns the result fast', async () => {
+    const provider = new CodexCliIntelligenceProvider({ codexPath: writeLingerFakeCodex('LINGER-OK') });
+    const usages: Array<{ inputTokens: number; outputTokens: number; cachedTokens?: number }> = [];
+    const started = Date.now();
+    // timeoutMs 30s (the real default). WITHOUT the fix this would linger past
+    // it and reject as a timeout; WITH the fix it settles in well under a second.
+    const result = await provider.evaluate('p', {
+      timeoutMs: 30000,
+      onUsage: (u) => usages.push(u),
+    });
+    const elapsed = Date.now() - started;
+    expect(result).toBe('LINGER-OK');
+    expect(elapsed).toBeLessThan(3000); // did NOT wait out the 30s linger
+    // Usage from turn.completed was parsed and reported (success carries usage).
+    expect(usages).toEqual([{ inputTokens: 120, outputTokens: 8, cachedTokens: 90 }]);
+  }, 15000);
+
+  it('records a SUCCESS (unclassified) row WITH usage through the funnel — not an error', async () => {
+    const captured: Array<Record<string, unknown>> = [];
+    setFeatureMetricsRecorder({ record: (e) => captured.push(e as Record<string, unknown>) });
+    const provider = new CircuitBreakingIntelligenceProvider(
+      new CodexCliIntelligenceProvider({ codexPath: writeLingerFakeCodex('OK') }),
+      new LlmCircuitBreaker(),
+    );
+    const result = await provider.evaluate('p', {
+      timeoutMs: 30000,
+      attribution: { component: 'TopicIntentExtractor' },
+    });
+    expect(result).toBe('OK');
+    expect(captured.find((r) => r.outcome === 'error')).toBeUndefined();
+    const okRow = captured.find((r) => r.outcome === 'unclassified');
+    expect(okRow).toBeDefined();
+    expect(okRow!.feature).toBe('TopicIntentExtractor');
+    expect(okRow!.framework).toBe('codex-cli');
+    expect(okRow!.tokensIn).toBe(120);
+  }, 15000);
+
+  it('a turn.failed stream is STILL a failure (the fix cannot mask real failures)', async () => {
+    // Emits turn.failed (NOT turn.completed) then exits non-zero: no terminal
+    // completion → no early settle → the existing error path throws.
+    const script = path.join(fixtureDir, 'failed-codex.sh');
+    fs.writeFileSync(
+      script,
+      `#!/bin/sh
+cat > /dev/null
+printf '%s\\n' '{"type":"turn.failed","error":{"message":"model refused"}}'
+exit 1
+`,
+      { mode: 0o755 },
+    );
+    const provider = new CodexCliIntelligenceProvider({ codexPath: script });
+    await expect(provider.evaluate('p', { timeoutMs: 5000 })).rejects.toThrow(/Codex CLI error/);
+  }, 10000);
+
+  it('turn.completed WITHOUT an agent_message does NOT early-settle (falls through to the file path)', async () => {
+    // No agent_message ⇒ settleOnTerminalLine never fires ⇒ the call waits for
+    // exit and reads the file as authority (unchanged behavior). Here the
+    // process exits promptly and writes the file.
+    const script = path.join(fixtureDir, 'nomsg-codex.sh');
+    fs.writeFileSync(
+      script,
+      `#!/bin/sh
+OUTFILE=""
+PREV=""
+for a in "$@"; do
+  if [ "$PREV" = "--output-last-message" ]; then OUTFILE="$a"; fi
+  PREV="$a"
+done
+cat > /dev/null
+printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}'
+printf '%s' 'FILE-AUTHORITY' > "$OUTFILE"
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    const provider = new CodexCliIntelligenceProvider({ codexPath: script });
+    await expect(provider.evaluate('p', { timeoutMs: 5000 })).resolves.toBe('FILE-AUTHORITY');
+  }, 10000);
 });

@@ -7,7 +7,7 @@
  *   Phase 1 — Feature is alive: /corrections returns 200 enabled / 503 off on
  *             the production boot path (the single most important assertion).
  *   Phase 2 — Preference acceptance fixture (§8): a recurring explicit preference
- *             stated across 2 distinct calendar days + 2 topics crosses the gate
+ *             stated across 2 distinct calendar days + 2 sessions crosses the gate
  *             and POST /corrections/analyze writes it to .instar/preferences.json
  *             via recordPreference() with provenance: correction-loop — observable
  *             on disk.
@@ -39,6 +39,7 @@ function seed(dbPath: string, opts: {
   summary: string;
   days: number;
   topics: number;
+  sessions?: number;
   count: number;
 }): void {
   const ledger = new CorrectionLedger({ dbPath, machineId: 'e2e' });
@@ -50,6 +51,7 @@ function seed(dbPath: string, opts: {
         scrubbedSummary: opts.summary,
         deterministicWeight: 3,
         topicId: (i % opts.topics) + 1,
+        sessionId: `e2e-session-${(i % (opts.sessions ?? 1)) + 1}`,
         detectedAt: `2026-05-0${(i % opts.days) + 1}T10:00:00Z`,
       });
     }
@@ -71,7 +73,7 @@ describe('Correction & Preference Learning Sentinel E2E lifecycle', () => {
       const mk = (dir: string, enabled: boolean): InstarConfig => ({
         projectName: enabled ? 'corr-e2e-on' : 'corr-e2e-off',
         agentName: 'E2E', projectDir: dir, stateDir: path.join(dir, '.instar'), port: 0, authToken: AUTH,
-        ...(enabled ? { monitoring: { correctionLearning: { enabled: true } } } : {}),
+        monitoring: { correctionLearning: { enabled }, failureCallouts: { enabled } },
       } as InstarConfig);
       onServer = new AgentServer({ config: mk(onDir, true), sessionManager: createMockSessionManager() as any, state: new StateManager(path.join(onDir, '.instar')) });
       offServer = new AgentServer({ config: mk(offDir, false), sessionManager: createMockSessionManager() as any, state: new StateManager(path.join(offDir, '.instar')) });
@@ -84,6 +86,22 @@ describe('Correction & Preference Learning Sentinel E2E lifecycle', () => {
     it('returns 200 when enabled', async () => {
       const res = await request(onServer.getApp()).get('/corrections').set(auth());
       expect(res.status).toBe(200);
+    });
+    it('records the real Telegram handoff case on the production path and refuses premature closure', async () => {
+      const fixture = JSON.parse(fs.readFileSync(new URL('../fixtures/failure-callouts/telegram-group-handoff.json', import.meta.url), 'utf8'));
+      const created = await request(onServer.getApp()).post('/corrections').set(auth()).set('X-Instar-Request', '1')
+        .send({ kind: 'infra-gap', severity: 'failure-callout', learning: fixture.learning, topicId: fixture.topicId, failureContext: fixture.context });
+      expect(created.status).toBe(201);
+      expect(created.body.failureCase.state).toBe('captured');
+      const read = await request(onServer.getApp()).get(`/corrections/${created.body.id}`).set(auth());
+      expect(read.body.failureCase.context.instructions.join(' ')).toContain('Do NOT use');
+      expect(read.body.failureCase.context.decisions.join(' ')).toContain('explicitly overridden');
+      const closed = await request(onServer.getApp()).patch(`/corrections/${created.body.id}/failure-case`).set(auth()).set('X-Instar-Request', '1')
+        .send({ version: created.body.version, verification: { replayPassed: true } });
+      expect(closed.status).toBe(400);
+      const off = await request(offServer.getApp()).patch(`/corrections/${created.body.id}/failure-case`).set(auth()).set('X-Instar-Request', '1')
+        .send({ version: created.body.version, context: fixture.context });
+      expect(off.status).toBe(503);
     });
     it('returns 503 when disabled', async () => {
       const res = await request(offServer.getApp()).get('/corrections').set(auth());
@@ -110,13 +128,14 @@ describe('Correction & Preference Learning Sentinel E2E lifecycle', () => {
       SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'corr-e2e:p2' });
     });
 
-    it('a recurring "no good stopping point" preference (2 days / 2 topics) writes .instar/preferences.json', async () => {
-      // The named §8 preference fixture — restated across 2 distinct calendar days.
+    it('a recurring "no good stopping point" preference (2 days / 2 sessions) writes .instar/preferences.json', async () => {
+      // The named §8 preference fixture — restated across 2 distinct calendar
+      // days and sessions while staying in one topic.
       seed(dbPath, {
         kind: 'user-preference',
         learning: "don't pause for context length; session length is irrelevant — keep going",
         summary: 'Keep going; do not pause for context length / session length.',
-        days: 2, topics: 2, count: 4,
+        days: 2, topics: 1, sessions: 2, count: 4,
       });
       expect(fs.existsSync(prefsPath)).toBe(false);
 

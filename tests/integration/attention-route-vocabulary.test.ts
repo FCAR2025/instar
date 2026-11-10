@@ -39,10 +39,11 @@ function makeApp() {
         return status ? values.filter(i => i.status === status) : values;
       },
       getAttentionItem: (id: string) => items.get(id),
-      updateAttentionStatus: async (id: string, status: StubItem['status']) => {
-        const item = items.get(id);
+      updateAttentionStatus: async (id: string, status: StubItem['status'], opts?: { resolution?: string }) => {
+        const item = items.get(id) as (StubItem & { resolution?: string }) | undefined;
         if (!item) return false;
         item.status = status;
+        if (opts?.resolution !== undefined) item.resolution = opts.resolution;
         item.updatedAt = new Date().toISOString();
         return true;
       },
@@ -52,6 +53,21 @@ function makeApp() {
 }
 
 describe('Attention route vocabulary compatibility', () => {
+  it('applies every documented bound alias while an unbounded read returns the full population', async () => {
+    const { app } = makeApp();
+    for (const id of ['a', 'b', 'c']) {
+      await request(app).post('/attention').send({ id, title: id, summary: id, category: 'general', priority: 'NORMAL' }).expect(201);
+    }
+
+    for (const key of ['limit', 'count', 'take', 'pageSize']) {
+      const bounded = await request(app).get('/attention').query({ [key]: 2 }).expect(200);
+      expect(bounded.body.count).toBe(2);
+      expect(bounded.body.items.map((x: StubItem) => x.id)).toEqual(['a', 'b']);
+    }
+    const unbounded = await request(app).get('/attention').expect(200);
+    expect(unbounded.body.count).toBe(3);
+  });
+
   it('accepts documented POST aliases and stores canonical priority/source fields', async () => {
     const { app, capturedCreates } = makeApp();
 
@@ -102,5 +118,33 @@ describe('Attention route vocabulary compatibility', () => {
     expect(filtered.body.count).toBe(1);
     expect(filtered.body.items[0].id).toBe('att-resolve');
     expect(filtered.body.items[0].status).toBe('DONE');
+  });
+
+  it('refuses unsupported PATCH fields instead of answering 200 for a change it did not make', async () => {
+    const { app, items } = makeApp();
+    await request(app).post('/attention').send({ id: 'p', title: 'p', summary: 'kept', category: 'general', priority: 'NORMAL' }).expect(201);
+    for (const extra of [{ body: 'x' }, { summary: 'x' }, { priority: 'HIGH' }, { title: 'x' }]) {
+      const res = await request(app).patch('/attention/p').send({ status: 'resolved', ...extra }).expect(400);
+      expect(res.body.error).toMatch(/^Unsupported field\(s\): /);
+      expect(res.body.unsupportedFields).toEqual(Object.keys(extra));
+    }
+    expect(items.get('p')).toMatchObject({ status: 'OPEN', summary: 'kept', priority: 'NORMAL' });
+    await request(app).patch('/attention/p').send(['resolved']).expect(400);
+  });
+
+  it('stores the documented resolution and the reason alias, and rejects an empty one', async () => {
+    const { app, items } = makeApp();
+    for (const id of ['r1', 'r2', 'r3']) {
+      await request(app).post('/attention').send({ id, title: id, summary: id, category: 'general', priority: 'NORMAL' }).expect(201);
+    }
+    await request(app).patch('/attention/r1').send({ status: 'resolved', resolution: 'Done' }).expect(200);
+    await request(app).patch('/attention/r2').send({ status: 'resolved', reason: 'release shipped' }).expect(200);
+    await request(app).patch('/attention/r3').send({ status: 'resolved', resolution: '  ' }).expect(400);
+    expect((items.get('r1') as any).resolution).toBe('Done');
+    expect((items.get('r2') as any).resolution).toBe('release shipped');
+    expect(items.get('r3')!.status).toBe('OPEN');
+    // A status-only change still works and stores no resolution.
+    await request(app).patch('/attention/r3').send({ status: 'ack' }).expect(200);
+    expect((items.get('r3') as any).resolution).toBeUndefined();
   });
 });

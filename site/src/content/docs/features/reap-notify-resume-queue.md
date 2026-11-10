@@ -1,6 +1,6 @@
 ---
 title: Reap notices & the mid-work resume queue
-description: Every autonomous session kill notifies the conversation it belonged to, and sessions killed mid-work are queued for ordered automatic revival once the machine recovers.
+description: Reaps retain an auditable notice for each affected conversation, and sessions killed mid-work enter an ordered automatic resume queue.
 ---
 
 When an Instar machine comes under resource pressure, the session reaper sheds
@@ -27,6 +27,26 @@ PendingRelayStore and delivered by `ReapNoticeDrain`, a small always-on loop
 when retries exhaust). A Telegram hiccup delays a notice instead of eating it,
 and every outcome lands in the reap-log as an `enqueued` → `sent` /
 `send-failed-escalated` pair, so "did the user get told" is auditable.
+
+## Quiet by Default delivery
+
+When [Quiet by Default](../quiet-notifications/) enforcement is enabled, reap
+and resume housekeeping is recorded in Notifications unless its category is
+opted into push. A quiet notice remains linked to the affected conversation.
+`ReapNoticeDrain` terminates its queue row as `quiet-recorded` and records that
+outcome in the reap log; it does not report `sent` or keep retrying. The notice
+and the automatic resume work remain durable. When enforcement is off, the
+per-topic delivery behavior above remains available.
+
+## One kill authority, one keep guard
+
+Every autonomous killer funnels through the single ReapAuthority
+(`SessionManager.terminateSession`), and that authority consults **`ReapGuard`** — the shared,
+stateless "is it safe to reap this session?" guard — before any session is ended. The guard runs the
+positive-evidence KEEP checks (protected sessions, live work, recovery in flight); a non-null
+verdict means the session must be kept and the terminate is a no-op. Extracting the guard out of the
+reaper means a careless new killer cannot skip the keep checks the careful one applies — they are
+the same code path.
 
 ## Killer-stamped work evidence
 

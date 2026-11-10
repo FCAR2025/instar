@@ -1,3 +1,4 @@
+import { topicRef } from '../messaging/shared/topicRef.js';
 /**
  * AutonomousLivenessReconciler — a level-triggered control loop that self-heals
  * an autonomous run whose state file says ACTIVE (with time remaining) but has
@@ -43,7 +44,9 @@ export type ReconcileCondition =
   | 'blocked-pressure'
   | 'blocked-not-owner'
   | 'blocked-queue-owns'
-  | 'mid-move';
+  | 'mid-move'
+  | 'terminal-turn'
+  | 'turn-revived';
 
 export interface ReconcilerActiveRun {
   topicId: number;
@@ -83,6 +86,12 @@ export interface AutonomousLivenessReconcilerDeps {
    * the returned set.
    */
   liveTopicSnapshot: () => Set<number>;
+  /**
+   * Active autonomous topics whose live process is positively at a completed
+   * turn prompt. The value is the authoritative tmux session name. Optional so
+   * older/single-shot wiring keeps the dead-process behavior unchanged.
+   */
+  idleTopicSnapshot?: () => Map<number, string>;
   /** Is the resume queue globally paused (e.g. emergency stop)? */
   queuePaused: () => boolean;
   /** Is this topic already queued / in-flight in the resume queue? (criterion 7, queue arm) */
@@ -142,6 +151,8 @@ export interface AutonomousLivenessReconcilerDeps {
    * inputs; tags the new session midWork so a later reaper kill is revived.
    */
   respawn: (input: { topicId: number; resumeUuid: string | null; cwd: string }) => Promise<void>;
+  /** Replace a completed-turn session through the canonical refresh funnel. */
+  recoverIdle?: (input: { topicId: number; sessionName: string }) => Promise<boolean>;
   /**
    * Atomic CAS claim of the in-flight-spawn key for a topic (process-local
    * in-memory map). Returns true if THIS caller now owns the claim, false if
@@ -252,6 +263,9 @@ export class AutonomousLivenessReconciler {
   private readonly pressureSurfaced = new Set<number>();
   private lastTickAt: number | null = null;
   private respawnTotal = 0;
+  /** Observe-only decisions awaiting one next-tick outcome classification. */
+  private readonly dryRunFollowups = new Map<number, { decisionId: string; decidedAt: number; startedAtMs: number | null }>();
+  private dryRunDecisionSeq = 0;
   /** Effective inflight TTL (cfg.inflightSpawnTtlMs ?? respawnTimeoutMs + grace). */
   private readonly inflightTtlMs: number;
 
@@ -325,9 +339,51 @@ export class AutonomousLivenessReconciler {
     }
 
     // Hoist the once-per-tick snapshots (criterion 6, pressure gate).
-    const liveTopics = this.safe(() => this.deps.liveTopicSnapshot(), new Set<number>());
+    let liveTopicsEvidence: Set<number> | null = null;
+    try {
+      liveTopicsEvidence = this.deps.liveTopicSnapshot();
+    } catch {
+      // Actuation still fails safe below; evidence classification stays honest.
+    }
+    const liveTopics = liveTopicsEvidence ?? new Set<number>();
+    const idleTopics = this.safe(() => this.deps.idleTopicSnapshot?.() ?? new Map<number, string>(), new Map<number, string>());
     const pressure = this.safe(() => this.deps.pressureTier(), 'critical' as const);
     const queuePaused = this.safeBool(() => this.deps.queuePaused(), false);
+
+    // Close the observe-only evidence loop before making this tick's decisions.
+    // This never actuates: it classifies what happened after the prior
+    // would-respawn so production soak can measure false positives.
+    if (this.cfg.dryRun) {
+      const runsByTopic = new Map(runs.map((run) => [run.topicId, run]));
+      for (const [topicId, pending] of this.dryRunFollowups) {
+        const run = runsByTopic.get(topicId);
+        let outcome = 'still-orphaned';
+        if (!run || run.remainingSeconds <= 0) outcome = 'run-ended';
+        else if (liveTopicsEvidence == null) outcome = 'evidence-unknown';
+        else if (liveTopicsEvidence.has(topicId)) outcome = 'recovered-live';
+        else {
+          try {
+            if (this.deps.operatorStoppedSince(topicId, new Date(pending.startedAtMs ?? 0).toISOString())) {
+              outcome = 'operator-stopped';
+            } else if (this.deps.topicOwnerElsewhere(topicId)) outcome = 'owner-moved';
+            else if (!this.deps.holdsLease()) outcome = 'lease-lost';
+            else if (this.deps.topicInResumeQueue(topicId)) outcome = 'queued-elsewhere';
+          } catch {
+            outcome = 'evidence-unknown';
+          }
+        }
+        this.deps.audit({
+          ts: new Date(now).toISOString(),
+          event: 'would-respawn-followup',
+          topicId,
+          decisionId: pending.decisionId,
+          decidedAt: new Date(pending.decidedAt).toISOString(),
+          outcome,
+          dryRun: true,
+        });
+        this.dryRunFollowups.delete(topicId);
+      }
+    }
 
     const candidateTopics = new Set<number>();
     let actedThisTick = false;
@@ -336,11 +392,6 @@ export class AutonomousLivenessReconciler {
       const topicId = run.topicId;
 
       // ── Candidate criteria (each fails toward NOT-a-candidate — the safe side) ──
-      // Global gate: an emergency-paused queue means "halt all automation".
-      if (queuePaused) {
-        this.observed.delete(topicId);
-        continue;
-      }
       // Criterion 1: active + remaining + CURRENT generation (obsolete run rejected).
       if (run.remainingSeconds <= 0) {
         this.observed.delete(topicId);
@@ -377,7 +428,8 @@ export class AutonomousLivenessReconciler {
         continue;
       }
       // Criterion 6: NO live session (own once-per-tick snapshot).
-      if (liveTopics.has(topicId)) {
+      const idleSession = idleTopics.get(topicId);
+      if (liveTopics.has(topicId) && !idleSession) {
         // Stably live → debounce reset. Record live-since for the stable-live rule.
         const obs = this.observed.get(topicId);
         if (obs) {
@@ -407,7 +459,7 @@ export class AutonomousLivenessReconciler {
           this.ambiguousSurfaced.add(topicId);
           this.deps.raiseAggregated(
             'liveness-ambiguous-binding',
-            `topic ${topicId} looks orphaned but its session↔topic binding is ambiguous — needs your eyes (not auto-respawning).`,
+            `${topicRef(topicId)} looks orphaned but its session↔topic binding is ambiguous — needs your eyes (not auto-respawning).`,
           );
         }
         this.deps.audit({ ts: new Date(now).toISOString(), event: 'ambiguous-binding', topicId });
@@ -438,6 +490,21 @@ export class AutonomousLivenessReconciler {
         continue;
       }
 
+      // A paused resume queue is an actuation brake, not an evidence brake.
+      // Keep the orphan in observation (and in dry-run evidence) so a pause
+      // cannot create a silent dead-but-active window.
+      if (queuePaused) {
+        this.setCondition(topicId, 'blocked-queue-owns', now);
+        this.deps.audit({
+          ts: new Date(now).toISOString(),
+          event: 'would-respawn-paused',
+          topicId,
+          remainingSeconds: run.remainingSeconds,
+          dryRun: this.cfg.dryRun,
+        });
+        continue;
+      }
+
       // NOTE: do NOT setCondition('orphaned-observing') here — actOn sets the
       // terminal condition for this tick, and a premature overwrite would zero the
       // blocked-pressure tick counter every pass (defeating the bounded skip).
@@ -446,7 +513,8 @@ export class AutonomousLivenessReconciler {
       // their debounce state persists. dryRun would-respawn is cheap → still log.
       if (actedThisTick && !this.cfg.dryRun) continue;
 
-      const acted = await this.actOn(run, now, pressure);
+      if (idleSession) this.setCondition(topicId, 'terminal-turn', now);
+      const acted = await this.actOn(run, now, pressure, idleSession);
       if (acted) actedThisTick = true;
     }
 
@@ -463,6 +531,7 @@ export class AutonomousLivenessReconciler {
     run: ReconcilerActiveRun,
     now: number,
     pressure: 'normal' | 'moderate' | 'critical',
+    idleSession?: string,
   ): Promise<boolean> {
     const topicId = run.topicId;
 
@@ -475,7 +544,7 @@ export class AutonomousLivenessReconciler {
         this.cappedSurfaced.add(topicId);
         this.deps.raiseAggregated(
           'liveness-cap',
-          `autonomous run on topic ${topicId} hit the respawn cap (${this.cfg.respawnCapPerWindow} in ${Math.round(
+          `autonomous run on ${topicRef(topicId)} hit the respawn cap (${this.cfg.respawnCapPerWindow} in ${Math.round(
             this.cfg.respawnCapWindowSec / 3600,
           )}h) and keeps dying — not auto-respawning again; needs your eyes.`,
         );
@@ -499,7 +568,7 @@ export class AutonomousLivenessReconciler {
         this.spawnFailSurfaced.add(topicId);
         this.deps.raiseAggregated(
           'liveness-respawn-failed',
-          `respawn of autonomous run on topic ${topicId} keeps failing before any session exists (${this.cfg.spawnFailureRetryCeiling} attempts) — likely infra; needs your eyes.`,
+          `respawn of autonomous run on ${topicRef(topicId)} keeps failing before any session exists (${this.cfg.spawnFailureRetryCeiling} attempts) — likely infra; needs your eyes.`,
         );
       }
       this.deps.audit({ ts: new Date(now).toISOString(), event: 'spawn-failure-ceiling', topicId });
@@ -532,7 +601,7 @@ export class AutonomousLivenessReconciler {
           this.pressureSurfaced.add(topicId);
           this.deps.raiseAggregated(
             'liveness-sustained-pressure',
-            `topic ${topicId} is orphaned but the machine is under sustained pressure — needs your eyes.`,
+            `${topicRef(topicId)} is orphaned but the machine is under sustained pressure — needs your eyes.`,
           );
         }
         this.deps.audit({
@@ -566,6 +635,86 @@ export class AutonomousLivenessReconciler {
       return false;
     }
 
+    // A live process sitting at a positively identified completed-turn prompt
+    // cannot be revived by another newline: the prior Codex turn is already
+    // terminal. Replace it through SessionRefresh, which preserves the topic
+    // binding and uses the same spawn/ownership gates as operator refreshes.
+    if (idleSession) {
+      if (!this.deps.recoverIdle) {
+        this.deps.raiseAggregated('liveness-idle-recovery-unwired', `${topicRef(topicId)} has an active run at a completed turn, but idle recovery is unavailable.`);
+        this.deps.audit({ ts: new Date(now).toISOString(), event: 'idle-recovery-unwired', topicId });
+        return false;
+      }
+      if (this.cfg.dryRun) {
+        this.deps.audit({ ts: new Date(now).toISOString(), event: 'would-recover-idle-turn', topicId, dryRun: true });
+        this.observed.delete(topicId);
+        return true;
+      }
+      if (!this.safeBool(() => this.deps.claimInflight(topicId), false)) return false;
+      try {
+        const currentIdle = this.safe(() => this.deps.idleTopicSnapshot?.().get(topicId), undefined);
+        const currentRun = this.safe(
+          () => this.deps.listActiveRuns().find((candidate) => candidate.topicId === topicId),
+          undefined,
+        );
+        const stoppedNow = this.safeBool(
+          () => this.deps.operatorStoppedSince(topicId, new Date(run.startedAtMs ?? 0).toISOString()),
+          true,
+        );
+        const ownerElsewhereNow = this.safeBool(() => this.deps.topicOwnerElsewhere(topicId), true);
+        const leaseHeldNow = this.safeBool(() => this.deps.holdsLease(), false);
+        const queuedNow = this.safeBool(() => this.deps.topicInResumeQueue(topicId), true);
+        const runEligibleNow =
+          currentRun != null &&
+          currentRun.remainingSeconds > 0 &&
+          !currentRun.paused &&
+          currentRun.movedTo == null &&
+          !currentRun.moveSuspended &&
+          this.isCurrentGeneration(currentRun);
+        if (
+          currentIdle !== idleSession ||
+          stoppedNow ||
+          ownerElsewhereNow ||
+          !leaseHeldNow ||
+          queuedNow ||
+          !runEligibleNow
+        ) {
+          this.deps.audit({
+            ts: new Date(now).toISOString(),
+            event: 'idle-recheck-aborted',
+            topicId,
+            sameIdleSession: currentIdle === idleSession,
+            stopped: stoppedNow,
+            ownerElsewhere: ownerElsewhereNow,
+            leaseHeld: leaseHeldNow,
+            queued: queuedNow,
+            runEligible: runEligibleNow,
+          });
+          this.observed.delete(topicId);
+          return false;
+        }
+        const ok = await this.withTimeout(
+          this.deps.recoverIdle({ topicId, sessionName: idleSession }),
+          this.cfg.respawnTimeoutMs,
+        );
+        if (!ok) throw new Error('canonical-refresh-refused');
+        this.recordRedie(topicId, now);
+        this.respawnTotal += 1;
+        this.setCondition(topicId, 'turn-revived', now);
+        this.deps.audit({ ts: new Date(now).toISOString(), event: 'idle-turn-revived', topicId });
+        if (this.cfg.notifyUser) void this.deps.notifyTopic(topicId, 'My autonomous run had reached a completed turn while work remained, so I started a fresh continuation session.').catch(() => {});
+        this.observed.delete(topicId);
+        return true;
+      } catch (err) {
+        this.recordSpawnFailure(topicId, now);
+        this.deps.audit({ ts: new Date(now).toISOString(), event: 'idle-recovery-failed', topicId, error: this.scrub(err) });
+        this.deps.raiseAggregated('liveness-idle-recovery-failed', `${topicRef(topicId)} remained active after its turn completed, and canonical refresh failed — needs your eyes.`);
+        return true;
+      } finally {
+        this.deps.releaseClaim(topicId);
+      }
+    }
+
     // ── Resolve authoritative respawn inputs (NEVER the untrusted state file) ──
     const resumeUuid = this.safe(() => this.deps.resolveResumeUuid(topicId), null);
     if (resumeUuid == null && !this.cfg.allowFreshFallback) {
@@ -573,7 +722,7 @@ export class AutonomousLivenessReconciler {
         this.missingUuidSurfaced.add(topicId);
         this.deps.raiseAggregated(
           'liveness-missing-resume',
-          `can't resume topic ${topicId} — no resume UUID on the canonical resume map; not respawning (would lose prior context). Needs your eyes.`,
+          `can't resume ${topicRef(topicId)} — no resume UUID on the canonical resume map; not respawning (would lose prior context). Needs your eyes.`,
         );
       }
       this.deps.audit({ ts: new Date(now).toISOString(), event: 'missing-resume-uuid', topicId });
@@ -586,7 +735,7 @@ export class AutonomousLivenessReconciler {
       // binding, or realpath escaping the agent home) must never spawn against a guess.
       this.deps.raiseAggregated(
         'liveness-bad-cwd',
-        `can't resume topic ${topicId} — its working directory can't be safely resolved; not respawning. Needs your eyes.`,
+        `can't resume ${topicRef(topicId)} — its working directory can't be safely resolved; not respawning. Needs your eyes.`,
       );
       this.deps.audit({ ts: new Date(now).toISOString(), event: 'unsafe-cwd', topicId });
       this.observed.delete(topicId);
@@ -595,6 +744,7 @@ export class AutonomousLivenessReconciler {
 
     // ── dryRun: log what we WOULD do and actuate nothing ──
     if (this.cfg.dryRun) {
+      const decisionId = `liveness:${topicId}:${now}:${++this.dryRunDecisionSeq}`;
       this.deps.audit({
         ts: new Date(now).toISOString(),
         event: 'would-respawn',
@@ -602,7 +752,9 @@ export class AutonomousLivenessReconciler {
         dryRun: true,
         remainingSeconds: run.remainingSeconds,
         resumeUuid: resumeUuid ? 'present' : 'fresh-fallback',
+        decisionId,
       });
+      this.dryRunFollowups.set(topicId, { decisionId, decidedAt: now, startedAtMs: run.startedAtMs });
       // Shadow the cap (spec adversarial F6): record a shadow redie so the
       // reaper-thrash/cap BEHAVIOR — which real dryRun can't trigger (no real
       // respawn ⇒ no re-die) — still becomes observable as a would-have-capped

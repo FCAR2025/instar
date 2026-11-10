@@ -92,6 +92,11 @@ describe('instar-dev pre-commit — decision-audit line rides the commit (self-s
       { recursive: true },
     );
     fs.copyFileSync(HOOK_SCRIPT, path.join(sandbox, 'scripts', 'instar-dev-precommit.js'));
+    // audit-convergence-enforcement §2: the hook now imports these two sibling
+    // scripts — copy them so the sandbox hook resolves its imports.
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'write-audit-convergence.mjs'), path.join(sandbox, 'scripts', 'write-audit-convergence.mjs'));
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'audit-secret-patterns.mjs'), path.join(sandbox, 'scripts', 'audit-secret-patterns.mjs'));
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'standards-registry-article-core.mjs'), path.join(sandbox, 'scripts', 'standards-registry-article-core.mjs'));
   });
 
   afterEach(() => {
@@ -173,6 +178,74 @@ describe('instar-dev pre-commit — decision-audit line rides the commit (self-s
     }
   });
 
+  // ── Deleted paths enter the record scope (PR #2821) ──
+  // The PR-boundary check takes every changed path, so a path the gate leaves
+  // out of scope can never pass it.
+
+  function commitBase(files: string[]): void {
+    for (const rel of files) fs.writeFileSync(path.join(sandbox, rel), `// ${rel}\nline two\nline three\n`);
+    execFileSync('git', ['add', ...files], { cwd: sandbox });
+    execFileSync('git', ['commit', '-q', '--no-verify', '-m', 'base'], { cwd: sandbox });
+  }
+  function writeTrace(coveredFiles: string[]): void {
+    fs.writeFileSync(
+      path.join(sandbox, '.instar', 'instar-dev-traces', `${Date.now()}-audit-fixture.json`),
+      JSON.stringify({
+        phase: 'complete', slug: 'audit-fixture', tier: 1, coveredFiles, createdAt: new Date().toISOString(),
+      }, null, 2),
+    );
+  }
+  function onlyEntry(): { scope: { basis: string; files: string[] } } {
+    const entries = listEntryFiles();
+    expect(entries.length).toBe(1);
+    return JSON.parse(fs.readFileSync(path.join(sandbox, '.instar', 'instar-dev-decisions', entries[0]), 'utf8'));
+  }
+
+  it('a deletion-only commit reaches the gate, and the deleted path enters the record scope', async () => {
+    commitBase(['src/gone.ts']);
+    execFileSync('git', ['rm', '-q', 'src/gone.ts'], { cwd: sandbox });
+    writeTrace(['src/gone.ts']);
+
+    const result = await runHook(process.env, sandbox);
+    expect(result.status).not.toBe(0); // incomplete Tier-1 bundle: the gate ran
+    const entry = onlyEntry();
+    expect(entry.scope.files).toEqual(['src/gone.ts']);
+    expect(entry.scope.basis).not.toBe('staged-in-scope-additions-plus-deletions');
+  });
+
+  it('a trace that leaves out a deleted path does not cover the commit', async () => {
+    commitBase(['src/gone.ts', 'src/kept.ts']);
+    execFileSync('git', ['rm', '-q', 'src/gone.ts'], { cwd: sandbox });
+    fs.appendFileSync(path.join(sandbox, 'src/kept.ts'), '// changed\n');
+    execFileSync('git', ['add', 'src/kept.ts'], { cwd: sandbox });
+    writeTrace(['src/kept.ts']);
+
+    const result = await runHook(process.env, sandbox);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('No fresh complete trace covers this staged change, deleted and renamed-away paths included');
+    expect(listEntryFiles()).toEqual([]);
+  });
+
+  it('a rename puts both the old and the new path in the record scope', async () => {
+    commitBase(['src/old-name.ts']);
+    execFileSync('git', ['mv', 'src/old-name.ts', 'src/new-name.ts'], { cwd: sandbox });
+    writeTrace(['src/new-name.ts', 'src/old-name.ts']);
+
+    await runHook(process.env, sandbox);
+    expect(onlyEntry().scope.files.sort()).toEqual(['src/new-name.ts', 'src/old-name.ts']);
+  });
+
+  it('a deleted out-of-scope file alone still passes through the gate', async () => {
+    fs.writeFileSync(path.join(sandbox, 'docs', 'note.md'), 'note\n');
+    execFileSync('git', ['add', 'docs/note.md'], { cwd: sandbox });
+    execFileSync('git', ['commit', '-q', '--no-verify', '-m', 'base'], { cwd: sandbox });
+    execFileSync('git', ['rm', '-q', 'docs/note.md'], { cwd: sandbox });
+
+    const result = await runHook(process.env, sandbox);
+    expect(result.status).toBe(0);
+    expect(listEntryFiles()).toEqual([]);
+  });
+
   // ── Verdict finalization (the mislabeled rode-along entry, 2026-06-05) ──
   // Riding-the-retry is deliberate: a blocked evaluation's entry rides the
   // next successful commit. But without a verdict, an entry written under a
@@ -241,6 +314,66 @@ describe('instar-dev pre-commit — decision-audit line rides the commit (self-s
     );
     expect(entry.verdict).toBe('pass');
     expect(entry.slug).toBe('pass-fixture');
+    expect(entry.scope).toEqual({
+      basis: 'staged-in-scope-paths-including-deleted',
+      files: [srcRel],
+      addedLines: 1,
+      deletedLines: 0,
+    });
+  });
+
+  it('binds the decision audit to the newest trace that covers the staged change', async () => {
+    const srcRel = 'src/touched.ts';
+    const eli16Rel = 'upgrades/pass-fixture.eli16.md';
+    const seRel = 'upgrades/side-effects/pass-fixture.md';
+    fs.writeFileSync(path.join(sandbox, srcRel), '// touched\n');
+    fs.writeFileSync(path.join(sandbox, eli16Rel), 'E'.repeat(900));
+    fs.writeFileSync(path.join(sandbox, seRel), `# Side-Effects Review\n\n${'S'.repeat(250)}\n`);
+
+    const matching = path.join(sandbox, '.instar', 'instar-dev-traces', 'matching.json');
+    fs.writeFileSync(matching, JSON.stringify({
+      phase: 'complete', slug: 'right-work-item', tier: 1,
+      coveredFiles: [srcRel, eli16Rel, seRel], eli16Path: eli16Rel, sideEffectsPath: seRel,
+    }));
+    const foreign = path.join(sandbox, '.instar', 'instar-dev-traces', 'foreign.json');
+    fs.writeFileSync(foreign, JSON.stringify({
+      phase: 'complete', slug: 'unknown', tier: 1, coveredFiles: ['src/other.ts'],
+    }));
+    const now = Date.now();
+    fs.utimesSync(matching, new Date(now - 1_000), new Date(now - 1_000));
+    fs.utimesSync(foreign, new Date(now), new Date(now));
+    execFileSync('git', ['add', srcRel, eli16Rel, seRel], { cwd: sandbox });
+
+    const result = await runHook(process.env, sandbox);
+    expect(result.status).toBe(0);
+    const entries = listEntryFiles();
+    expect(entries).toHaveLength(1);
+    const entry = JSON.parse(fs.readFileSync(path.join(sandbox, '.instar', 'instar-dev-decisions', entries[0]), 'utf8'));
+    expect(entry.slug).toBe('right-work-item');
+    expect(entries[0]).toContain('right-work-item');
+  });
+
+  it('derives stable identity from artifactPath for legacy generated traces without slug', async () => {
+    const srcRel = 'src/touched.ts';
+    const eli16Rel = 'upgrades/legacy-fixture.eli16.md';
+    const seRel = 'upgrades/side-effects/legacy-fixture.md';
+    fs.writeFileSync(path.join(sandbox, srcRel), '// touched\n');
+    fs.writeFileSync(path.join(sandbox, eli16Rel), 'E'.repeat(900));
+    fs.writeFileSync(path.join(sandbox, seRel), `# Side-Effects Review\n\n${'S'.repeat(250)}\n`);
+    fs.writeFileSync(
+      path.join(sandbox, '.instar', 'instar-dev-traces', 'legacy.json'),
+      JSON.stringify({
+        phase: 'complete', tier: 1, artifactPath: seRel,
+        coveredFiles: [srcRel, eli16Rel, seRel], eli16Path: eli16Rel, sideEffectsPath: seRel,
+      }),
+    );
+    execFileSync('git', ['add', srcRel, eli16Rel, seRel], { cwd: sandbox });
+
+    const result = await runHook(process.env, sandbox);
+    expect(result.status).toBe(0);
+    const entries = listEntryFiles();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain('legacy-fixture');
   });
 });
 
@@ -290,6 +423,11 @@ describe('instar-dev pre-commit — causalAutopsy (advisory slice)', () => {
       { recursive: true },
     );
     fs.copyFileSync(HOOK_SCRIPT, path.join(sandbox, 'scripts', 'instar-dev-precommit.js'));
+    // audit-convergence-enforcement §2: the hook now imports these two sibling
+    // scripts — copy them so the sandbox hook resolves its imports.
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'write-audit-convergence.mjs'), path.join(sandbox, 'scripts', 'write-audit-convergence.mjs'));
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'audit-secret-patterns.mjs'), path.join(sandbox, 'scripts', 'audit-secret-patterns.mjs'));
+    fs.copyFileSync(path.join(path.dirname(HOOK_SCRIPT), 'standards-registry-article-core.mjs'), path.join(sandbox, 'scripts', 'standards-registry-article-core.mjs'));
   });
 
   afterEach(() => {

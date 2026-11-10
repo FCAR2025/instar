@@ -34,6 +34,20 @@ function mkResolver(over: Partial<PeerEndpointResolverConfig> = {}, deps: { now?
   return new PeerEndpointResolver({ config, now: deps.now, ownCidrs: deps.ownCidrs ?? (() => ['192.168.87.67/24', '100.64.165.27/10']) });
 }
 
+describe('LAN subnet check on a cloud private network', () => {
+  const lan = [{ kind: 'lan' as const, url: 'http://10.77.0.3:4040' }];
+  const kinds = (cidr: string, url = lan) => mkResolver({ lanSubnetGate: true }, { ownCidrs: () => [cidr] }).resolve('peerA', url, undefined).map((e) => e.kind);
+  it('a /32 interface does not rule out a peer on the same /16', () => {
+    expect(kinds('10.77.0.2/32')).toContain('lan');
+  });
+  it('a /32 interface still rules out another network', () => {
+    expect(kinds('10.78.0.2/32')).not.toContain('lan');
+  });
+  it('an ordinary subnet keeps its exact width', () => {
+    expect(kinds('10.77.1.2/24')).not.toContain('lan');
+  });
+});
+
 describe('PeerEndpointResolver — host validation helpers', () => {
   it('isTailscaleCgnat accepts 100.64/10, rejects outside', () => {
     expect(isTailscaleCgnat('100.64.0.0')).toBe(true);
@@ -153,6 +167,47 @@ describe('PeerEndpointResolver — resolve', () => {
 });
 
 describe('PeerEndpointResolver — health-driven ordering', () => {
+  it('orders advertised-alive before observed, and observed before advertised-dead, within one kind', () => {
+    const r = mkResolver();
+    const advertised = TS('100.64.0.20');
+    const observed = { ...TS('100.64.0.21'), origin: 'observed' as const };
+    r.resolve('peerA', [advertised, observed], undefined);
+    r.recordResult('peerA', 'tailscale', true, 20, advertised.url);
+    expect(r.resolve('peerA', [advertised, observed], undefined).map((row) => row.url)).toEqual([advertised.url, observed.url]);
+    r.recordResult('peerA', 'tailscale', false, 20, advertised.url);
+    r.recordResult('peerA', 'tailscale', false, 20, advertised.url);
+    r.recordResult('peerA', 'tailscale', false, 20, advertised.url);
+    expect(r.resolve('peerA', [advertised, observed], undefined).map((row) => row.url)).toEqual([observed.url, advertised.url]);
+  });
+
+  it('retains an observed endpoint past the cap when four same-kind advertisements are dead', () => {
+    const r = mkResolver();
+    const advertised = [
+      TS('100.64.0.20'), TS('100.64.0.21'), TS('100.64.0.22'), TS('100.64.0.23'),
+    ];
+    const observed = { ...TS('100.64.0.24'), origin: 'observed' as const };
+    r.resolve('peerA', [...advertised, observed], undefined);
+    for (const endpoint of advertised) {
+      for (let i = 0; i < 3; i++) r.recordResult('peerA', 'tailscale', false, 20, endpoint.url);
+    }
+    const out = r.resolve('peerA', [...advertised, observed], undefined);
+    expect(out).toHaveLength(MAX_ENDPOINTS);
+    expect(out[0].url).toBe(observed.url);
+    expect(out.some((row) => row.url === observed.url)).toBe(true);
+  });
+
+  it('keeps same-kind health independent by URL', () => {
+    const r = mkResolver();
+    const a = TS('100.64.0.20');
+    const b = TS('100.64.0.21');
+    r.resolve('peerA', [a, b], undefined);
+    for (let i = 0; i < 3; i++) r.recordResult('peerA', 'tailscale', false, 20, a.url);
+    r.recordResult('peerA', 'tailscale', true, 20, b.url);
+    expect(r.healthOf('peerA', 'tailscale', a.url)?.consecutiveFailures).toBe(3);
+    expect(r.healthOf('peerA', 'tailscale', b.url)?.consecutiveFailures).toBe(0);
+    expect(r.snapshot()[0].dead).toBe(false);
+  });
+
   it('a dead rope (>= unhealthyAfterFailures) sinks behind a healthy lower-priority rope', () => {
     let t = 1_000_000;
     const r = mkResolver({}, { now: () => t });

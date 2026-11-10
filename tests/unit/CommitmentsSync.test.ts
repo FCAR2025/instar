@@ -108,6 +108,23 @@ describe('buildCommitmentsSyncPage — paged deltas (§3.2)', () => {
     expect(row.userRequest).toContain('[redacted:'); // field redacted
     expect(row.id).toBe('CMT-007'); // record still replicates — closeability intact
   });
+
+  it('redacts credential-shaped opt-out reasons while preserving the enrollment decision', () => {
+    const records = [fakeCommitment({
+      id: 'CMT-008',
+      lastMutatedSeq: 4,
+      beaconEnabled: false,
+      followThroughOptOutReason: 'Already done; api_key = "abcdef123456789012345"',
+    })];
+    const page = buildCommitmentsSyncPage(
+      { sinceSeq: 0 },
+      { ownMachineId: 'm_a', records, advert: ADVERT },
+    );
+    const row = page.records[0];
+    expect(row.textRedacted).toBe(true);
+    expect(row.followThroughOptOutReason).toContain('[redacted:');
+    expect(row.beaconEnabled).toBe(false);
+  });
 });
 
 describe('CommitmentReplicaStore — receive side (§3.2)', () => {
@@ -122,6 +139,24 @@ describe('CommitmentReplicaStore — receive side (§3.2)', () => {
     const b = new CommitmentReplicaStore({ stateDir: tmpDir });
     expect(b.cursorFor('m_peer')).toEqual({ sinceSeq: 5, incarnation: 'inc-1' });
     expect(b.allReplicas()[0].records[0].id).toBe('CMT-001');
+  });
+
+  it('an idle peer confirmed current by its advert reads as fresh, not hours stale (operator 2026-10-31)', () => {
+    let t = Date.parse('2026-10-31T12:00:00Z');
+    const store = new CommitmentReplicaStore({ stateDir: tmpDir, now: () => new Date(t) });
+    store.applyPage('m_peer', { incarnation: 'inc-1', replicationSeq: 5, records: [servedRow()], nextSinceSeq: 5, done: true });
+    t += 2 * 60 * 60 * 1000; // two quiet hours: nothing new to pull
+    expect(store.allReplicas()[0].receivedAt).toBe('2026-10-31T12:00:00.000Z');
+    expect(store.confirmCurrent('m_peer', { incarnation: 'inc-1', replicationSeq: 5 })).toBe(true);
+    expect(store.allReplicas()[0].receivedAt).toBe('2026-10-31T14:00:00.000Z');
+  });
+
+  it('confirmCurrent refuses when the advert is ahead, the incarnation changed, or the replica is unknown', () => {
+    const store = new CommitmentReplicaStore({ stateDir: tmpDir });
+    store.applyPage('m_peer', { incarnation: 'inc-1', replicationSeq: 5, records: [servedRow()], nextSinceSeq: 5, done: true });
+    expect(store.confirmCurrent('m_peer', { incarnation: 'inc-1', replicationSeq: 6 })).toBe(false);
+    expect(store.confirmCurrent('m_peer', { incarnation: 'inc-2', replicationSeq: 5 })).toBe(false);
+    expect(store.confirmCurrent('m_other', { incarnation: 'inc-1', replicationSeq: 0 })).toBe(false);
   });
 
   it('C1+C2: clamps out-of-enum owner/blockedOn on receive (untrusted-peer hardening, §4.1)', () => {

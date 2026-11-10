@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { featureEvidence } from './FeatureEvidenceLog.js';
 import type { SessionOwnershipRecord } from '../core/SessionOwnership.js';
 import type { MachineCapacity } from '../core/types.js';
 import type { ChannelScope } from '../core/machineServesChannel.js';
@@ -37,6 +38,7 @@ import {
   type StrandedTopic,
   type StrandReason,
 } from './strandedTopicDecision.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
 
 export interface StrandedTopicSentinelConfig {
   enabled?: boolean;
@@ -61,6 +63,7 @@ const DEFAULT_CONFIG: Required<StrandedTopicSentinelConfig> = {
 
 /** The raise/update payload for the aggregated attention item. */
 export interface StrandAttentionItem {
+  contextTopicIds?: number[];
   id: string;
   title: string;
   summary: string;
@@ -87,6 +90,11 @@ export interface StrandedTopicSentinelDeps {
   resolveScope?: (sessionKey: string) => ChannelScope | undefined;
   /** Resolve a machine's display nickname (for the item text). */
   nicknameOf?: (machineId: string) => string;
+  /** U4.2 R-r2-1: relax the not-lease-holder gate for DETECTION + ESCALATION
+   *  only when this machine sits in a majority partition (episode-keyed items
+   *  P17-coalesce pool-wide). Wired from the staleOwnerRelease feature gate;
+   *  absent/false = today's behavior. */
+  escalationQuorumHosted?: () => boolean;
   /** Override Date.now (tests). */
   now?: () => number;
 }
@@ -102,13 +110,16 @@ export class StrandedTopicSentinel extends EventEmitter {
   private emptyTicks = new Map<string, number>();
   /** Per-owner open stranding-window id (the dwell-epoch of the first strand). */
   private windowId = new Map<string, number>();
+  /** Items update in place every tick; evidence is written when one changes shape. */
+  private lastOwnerEvidence = new Map<string, string>();
+  private lastCantAssessEvidence: number | null = null;
 
   constructor(
     private readonly deps: StrandedTopicSentinelDeps,
     cfg: StrandedTopicSentinelConfig = {},
   ) {
     super();
-    this.cfg = { ...DEFAULT_CONFIG, ...cfg };
+    this.cfg = mergeDefaults(DEFAULT_CONFIG, cfg);
   }
 
   start(): void {
@@ -121,6 +132,11 @@ export class StrandedTopicSentinel extends EventEmitter {
         // propagate or degrade anything (it mutates nothing). The error is
         // surfaced as a 'tick-error' event for observability; swallowing the
         // throw IS the correct fail-closed behavior, not a hidden degradation.
+        featureEvidence.recordAtMostEvery('monitoring.strandedTopicSentinel', 'tick-error', 3_600_000, {
+          kind: 'error',
+          reason: 'tick-error',
+          context: { errorName: err instanceof Error ? err.name : 'unknown' },
+        });
         this.emit('tick-error', { err });
       }
     }, this.cfg.tickMs);
@@ -158,6 +174,9 @@ export class StrandedTopicSentinel extends EventEmitter {
       now,
       cfg: { dwellMs: this.cfg.dwellMs, freshnessBoundMs: this.cfg.freshnessBoundMs },
       resolveScope: this.deps.resolveScope,
+      escalationQuorumHosted: (() => {
+        try { return this.deps.escalationQuorumHosted?.() === true; } catch { return false; /* @silent-fallback-ok — an unreadable gate reads as today's lease-holder-only behavior (fail toward the stricter gate) */ }
+      })(),
     });
 
     // Reconcile the dwell map (delete stale keys — spec step 2).
@@ -188,6 +207,7 @@ export class StrandedTopicSentinel extends EventEmitter {
       if (n >= this.cfg.clearAfterTicks) {
         this.windowId.delete(owner);
         this.emptyTicks.delete(owner);
+        this.lastOwnerEvidence.delete(owner);
         this.emit('window-closed', { owner });
       } else {
         this.emptyTicks.set(owner, n);
@@ -224,6 +244,7 @@ export class StrandedTopicSentinel extends EventEmitter {
 
     const item: StrandAttentionItem = {
       id: `stranded-topic:${owner}:${windowId}`,
+      contextTopicIds: topics.map(topic => /^telegram:(\d+)$/.exec(topic.sessionKey)).filter((match): match is RegExpExecArray => match !== null).map(match => Number(match[1])),
       title: `Inbound stranded on ${nick} (${topics.length} topic${topics.length === 1 ? '' : 's'})`,
       summary: `Topics owned by ${nick} (${reasonText}) — inbound can't reach a servable machine.`,
       description:
@@ -238,8 +259,22 @@ export class StrandedTopicSentinel extends EventEmitter {
     };
     try {
       this.deps.raiseAttention(item);
+      const evidence = `${windowId}:${topics.length}:${reasonText}:${anyServable}`;
+      if (this.lastOwnerEvidence.get(owner) !== evidence) {
+        this.lastOwnerEvidence.set(owner, evidence);
+        featureEvidence.record('monitoring.strandedTopicSentinel', {
+          kind: 'fired',
+          reason: `stranded:${reasonText}`,
+          context: { ownerMachineId: owner, windowId, topics: topics.length, reasons: reasonText, servablePeerExists: anyServable, ownerBeatAgeSec: Math.round(ageMs / 1000) },
+        });
+      }
       this.emit('stranded', { owner, windowId, topics });
     } catch (err) {
+      featureEvidence.recordAtMostEvery('monitoring.strandedTopicSentinel', `raise-error:${owner}`, 3_600_000, {
+        kind: 'error',
+        reason: 'attention-raise-failed',
+        context: { ownerMachineId: owner, topics: topics.length, errorName: err instanceof Error ? err.name : 'unknown' },
+      });
       // @silent-fallback-ok — the attention raise is the sentinel's only output;
       // if it throws, the correct signal-only behavior is to surface a
       // 'raise-error' event and continue (no degradation, nothing to fall back
@@ -266,8 +301,17 @@ export class StrandedTopicSentinel extends EventEmitter {
     };
     try {
       this.deps.raiseAttention(item);
+      if (this.lastCantAssessEvidence !== count) {
+        this.lastCantAssessEvidence = count;
+        featureEvidence.record('monitoring.strandedTopicSentinel', { kind: 'held', reason: 'cant-assess-owner-heartbeat', context: { owners: count } });
+      }
       this.emit('cant-assess', { count });
     } catch (err) {
+      featureEvidence.recordAtMostEvery('monitoring.strandedTopicSentinel', 'raise-error:cant-assess', 3_600_000, {
+        kind: 'error',
+        reason: 'attention-raise-failed',
+        context: { owners: count, errorName: err instanceof Error ? err.name : 'unknown' },
+      });
       // @silent-fallback-ok — signal-only: surface a 'raise-error' event and
       // continue; a raise failure must never crash the monitoring tick.
       this.emit('raise-error', { err });

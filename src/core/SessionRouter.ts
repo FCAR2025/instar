@@ -18,7 +18,7 @@
  * timeout (it throws on timeout) — the router owns the retry/backoff/fallback loop.
  */
 
-import type { PlacementExecutor, TopicPlacement } from './PlacementExecutor.js';
+import type { PlacementDecision, PlacementExecutor, TopicPlacement } from './PlacementExecutor.js';
 import type { MachineCapacity } from './types.js';
 
 export interface OwnershipView {
@@ -49,6 +49,10 @@ export interface InboundSenderEnvelope {
   userId?: string | number;
   username?: string;
   firstName?: string;
+  /** Set when the message was typed in the native app (mobile-operator-chat). */
+  via?: 'mobile-device';
+  deviceId?: string;
+  eventId?: string;
 }
 
 export interface InboundMessage {
@@ -57,6 +61,9 @@ export interface InboundMessage {
   payload: unknown;
   topicMetadata?: TopicPlacement;
   senderEnvelope?: InboundSenderEnvelope | null;
+  /** A pool stepped down to dark: reach a peer that owns this conversation, never place one.
+   *  Anything that would place stays on this machine instead. */
+  routingOnly?: boolean;
   /** The channel scope this message arrived on — threaded into placement so a Slack channel
    *  is never placed on a machine not connected to its workspace (spec:
    *  placement-platform-workspace-aware). Populated at the inbound from the platform event
@@ -77,14 +84,34 @@ export type RouteAction =
   | 'queued'
   | 'duplicate'
   | 'owner-dead-replaced'
-  | 'placement-blocked';
+  | 'placement-blocked'
+  /**
+   * TERMINAL REFUSAL (silent-loss-refusal-conservation §2.A — "A Refusal Stays a
+   * Refusal"). The owner peer answered a `deliverMessage` with a typed
+   * `sender-rejected` NACK: it re-validated the carried sender against its OWN
+   * users registry and refused. This is NOT a successful forward — it is a
+   * first-class terminal outcome that MUST stay distinguishable from `forwarded`
+   * at every consumer. `acked` is true (transport-terminal: the offset advances,
+   * the message is never retried/re-placed — a re-placed owner's registry would
+   * reject identically), but the message was DROPPED, not delivered. Every
+   * consumer enumerates this branch explicitly and fires the §2.C loss notice
+   * BEFORE any local-dispatch / isRemotelyHandled check. */
+  | 'rejected';
 
 export interface RouteOutcome {
   action: RouteAction;
   owner?: string | null;
   detail?: string;
-  /** True once the inbound is durably accepted (ledger ACK or local handling) — the
-   * caller may advance the platform offset ONLY when this is true (§L4 ACK protocol). */
+  /**
+   * TRANSPORT-TERMINAL, not delivery-success. True once the inbound reached a
+   * terminal transport state and the platform offset may advance (§L4 ACK
+   * protocol) — this includes a durable accept (ledger ACK / local handling) AND
+   * a terminal `action:'rejected'` refusal (advance the offset so the refused
+   * message is never retried). NEVER read `acked:true` as "the user received
+   * this" — a `rejected` outcome is acked AND dropped. Read `action` to know
+   * which. (Conservation of refusal: the pre-fix code set acked:true on a
+   * rejection and labelled it `forwarded`, so every consumer read it as success.)
+   */
   acked: boolean;
 }
 
@@ -110,6 +137,10 @@ export function isRemotelyHandled(outcome: RouteOutcome, selfMachineId: string |
   const remoteOwner = outcome.owner != null && outcome.owner !== selfMachineId;
   if (outcome.action === 'spawned' && remoteOwner) return true;
   if (outcome.action === 'owner-dead-replaced' && remoteOwner) return true;
+  // 'rejected' is DELIBERATELY not "remotely handled" (§2.A): a refusal is not a
+  // success, and treating it as handled-elsewhere would re-hide the drop. Every
+  // consumer branches on action==='rejected' explicitly BEFORE reaching here (and
+  // fires the loss notice); this function only classifies success dispositions.
   return false;
 }
 
@@ -151,8 +182,30 @@ export interface SessionRouterDeps {
   deliverMessage: (target: string, env: { sessionKey: string; messageId: string; payload: unknown; ownershipEpoch: number; senderEnvelope?: InboundSenderEnvelope | null }) => Promise<DeliverAck>;
   /** Router == owner: process the message on this machine. */
   handleLocally: (msg: InboundMessage) => Promise<void>;
-  /** Instruct the chosen machine to spawn/resume the session. */
-  spawnOnMachine: (machineId: string, msg: InboundMessage) => Promise<void>;
+  /**
+   * Instruct the chosen machine to spawn/resume the session: ONE deliverMessage
+   * attempt carrying the epoch the placement CAS just landed. Returns the
+   * receiver's ACK; throws on transport error/timeout (like deliverMessage).
+   * The router reads the ACK — a placement counts as `spawned` only when the
+   * chosen machine actually took the message (2026-11-01: the reply was
+   * ignored, the receiver refused a hard-coded epoch 0 as stale, and the
+   * message was logged `spawned` while no machine held it).
+   */
+  spawnOnMachine: (machineId: string, msg: InboundMessage, ownershipEpoch: number) => Promise<DeliverAck>;
+  /**
+   * Undo a remote placement this router just made whose spawn never landed:
+   * move the still-`placing` record (owned by `placedOn`) to THIS machine as
+   * active, so the message can be handled locally under real ownership.
+   * Returns true when the record now names this machine. Absent → the router
+   * falls back to durable custody / the un-acked local fall-through.
+   */
+  reclaimPlacement?: (sessionKey: string, placedOn: string) => boolean;
+  /**
+   * Is a session for this key already running on THIS machine? Placement for an unowned
+   * key honours it, so turning the pool on never hops a conversation that is mid-flight.
+   * Absent means no live-session knowledge, so placement decides as before.
+   */
+  liveLocalSession?: (sessionKey: string) => boolean;
   /**
    * Confirm a just-placed REMOTE session as the owner (status placing→active) once
    * the spawn has been dispatched to it. Without this the ownership stays 'placing'
@@ -214,7 +267,7 @@ export class SessionRouter {
    * dispatch. Returns true when the message ended up durably handled
    * (acked outcome that isn't another queued/blocked verdict).
    */
-  async forceReplace(msg: InboundMessage): Promise<boolean> {
+  async forceReplace(msg: InboundMessage): Promise<boolean | 'rejected' | 'local'> {
     const prior = this.chains.get(msg.sessionKey) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(() => this.placeAndClaim(msg, 'failover', true));
     const tail = next.then(() => undefined, () => undefined);
@@ -223,7 +276,27 @@ export class SessionRouter {
       if (this.chains.get(msg.sessionKey) === tail) this.chains.delete(msg.sessionKey);
     });
     const outcome = await next;
-    return outcome.acked && outcome.action !== 'queued' && outcome.action !== 'placement-blocked';
+    // Ratchet (§2.A / round-2 adversarial #M1): a `rejected` outcome is
+    // acked-but-DROPPED — it must NEVER read as "durably handled" here (the
+    // drain's maxAttempts escape keys on this return value; a truthy value would
+    // suppress the §2.C loss notice). It also must NOT return bare `false` — bare
+    // false lands in the escape's `else` and mislabels the cause `attempts-exhausted`,
+    // losing the refusal cause + the divergence signal. Return the DISTINCT
+    // `'rejected'` verdict so the drain escape maps it to the SAME
+    // `sender-deauthorized` terminal handling (unified notice + divergence probe).
+    // placeAndClaim CAN yield `rejected` via its CAS-lost → forwardToOwner arm.
+    if (outcome.action === 'rejected') return 'rejected';
+    // The session landed on THIS machine. handleLocally is only the router's
+    // verdict (the caller owns local delivery), so this is NOT "durably
+    // handled" — the drain must deliver it locally itself.
+    if (outcome.action === 'handled-locally' || (outcome.action === 'owner-dead-replaced' && outcome.owner === this.deps.selfMachineId)) {
+      return 'local';
+    }
+    return (
+      outcome.acked &&
+      outcome.action !== 'queued' &&
+      outcome.action !== 'placement-blocked'
+    );
   }
 
   private backoff(attempt: number): number {
@@ -278,7 +351,13 @@ export class SessionRouter {
         // (healthy, never suspect) and durably REFUSED the sender. Terminal for
         // this message: acked so the offset advances; never retried/re-placed.
         if (ack.accepted === 'sender-rejected') {
-          return { action: 'forwarded', owner, detail: 'sender-rejected', acked: true };
+          // §2.A — the core silent-loss fix. The owner re-validated the sender
+          // and refused. Return the FIRST-CLASS terminal `rejected` (NOT
+          // `forwarded`) so no consumer can read the refusal as a successful
+          // delivery. `acked:true` still advances the offset (never retried —
+          // a re-placed owner rejects identically); `detail` carries the
+          // canonical cause the §2.C notice + drain unify on.
+          return { action: 'rejected', owner, detail: 'sender-deauthorized', acked: true };
         }
         // stale-ownership → re-resolve (bounded) and route to the current owner.
         if (reResolveDepth >= this.cfg.maxReResolveDepth) {
@@ -313,8 +392,51 @@ export class SessionRouter {
     return this.placeAndClaim(msg, 'failover', true);
   }
 
+  /**
+   * An unowned key with a live session here stays here, so turning the pool on never hops a
+   * running conversation. Placement still runs, with this machine as the only candidate, so
+   * every mandatory check holds (online, workspace reachable, not refusing work); only cost
+   * stops counting. Any escalation, such as a blocked quota, means normal placement decides.
+   * A pin or preferred machine wins: that is an explicit request to be elsewhere.
+   */
+  private liveLocalPlacement(msg: InboundMessage, reason: 'new' | 'failover'): PlacementDecision | null {
+    if (reason !== 'new' || msg.topicMetadata?.preferredMachine) return null;
+    try {
+      if (this.deps.liveLocalSession?.(msg.sessionKey) !== true) return null;
+      const self = this.deps.selfMachineId;
+      const decision = this.deps.placement.decide({
+        sessionKey: msg.sessionKey,
+        topicMetadata: msg.topicMetadata ?? {},
+        machineRegistry: this.deps.machineRegistry().filter((m) => m.machineId === self),
+        currentOwner: undefined,
+        reason,
+        ...(msg.channel ? { channel: msg.channel } : {}),
+      });
+      return decision.outcome === 'placed' && decision.chosenMachine === self && !decision.escalationReason ? decision : null;
+    } catch (err) {
+      this.deps.log?.(`liveLocalSession for ${msg.sessionKey} failed: ${String((err as Error)?.message ?? err)}`);
+      return null;
+    }
+  }
+
   private async placeAndClaim(msg: InboundMessage, reason: 'new' | 'failover', fromDead: boolean): Promise<RouteOutcome> {
-    const decision = this.deps.placement.decide({
+    if (msg.routingOnly) {
+      // The record must change hands too: the queue refuses local delivery while it names
+      // the peer, and nothing else re-places at dark, so the message would run out of tries.
+      const held = this.deps.resolveOwnership(msg.sessionKey);
+      if (held.owner && held.owner !== this.deps.selfMachineId) {
+        const cas = this.deps.casClaimOwnership(msg.sessionKey, this.deps.selfMachineId, held.epoch);
+        if (!cas.ok) {
+          const q = this.deps.queueMessage(msg, 'routing-only-claim-lost');
+          return { action: 'queued', detail: 'routing-only-claim-lost', acked: q === 'queued' || q === 'already-queued' };
+        }
+        this.deps.confirmClaim?.(msg.sessionKey, this.deps.selfMachineId);
+      }
+      await this.deps.handleLocally(msg);
+      return { action: 'handled-locally', owner: this.deps.selfMachineId, detail: 'routing-only', acked: true };
+    }
+    const kept = this.liveLocalPlacement(msg, reason);
+    const decision = kept ?? this.deps.placement.decide({
       sessionKey: msg.sessionKey,
       topicMetadata: msg.topicMetadata ?? {},
       machineRegistry: this.deps.machineRegistry(),
@@ -357,14 +479,66 @@ export class SessionRouter {
     // CAS won → spawn on the winner (or handle locally if that's us).
     const action: RouteAction = fromDead ? 'owner-dead-replaced' : 'spawned';
     if (decision.chosenMachine === this.deps.selfMachineId) {
+      // A kept session is already running, so nothing is left for `placing` to wait on. Confirm
+      // here: only the Telegram path confirms after delivery, and a row left `placing` would
+      // queue every later Slack or drained message for this key.
+      if (kept) {
+        try {
+          this.deps.confirmClaim?.(msg.sessionKey, decision.chosenMachine);
+        } catch (err) {
+          this.deps.log?.(`confirmClaim for kept ${msg.sessionKey} failed: ${String((err as Error)?.message ?? err)}`);
+        }
+      }
       await this.deps.handleLocally(msg);
       return { action: fromDead ? 'owner-dead-replaced' : 'handled-locally', owner: decision.chosenMachine, detail: 'placed-self', acked: true };
     }
-    await this.deps.spawnOnMachine(decision.chosenMachine, msg);
-    // Confirm the remote owner (placing → active). The 'place' above left the record
-    // transient; without this the session is owned-but-never-active and every later
-    // message routes to the placing/transferring branch → queued forever (bug #11).
-    this.deps.confirmClaim?.(msg.sessionKey, decision.chosenMachine);
-    return { action, owner: decision.chosenMachine, acked: true };
+    const target = decision.chosenMachine;
+    const spawn = await this.spawnWithRetries(target, msg, cas.epoch);
+    if (spawn === 'queued' || spawn === 'duplicate') {
+      // Confirm the remote owner (placing → active). The 'place' above left the record
+      // transient; without this the session is owned-but-never-active and every later
+      // message routes to the placing/transferring branch → queued forever (bug #11).
+      this.deps.confirmClaim?.(msg.sessionKey, target);
+      return { action, owner: target, acked: true };
+    }
+    if (spawn === 'sender-rejected') {
+      // Same terminal refusal as the forward path (§2.A): never re-placed.
+      this.deps.onOwnerResponsive?.(target);
+      return { action: 'rejected', owner: target, detail: 'sender-deauthorized', acked: true };
+    }
+    // The chosen machine never took the message (it refused the epoch as stale,
+    // or never answered). Reporting `spawned` here is the silent loss: the caller
+    // skips local dispatch and nothing holds the message. Take the placement back
+    // and handle it here; failing that, durable custody; failing that, un-acked
+    // → the caller's local fall-through. Delivery beats placement.
+    if (spawn === 'unreachable') this.deps.markOwnerSuspect?.(target);
+    else this.deps.onOwnerResponsive?.(target);
+    this.deps.log?.(`spawn on ${target} for ${msg.sessionKey} not accepted (${spawn}) — keeping the message on this machine`);
+    let reclaimed = false;
+    try {
+      reclaimed = this.deps.reclaimPlacement?.(msg.sessionKey, target) ?? false;
+    } catch (err) {
+      this.deps.log?.(`reclaimPlacement for ${msg.sessionKey} failed: ${String((err as Error)?.message ?? err)}`);
+    }
+    if (reclaimed) {
+      await this.deps.handleLocally(msg);
+      return { action: 'handled-locally', owner: this.deps.selfMachineId, detail: `spawn-${spawn}`, acked: true };
+    }
+    const q = this.deps.queueMessage(msg, `spawn-${spawn}`);
+    return { action: 'queued', owner: target, detail: `spawn-${spawn}`, acked: q === 'queued' || q === 'already-queued' };
+  }
+
+  /** The placement spawn hop, with the same retry/backoff as forwardToOwner. */
+  private async spawnWithRetries(target: string, msg: InboundMessage, epoch: number): Promise<DeliverAck['accepted'] | 'unreachable'> {
+    for (let attempt = 0; attempt <= this.cfg.deliverMessageMaxRetries; attempt++) {
+      try {
+        const ack = await this.deps.spawnOnMachine(target, msg, epoch);
+        return ack.accepted;
+      } catch (err) {
+        this.deps.log?.(`spawn attempt ${attempt} on ${target} failed: ${String((err as Error)?.message ?? err)}`);
+        if (attempt < this.cfg.deliverMessageMaxRetries) await this.deps.sleep(this.backoff(attempt));
+      }
+    }
+    return 'unreachable';
   }
 }

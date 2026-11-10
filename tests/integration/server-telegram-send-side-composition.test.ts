@@ -1,0 +1,210 @@
+import { NotificationSelectivityGate } from '../../src/messaging/NotificationSelectivityGate.js';
+import { unknownAutomationAuthor } from '../../src/messaging/telegram-origin/OriginAutomationAuthor.js';
+/**
+ * Regression for the production topology gap where the server constructed a
+ * send-capable TelegramAdapter in Lifeline-owned/send-only mode, but only wired
+ * scheduler and notification consumers inside the server-polls branch.
+ *
+ * The parameterized cases behaviorally compose topology + handoff. The final
+ * case is explicitly a structural production-call-site lint: it makes branch
+ * placement drift visible, but does not claim to execute or prove server.ts
+ * reachability.
+ */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { StateManager } from '../../src/core/StateManager.js';
+import { SessionManager } from '../../src/core/SessionManager.js';
+import type { JobDefinition, SessionManagerConfig } from '../../src/core/types.js';
+import { TelegramAdapter } from '../../src/messaging/TelegramAdapter.js';
+import { NotificationBatcher } from '../../src/messaging/NotificationBatcher.js';
+import { JobScheduler } from '../../src/scheduler/JobScheduler.js';
+import {
+  resolveTelegramStartupTopology,
+  wireTelegramSendSide,
+} from '../../src/messaging/telegramSendSideComposition.js';
+import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+
+vi.mock('node:child_process', () => ({
+  execFileSync: vi.fn().mockReturnValue(''),
+  execFile: vi.fn(),
+}));
+
+vi.mock('croner', () => ({
+  Cron: vi.fn().mockImplementation(() => ({ stop: vi.fn() })),
+}));
+
+vi.mock('../../src/scheduler/JobLoader.js', () => {
+  const loadJobs = vi.fn().mockReturnValue([]);
+  return {
+    loadJobs,
+    // The scheduler's trigger-boundary reload uses the detailed loader; keep
+    // the mock derived from `loadJobs` so a mocked return value still steers
+    // what the scheduler sees.
+    loadJobsDetailed: vi.fn((jobsFile: string) => ({
+      jobs: loadJobs(jobsFile), problems: [], bodyFailures: [], diagnostics: [],
+    })),
+    formatLoadProblem: vi.fn((p: { message: string }) => p.message),
+  };
+});
+
+describe('server Telegram send-side composition', () => {
+  let tmpDir: string;
+  let stateDir: string;
+  let scheduler: JobScheduler;
+  let adapter: TelegramAdapter;
+  let batcher: NotificationBatcher;
+
+  const job: JobDefinition = {
+    slug: 'health-check',
+    name: 'Health Check',
+    description: 'health',
+    schedule: '*/5 * * * *',
+    enabled: true,
+    priority: 'critical',
+    model: 'haiku',
+    execute: { type: 'prompt', value: 'health' },
+  };
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'instar-send-side-compose-'));
+    stateDir = path.join(tmpDir, '.instar');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'jobs.json'), '[]');
+
+    const state = new StateManager(stateDir);
+    state.set('agent-attention-topic', 88);
+    const sessionConfig: SessionManagerConfig = {
+      tmuxPath: '/usr/bin/tmux',
+      claudePath: '/usr/local/bin/claude',
+      projectDir: tmpDir,
+      maxSessions: 5,
+      protectedSessions: [],
+      completionPatterns: [],
+    };
+    const sessions = new SessionManager(sessionConfig, state);
+    scheduler = new JobScheduler({ jobsFile: path.join(tmpDir, 'jobs.json'), projectDir: tmpDir }, sessions, state, stateDir);
+    adapter = new TelegramAdapter({ token: 'fake-token', chatId: '-100123' }, stateDir);
+    batcher = new NotificationBatcher();
+  });
+
+  afterEach(() => {
+    batcher.stop();
+    vi.restoreAllMocks();
+    SafeFsExecutor.safeRmSync(tmpDir, { recursive: true, force: true, operation: 'tests/integration/server-telegram-send-side-composition.test.ts' });
+  });
+
+  it.each([
+    {
+      name: 'explicit send-only',
+      input: { telegramConfigured: true, skipTelegram: true, coordinatorAwake: true, lifelineOwnsPolling: false },
+      expectedMode: 'send-only',
+      expectedBridgeOwner: true,
+    },
+    {
+      name: 'standby laptop',
+      input: { telegramConfigured: true, skipTelegram: false, coordinatorAwake: false, lifelineOwnsPolling: false },
+      expectedMode: 'send-only',
+      expectedBridgeOwner: false,
+    },
+    {
+      name: 'Lifeline polling owner',
+      input: { telegramConfigured: true, skipTelegram: false, coordinatorAwake: true, lifelineOwnsPolling: true },
+      expectedMode: 'send-only',
+      expectedBridgeOwner: true,
+    },
+    {
+      name: 'server polling owner',
+      input: { telegramConfigured: true, skipTelegram: false, coordinatorAwake: true, lifelineOwnsPolling: false },
+      expectedMode: 'server-polling',
+      expectedBridgeOwner: true,
+    },
+  ] as const)(
+    'composes production $name topology into a usable scheduler and batcher sink',
+    async ({ input, expectedMode, expectedBridgeOwner }) => {
+      const genericSend = vi.spyOn(adapter, 'send').mockResolvedValue({ messageId: 1 });
+      const topicSend = vi.spyOn(adapter, 'sendToTopic').mockResolvedValue({ messageId: 2, topicId: 77 });
+
+      const topology = resolveTelegramStartupTopology(input);
+      expect(topology).toEqual({ mode: expectedMode, bridgeOwner: expectedBridgeOwner });
+      if (!topology) throw new Error('expected a configured Telegram topology');
+
+      const result = wireTelegramSendSide({ mode: topology.mode, telegram: adapter, scheduler, notificationBatcher: batcher });
+      expect(result).toEqual({ mode: expectedMode, schedulerAttached: true, batcherAttached: true });
+
+      await (scheduler as unknown as {
+        alertOnConsecutiveFailures(j: JobDefinition, failures: number, error: string): Promise<void>;
+      }).alertOnConsecutiveFailures(job, 2, 'spawn refused');
+      expect(genericSend).not.toHaveBeenCalled();
+      expect(topicSend).toHaveBeenCalledWith(88, expect.stringContaining('Health Check'));
+
+      await batcher.enqueue({
+        tier: 'IMMEDIATE',
+        category: 'composition-test',
+        message: 'send-side alive',
+        timestamp: new Date(),
+        topicId: 77,
+      });
+      expect(topicSend).toHaveBeenCalledWith(77, 'send-side alive');
+    },
+  );
+
+  it('structurally lints polling-independent handoffs after both ownership branches', () => {
+    const serverPath = fileURLToPath(new URL('../../src/commands/server.ts', import.meta.url));
+    const src = fs.readFileSync(serverPath, 'utf8');
+    const topology = src.indexOf('const telegramTopology = resolveTelegramStartupTopology({');
+    const sendOnly = src.indexOf("if (telegramTopology?.mode === 'send-only' && telegramConfig)");
+    const polling = src.indexOf("if (telegramTopology?.mode === 'server-polling' && telegramConfig)");
+    const sharedWiring = src.indexOf('wireTelegramSendSide({');
+    const bridge = src.indexOf('telegramBridge = new TelegramBridge({');
+    const liveBridgeOwner = src.indexOf('isOwner: () => coordinator.isAwake && coordinator.holdsLease()');
+    const roleGuard = src.indexOf('scheduler.setRoleGuard(');
+    const alertDeliveryActivation = src.indexOf('scheduler?.activateFailureAlertDelivery()');
+    const coherenceSeam = src.indexOf('// ── Coherence Journal × Telegram emergency-stop seam');
+    const topicMemoryOpen = src.indexOf('await topicMemory.open()');
+    const topicMemoryHandoff = src.indexOf('scheduler.setTopicMemory(topicMemory)');
+
+    for (const index of [topology, sendOnly, polling, sharedWiring, bridge, liveBridgeOwner, roleGuard, alertDeliveryActivation, coherenceSeam, topicMemoryOpen, topicMemoryHandoff]) {
+      expect(index).toBeGreaterThan(-1);
+    }
+    expect(topology).toBeLessThan(sendOnly);
+    expect(sharedWiring).toBeGreaterThan(polling);
+    expect(sharedWiring).toBeLessThan(coherenceSeam);
+    expect(bridge).toBeGreaterThan(sharedWiring);
+    expect(liveBridgeOwner).toBeGreaterThan(bridge);
+    expect(bridge).toBeLessThan(coherenceSeam);
+    expect(roleGuard).toBeGreaterThan(polling);
+    expect(roleGuard).toBeLessThan(coherenceSeam);
+    expect(alertDeliveryActivation).toBeGreaterThan(roleGuard);
+    expect(alertDeliveryActivation).toBeLessThan(coherenceSeam);
+    expect(topicMemoryHandoff).toBeGreaterThan(topicMemoryOpen);
+
+    const pollingOnlySlice = src.slice(polling, sharedWiring);
+    expect(pollingOnlySlice).not.toContain('scheduler.setMessenger(');
+    expect(pollingOnlySlice).not.toContain('scheduler.setTelegram(');
+    expect(pollingOnlySlice).not.toContain('notificationBatcher.setSendFunction(');
+    expect(pollingOnlySlice).not.toContain('telegramBridge = new TelegramBridge(');
+    expect(pollingOnlySlice).not.toContain('scheduler.setRoleGuard(');
+  });
+});
+
+
+it('separates quota/reap choices through actual batching and derives push only from delivery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quiet-batcher-compose-'));
+  const gate = new NotificationSelectivityGate(root, 'test', () => ({ enabled: true, dryRun: false, push: { categories: { 'spend-alert': true } } }));
+  const adapter = new TelegramAdapter({ token: '123:test', chatId: '-1001' }, root); adapter.selectivity = gate;
+  const batcher = new NotificationBatcher(); const delivered = vi.fn(); batcher.onDelivered = delivered;
+  const network = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, result: { message_id: 123 } }) }); vi.stubGlobal('fetch', network);
+  try {
+    wireTelegramSendSide({ mode: 'send-only', telegram: adapter, notificationBatcher: batcher });
+    for (const producerId of ['quota-notifier', 'reap-notifier'] as const) await batcher.enqueue({ tier: 'DIGEST', category: producerId, message: `Routine ${producerId}`, timestamp: new Date(), topicId: 42, origin: { producerId, author: unknownAutomationAuthor('fixture') } });
+    await batcher.flush('DIGEST');
+    expect(network).toHaveBeenCalledOnce(); expect(delivered).toHaveBeenCalledOnce();
+    expect(batcher.getQueueSize()).toEqual({ summary: 0, digest: 0 }); expect(batcher.getStats().totalFlushed).toBe(1);
+    expect(gate.store.list().map(row => row.category).sort()).toEqual(['reap-notice', 'spend-alert']);
+    await batcher.flush('DIGEST'); expect(network).toHaveBeenCalledOnce();
+  } finally { batcher.stop(); await gate.close(); await adapter.stop(); vi.unstubAllGlobals(); SafeFsExecutor.safeRmSync(root, { recursive: true, force: true, operation: 'quiet batcher composition fixture' }); }
+});

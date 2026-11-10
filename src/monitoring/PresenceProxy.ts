@@ -13,6 +13,7 @@
  */
 
 import * as fs from 'fs';
+import { featureEvidence } from './FeatureEvidenceLog.js';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
@@ -24,6 +25,9 @@ import { LlmAbortedError } from './LlmQueue.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
 import type { IntelligenceFramework } from '../core/intelligenceProviderFactory.js';
 import { looksActivelyWorking } from './sentinelWiring.js';
+import { currentUsageLimitBanner } from './rateLimitDetection.js';
+import { OriginAuthorCall, deterministicAutomationAuthor } from '../messaging/telegram-origin/OriginAutomationAuthor.js';
+import type { OriginAutomationAuthor } from '../messaging/telegram-origin/OriginAutomationAuthor.js';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -33,6 +37,8 @@ import { looksActivelyWorking } from './sentinelWiring.js';
  * (the one-voice silent-suppress, distinct from null = "not stuck, normal path").
  */
 const PRESENCE_SUPPRESS = Symbol('presence-proxy-suppress');
+/** The session is at a usage wall and the conversation was already told directly. */
+const QUOTA_ALREADY_TOLD = Symbol('presence-proxy-quota-already-told');
 
 export interface PresenceProxyConfig {
   stateDir: string;
@@ -52,6 +58,9 @@ export interface PresenceProxyConfig {
   captureSessionOutput: (sessionName: string, lines?: number) => string | null;
   getSessionForTopic: (topicId: number) => string | null;
   isSessionAlive: (sessionName: string) => boolean;
+  /** Exact serving-session transcript confirms its latest turn is a provider
+   * usage error. Missing/unknown evidence never authorizes a limit claim. */
+  confirmSessionUsageLimit?: (sessionName: string) => boolean | string;
   sendMessage: (topicId: number, text: string, metadata?: ProxyMetadata) => Promise<void>;
   getAuthorizedUserIds: () => number[];
   getProcessTree: (sessionName: string) => ProcessInfo[];
@@ -83,6 +92,29 @@ export interface PresenceProxyConfig {
    * exactly today's behavior.
    */
   speakerElection?: import('./SpeakerElection.js').SpeakerElection;
+
+  /**
+   * Duplicate-session stand-down seam (docs/specs/duplicate-session-standdown.md).
+   * Absent ⇒ the feature is dark ⇒ this proxy behaves exactly as today.
+   *
+   * `entryForTopic` answers whether THIS machine holds a live, ENFORCING muzzle
+   * for the topic; `claimProxyNotice` is the per-episode budget — it returns true
+   * at most once, so a frozen copy explains itself exactly once rather than
+   * narrating its own silence on every tier.
+   */
+  standDown?: {
+    entryForTopic(topicId: number): { ownerMachineId: string; enforcing: boolean } | null;
+    /** Non-consuming read of the USER-channel budget: was the line already sent
+     *  this episode? Read BEFORE sending — without it "claim after success"
+     *  degenerates into send-every-tier. */
+    hasProxyNotice?: (topicId: number) => boolean;
+    /** The per-episode USER-channel budget. Claimed only after a confirmed send. */
+    claimProxyNotice(topicId: number): boolean;
+    /** The DETERMINISTIC send path (telegram.sendToTopic), which does not
+     *  traverse the muzzled reply route. Without it the honest line is
+     *  structurally undeliverable to the very topic it is about. */
+    sendDeterministic?: (topicId: number, text: string, inboundMessageId?: string) => Promise<boolean>;
+  };
 
   /**
    * BUILD-STALL-VISIBILITY-SPEC Fix 2 "Routing" — when a /build heartbeat has
@@ -119,6 +151,21 @@ export interface PresenceProxyConfig {
 
   // Optional: context exhaustion auto-recovery
   recoverContextExhaustion?: (topicId: number, sessionName: string) => Promise<{ recovered: boolean }>;
+  /** Durable context-wall latch, used when the original pane banner has
+   * scrolled away. Signal-only for Tier 1/2; Tier 3 may invoke the existing
+   * recovery callback exactly as it does for a live-tail context match. */
+  hasContextExhaustionLatch?: (topicId: number) => boolean;
+  /**
+   * Usage-wall wording override (usage-wall-rescue). When the session is at its
+   * account's usage wall but another subscription account has room, the wall
+   * is being solved by moving the session, so "paused until the quota resets"
+   * would be untrue. Returns the plain replacement sentence, null to keep the
+   * standard "paused until reset" notice, or false when the conversation was
+   * already told about this wall directly (say nothing more; the tier chain
+   * ends exactly as if the notice had been sent).
+   * Absent → the standard notice, exactly as before.
+   */
+  describeQuotaWall?: (sessionName: string) => string | false | null;
 
   /**
    * Honest turn-receipts: when a recovery sentinel (ContextWedgeSentinel,
@@ -128,6 +175,15 @@ export interface PresenceProxyConfig {
    * (the honest classifier is then the only voice, which is still correct).
    */
   isStuckRecoveryActive?: (sessionName: string) => boolean;
+
+  /**
+   * True while a session is being spawned (or respawned) for this topic /
+   * Slack channel. A session that is still starting is not "stopped": while
+   * this reads true the dead-session alarm is held and the check re-runs, for
+   * at most the Tier 3 delay (a spawn that never lands is then reported).
+   * Absent → no spawn signal; the Tier 1 grace below still applies.
+   */
+  isSessionStarting?: (topicId: number) => boolean;
 
   /**
    * honest-session-state-surfaces Finding (b): when true, the honest stuck
@@ -187,9 +243,12 @@ export interface PresenceProxyConfig {
 }
 
 export interface ProxyMetadata {
+  inboundMessageId?: string;
   source: 'presence-proxy';
   tier: number;
   isProxy: true;
+  /** Internal composer evidence; the HTTP endpoint never trusts this field. */
+  originAuthor?: OriginAutomationAuthor;
 }
 
 export interface ProcessInfo {
@@ -199,6 +258,7 @@ export interface ProcessInfo {
 }
 
 interface PresenceState {
+  inboundMessageId?: string;
   topicId: number;
   sessionName: string;
   userMessageAt: number;
@@ -345,71 +405,17 @@ export function guardProxyOutput(text: string): { safe: boolean; reason?: string
 
 // ─── Quota Exhaustion Detection ─────────────────────────────────────────────
 
-/** Patterns that indicate Claude's API quota has been exhausted */
-const QUOTA_EXHAUSTION_PATTERNS = [
-  /you've hit your limit/i,
-  /\/extra-usage to finish/i,
-  /resets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\(/i,  // "resets 7pm (America/..."
-  /usage limit.*reached/i,
-  /quota.*exceeded/i,
-  /rate limit.*exceeded/i,
-  // 2026-06-05 incident (topic 2169): the session-limit banner reads
-  // "Session limit reached ∙ resets 10:30pm" — no parenthesized timezone, and
-  // none of the patterns above matched, so the standby kept saying "actively
-  // working" while the session was paused on its limit. "approaching session
-  // limit" deliberately does NOT match (approaching ≠ paused).
-  /session limit reached/i,
-  /session limit\b[^a-z]*resets/i,                       // "session limit, resets 10:30pm" / "Session limit ∙ resets…"
-  /\blimit\b.*\bresets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/i, // any limit banner with a bare "resets 10:30pm" (no tz paren)
-];
-
-/**
- * Check if terminal output indicates quota exhaustion.
- * Returns a human-friendly message if detected, null otherwise.
- *
- * Only checks the LAST 15 lines of the snapshot, AND verifies
- * the quota error is the last substantive content. If there are
- * meaningful output lines AFTER the quota error (indicating the
- * session resumed work after quota reset), treat it as stale.
- */
+/** A current parent banner, not a reset hint or helper error in scrollback.
+ * Production callers also corroborate the exact session's structured error. */
 export function detectQuotaExhaustion(snapshot: string): string | null {
-  const lines = snapshot.split('\n');
-  const recentLines = lines.slice(-15);
-
-  // Find the LAST line that matches a quota pattern
-  let lastQuotaLineIdx = -1;
-  for (let i = recentLines.length - 1; i >= 0; i--) {
-    for (const pattern of QUOTA_EXHAUSTION_PATTERNS) {
-      if (pattern.test(recentLines[i])) {
-        lastQuotaLineIdx = i;
-        break;
-      }
-    }
-    if (lastQuotaLineIdx >= 0) break;
-  }
-
-  if (lastQuotaLineIdx < 0) return null;
-
-  // Check if there are substantive lines AFTER the quota error.
-  // If the session produced real output after the error, it recovered.
-  const linesAfterQuota = recentLines.slice(lastQuotaLineIdx + 1);
-  const substantiveAfter = linesAfterQuota.filter(line => {
-    const trimmed = line.trim();
-    if (!trimmed) return false;
-    // Also skip lines that are themselves quota messages
-    for (const pattern of QUOTA_EXHAUSTION_PATTERNS) {
-      if (pattern.test(trimmed)) return false;
-    }
-    return true;
-  });
-
-  // If there are 2+ substantive lines after the quota error, session has recovered
-  if (substantiveAfter.length >= 2) return null;
-
-  // Quota error is the last substantive content — it's current
-  const recentOutput = recentLines.join('\n');
+  const recentOutput = currentUsageLimitBanner(snapshot);
+  if (!recentOutput) return null;
   const resetMatch = recentOutput.match(/resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]+\))/i);
-  const resetTime = resetMatch ? resetMatch[1] : null;
+  // Current banners print a bare time ("limit resets 8am") with no timezone.
+  const bareResetMatch = resetMatch
+    ? null
+    : recentOutput.match(/\bresets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))\b/i);
+  const resetTime = resetMatch ? resetMatch[1] : bareResetMatch ? bareResetMatch[1] : null;
   if (resetTime) {
     return `The agent has hit its Claude API usage limit. Quota resets ${resetTime}. The session is paused until then — no work is being done.`;
   }
@@ -741,6 +747,7 @@ class LlmQueue {
 
 // ─── PresenceProxy ──────────────────────────────────────────────────────────
 
+// @self-action-controller: presence-usage-limit-notice
 export class PresenceProxy {
   private config: Required<Pick<PresenceProxyConfig, 'stateDir' | 'intelligence' | 'agentName' | 'captureSessionOutput' | 'getSessionForTopic' | 'isSessionAlive' | 'sendMessage' | 'getAuthorizedUserIds' | 'getProcessTree'>> & PresenceProxyConfig;
   private states: Map<number, PresenceState> = new Map();
@@ -753,6 +760,8 @@ export class PresenceProxy {
   private tier1DelayMs: number;
   private tier2DelayMs: number;
   private tier3DelayMs: number;
+  /** Topics whose last check was held or deferred (dead read / spawn in progress). */
+  private heldTopics = new Set<number>();
   private tier3RecheckDelayMs: number;
   private silenceDurationMs: number;
   private prefix: string;
@@ -874,7 +883,7 @@ export class PresenceProxy {
         return;
       }
 
-      this.handleAgentMessage(topicId);
+      this.handleAgentMessage(topicId, event.sessionName);
     }
   }
 
@@ -919,6 +928,10 @@ export class PresenceProxy {
       return;
     }
 
+    const wasActive = existingState && !existingState.cancelled;
+    // A timer already awaiting an assessment must not speak or persist for
+    // the superseded inbound message after the new watch has been installed.
+    if (existingState) existingState.cancelled = true;
     // Reset all timers for this topic (rapid message handling)
     this.clearTimersForTopic(topicId);
 
@@ -942,6 +955,7 @@ export class PresenceProxy {
       sessionName,
       userMessageAt: Date.now(),
       userMessageText: event.text,
+      inboundMessageId: String(event.messageId),
       userMessageBaselineSnapshot: baselineSnapshot,
       tier1FiredAt: null,
       tier1Snapshot: null,
@@ -963,7 +977,7 @@ export class PresenceProxy {
     };
 
     // If proxy was already active (conversation mode), add user message to history
-    if (existingState && !existingState.cancelled) {
+    if (wasActive) {
       state.conversationHistory.push({
         role: 'user',
         text: event.text,
@@ -981,14 +995,23 @@ export class PresenceProxy {
     this.scheduleTier(topicId, 1, this.tier1DelayMs);
   }
 
-  private handleAgentMessage(topicId: number): void {
+  private handleAgentMessage(topicId: number, sessionName?: string | null): void {
+    if (sessionName && sessionName === this.config.getSessionForTopic(topicId)) {
+      try {
+        const noticePath = this.usageLimitNoticePath(topicId);
+        fs.mkdirSync(path.dirname(noticePath), { recursive: true });
+        // A carried clear must overwrite a previous owner's old reservation;
+        // absence alone cannot clear a stale copy when a topic returns there.
+        fs.writeFileSync(noticePath, JSON.stringify({ sessionName: null }));
+      } catch { /* @silent-fallback-ok — retaining an old budget cannot duplicate a notice */ }
+    }
     const state = this.states.get(topicId);
     if (!state) return;
 
     // Agent responded — cancel everything
     state.cancelled = true;
     this.clearTimersForTopic(topicId);
-    this.cleanupState(topicId);
+    this.cleanupState(topicId, state);
   }
 
   // ─── Tier Scheduling ───────────────────────────────────────────────────
@@ -1015,7 +1038,17 @@ export class PresenceProxy {
     this.timers.set(key, timer);
   }
 
+  private readonly checksInFlight = new Set<PresenceState>();
+
   private async fireTier(topicId: number, tier: 1 | 2 | 3): Promise<void> {
+    const state = this.states.get(topicId);
+    if (!state || state.cancelled || this.checksInFlight.has(state)) return;
+    this.checksInFlight.add(state);
+    try { await this.assessTier(topicId, tier); }
+    finally { this.checksInFlight.delete(state); }
+  }
+
+  private async assessTier(topicId: number, tier: 1 | 2 | 3): Promise<void> {
     const state = this.states.get(topicId);
     if (!state || state.cancelled) return;
 
@@ -1026,7 +1059,7 @@ export class PresenceProxy {
       if (this.config.hasAgentRespondedSince(topicId, state.userMessageAt)) {
         console.log(`[PresenceProxy] Skipping Tier ${tier} for topic ${topicId} — agent already responded (race guard)`);
         state.cancelled = true;
-        this.cleanupState(topicId);
+        this.cleanupState(topicId, state);
         return;
       }
     }
@@ -1066,19 +1099,59 @@ export class PresenceProxy {
     // Check session — retry once after a short delay to avoid transient false negatives.
     // isSessionAlive can briefly return false during process restarts, compaction, or
     // pane command transitions. A single false reading should NOT fast-track to "dead."
-    const sessionName = state.sessionName;
-    let alive = this.config.isSessionAlive(sessionName);
+    //
+    // The name recorded when the message was logged can be stale: Slack and
+    // Telegram log the inbound message BEFORE they find the old session dead
+    // and spawn a replacement. Re-resolve before every liveness read so the
+    // watcher follows the session that is actually answering.
+    this.refreshSessionName(topicId, state);
+    let alive = this.config.isSessionAlive(state.sessionName);
 
     if (!alive) {
       // Wait 5 seconds and recheck before acting on a negative result
       await new Promise(resolve => setTimeout(resolve, 5000));
       if (state.cancelled) return; // Agent may have responded during the wait
-      alive = this.config.isSessionAlive(sessionName);
+      this.refreshSessionName(topicId, state);
+      alive = this.config.isSessionAlive(state.sessionName);
     }
 
-    if (!alive && tier < 3) {
-      // Dead session — skip to Tier 3 logic
-      return this.fireTier(topicId, 3);
+    if (!alive) {
+      const elapsed = Date.now() - state.userMessageAt;
+      // A session being started for this message is not "stopped".
+      if (elapsed < this.tier3DelayMs && this.isSessionStarting(topicId)) {
+        console.log(`[PresenceProxy] Holding Tier ${tier} for topic ${topicId} — a session is starting`);
+        this.heldTopics.add(topicId);
+        this.scheduleTier(topicId, tier, this.tier1DelayMs);
+        return;
+      }
+      // At the first check, give a replacement until the Tier 2 mark to appear
+      // before calling the conversation stopped.
+      if (tier === 1) {
+        console.log(`[PresenceProxy] Session ${state.sessionName} not running for topic ${topicId} at Tier 1 — re-checking at Tier 2`);
+        // Tier 1's stage has passed (as on the ack-suppressed path); Tier 2
+        // requires it, and must keep the watch going if a replacement appears.
+        state.tier1FiredAt = Date.now();
+        this.heldTopics.add(topicId);
+        this.scheduleTier(topicId, 2, Math.max(0, this.tier2DelayMs - elapsed));
+        return;
+      }
+      if (tier < 3) {
+        // Dead session with no replacement — skip to Tier 3 logic
+        return this.assessTier(topicId, 3);
+      }
+    }
+
+    // A hold (dead read / spawn in progress) can end after later tier marks
+    // have passed. Run the tier that matches the elapsed time, so the next
+    // tier is still scheduled and the watch never silently ends.
+    // Only after a hold: a plain on-time check keeps its own tier.
+    if (alive && this.heldTopics.delete(topicId)) {
+      const elapsed = Date.now() - state.userMessageAt;
+      if (tier === 1 && elapsed >= this.tier2DelayMs) {
+        state.tier1FiredAt = state.tier1FiredAt ?? Date.now();
+        tier = 2;
+      }
+      if (tier === 2 && elapsed >= this.tier3DelayMs) tier = 3;
     }
 
     switch (tier) {
@@ -1107,26 +1180,51 @@ export class PresenceProxy {
   // No-leak: emits ONLY `StuckClassification.message` verbatim with the tier
   // prefix — never concatenates pane-derived text.
   private maybeStuckMessage(
+    topicId: number,
     snapshot: string | null,
     sessionName: string,
     tierLabel: 1 | 2,
   ): string | typeof PRESENCE_SUPPRESS | null {
     if (!this.config.standbyHonestyTiers) return null;
+    if (this.config.hasContextExhaustionLatch?.(topicId)) {
+      if (this.config.isStuckRecoveryActive?.(sessionName)) {
+        featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'held', reason: 'latched-recovery-owns-voice', context: { tier: tierLabel, kind: 'context-exhaustion-latch' } });
+        return PRESENCE_SUPPRESS;
+      }
+      featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'fired', reason: 'honest-message:context-exhaustion-latch', context: { tier: tierLabel, kind: 'context-exhaustion-latch' } });
+      const prefix = tierLabel === 1
+        ? `${this.prefix} `
+        : `${this.prefix} 2-minute update — `;
+      return `${prefix}This conversation is latched at its context limit and cannot produce another reply until recovery starts.`;
+    }
     if (!snapshot) return null;
     let stuck;
     try {
       stuck = classifyStuckSignature(snapshot);
     } catch {
       // Fail toward today's behavior — never fabricate an honest claim.
+      featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'error', reason: 'stuck-classification-threw', context: { tier: tierLabel } });
       return null;
     }
     if (!stuck) return null;
+    if (stuck.kind === 'rate-limited' && !this.confirmUsageLimit(sessionName)) return null;
+    // The framework approval-prompt class is NEVER surfaced to the user — the
+    // PermissionPromptAutoResolver auto-clears it, and only if it genuinely
+    // cannot does it raise a Terminal Attention defect (the sole surface).
+    // Suppress here UNCONDITIONALLY (a consumer policy, not a classifier
+    // contract inversion), with no lifecycle gap.
+    if (stuck.kind === 'approval-prompt-waiting') {
+      featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'held', reason: 'approval-prompt-never-surfaced', context: { tier: tierLabel, kind: stuck.kind } });
+      return PRESENCE_SUPPRESS;
+    }
     // A recovery sentinel already messaging about this stuck state owns the
     // voice — mirror Tier 3's silent return (suppress, do NOT fall through to
     // the "actively working" fallback, which would re-introduce the lie).
     if (this.config.isStuckRecoveryActive?.(sessionName)) {
+      featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'held', reason: 'recovery-owns-voice', context: { tier: tierLabel, kind: stuck.kind } });
       return PRESENCE_SUPPRESS;
     }
+    featureEvidence.record('monitoring.standbyHonestyTiers', { kind: 'fired', reason: `honest-message:${stuck.kind}`, context: { tier: tierLabel, kind: stuck.kind } });
     const prefix = tierLabel === 1
       ? `${this.prefix} `
       : `${this.prefix} 2-minute update — `;
@@ -1134,6 +1232,68 @@ export class PresenceProxy {
   }
 
   // ─── Tier 1: Status Update ─────────────────────────────────────────────
+
+  /**
+   * Point the watcher at the session currently registered for this topic /
+   * channel. A replacement spawned after the message was logged gets a new
+   * name; the old one reads dead. The pre-message baseline belonged to the old
+   * pane, so it is dropped on a switch.
+   */
+  private refreshSessionName(topicId: number, state: PresenceState): void {
+    let current: string | null = null;
+    try {
+      current = this.config.getSessionForTopic(topicId);
+    } catch {
+      return; // @silent-fallback-ok — lookup failed ⇒ keep watching the recorded name
+    }
+    if (current && current !== state.sessionName) {
+      console.log(`[PresenceProxy] Topic ${topicId} now served by ${current} (was ${state.sessionName}) — following the replacement`);
+      state.sessionName = current;
+      state.userMessageBaselineSnapshot = null;
+    }
+  }
+
+  private isSessionStarting(topicId: number): boolean {
+    try {
+      return this.config.isSessionStarting?.(topicId) === true;
+    } catch {
+      return false; // @silent-fallback-ok — no spawn signal ⇒ the Tier 1 grace still applies
+    }
+  }
+
+  /**
+   * The Tier 3 label. "5-minute check" only when that much time has really
+   * passed since the user's message; an earlier report carries no time claim.
+   */
+  private tier3Label(state: PresenceState): string {
+    const elapsed = Date.now() - state.userMessageAt;
+    return elapsed >= this.tier3DelayMs * 0.9 ? '5-minute check' : 'Check';
+  }
+
+  /**
+   * The usage-wall notice for this session, or null when the pane is not at a
+   * wall. When another account has room the wiring supplies a "moving you to
+   * another account" sentence instead of "paused until reset".
+   */
+  private confirmUsageLimit(sessionName: string): boolean {
+    try { const evidence = this.config.confirmSessionUsageLimit?.(sessionName); return evidence === true || (typeof evidence === 'string' && evidence.length > 0); }
+    catch { return false; /* @silent-fallback-ok — unknown is not proof of a limit */ }
+  }
+
+  private quotaWallMessage(sessionName: string, snapshot: string): string | typeof QUOTA_ALREADY_TOLD | null {
+    const standard = detectQuotaExhaustion(snapshot);
+    if (!standard || !this.confirmUsageLimit(sessionName)) return null;
+    let override: string | false | null = null;
+    try {
+      override = this.config.describeQuotaWall?.(sessionName) ?? null;
+    } catch {
+      // @silent-fallback-ok: the override is wording only; the standard
+      // notice is still true enough to send.
+      override = null;
+    }
+    if (override === false) return QUOTA_ALREADY_TOLD;
+    return override ?? standard;
+  }
 
   private async fireTier1(topicId: number, state: PresenceState): Promise<void> {
     const lines = this.config.maxTmuxLines?.t1 ?? 50;
@@ -1149,16 +1309,23 @@ export class PresenceProxy {
       && state.conversationHistory.some(m => m.role === 'proxy');
 
     let message: string;
+    let originAuthor = deterministicAutomationAuthor();
 
     // ── Quota exhaustion: detect before LLM call (saves tokens + gives clear message) ──
     if (snapshot) {
-      const quotaMessage = detectQuotaExhaustion(snapshot);
+      const quotaMessage = this.quotaWallMessage(state.sessionName, snapshot);
+      if (quotaMessage === QUOTA_ALREADY_TOLD) {
+        if (state.cancelled) return;
+        state.tier1FiredAt = Date.now();
+        this.persistState(topicId, state);
+        return; // already told directly; nothing more to assess
+      }
       if (quotaMessage) {
         message = `${this.prefix} ${quotaMessage}`;
         // Skip LLM, cancel further tiers — quota is a definitive state, not ambiguous
         if (state.cancelled) return;
         state.tier1FiredAt = Date.now();
-        await this.sendProxyMessage(topicId, message, 1);
+        await this.sendProxyMessage(topicId, message, 1, originAuthor, state.sessionName);
         this.persistState(topicId, state);
         state.conversationHistory.push({ role: 'proxy', text: message, timestamp: Date.now() });
         return; // Don't schedule tier 2/3 — nothing more to assess
@@ -1202,7 +1369,7 @@ export class PresenceProxy {
     // not only Tier 3. Substitutes the message string only; scheduling is
     // unchanged below. SUPPRESS = a recovery sentinel owns the voice → send
     // nothing this fire, but still schedule Tier 2.
-    const honest1 = this.maybeStuckMessage(snapshot, state.sessionName, 1);
+    const honest1 = this.maybeStuckMessage(topicId, snapshot, state.sessionName, 1);
     if (honest1 === PRESENCE_SUPPRESS) {
       if (state.cancelled) return;
       state.tier1FiredAt = Date.now();
@@ -1222,7 +1389,7 @@ export class PresenceProxy {
           ? this.buildConversationPrompt(state, snapshot)
           : this.buildTier1Prompt(state, snapshot);
 
-        const summary = await this.callLlm(
+        const { text: summary, author } = await this.callLlm(
           prompt,
           { model: this.config.tier1Model ?? 'fast', maxTokens: isConversation ? 500 : 300 },
           'low',
@@ -1233,6 +1400,7 @@ export class PresenceProxy {
 
         // Guard the output
         const guard = guardProxyOutput(summary);
+        if (guard.safe) originAuthor = author;
         message = guard.safe
           ? `${this.prefix} ${summary}`
           : `${this.prefix} ${this.config.agentName} is actively working. Your message has been delivered to the session.`;
@@ -1246,7 +1414,7 @@ export class PresenceProxy {
     if (state.cancelled) return;
 
     state.tier1FiredAt = Date.now();
-    await this.sendProxyMessage(topicId, message, 1);
+    await this.sendProxyMessage(topicId, message, 1, originAuthor, typeof honest1 === 'string' && snapshot && currentUsageLimitBanner(snapshot) ? state.sessionName : undefined);
     this.persistState(topicId, state);
 
     // Add to conversation history
@@ -1294,11 +1462,17 @@ export class PresenceProxy {
 
     // ── Quota exhaustion: check before LLM call ──
     if (snapshot) {
-      const quotaMessage = detectQuotaExhaustion(snapshot);
+      const quotaMessage = this.quotaWallMessage(state.sessionName, snapshot);
+      if (quotaMessage === QUOTA_ALREADY_TOLD) {
+        if (state.cancelled) return;
+        state.tier2FiredAt = Date.now();
+        this.persistState(topicId, state);
+        return;
+      }
       if (quotaMessage) {
         if (state.cancelled) return;
         state.tier2FiredAt = Date.now();
-        await this.sendProxyMessage(topicId, `${this.prefix} 2-minute update — ${quotaMessage}`, 2);
+        await this.sendProxyMessage(topicId, `${this.prefix} 2-minute update — ${quotaMessage}`, 2, undefined, state.sessionName);
         this.persistState(topicId, state);
         return; // Don't schedule tier 3
       }
@@ -1311,7 +1485,7 @@ export class PresenceProxy {
       const processes = this.config.getProcessTree(state.sessionName);
       if (processes.length === 0) {
         state.cancelled = true;
-        this.cleanupState(topicId);
+        this.cleanupState(topicId, state);
         return; // Agent finished — don't send tier 2/3
       }
     }
@@ -1320,7 +1494,7 @@ export class PresenceProxy {
     // Same lift as Tier 1: surface the REAL reason instead of "is still
     // working" at the 2-minute mark. Substitutes the message string only;
     // Tier 3 is still scheduled below in every branch (never gated).
-    const honest2 = this.maybeStuckMessage(snapshot, state.sessionName, 2);
+    const honest2 = this.maybeStuckMessage(topicId, snapshot, state.sessionName, 2);
     if (honest2 === PRESENCE_SUPPRESS) {
       if (state.cancelled) return;
       state.tier2FiredAt = Date.now();
@@ -1334,13 +1508,14 @@ export class PresenceProxy {
     const outputChanged = state.tier1SnapshotHash !== hash;
 
     let message: string;
+    let originAuthor = deterministicAutomationAuthor();
 
     if (typeof honest2 === 'string') {
       // Honest stuck reason — skip the LLM path entirely.
       message = honest2;
     } else {
       try {
-        const summary = await this.callLlm(
+        const { text: summary, author } = await this.callLlm(
           this.buildTier2Prompt(state, snapshot, outputChanged),
           { model: this.config.tier2Model ?? 'fast', maxTokens: 500 },
           'low',
@@ -1350,6 +1525,7 @@ export class PresenceProxy {
         state.lastLlmCallAt = Date.now();
 
         const guard = guardProxyOutput(summary);
+        if (guard.safe) originAuthor = author;
         message = guard.safe
           ? `${this.prefix} 2-minute update — ${summary}`
           : `${this.prefix} 2-minute update — ${this.config.agentName} is still working. ${outputChanged ? 'Output has changed since the last check.' : 'Output appears unchanged — may be waiting on a long operation.'}`;
@@ -1361,7 +1537,7 @@ export class PresenceProxy {
     if (state.cancelled) return;
 
     state.tier2FiredAt = Date.now();
-    await this.sendProxyMessage(topicId, message, 2);
+    await this.sendProxyMessage(topicId, message, 2, originAuthor, typeof honest2 === 'string' && snapshot && currentUsageLimitBanner(snapshot) ? state.sessionName : undefined);
     this.persistState(topicId, state);
 
     state.conversationHistory.push({ role: 'proxy', text: message, timestamp: Date.now() });
@@ -1377,6 +1553,7 @@ export class PresenceProxy {
   // ─── Tier 3: Stall Assessment ──────────────────────────────────────────
 
   private async fireTier3(topicId: number, state: PresenceState): Promise<void> {
+    this.refreshSessionName(topicId, state);
     // ── Session idle: agent completed work but didn't relay response ──
     // Same check as tier 2 — if the agent finished, skip tier 3 entirely.
     {
@@ -1386,7 +1563,7 @@ export class PresenceProxy {
         const processes = this.config.getProcessTree(state.sessionName);
         if (processes.length === 0) {
           state.cancelled = true;
-          this.cleanupState(topicId);
+          this.cleanupState(topicId, state);
           return;
         }
       }
@@ -1396,7 +1573,7 @@ export class PresenceProxy {
     if (state.tier3RecheckCount >= this.rateLimit.tier3MaxRechecks) {
       const msg = `${this.prefix} I've been monitoring for a while now. ${this.config.agentName} appears to be running a very long process. I'll stop checking — you'll hear from ${this.config.agentName} directly when it finishes.`;
       await this.sendProxyMessage(topicId, msg, 3);
-      this.cleanupState(topicId);
+      this.cleanupState(topicId, state);
       return;
     }
 
@@ -1420,6 +1597,21 @@ export class PresenceProxy {
         return;
       }
       alive = this.config.isSessionAlive(state.sessionName);
+      if (!alive) {
+        const before = state.sessionName;
+        this.refreshSessionName(topicId, state);
+        if (state.sessionName !== before) {
+          // A replacement registered during the wait — hand the triage claim
+          // over and assess the live session instead.
+          this.config.releaseTriageMutex?.(before, 'presence-proxy');
+          if (this.config.acquireTriageMutex) {
+            const held = this.config.isTriageMutexHeld?.(state.sessionName);
+            if (held && held !== 'presence-proxy') return; // StallTriageNurse owns it
+            this.config.acquireTriageMutex(state.sessionName, 'presence-proxy');
+          }
+          alive = this.config.isSessionAlive(state.sessionName);
+        }
+      }
     }
 
     const lines = this.config.maxTmuxLines?.t3 ?? 200;
@@ -1453,7 +1645,15 @@ export class PresenceProxy {
 
     // ── Quota exhaustion: check before LLM call ──
     if (snapshot) {
-      const quotaMessage = detectQuotaExhaustion(snapshot);
+      const quotaMessage = this.quotaWallMessage(state.sessionName, snapshot);
+      if (quotaMessage === QUOTA_ALREADY_TOLD) {
+        state.tier3FiredAt = Date.now();
+        state.tier3Assessment = 'waiting';
+        this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
+        this.persistState(topicId, state);
+        this.cleanupState(topicId, state);
+        return;
+      }
       if (quotaMessage) {
         if (state.cancelled) {
           this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
@@ -1462,12 +1662,52 @@ export class PresenceProxy {
         state.tier3FiredAt = Date.now();
         state.tier3Assessment = 'waiting';
         state.tier3Summary = quotaMessage;
-        await this.sendProxyMessage(topicId, `${this.prefix} 5-minute check — ${quotaMessage}`, 3);
+        await this.sendProxyMessage(topicId, `${this.prefix} ${this.tier3Label(state)} — ${quotaMessage}`, 3, undefined, state.sessionName);
         this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
         this.persistState(topicId, state);
-        this.cleanupState(topicId);
+        this.cleanupState(topicId, state);
         return;
       }
+    }
+
+    // A durable context-wall latch outranks the pane tail. The original banner
+    // can scroll away while the session remains unable to answer; reporting
+    // "actively working" in that state is the exact standby-honesty failure.
+    if (this.config.hasContextExhaustionLatch?.(topicId)) {
+      if (this.config.isStuckRecoveryActive?.(state.sessionName)) {
+        this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
+        this.persistState(topicId, state);
+        return;
+      }
+      if (this.config.recoverContextExhaustion) {
+        const result = await this.config.recoverContextExhaustion(topicId, state.sessionName);
+        if (result.recovered) {
+          state.tier3FiredAt = Date.now();
+          state.tier3Assessment = 'waiting';
+          state.tier3Summary = 'Latched context exhaustion — auto-recovered';
+          await this.sendProxyMessage(
+            topicId,
+            '🔄 The session was latched at its context limit — recovery has started with recent history.',
+            3,
+          );
+          this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
+          this.persistState(topicId, state);
+          this.cleanupState(topicId, state);
+          return;
+        }
+      }
+      state.tier3FiredAt = Date.now();
+      state.tier3Assessment = 'dead';
+      state.tier3Summary = 'Latched context exhaustion';
+      await this.sendProxyMessage(
+        topicId,
+        `${this.prefix} ${this.tier3Label(state)} — This conversation is latched at its context limit and cannot produce another reply until recovery succeeds.`,
+        3,
+      );
+      this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
+      this.persistState(topicId, state);
+      this.cleanupState(topicId, state);
+      return;
     }
 
     // ── Honest turn-receipts: classify a live-but-failing session ──
@@ -1483,7 +1723,18 @@ export class PresenceProxy {
     // the voice and we stay silent.
     if (snapshot) {
       const stuck = classifyStuckSignature(snapshot);
-      if (stuck) {
+      if (stuck && (stuck.kind !== 'rate-limited' || this.confirmUsageLimit(state.sessionName))) {
+        // Framework approval-prompt: NEVER surfaced to the user, NEVER 'dead'
+        // (so it is not respawned). The PermissionPromptAutoResolver owns
+        // clearing it; the only user-facing surface is its Terminal defect.
+        // Unconditional suppression (consumer policy), with no lifecycle gap.
+        if (stuck.kind === 'approval-prompt-waiting') {
+          state.tier3Assessment = 'waiting';
+          state.tier3Summary = 'approval-prompt (auto-clearing)';
+          this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
+          this.persistState(topicId, state);
+          return;
+        }
         if (state.cancelled) {
           this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
           return;
@@ -1507,7 +1758,7 @@ export class PresenceProxy {
               `🔄 Conversation got too long — starting a fresh session with your recent history.`, 3);
             this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
             this.persistState(topicId, state);
-            this.cleanupState(topicId);
+            this.cleanupState(topicId, state);
             return;
           }
         }
@@ -1517,10 +1768,10 @@ export class PresenceProxy {
         state.tier3FiredAt = Date.now();
         state.tier3Assessment = stuck.kind === 'rate-limited' ? 'waiting' : 'dead';
         state.tier3Summary = stuck.detail ? `${stuck.kind} (${stuck.detail})` : stuck.kind;
-        await this.sendProxyMessage(topicId, `${this.prefix} ${stuck.message}`, 3);
+        await this.sendProxyMessage(topicId, `${this.prefix} ${stuck.message}`, 3, undefined, stuck.kind === 'rate-limited' ? state.sessionName : undefined);
         this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
         this.persistState(topicId, state);
-        this.cleanupState(topicId);
+        this.cleanupState(topicId, state);
         return;
       }
     }
@@ -1530,6 +1781,7 @@ export class PresenceProxy {
     const hasActiveProcesses = processes.length > 0;
     const hasLongRunning = isLongRunningProcess(processes);
 
+    let originAuthor = deterministicAutomationAuthor();
     let assessment: 'working' | 'waiting' | 'stalled' | 'dead';
     let summary: string;
 
@@ -1541,7 +1793,7 @@ export class PresenceProxy {
         // Session was active at tier 1 but died before tier 3 — likely completed normally.
         // Use LLM to summarize what it did.
         try {
-          const completionSummary = await this.callLlm(
+          const { text: completionSummary, author } = await this.callLlm(
             `A Claude Code session was working on a task and has now exited. Based on the last terminal output, summarize what the session accomplished in 1-2 sentences. If it looks like it completed its work, say so. If it looks like it crashed or failed, note that.\n\nTerminal output:\n${state.tier1Snapshot.slice(-2000)}`,
             { model: this.config.tier1Model ?? 'fast', maxTokens: 200 },
             'low',
@@ -1555,7 +1807,7 @@ export class PresenceProxy {
           state.tier3FiredAt = Date.now();
           state.tier3Assessment = 'dead';
           state.tier3Summary = safeSummary;
-          await this.sendProxyMessage(topicId, msg, 3);
+          await this.sendProxyMessage(topicId, msg, 3, guard.safe ? author : deterministicAutomationAuthor());
           this.persistState(topicId, state);
           state.conversationHistory.push({ role: 'proxy', text: msg, timestamp: Date.now() });
           this.config.releaseTriageMutex?.(state.sessionName, 'presence-proxy');
@@ -1575,10 +1827,22 @@ export class PresenceProxy {
       // Active child processes = working
       assessment = 'working';
       summary = 'Active child processes detected.';
+    } else if (
+      snapshot
+      && looksActivelyWorking(snapshot, this.config.agentFramework)
+      && state.tier2SnapshotHash !== crypto.createHash('sha256').update(snapshot).digest('hex')
+    ) {
+      // An affirmative live framework signal is stronger than an interpretive
+      // model verdict. In-process Codex work has no child process to discover,
+      // so allowing tier 3 to override fresh terminal evidence created false
+      // "stuck" alarms. A frozen live-looking marker is not freshness proof;
+      // unchanged output still proceeds to the stall assessment below.
+      assessment = 'working';
+      summary = 'The session still shows an active-work signal.';
     } else {
-      // No active processes — use LLM to assess
+      // No active processes or deterministic live signal — use LLM to assess.
       try {
-        const llmResult = await this.callLlm(
+        const { text: llmResult, author } = await this.callLlm(
           this.buildTier3Prompt(state, snapshot, processes),
           { model: this.config.tier3Model ?? 'balanced', maxTokens: 1000 },
           'high',
@@ -1596,6 +1860,7 @@ export class PresenceProxy {
         // Extract summary (first line after classification or full text)
         const lines = llmResult.split('\n').filter(l => l.trim());
         summary = lines.find(l => !l.match(/^(working|waiting|stalled|dead)$/i)) || llmResult.slice(0, 200);
+        originAuthor = author;
       } catch {
         // LLM failed — fall back to the deterministic framework-aware signal
         // instead of blindly assuming "working". The old "default to active"
@@ -1621,19 +1886,25 @@ export class PresenceProxy {
     let message: string;
 
     if (assessment === 'stalled' || assessment === 'dead') {
-      const action = assessment === 'dead' ? 'The session appears to have stopped.' : `${this.config.agentName} appears to be stuck — ${summary}`;
-      message = `${this.prefix} 5-minute check — ${action}\n\nReply "unstick" to attempt recovery, or "restart" to start a fresh session.`;
+      if (assessment === 'dead') originAuthor = deterministicAutomationAuthor();
+      const action = assessment === 'dead'
+        ? (this.tier3Label(state) === '5-minute check'
+          ? 'The session appears to have stopped.'
+          : 'The session handling this conversation has stopped, and no new session has started for it.')
+        : `${this.config.agentName} appears to be stuck — ${summary}`;
+      message = `${this.prefix} ${this.tier3Label(state)} — ${action}\n\nReply "unstick" to attempt recovery, or "restart" to start a fresh session.`;
     } else {
       // Working or waiting
       const guard = guardProxyOutput(summary);
       const safeSummary = guard.safe ? summary : 'making progress on your request';
-      message = `${this.prefix} 5-minute check — ${this.config.agentName} is still actively working — ${safeSummary}. I'll keep watching.`;
+      if (!guard.safe) originAuthor = deterministicAutomationAuthor();
+      message = `${this.prefix} ${this.tier3Label(state)} — ${this.config.agentName} is still actively working — ${safeSummary}. I'll keep watching.`;
 
       // Schedule re-check
       this.scheduleTier(topicId, 3, this.tier3RecheckDelayMs);
     }
 
-    await this.sendProxyMessage(topicId, message, 3);
+    await this.sendProxyMessage(topicId, message, 3, originAuthor);
     this.persistState(topicId, state);
     state.conversationHistory.push({ role: 'proxy', text: message, timestamp: Date.now() });
 
@@ -1890,12 +2161,16 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
     options: IntelligenceOptions,
     priority: 'low' | 'high',
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<{ text: string; author: OriginAutomationAuthor }> {
+    // Usage diagnoses have their own exact-session evidence + one-notice path.
+    // Terminal text may quote a helper failure; the summarizer is not its owner.
+    prompt = `Usage-limit ownership: Do not diagnose a usage limit, quota exhaustion, or a wait for quota reset in this summary. Terminal errors may belong to a helper or be historical. Verified serving-session usage warnings are sent separately with provider evidence and deduplication. Describe other observed activity, or say the session has not replied yet when its state is unclear.\n\n${prompt}`;
     // Default attribution so every PresenceProxy LLM call is labeled in
     // /metrics/features (this is a high-frequency monitor); a caller that already
     // set attribution wins.
+    const authorCall = new OriginAuthorCall();
     const opts: IntelligenceOptions = {
-      ...options,
+      ...authorCall.options(options),
       attribution: options.attribution ?? { component: 'PresenceProxy' },
     };
     // Prefer the shared cross-monitor queue when wired (spec follow-up). Both
@@ -1905,7 +2180,7 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
     // daily spend cap across both monitors.
     if (this.config.sharedLlmQueue) {
       try {
-        return await this.config.sharedLlmQueue.enqueue(
+        const text = await this.config.sharedLlmQueue.enqueue(
           'interactive',
           async (signal) => {
             const result = await Promise.race([
@@ -1923,13 +2198,14 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
           // Rough cost estimate — tier messages are ~1-3k tokens.
           1,
         );
+        return { text, author: authorCall.snapshot() };
       } catch (err) {
         // Surface the cap-exceeded / aborted cases to the caller, same as the
         // legacy queue's behavior (caller decides whether to fallback).
         throw err;
       }
     }
-    return this.llmQueue.enqueue(async () => {
+    const text = await this.llmQueue.enqueue(async () => {
       const result = await Promise.race([
         this.config.intelligence.evaluate(prompt, opts),
         new Promise<never>((_, reject) =>
@@ -1938,9 +2214,10 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
       ]);
       return result;
     }, priority);
+    return { text, author: authorCall.snapshot() };
   }
 
-  private async sendProxyMessage(topicId: number, text: string, tier: number): Promise<void> {
+  private async sendProxyMessage(topicId: number, text: string, tier: number, originAuthor = deterministicAutomationAuthor(), usageLimitSession?: string): Promise<void> {
     // WS3 one-voice election: only this topic's owner machine speaks the 🔭
     // voice. Single chokepoint for every tier emission. Silent/defer verdicts
     // simply skip this send — the proxy's own cadence re-evaluates later, and
@@ -1951,6 +2228,50 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
         console.log(`[PresenceProxy] one-voice gate: not this machine's topic (${verdict.reason}) — skipping tier ${tier} send for topic ${topicId}`);
         return;
       }
+    }
+    // ── Duplicate-session stand-down (docs/specs/duplicate-session-standdown.md) ──
+    // AFTER the one-voice election, deliberately: a machine that is not this
+    // topic's speaker sends nothing at all — including the honest line.
+    // This copy is standing down, so its "actively working" / classification
+    // lines are false: the topic is being served on another machine and this
+    // session is deliberately frozen. Two things follow, and the second is the
+    // one that matters. (1) The honest one-liner replaces the classification —
+    // at most once per episode, on the same per-episode notice budget. (2) Every
+    // OTHER tier emission is skipped entirely rather than attempted: this proxy
+    // sends through POST /telegram/reply, which 409s a muzzled topic, and its
+    // error handling would otherwise loop on that refusal. The 409 stays as the
+    // backstop; it is no longer the mechanism.
+    const standDown = (() => {
+      try { return this.config.standDown?.entryForTopic(topicId) ?? null; } catch { return null; /* @silent-fallback-ok — lookup failed ⇒ proxy behaves exactly as today */ }
+    })();
+    if (standDown?.enforcing) {
+      // Sent on the DETERMINISTIC path, not this proxy's normal funnel. The
+      // normal funnel is POST /telegram/reply/:topicId — the exact route whose
+      // voice half 409s this topic — so routing the honest line through it burned
+      // the per-episode budget, threw, and left the user with nothing at all for
+      // that episode. The internal deterministic senders (reap-notify, the
+      // cold-start fallback, the owner-dark ladder) are exempt by construction
+      // for precisely this reason; this line belongs with them.
+      //
+      // The budget is claimed only AFTER a confirmed send, so a failed delivery
+      // does not consume the one chance to explain the silence.
+      const line = `${this.prefix} This copy is standing down — the conversation continues on my other machine, and I'll answer from there.`;
+      try {
+        // CONSULT the budget before sending, commit it only on success. The
+        // round-4 version sent first and claimed after — but never READ the
+        // budget, so the line went out again on every tier emission ("at most
+        // once per episode" was the comment over a loop), and the deterministic
+        // path bypasses the /telegram/reply duplicate suppression that would
+        // otherwise have absorbed the repeats.
+        if (this.config.standDown?.hasProxyNotice?.(topicId)) return;
+        const sent = await this.config.standDown?.sendDeterministic?.(topicId, line, this.states.get(topicId)?.inboundMessageId);
+        if (sent) this.config.standDown?.claimProxyNotice(topicId);
+      } catch {
+        /* @silent-fallback-ok — the honest line is courtesy; failing to send it must
+           never surface as an error on a deliberately-quiesced copy. The budget is
+           untouched, so a later tick can try again. */
+      }
+      return;
     }
     // Spec A10: acquire shared per-topic proxy mutex if one is wired.
     // PromiseBeacon consumes the same coordinator; the acquire here guarantees
@@ -1963,13 +2284,42 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
         return;
       }
     }
+    // Durable semantic claim, independent of tier copy/prefix or inbound
+    // message. Claim synchronously BEFORE the transport await (overlap-safe).
+    const noticePath = this.usageLimitNoticePath(topicId);
+    let confirmation: boolean | string | null | undefined = null;
+    try { confirmation = usageLimitSession ? this.config.confirmSessionUsageLimit?.(usageLimitSession) : null; }
+    catch { /* @silent-fallback-ok — unreadable corroboration never authorizes a claim */ }
+    const noticeIdentity = typeof confirmation === 'string' ? confirmation : usageLimitSession;
+    if (usageLimitSession && (!confirmation || this.config.getSessionForTopic(topicId) !== usageLimitSession)) {
+      if (heldMutex) this.config.releaseProxyMutex?.(topicId, 'presence-proxy');
+      return;
+    }
+    if (usageLimitSession) {
+      try {
+        fs.mkdirSync(path.dirname(noticePath), { recursive: true });
+        if (fs.existsSync(noticePath) && JSON.parse(fs.readFileSync(noticePath, 'utf8')).sessionName === noticeIdentity) {
+          if (heldMutex) this.config.releaseProxyMutex?.(topicId, 'presence-proxy');
+          return;
+        }
+        fs.writeFileSync(noticePath, JSON.stringify({ sessionName: noticeIdentity }));
+      } catch (err) {
+        console.error('[PresenceProxy] Cannot reserve usage-limit notice:', (err as Error).message);
+        if (heldMutex) this.config.releaseProxyMutex?.(topicId, 'presence-proxy');
+        return; // Unknown budget must not send a duplicate.
+      }
+    }
     try {
       await this.config.sendMessage(topicId, text, {
         source: 'presence-proxy',
+        inboundMessageId: this.states.get(topicId)?.inboundMessageId,
         tier,
         isProxy: true,
+        originAuthor,
       });
     } catch (err) {
+      // A rejected transport promise may mean acceptance followed by a lost
+      // acknowledgement. Keep the claim: this courtesy notice is at-most-once.
       console.error(`[PresenceProxy] Failed to send message to topic ${topicId}:`, (err as Error).message);
     } finally {
       if (heldMutex && this.config.releaseProxyMutex) {
@@ -2014,7 +2364,14 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
     }
   }
 
-  private cleanupState(topicId: number): void {
+  private usageLimitNoticePath(topicId: number): string {
+    // `<topic>.` convention files ride the existing WorkingSetManifest carrier
+    // during topic transfer, so the new owner inherits the episode budget.
+    return path.join(this.config.stateDir, 'autonomous', `${topicId}.usage-limit-notice.json`);
+  }
+
+  private cleanupState(topicId: number, expectedState: PresenceState): void {
+    if (this.states.get(topicId) !== expectedState) return;
     this.clearTimersForTopic(topicId);
     this.states.delete(topicId);
     // Remove persisted state file
@@ -2023,6 +2380,7 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
   }
 
   private persistState(topicId: number, state: PresenceState): void {
+    if (this.states.get(topicId) !== state) return;
     const filePath = path.join(this.stateDir, `${topicId}.json`);
     try {
       // Don't persist snapshot content to disk (too large, contains sensitive data)
@@ -2031,6 +2389,7 @@ IMPORTANT BIAS: Default to "working" or "waiting" unless there is STRONG evidenc
         sessionName: state.sessionName,
         userMessageAt: state.userMessageAt,
         userMessageText: state.userMessageText,
+        inboundMessageId: state.inboundMessageId,
         tier1FiredAt: state.tier1FiredAt,
         tier1SnapshotHash: state.tier1SnapshotHash,
         tier2FiredAt: state.tier2FiredAt,

@@ -25,6 +25,7 @@ import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
 import { SafeFsExecutor } from './SafeFsExecutor.js';
 import { SafeGitExecutor } from './SafeGitExecutor.js';
+import { isInstarSourceTree } from './SourceTreeGuard.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -734,7 +735,33 @@ export class WorktreeManager extends EventEmitter {
           break;
         }
       }
-      if (!evicted) throw new Error(`Max active bindings (${MAX_ACTIVE_BINDINGS}) reached`);
+      // Nothing ever marks a binding merged or abandoned, so at the cap every
+      // record is still 'active' and the check above evicts nothing: once 30
+      // topics had a workspace, no new topic could get one. Evict the oldest
+      // binding that no session currently holds a live lock on. Only the
+      // record goes: the worktree stays on disk, and a later resolve for that
+      // topic adopts the existing path (see "Adopt existing" below).
+      if (!evicted) {
+        const idle = [...this.bindings.entries()]
+          .filter(([, b]) => {
+            const lock = this.locks.get(b.worktreePath);
+            return !lock || !this.isLockLive(lock);
+          })
+          .sort(([, a], [, b]) => a.createdAt.localeCompare(b.createdAt));
+        if (idle.length > 0) {
+          const [k, b] = idle[0]!;
+          this.bindings.delete(k);
+          evicted = true;
+          this.appendHistoryEvent({
+            kind: 'binding-evicted-idle',
+            topicId: b.topicId,
+            mode: b.mode,
+            branch: b.branch,
+            worktreePath: b.worktreePath,
+          });
+        }
+      }
+      if (!evicted) throw new Error(`Max active bindings (${MAX_ACTIVE_BINDINGS}) reached, all held by live sessions`);
     }
 
     const branch = args.mode === 'platform'
@@ -755,10 +782,19 @@ export class WorktreeManager extends EventEmitter {
     if (fs.existsSync(worktreePath)) {
       // Adopt existing if .git is valid
       try {
-        SafeGitExecutor.readSync(['-C', worktreePath, 'rev-parse', 'HEAD'], { stdio: 'pipe', timeout: 3000, operation: 'src/core/WorktreeManager.ts:759' });
+        SafeGitExecutor.readSync(['-C', worktreePath, 'rev-parse', 'HEAD'], { stdio: 'pipe', timeout: 3000, operation: 'src/core/WorktreeManager.ts:759', sourceTreeWorktreeManagerOk: true });
       } catch {
         throw new Error(`Worktree path ${worktreePath} exists but is not a valid git worktree`);
       }
+    } else if (isInstarSourceTree(this.opts.projectDir)) {
+      // The project is itself an instar source checkout (e.g. the instar-dev
+      // agent's home). SourceTreeGuard refuses `git branch` and the clone path's
+      // writes against it, which made every topic-bound spawn fail. Create the
+      // branch and worktree in ONE `git worktree add`, the shape the guard's
+      // narrow worktree-manager carve-out admits, and base a new branch on
+      // origin/main: the checkout's own HEAD may be any local branch.
+      this.addInstarSourceWorktree(worktreePath, branch);
+      await this.fastCopyDeps(worktreePath);
     } else if (this.shouldCloneInsteadOfWorktree()) {
       // Clone-default for cross-project worktrees: when the source repo lives
       // outside agent home, `git worktree add` leaves per-worktree metadata
@@ -813,6 +849,13 @@ export class WorktreeManager extends EventEmitter {
       await this.fastCopyDeps(worktreePath);
     }
 
+    // Seed the repo's git-hooks shim into the fresh worktree/clone so the
+    // commit/push gates are LIVE from the first commit — see seedGitHooks.
+    // Without this a fresh checkout silently runs NO hook (the git-ignored
+    // husky `.husky/_` shim is absent), and the instar-dev pre-commit/pre-push
+    // enforcement is bypassed until an install regenerates it.
+    this.seedGitHooks(worktreePath);
+
     const fencingToken = this.nextFencingToken();
     const now = new Date().toISOString();
     const binding = this.signBinding({
@@ -838,6 +881,32 @@ export class WorktreeManager extends EventEmitter {
     });
     this.emit('binding:created', binding);
     return binding;
+  }
+
+  /**
+   * `git worktree add` for an instar source checkout, under the
+   * `sourceTreeWorktreeManagerOk` carve-out (worktree add only — no `branch`,
+   * no clone writes). Reuses the branch when it exists; otherwise creates it
+   * from origin/main, falling back to HEAD when there is no origin/main.
+   */
+  private addInstarSourceWorktree(worktreePath: string, branch: string): void {
+    const refExists = (ref: string): boolean => {
+      try {
+        SafeGitExecutor.readSync(['-C', this.opts.projectDir, 'rev-parse', '--verify', '--quiet', ref], { stdio: 'pipe', timeout: 3000, operation: 'src/core/WorktreeManager.ts:source-tree-ref-check', sourceTreeWorktreeManagerOk: true });
+        return true;
+      } catch {
+        // @silent-fallback-ok: expected path — rev-parse --verify exits non-zero when the ref is absent
+        return false;
+      }
+    };
+    const args = refExists(`refs/heads/${branch}`)
+      ? ['worktree', 'add', worktreePath, branch]
+      : ['worktree', 'add', '-b', branch, worktreePath, refExists('refs/remotes/origin/main') ? 'origin/main' : 'HEAD'];
+    SafeGitExecutor.execSync(['-C', this.opts.projectDir, ...args], {
+      timeout: 30_000,
+      operation: 'src/core/WorktreeManager.ts:source-tree-worktree-add',
+      sourceTreeWorktreeManagerOk: true,
+    });
   }
 
   /**
@@ -890,6 +959,109 @@ export class WorktreeManager extends EventEmitter {
       }
     } catch (err) {
       this.emit('warn', `node_modules copy failed (${(err as Error).message}); will need fresh install`);
+    }
+  }
+
+  /**
+   * Seed the repo's git-hooks shim into a freshly-created worktree/clone so
+   * that commit/push gates run from the FIRST commit.
+   *
+   * Husky (v9) sets `core.hooksPath = .husky/_`, but `.husky/_` is git-ignored,
+   * generated content the `prepare` script writes on `npm install`. A fresh
+   * `git worktree add` inherits that hooksPath (shared `.git/config`) yet lacks
+   * the `.husky/_` directory; a fresh `git clone` gets a default config with NO
+   * hooksPath at all AND lacks the directory. Either way git resolves the
+   * hooksPath to a missing dir and silently runs NO hook (no error) — so the
+   * instar-dev pre-commit/pre-push enforcement is bypassed until an install
+   * regenerates the shim. This copies the shim from the source repo (and, on
+   * the clone path, replicates the hooksPath config) so the gate is live.
+   *
+   * Generic (never names husky), best-effort (warn, never throw — must never
+   * block worktree creation), and a no-op when: no hooksPath is configured in
+   * the worktree OR the source, the hooksPath is absolute (shared / user-owned —
+   * nothing worktree-local to seed), the shim already exists in the worktree, or
+   * the source repo has no shim to copy. Both resolved paths are containment-
+   * checked, so a hooksPath escaping the worktree/source root is refused.
+   */
+  private seedGitHooks(worktreePath: string): void {
+    try {
+      const readHooksPath = (dir: string): string => {
+        try {
+          return SafeGitExecutor.readSync(
+            ['-C', dir, 'config', '--get', 'core.hooksPath'],
+            // Read-only `config --get` (inside the worktree-manager carve-out) so an
+            // instar source checkout and its worktrees still get their hooks.
+            { stdio: 'pipe', timeout: 3000, operation: 'src/core/WorktreeManager.ts:seedGitHooks-read', sourceTreeWorktreeManagerOk: true },
+          ).trim();
+        } catch {
+          // @silent-fallback-ok: expected path — `git config --get` exits non-zero when the key is unset
+          return ''; // unset (git exits non-zero) or unreadable — treat as no hooks configured
+        }
+      };
+
+      // A `git worktree add` inherits the source hooksPath via the shared
+      // `.git/config`; a fresh `git clone` does not, so fall back to the
+      // source's hooksPath and replicate it onto the clone.
+      let hooksPath = readHooksPath(worktreePath);
+      let needsConfigSet = false;
+      if (!hooksPath) {
+        hooksPath = readHooksPath(this.opts.projectDir);
+        if (!hooksPath) return; // no git hooks configured anywhere — nothing to seed
+        needsConfigSet = true;
+      }
+      if (path.isAbsolute(hooksPath)) return; // absolute hooksPath resolves identically everywhere
+
+      const destDir = path.resolve(worktreePath, hooksPath);
+      const srcDir = path.resolve(this.opts.projectDir, hooksPath);
+      const wtRoot = path.resolve(worktreePath) + path.sep;
+      const projRoot = path.resolve(this.opts.projectDir) + path.sep;
+      if (!destDir.startsWith(wtRoot)) return; // hooksPath escapes the worktree — refuse
+      if (!srcDir.startsWith(projRoot)) return; // hooksPath escapes the source — refuse
+
+      // Symlink-safe containment: `path.resolve` is lexical and does NOT follow
+      // symlinks, so a tracked symlink on the path (e.g. `.husky` → elsewhere)
+      // could redirect the copy outside the root. Resolve the real path of the
+      // nearest existing ancestor of each side and require it stays within the
+      // worktree/source real root.
+      const realContained = (candidate: string, rootReal: string): boolean => {
+        let probe = candidate;
+        while (!fs.existsSync(probe) && path.dirname(probe) !== probe) probe = path.dirname(probe);
+        try {
+          const r = fs.realpathSync(probe);
+          return r === rootReal || r.startsWith(rootReal + path.sep);
+        } catch {
+          // @silent-fallback-ok: fail-closed — an unresolvable real path REFUSES the copy, never permits it
+          return false;
+        }
+      };
+      let wtReal: string;
+      let projReal: string;
+      try {
+        wtReal = fs.realpathSync(worktreePath);
+        projReal = fs.realpathSync(this.opts.projectDir);
+      } catch {
+        // @silent-fallback-ok: fail-closed — unresolvable roots refuse the seed rather than risk an escape
+        return; // roots unresolvable — refuse rather than risk an escape
+      }
+      if (!realContained(destDir, wtReal)) return; // symlinked dest escape — refuse
+      if (fs.existsSync(srcDir) && !realContained(srcDir, projReal)) return; // symlinked source escape — refuse
+
+      if (!fs.existsSync(destDir)) {
+        if (!fs.existsSync(srcDir)) {
+          this.emit('warn', `git-hooks shim not seeded: source '${hooksPath}' absent in projectDir; commit/push gates inactive in the new worktree until an install regenerates them`);
+          return;
+        }
+        fs.mkdirSync(path.dirname(destDir), { recursive: true });
+        fs.cpSync(srcDir, destDir, { recursive: true });
+      }
+      if (needsConfigSet) {
+        SafeGitExecutor.execSync(
+          ['-C', worktreePath, 'config', 'core.hooksPath', hooksPath],
+          { timeout: 3000, operation: 'src/core/WorktreeManager.ts:seedGitHooks-set' },
+        );
+      }
+    } catch (err) {
+      this.emit('warn', `git-hooks shim seed failed (${(err as Error).message}); commit/push gates may be inactive in the new worktree`);
     }
   }
 

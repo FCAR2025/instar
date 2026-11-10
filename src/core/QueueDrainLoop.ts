@@ -32,6 +32,7 @@ import type {
   EnqueueOutcome,
 } from './PendingInboundStore.js';
 import { sanitizeError } from './PendingInboundStore.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
 import type { InboundQueueConfig, HoldForStabilityConfig } from './inboundQueueConfig.js';
 
 // ── Dispatch seam contract (§3.1/§3.4) ────────────────────────────────
@@ -89,6 +90,9 @@ export interface LossItem {
 
 export interface QueueDrainLoopDeps {
   store: PendingInboundStore;
+  /** Non-authoritative store used only while qcfg.dryRun is true. It shares
+   * the production schema/durability settings but is never drained. */
+  shadowStore?: PendingInboundStore;
   qcfg: InboundQueueConfig;
   hcfg: HoldForStabilityConfig;
   selfMachineId: string;
@@ -100,8 +104,15 @@ export interface QueueDrainLoopDeps {
   /** The §3.1 dispatch seam (via:'drain'). Bounded by dispatchDeadlineMs here. */
   dispatchInbound(msg: DrainMessage, handover: DrainHandover): Promise<DrainDispatchResult>;
   /** maxAttempts escape hatch — ONE forced re-place bypassing hold/deliver
-   *  verdicts (§3.3). Resolves true when the re-place succeeded. */
-  forceReplace(msg: DrainMessage): Promise<boolean>;
+   *  verdicts (§3.3). Resolves true when the re-place succeeded, false on a
+   *  non-terminal failure (→ attempts-exhausted), or the DISTINCT `'rejected'`
+   *  verdict when the re-place hit a first-class sender refusal (silent-loss-
+   *  refusal-conservation §2.A — mapped to the SAME sender-deauthorized terminal
+   *  + unified notice, NOT mislabeled attempts-exhausted). `'local'` means
+   *  the re-place put the session on THIS machine: the router only decided,
+   *  nothing has delivered the message yet, so the drain runs ONE local
+   *  dispatch under the held claim (a failure there is terminal). */
+  forceReplace(msg: DrainMessage): Promise<boolean | 'rejected' | 'local'>;
   /** §4 hold verdict — required; the server injects always-'failover' when the
    *  policy is off (§4.2). Pure in-memory (breaker + capacity registry). */
   holdVerdict(sessionKey: string): HoldVerdict;
@@ -144,6 +155,11 @@ export class QueueDrainLoop {
   private heldSeqs = new Set<number>();
   /** Refusal negative cache keyed on the canonical id (§1). */
   private refusalCache = new Map<string, number>();
+  private evidenceAt = -Infinity;
+  private evidenceDelivered = 0;
+  private evidenceFailed = 0;
+  private evidenceUnroutable = 0;
+  private evidenceHeld = 0;
   /** Single-flight + rerun (§3.2). */
   private passInFlight = false;
   private rerunRequested: string | null = null;
@@ -156,11 +172,15 @@ export class QueueDrainLoop {
   private tickCount = 0;
   /** Current tenure id — refreshed by observeLeaseClaim at lease acquisition. */
   private tenure: string | null = null;
+  private tenureStartedAt: string | null = null;
+  private shadowAttempt = 0;
 
   constructor(deps: QueueDrainLoopDeps) {
     this.d = deps;
     this.rebuildCaches();
     this.tenure = deps.store.currentTenure(deps.selfMachineId);
+    this.tenureStartedAt = deps.store.currentTenureStartedAt();
+    this.recoverDryRunShadowCustody();
   }
 
   // ── Boot-rebuilt caches ─────────────────────────────────────────────
@@ -187,7 +207,12 @@ export class QueueDrainLoop {
   /** Call at every lease ACQUISITION (not renewal) with the ref-tip holder
    *  observed at claim time. */
   onLeaseAcquired(tipHolderAtClaim: string | null): void {
-    this.tenure = this.d.store.observeLeaseClaim(this.d.selfMachineId, tipHolderAtClaim);
+    this.tenure = this.d.store.observeLeaseClaim(
+      this.d.selfMachineId,
+      tipHolderAtClaim,
+      new Date(this.d.now()).toISOString(),
+    );
+    this.tenureStartedAt = this.d.store.currentTenureStartedAt();
   }
 
   currentTenure(): string | null {
@@ -217,6 +242,7 @@ export class QueueDrainLoop {
       try {
         this.d.store.incrementCounter('wouldEnqueue');
         if (this.d.holdVerdict(msg.sessionKey) === 'hold') this.d.store.incrementCounter('wouldHold');
+        this.exerciseDryRunShadowCustody(msg, reason);
       } catch {
         try { this.d.store.incrementCounter('dryRunErrors'); } catch { /* counted best-effort */ }
       }
@@ -228,7 +254,7 @@ export class QueueDrainLoop {
     if (this.d.handoffInProgress?.()) return { result: 'refused', reason: 'handoff-in-progress' };
 
     // Refusal negative cache (§1) — canonical-id keyed.
-    const cacheKey = `${msg.sessionKey} ${msg.messageId}`;
+    const cacheKey = `${msg.sessionKey}\u0000${msg.messageId}`;
     const cachedUntil = this.refusalCache.get(cacheKey);
     const nowMs = this.d.now();
     if (cachedUntil !== undefined && cachedUntil > nowMs) {
@@ -286,6 +312,7 @@ export class QueueDrainLoop {
         // A refusal for a session WITH queued entries is ordering-affecting (§1).
         if (this.hasQueued(msg.sessionKey)) {
           this.d.store.incrementCounter('orderingViolations');
+          featureEvidence.recordAtMostEvery('multiMachine.sessionPool.inboundQueue', 'ordering-violation', 60 * 60_000, { kind: 'error', reason: 'ordering violation: refused a message for a session with queued entries', context: { refusal: out.reason ?? null } });
         }
         this.d.store.incrementCounter('wouldRefuse');
       }
@@ -294,6 +321,124 @@ export class QueueDrainLoop {
       this.d.log(`[inbound-queue] post-enqueue bookkeeping failed (outcome unchanged): ${sanitizeError(err)}`);
     }
     return out;
+  }
+
+  /**
+   * Exercise the real custody transaction in a non-authoritative store, then
+   * read the committed row back before scrubbing it. The live queue remains
+   * empty and the caller still falls through exactly as dry-run requires.
+   */
+  private exerciseDryRunShadowCustody(
+    msg: {
+      sessionKey: string;
+      messageId: string;
+      payload: string;
+      senderEnvelope?: SenderEnvelope | null;
+      topicMetadata?: unknown;
+    },
+    reason: string,
+  ): void {
+    const shadow = this.d.shadowStore;
+    const nowMs = this.d.now();
+    const nowIso = new Date(nowMs).toISOString();
+    if (!shadow) {
+      this.d.store.recordDryRunShadowCustodyResult('error', nowIso);
+      this.d.store.incrementCounter('dryRunErrors');
+      return;
+    }
+
+    let seq: number | null = null;
+    try {
+      const shadowMessageId = `${msg.messageId}:dry-run-shadow:${this.d.bootSessionId}:${++this.shadowAttempt}`;
+      const out = shadow.enqueue(
+        {
+          sessionKey: msg.sessionKey,
+          messageId: shadowMessageId,
+          payload: msg.payload,
+          senderEnvelope: msg.senderEnvelope ?? null,
+          topicMetadata: msg.topicMetadata,
+          reason: `dry-run-shadow:${reason}`,
+          tenure: this.tenure,
+          nowIso,
+          monoMs: this.d.mono(),
+          bootSessionId: this.d.bootSessionId,
+          frozenAtEnqueue: false,
+        },
+        {
+          maxPerSession: this.d.qcfg.maxPerSession,
+          maxTotal: this.d.qcfg.maxTotal,
+          hardMaxTotal: this.d.qcfg.hardMaxTotal,
+          maxPayloadBytes: this.d.qcfg.maxPayloadBytes,
+        },
+      );
+      if (out.result === 'refused') {
+        this.d.store.incrementCounter('wouldRefuse');
+        this.d.store.recordDryRunShadowCustodyResult('refused', nowIso);
+        return;
+      }
+      if (out.result !== 'queued') {
+        throw new Error(`unexpected shadow enqueue result: ${out.result}`);
+      }
+      seq = out.seq;
+      const row = shadow.getRow(seq);
+      const persisted = row
+        && row.state === 'queued'
+        && row.session_key === msg.sessionKey
+        && row.message_id === shadowMessageId
+        && row.payload === msg.payload
+        && row.payload_bytes === Buffer.byteLength(msg.payload, 'utf-8');
+      if (!persisted) throw new Error('shadow custody row did not read back exactly');
+
+      // Record proof BEFORE cleanup. A crash in the gap leaves the shadow row
+      // for constructor recovery, rather than erasing the only evidence.
+      this.d.store.recordDryRunShadowCustodyResult('verified', nowIso);
+      featureEvidence.recordAtMostEvery('multiMachine.sessionPool.inboundQueue', 'shadow-verified', 60 * 60_000, { kind: 'fired', reason: 'dry-run: shadow custody round trip verified', context: { dryRun: true } });
+      if (!shadow.transition(seq, 'queued', 'delivered', { nowIso, terminalReason: 'dry-run-shadow-verified' })) {
+        throw new Error('shadow custody cleanup transition lost its row');
+      }
+      shadow.pruneShadowTerminal(new Date(nowMs + 1).toISOString());
+    } catch (err) {
+      this.d.store.recordDryRunShadowCustodyResult('error', nowIso);
+      this.d.store.incrementCounter('dryRunErrors');
+      this.d.log(`[inbound-queue] dry-run shadow custody failed: ${sanitizeError(err)}`);
+      featureEvidence.recordAtMostEvery('multiMachine.sessionPool.inboundQueue', 'shadow-error', 60 * 60_000, { kind: 'error', reason: 'dry-run: shadow custody failed', context: { dryRun: true } });
+      if (seq !== null) {
+        try {
+          const row = shadow.getRow(seq);
+          if (row && (row.state === 'queued' || row.state === 'claimed')) {
+            shadow.transition(seq, row.state, 'expired', { nowIso, terminalReason: 'dry-run-shadow-error' });
+          }
+          shadow.pruneShadowTerminal(new Date(nowMs + 1).toISOString());
+        } catch { /* @silent-fallback-ok — the isolated shadow row is recovered and scrubbed on the next boot */ }
+      }
+    }
+  }
+
+  /** A crash between shadow commit and cleanup is itself strong persistence
+   * evidence. Count it, scrub content, and never dispatch the shadow row. */
+  private recoverDryRunShadowCustody(): void {
+    if (!this.d.qcfg.dryRun || !this.d.shadowStore) return;
+    const shadow = this.d.shadowStore;
+    const nowMs = this.d.now();
+    const nowIso = new Date(nowMs).toISOString();
+    try {
+      for (const row of shadow.listNonTerminal()) {
+        const survived = row.payload !== null && Buffer.byteLength(row.payload, 'utf-8') === row.payload_bytes;
+        this.d.store.recordDryRunShadowCustodyResult(survived ? 'recovered-after-restart' : 'error', nowIso);
+        if (!survived) this.d.store.incrementCounter('dryRunErrors');
+        shadow.transition(row.enqueue_seq, row.state, 'expired', {
+          nowIso,
+          terminalReason: survived ? 'dry-run-shadow-recovered' : 'dry-run-shadow-recovery-invalid',
+        });
+      }
+      shadow.pruneShadowTerminal(new Date(nowMs + 1).toISOString());
+    } catch (err) {
+      try {
+        this.d.store.recordDryRunShadowCustodyResult('error', nowIso);
+        this.d.store.incrementCounter('dryRunErrors');
+      } catch { /* @silent-fallback-ok — the primary evidence store is also unavailable; dry-run remains fail-open */ }
+      this.d.log(`[inbound-queue] dry-run shadow recovery failed: ${sanitizeError(err)}`);
+    }
   }
 
   private pruneRefusalCache(nowMs: number): void {
@@ -425,7 +570,10 @@ export class QueueDrainLoop {
         expired.push(this.lossItem(row, 'ttl-expired'));
       }
     }
-    if (expired.length > 0) this.d.reportLoss(expired, 'ttl-expired');
+    if (expired.length > 0) {
+      this.d.reportLoss(expired, 'ttl-expired');
+      featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'error', reason: 'queued messages expired: ttl', context: { terminalReason: 'ttl-expired', count: expired.length, entryTtlMs: q.entryTtlMs } });
+    }
   }
 
   // ── Hold recheck (§3.2/§4.3) ────────────────────────────────────────
@@ -466,6 +614,7 @@ export class QueueDrainLoop {
         // is imprecise for restart-recovered owners, round-7 — the bound is
         // drainConcurrency + the peer's spawn-in-progress backpressure).
         this.d.store.incrementCounter(verdict === 'failover' ? 'holdsReleasedToFailover:flap-forced' : 'holdsRecoveredInPlace');
+        featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'held', reason: verdict === 'failover' ? 'hold released to failover: flap forced' : 'hold recovered in place', context: { verdict, seq, trigger: 'recheck' } });
       }
       this.heldSeqs.delete(seq);
       this.d.store.resetNextAttempt(row.session_key);
@@ -492,6 +641,7 @@ export class QueueDrainLoop {
       if (this.d.holdVerdict(row.session_key) !== 'hold') {
         this.heldSeqs.delete(seq);
         this.d.store.incrementCounter('holdsRecoveredInPlace');
+        featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'held', reason: 'hold recovered in place', context: { seq, trigger: 'breaker-close' } });
         this.d.store.resetNextAttempt(row.session_key);
       }
     }
@@ -582,6 +732,7 @@ export class QueueDrainLoop {
         }
         if (summary.deadlineHit) break;
       }
+      this.recordDrainEvidence(summary);
       return summary;
     } finally {
       // Abnormal pass releases the single-flight guard (§3.3).
@@ -624,6 +775,7 @@ export class QueueDrainLoop {
           this.mirrorRemove(row.session_key);
           summary.staleCustodyExpired += 1;
           this.d.reportLoss([this.lossItem(row, 'stale-custody')], 'stale-custody');
+          featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'error', reason: 'queued message expired: stale custody', context: { terminalReason: crossTenure ? 'stale-custody-tenure' : 'stale-custody-reboot', seq: row.enqueue_seq, ageMs: age } });
         }
         return;
       }
@@ -640,6 +792,7 @@ export class QueueDrainLoop {
       if (this.d.store.transition(row.enqueue_seq, 'queued', 'expired', { nowIso, terminalReason: 'poisoned', lastError: sanitizeError(err) })) {
         this.mirrorRemove(row.session_key);
         this.d.reportLoss([this.lossItem(row, 'poisoned')], 'poisoned');
+        featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'error', reason: 'queued message dropped: unreadable row', context: { terminalReason: 'poisoned', seq: row.enqueue_seq } });
       }
       return;
     }
@@ -649,18 +802,28 @@ export class QueueDrainLoop {
       const claimed = this.d.store.claim(row.enqueue_seq, nowIso);
       if (!claimed) return;
       this.d.store.incrementCounter('holdBypassedByAttemptsCap');
-      let ok = false;
+      let res: boolean | 'rejected' | 'local' = false;
       try {
-        ok = await this.d.forceReplace(this.toMsg(row, senderEnvelope, topicMetadata));
-      } catch { ok = false; }
-      if (ok) {
+        res = await this.d.forceReplace(this.toMsg(row, senderEnvelope, topicMetadata));
+      } catch { res = false; }
+      if (res === 'local') {
+        // Counting this `delivered` would drop the message: the router's
+        // local verdict is only a decision (2026-11-01 second-pass finding).
+        summary.dispatched += 1;
+        await this.dispatchClaimed(row, claimed, senderEnvelope, topicMetadata, summary, true);
+      } else if (res === true) {
         this.d.store.transition(row.enqueue_seq, 'claimed', 'delivered', { nowIso: new Date(this.d.now()).toISOString() });
         this.mirrorRemove(row.session_key);
         summary.delivered += 1;
-      } else {
-        this.d.store.transition(row.enqueue_seq, 'claimed', 'expired', { nowIso: new Date(this.d.now()).toISOString(), terminalReason: 'attempts-exhausted' });
+      } else if (res === 'rejected') {
+        // §2.A — the forced re-place hit a first-class sender refusal. Terminal
+        // the SAME way as the direct 'sender-rejected' dispatch result (below):
+        // sender-deauthorized + the unified §2.C loss notice, NOT attempts-exhausted.
+        this.d.store.transition(row.enqueue_seq, 'claimed', 'expired', { nowIso: new Date(this.d.now()).toISOString(), terminalReason: 'sender-deauthorized' });
         this.mirrorRemove(row.session_key);
-        this.d.reportLoss([this.lossItem(row, 'attempts-exhausted')], 'attempts-exhausted');
+        this.d.reportLoss([this.lossItem(row, 'sender-deauthorized')], 'sender-deauthorized');
+      } else {
+        this.expireAttemptsExhausted(row, new Date(this.d.now()).toISOString());
       }
       return;
     }
@@ -669,7 +832,21 @@ export class QueueDrainLoop {
     const claimed = this.d.store.claim(row.enqueue_seq, nowIso);
     if (!claimed) return;
     summary.dispatched += 1;
+    await this.dispatchClaimed(row, claimed, senderEnvelope, topicMetadata, summary, false);
+  }
 
+  /** Dispatch a claimed row and settle it. `final` (the forced re-place's one
+   *  local attempt): a retryable failure terminals attempts-exhausted instead
+   *  of releasing, so the escape hatch stays bounded. */
+  private async dispatchClaimed(
+    row: PendingInboundRow,
+    claimed: { attempts: number },
+    senderEnvelope: SenderEnvelope | null,
+    topicMetadata: unknown,
+    summary: DrainPassSummary,
+    final: boolean,
+  ): Promise<void> {
+    const q = this.d.qcfg;
     // The §3.4 handover contract, bound to THIS row.
     const handover: DrainHandover = {
       commitReceipt: () => this.d.store.writeReceiptIfClaimed(row.enqueue_seq, row.session_key, row.message_id, new Date(this.d.now()).toISOString()),
@@ -733,12 +910,14 @@ export class QueueDrainLoop {
         // attempts++ (§3.1 round-3: without the increment, maxAttempts was
         // unreachable from this class).
         summary.unroutable += 1;
-        this.releaseWithBackoff(row, claimed.attempts + 1, `un-routable: ${result.reason}`, settleIso);
+        if (final) this.expireAttemptsExhausted(row, settleIso);
+        else this.releaseWithBackoff(row, claimed.attempts + 1, `un-routable: ${result.reason}`, settleIso);
         break;
       }
       case 'failed': {
         summary.failed += 1;
-        this.releaseWithBackoff(row, claimed.attempts + 1, sanitizeError(result.error) ?? 'dispatch-failed', settleIso);
+        if (final) this.expireAttemptsExhausted(row, settleIso);
+        else this.releaseWithBackoff(row, claimed.attempts + 1, sanitizeError(result.error) ?? 'dispatch-failed', settleIso);
         break;
       }
     }
@@ -753,6 +932,31 @@ export class QueueDrainLoop {
       topicMetadata,
       enqueueSeq: row.enqueue_seq,
     };
+  }
+
+  /** Deliveries as a bounded summary, not one row per message: at most one row per 15 minutes. */
+  private recordDrainEvidence(summary: DrainPassSummary): void {
+    this.evidenceDelivered += summary.delivered;
+    this.evidenceFailed += summary.failed;
+    this.evidenceUnroutable += summary.unroutable;
+    this.evidenceHeld += summary.skippedHeld;
+    if (this.evidenceDelivered + this.evidenceFailed + this.evidenceUnroutable + this.evidenceHeld === 0) return;
+    const now = this.d.now();
+    if (now - this.evidenceAt < 15 * 60_000) return;
+    this.evidenceAt = now;
+    featureEvidence.record('multiMachine.sessionPool.inboundQueue', {
+      kind: this.evidenceDelivered > 0 ? 'fired' : 'held',
+      reason: 'drain summary',
+      context: { delivered: this.evidenceDelivered, failed: this.evidenceFailed, unroutable: this.evidenceUnroutable, skippedHeld: this.evidenceHeld, trigger: summary.trigger },
+    });
+    this.evidenceDelivered = this.evidenceFailed = this.evidenceUnroutable = this.evidenceHeld = 0;
+  }
+
+  private expireAttemptsExhausted(row: PendingInboundRow, nowIso: string): void {
+    this.d.store.transition(row.enqueue_seq, 'claimed', 'expired', { nowIso, terminalReason: 'attempts-exhausted' });
+    this.mirrorRemove(row.session_key);
+    this.d.reportLoss([this.lossItem(row, 'attempts-exhausted')], 'attempts-exhausted');
+    featureEvidence.record('multiMachine.sessionPool.inboundQueue', { kind: 'error', reason: 'queued message dropped: attempts exhausted', context: { terminalReason: 'attempts-exhausted', seq: row.enqueue_seq, attempts: row.attempts } });
   }
 
   private releaseWithBackoff(row: PendingInboundRow, attempts: number, lastError: string, nowIso: string): void {
@@ -882,6 +1086,10 @@ export class QueueDrainLoop {
   // ── Remote receive side (§3.4 remote path — peer-side surface) ──────
 
   /** Receive-side durable receipt, canonical-id keyed (loss window 6 arm). */
+  hasRemoteReceipt(sessionKey: string, messageId: string): boolean {
+    return this.d.store.hasRemoteReceipt(sessionKey, messageId);
+  }
+
   recordRemoteReceipt(sessionKey: string, messageId: string): boolean {
     return this.d.store.recordRemoteReceipt(sessionKey, messageId, new Date(this.d.now()).toISOString());
   }
@@ -907,7 +1115,10 @@ export class QueueDrainLoop {
     counters: Record<string, number>;
     heldSeqs: number;
     paused: boolean;
+    dryRun: boolean;
     tenure: string | null;
+    tenureStartedAt: string | null;
+    shadowCustody: ReturnType<PendingInboundStore['dryRunShadowCustodyEvidence']> & { available: boolean };
   } {
     const counterKeys = [
       'wouldEnqueue', 'wouldHold', 'wouldRefuse', 'dryRunErrors',
@@ -915,6 +1126,8 @@ export class QueueDrainLoop {
       'holdBypassedByAttemptsCap', 'holdsStarted', 'holdsRecoveredInPlace',
       'holdsReleasedToFailover:budget-exhausted', 'holdsReleasedToFailover:flap-forced',
       'holdsReleasedToFailover:maxHeldTotal-refused', 'budgetOverrunHolds',
+      'shadowCustodyVerified', 'shadowCustodyRefused', 'shadowCustodyError',
+      'shadowCustodyRecoveredAfterRestart',
     ];
     const counters: Record<string, number> = {};
     for (const k of counterKeys) counters[k] = this.d.store.getCounter(k);
@@ -923,7 +1136,13 @@ export class QueueDrainLoop {
       counters,
       heldSeqs: this.heldSeqs.size,
       paused: this.d.store.isPaused(),
+      dryRun: this.d.qcfg.dryRun,
       tenure: this.tenure,
+      tenureStartedAt: this.tenureStartedAt,
+      shadowCustody: {
+        available: this.d.qcfg.dryRun && this.d.shadowStore !== undefined,
+        ...this.d.store.dryRunShadowCustodyEvidence(),
+      },
     };
   }
 }

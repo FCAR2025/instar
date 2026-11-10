@@ -39,10 +39,11 @@ function createAttentionAdapter() {
       return status ? values.filter(i => i.status === status) : values;
     },
     getAttentionItem: (id: string) => items.get(id),
-    updateAttentionStatus: async (id: string, status: StubStatus) => {
-      const item = items.get(id);
+    updateAttentionStatus: async (id: string, status: StubStatus, opts?: { resolution?: string }) => {
+      const item = items.get(id) as (StubItem & { resolution?: string }) | undefined;
       if (!item) return false;
       item.status = status;
+      if (opts?.resolution !== undefined) item.resolution = opts.resolution;
       item.updatedAt = new Date().toISOString();
       return true;
     },
@@ -130,5 +131,36 @@ describe('Attention queue vocabulary lifecycle', () => {
 
     expect(filtered.body.count).toBe(1);
     expect(filtered.body.items[0]).toMatchObject({ id: 'att-e2e', status: 'DONE' });
+  });
+
+  it('refuses a status change carrying a field it would not apply, and stores the resolution it does', async () => {
+    await request(app).post('/attention').set(auth()).send({
+      id: 'att-partial', title: 'Partial write', summary: 'original', category: 'general', priority: 'NORMAL',
+    }).expect(201);
+
+    // The 2026-10-19 case: status + body answered 200, applied the status, dropped the body.
+    const refused = await request(app).patch('/attention/att-partial').set(auth())
+      .send({ status: 'resolved', body: 'new text' }).expect(400);
+    expect(refused.body.unsupportedFields).toEqual(['body']);
+    expect(refused.body.supportedFields).toEqual(['status', 'resolution', 'reason']);
+    const untouched = await request(app).get('/attention?status=OPEN').set(auth()).expect(200);
+    expect(untouched.body.items.find((i: StubItem) => i.id === 'att-partial')).toMatchObject({ status: 'OPEN', summary: 'original' });
+
+    const resolved = await request(app).patch('/attention/att-partial').set(auth())
+      .send({ status: 'resolved', resolution: 'Fixed in PR 1' }).expect(200);
+    expect(resolved.body).toMatchObject({ status: 'DONE', resolution: 'Fixed in PR 1' });
+  });
+
+  it('bounds the live HTTP read without truncating the underlying queue', async () => {
+    for (const id of ['bound-a', 'bound-b', 'bound-c']) {
+      await request(app).post('/attention').set(auth()).send({
+        id, title: id, summary: id, category: 'general', priority: 'NORMAL',
+      }).expect(201);
+    }
+    const bounded = await request(app).get('/attention?limit=2').set(auth()).expect(200);
+    const unbounded = await request(app).get('/attention').set(auth()).expect(200);
+    expect(bounded.body.count).toBe(2);
+    expect(bounded.body.items).toHaveLength(2);
+    expect(unbounded.body.count).toBeGreaterThanOrEqual(3);
   });
 });

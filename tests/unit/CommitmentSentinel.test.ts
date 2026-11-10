@@ -16,12 +16,16 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { CommitmentSentinel } from '../../src/monitoring/CommitmentSentinel.js';
+import {
+  CommitmentSentinel,
+  COMMITMENT_SENTINEL_PROMPT_ID,
+} from '../../src/monitoring/CommitmentSentinel.js';
 import type { CommitmentSentinelConfig } from '../../src/monitoring/CommitmentSentinel.js';
 import { CommitmentTracker } from '../../src/monitoring/CommitmentTracker.js';
 import { LiveConfig } from '../../src/config/LiveConfig.js';
 import type { IntelligenceProvider, IntelligenceOptions } from '../../src/core/types.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { DP_COMMITMENT_DETECT } from '../../src/data/provenanceCoverage.js';
 
 // ── Mock IntelligenceProvider ────────────────────────────────────
 
@@ -60,6 +64,7 @@ function writeMessages(stateDir: string, messages: Array<{
   text: string;
   fromUser: boolean;
   timestamp?: string;
+  provenance?: 'user' | 'agent' | 'automation';
 }>): void {
   const messagesPath = path.join(stateDir, 'telegram-messages.jsonl');
   const lines = messages.map(m => JSON.stringify({
@@ -68,6 +73,7 @@ function writeMessages(stateDir: string, messages: Array<{
     text: m.text,
     fromUser: m.fromUser,
     timestamp: m.timestamp ?? new Date().toISOString(),
+    ...(m.provenance ? { provenance: m.provenance } : {}),
   }));
   fs.writeFileSync(messagesPath, lines.join('\n') + '\n');
 }
@@ -127,6 +133,37 @@ describe('CommitmentSentinel', () => {
       const detected = await sentinel.scan();
       expect(detected).toBe(0);
       expect(intelligence.evaluate).not.toHaveBeenCalled();
+    });
+
+    it('does not treat an automated outbound row as the agent reply in a commitment pair', async () => {
+      writeMessages(stateDir, [
+        { messageId: 1, topicId: 100, text: 'Can you investigate this?', fromUser: true, provenance: 'user' },
+        { messageId: 2, topicId: 100, text: 'System status: all checks running', fromUser: false, provenance: 'automation' },
+      ]);
+
+      const intelligence = createMockIntelligence('[]');
+      const { sentinel } = makeSentinel(stateDir, intelligence);
+
+      await expect(sentinel.scan()).resolves.toBe(0);
+      expect(intelligence.evaluate).not.toHaveBeenCalled();
+    });
+
+    it('pairs the user request with the later agent reply across intervening automation', async () => {
+      writeMessages(stateDir, [
+        { messageId: 1, topicId: 100, text: 'Please turn off auto-updates', fromUser: true, provenance: 'user' },
+        { messageId: 2, topicId: 100, text: 'System status: recovery running', fromUser: false, provenance: 'automation' },
+        { messageId: 3, topicId: 100, text: 'I will turn off auto-updates now', fromUser: false, provenance: 'agent' },
+      ]);
+
+      const intelligence = createMockIntelligence('[]');
+      const { sentinel } = makeSentinel(stateDir, intelligence);
+      await sentinel.scan();
+
+      expect(intelligence.evaluate).toHaveBeenCalledTimes(1);
+      const prompt = String((intelligence.evaluate as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(prompt).toContain('Please turn off auto-updates');
+      expect(prompt).toContain('I will turn off auto-updates now');
+      expect(prompt).not.toContain('System status: recovery running');
     });
 
     it('returns 0 for empty message file', async () => {
@@ -301,6 +338,26 @@ describe('CommitmentSentinel', () => {
   // ── LLM Commitment Detection ──────────────────────────
 
   describe('LLM commitment detection', () => {
+    it('enrolls exchange evidence without storing conversation bodies', async () => {
+      writeMessages(stateDir, [
+        { messageId: 1, topicId: 100, text: 'Please remember cobalt-lantern behavior', fromUser: true },
+        { messageId: 2, topicId: 100, text: 'I will remember cobalt-lantern behavior', fromUser: false },
+      ]);
+      const intelligence = createMockIntelligence('[]');
+      const { sentinel } = makeSentinel(stateDir, intelligence);
+
+      await sentinel.scan();
+
+      const [prompt, options] = (intelligence.evaluate as any).mock.calls[0];
+      expect(prompt).toContain('cobalt-lantern');
+      expect(options.provenance).toMatchObject({
+        decisionPoint: DP_COMMITMENT_DETECT,
+        optionsPresented: ['no-commitment', 'config-change', 'behavioral', 'one-time-action'],
+        promptId: COMMITMENT_SENTINEL_PROMPT_ID,
+      });
+      expect(JSON.stringify(options.provenance.context)).not.toContain('cobalt-lantern');
+    });
+
     it('detects and registers a config-change commitment', async () => {
       writeMessages(stateDir, [
         { messageId: 1, topicId: 100, text: 'Turn off auto-updates', fromUser: true },
@@ -327,6 +384,19 @@ describe('CommitmentSentinel', () => {
       expect(commitments[0].type).toBe('config-change');
       expect(commitments[0].userRequest).toBe('Turn off auto-updates');
       expect(commitments[0].topicId).toBe(100);
+    });
+
+    it('keeps a setting claim without check coordinates as an unverified action', async () => {
+      writeMessages(stateDir, [
+        { messageId: 1, topicId: 100, text: 'Remove the daily delay', fromUser: true },
+        { messageId: 2, topicId: 100, text: 'I will remove the delay', fromUser: false },
+      ]);
+      const intelligence = createMockIntelligence(JSON.stringify([{ type: 'config-change',
+        userRequest: 'Remove the daily delay', agentResponse: 'I will remove the delay' }]));
+      const { sentinel, tracker } = makeSentinel(stateDir, intelligence);
+      expect(await sentinel.scan()).toBe(1);
+      expect(tracker.getAll()[0].type).toBe('one-time-action');
+      expect(tracker.getAll()[0].status).toBe('pending');
     });
 
     it('detects behavioral commitments', async () => {

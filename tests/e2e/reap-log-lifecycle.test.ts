@@ -77,6 +77,27 @@ describe('Reap-log E2E lifecycle (feature is alive)', () => {
       skipped: 'not-lease-holder',
       disposition: 'skipped:not-lease-holder',
     });
+    expect(res.body.pool).toBeUndefined();
+  });
+
+  it('GET /sessions/reap-log?scope=pool keeps local rows and returns an explicit pool block', async () => {
+    const res = await request(app).get('/sessions/reap-log?scope=pool&limit=500').set(auth());
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toHaveLength(2);
+    expect(res.body.entries[1]).toMatchObject({
+      type: 'skipped', skipped: 'not-lease-holder',
+      machine: 'e2e-machine', machineId: null, machineNickname: null, remote: false,
+    });
+    expect(res.body.pool).toEqual({
+      enabled: false,
+      selfMachineId: null,
+      selfMachineNickname: null,
+      peersQueried: 0,
+      peersOk: 0,
+      limitPerMachine: 500,
+      sources: [{ machineId: null, returned: 2, truncated: false }],
+      failed: [],
+    });
   });
 
   it('requires Bearer auth', async () => {
@@ -87,5 +108,23 @@ describe('Reap-log E2E lifecycle (feature is alive)', () => {
   it('is read-only — POST/DELETE are not registered (404)', async () => {
     expect((await request(app).post('/sessions/reap-log').set(auth())).status).toBe(404);
     expect((await request(app).delete('/sessions/reap-log').set(auth())).status).toBe(404);
+  });
+
+  it('preserves contrasting finished and stopped-mid-work rows through the live authenticated route', async () => {
+    reapLog.recordExited({
+      session: 'finished-worker', tmuxSession: 'finished-worker', reason: 'process-exited',
+      exitCode: 0, midWork: false, outcome: 'completed',
+    });
+    reapLog.recordExited({
+      session: 'interrupted-worker', tmuxSession: 'interrupted-worker', reason: 'process-exited',
+      exitCode: -1, midWork: true, outcome: 'stopped-mid-work',
+    });
+
+    const res = await request(app).get('/sessions/reap-log').set(auth());
+    expect(res.status).toBe(200);
+    expect(res.body.entries.slice(-2)).toMatchObject([
+      { type: 'exited', session: 'finished-worker', exitCode: 0, midWork: false, outcome: 'completed' },
+      { type: 'exited', session: 'interrupted-worker', exitCode: -1, midWork: true, outcome: 'stopped-mid-work' },
+    ]);
   });
 });

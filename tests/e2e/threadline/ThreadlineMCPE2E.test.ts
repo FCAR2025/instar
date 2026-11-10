@@ -374,7 +374,8 @@ describe('ThreadlineMCP E2E', () => {
         arguments: { agentId: 'flaky', message: 'Try 2' },
       });
       const d2 = JSON.parse((r2.content as any)[0].text);
-      expect(d2.delivered).toBe(true);
+      expect(d2.accepted).toBe(true);
+      expect(d2.delivered).toBe(false);
     });
 
     it('handles tool call with missing thread gracefully', async () => {
@@ -662,7 +663,7 @@ describe('ThreadlineMCP E2E', () => {
       const tools = await e2e.client.listTools();
       // includes threadline_request_secret (sealed-handoff keystone) +
       // threadline_pair (Secure A2A Verified Pairing §3.6).
-      expect(tools.tools.length).toBe(9);
+      expect(tools.tools.length).toBe(10);
 
       // Step 2: User discovers agents
       const discover = await e2e.client.callTool({

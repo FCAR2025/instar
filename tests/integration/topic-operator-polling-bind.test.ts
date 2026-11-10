@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { wireTelegramRouting } from '../../src/commands/server.js';
-import { TopicOperatorStore } from '../../src/users/TopicOperatorStore.js';
+import { TopicOperatorStore, EVER_VERIFIED_KEY } from '../../src/users/TopicOperatorStore.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 import type { TelegramAdapter } from '../../src/messaging/TelegramAdapter.js';
 import type { SessionManager } from '../../src/core/SessionManager.js';
@@ -46,6 +46,16 @@ function inbound(uid: number, firstName: string, topicId = 19437): Message {
   } as Message;
 }
 
+function authEvidence(uid: string, messageId = 'tg-seed') {
+  return {
+    kind: 'authenticated-inbound' as const,
+    ingress: 'telegram-polling' as const,
+    authorization: 'telegram-is-authorized-sender' as const,
+    senderUid: uid,
+    messageId,
+  };
+}
+
 describe('increment 2e — polling-path bind, integration', () => {
   it('CAROLINE REPLAY: the authorized operator binds; an unauthorized "Caroline" in the same topic cannot displace them', async () => {
     const store = new TopicOperatorStore(dir);
@@ -67,7 +77,11 @@ describe('increment 2e — polling-path bind, integration', () => {
     const store = new TopicOperatorStore(dir);
     // Pre-existing binding made through the server's instance (e.g. the
     // POST /topic-operator route or the lifeline auto-bind).
-    store.setOperator(111, { platform: 'telegram', uid: '555', displayName: 'Alice' });
+    store.setAuthenticatedOperator(
+      111,
+      { platform: 'telegram', uid: '555', displayName: 'Alice' },
+      authEvidence('555'),
+    );
 
     const { adapter, raw } = makeAdapter([OPERATOR_UID]);
     wireTelegramRouting(adapter, {} as SessionManager, undefined, undefined, undefined, undefined, undefined, () => store);
@@ -78,7 +92,9 @@ describe('increment 2e — polling-path bind, integration', () => {
     expect(store.getOperator(222)?.uid).toBe(String(OPERATOR_UID));
     // And the durable file carries both.
     const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'topic-operators.json'), 'utf-8'));
-    expect(Object.keys(onDisk).sort()).toEqual(['111', '222']);
+    expect(Object.keys(onDisk).filter((k) => k !== EVER_VERIFIED_KEY).sort()).toEqual(['111', '222']);
+    // …beside the append-only record of every verified principal (pairing approval reads it).
+    expect(onDisk[EVER_VERIFIED_KEY]).toEqual({ telegram: ['555', String(OPERATOR_UID)] });
   });
 
   it('pre-construction lifecycle: messages before the server exists bind nothing (fail-safe); after late-bind resolution they bind', async () => {

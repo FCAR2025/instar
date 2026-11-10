@@ -135,13 +135,14 @@ We didn't just claim it works. We ran controlled experiments — same model, sam
 | **Slack** | Two-way messaging via Slack adapter. Channel and DM routing, eight HTTP routes, dedicated CLI | [→](https://instar.sh/features/slack/) |
 | **Lifeline** | Persistent supervisor. Detects crashes, auto-recovers, queues messages, version-skew handling (v1.1.3+) | [→](https://instar.sh/features/lifeline/) |
 | **Conversational Memory** | Per-topic SQLite with FTS5, rolling summaries, context re-injection | [→](https://instar.sh/features/memory/) |
+| **Three-level Topic Awareness** | Keeps the whole-topic anchor and evolution, latest conversational arc, and current work visible together — each with goal, trend, and themes; stale projections say so | [→](docs/specs/topic-awareness-three-levels.eli16.md) |
 | **Evolution System** | Proposals, learnings, gap tracking, commitment follow-through | [→](https://instar.sh/features/evolution/) |
 | **Relationships** | Cross-platform identity resolution, significance scoring, context injection | [→](https://instar.sh/features/relationships/) |
 | **Safety Gates** | LLM-supervised gate for external operations. Adaptive trust per service | [→](https://instar.sh/features/safety-gates/) |
 | **Coherence Gate** | LLM-powered response review. PEL + gate reviewer + 9 specialist reviewers catch quality issues before delivery | [→](https://instar.sh/features/coherence-gate/) |
 | **Intent Alignment** | Decision journaling, drift detection, organizational constraints | [→](https://instar.sh/features/intent/) |
 | **EXO 3.0 Alignment** | MTP protocol refusal/endorsement tests (`IntentTestHarness`, `OrgIntentIdentityLayer`), agent-readiness scoring (`AgentReadinessScorer`), agent digital passports (`AgentPassport`), learning-velocity metrics (`LearningVelocityScorer`) | [→](https://instar.sh/features/exo3/) |
-| **Multi-Machine** | Ed25519/X25519 crypto identity, encrypted sync, automatic failover | [→](https://instar.sh/features/multi-machine/) |
+| **Multi-Machine** | Ed25519/X25519 crypto identity, encrypted sync, automatic failover, and evidence-gated session-pool promotion (`POST /session-pool/promote`) | [→](https://instar.sh/features/multi-machine/) |
 | **Serendipity Protocol** | Sub-agents capture out-of-scope discoveries without breaking focus. HMAC-signed, secret-scanned | [→](https://instar.sh/features/serendipity/) |
 | **Threadline Protocol** | Agent-to-agent conversations with canonical identity, three-layer trust model, authorization policy, Ed25519 invitations, Sybil protection, MoltBridge network discovery, rich agent profiles (auto-compiled from agent data with human review gate), discovery waterfall, message security, tamper-proof audit logging, framework-agnostic interop, persistent listener daemon (always-on relay connection, pipe-mode sessions, sub-30s cross-machine failover), eleven MCP tools (seven core + four registry-conditional). 80 modules, roughly 3,800 test cases across 74 dedicated test files plus 125 cross-cutting | [→](https://instar.sh/features/threadline/) |
 | **A2A Delivery Health** | Durable agent-to-agent delivery tracking (`threadline/A2ADeliveryTracker`) so a message between agents never silently dies out — a reply on the thread is the acknowledgement, and `GET /threadline/peers/health` answers "is my channel to this peer alive?" as a lookup, not a guess. The `monitoring/A2ARedeliverySentinel` adds active recovery: re-send unacknowledged messages with backoff, then one aggregated escalation per dark peer. Recording-only; never gates a send | [→](https://instar.sh/features/a2a-delivery-health/) |
@@ -153,6 +154,12 @@ We didn't just claim it works. We ran controlled experiments — same model, sam
 | **Observability** | Token burn detection, quota tracking with tiered backpressure, telemetry collection, homeostasis monitoring, session activity tracking, credential management | [→](https://instar.sh/features/observability/) |
 | **Cross-framework portability** | First-class Codex CLI support via `instar setup --framework codex-cli`. Codex-only init produces zero `.claude/` files. Framework-aware telegram-reply path. FrameworkSessionStore (per-runtime transcripts). FrameworkParitySentinel | [→](https://instar.sh/features/portability/) |
 | **Default Jobs** | Fourteen built-in jobs covering health, reflection, evolution, relationship maintenance, identity review, and five `overseer-*` jobs across development, learning, infrastructure, maintenance, and guardian responsibilities | [→](https://instar.sh/reference/default-jobs/) |
+
+**Queue pace** reports whether each work queue is catching up or falling behind, using arrivals,
+completions, and remaining work rather than a snapshot count alone. `QueuePace` defines the
+measurements, `QueuePaceAdapters` reads the source queues, `QueuePaceLedger` keeps hourly evidence,
+and the opt-in `QueuePaceTuner` can add bounded feedback-sorting runs when that worker is the limit.
+See the [queue pace guide](site/src/content/docs/features/queue-pace.md).
 
 > **Reference:** [CLI Commands](https://instar.sh/reference/cli/) · [API Endpoints](https://instar.sh/reference/api/) · [Configuration](https://instar.sh/reference/configuration/) · [File Structure](https://instar.sh/reference/file-structure/)
 

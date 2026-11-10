@@ -29,6 +29,7 @@
 
 import { EventEmitter } from 'node:events';
 import type { StallEvent } from '../core/SleepWakeDetector.js';
+import { featureEvidence } from './FeatureEvidenceLog.js';
 
 /** The outcome classification the (A) tmux wrapper reports for each call. */
 export type TmuxCallOutcome = 'success' | 'killed-client' | 'indeterminate';
@@ -71,10 +72,16 @@ export interface DegradedTmuxGuardConfig {
 export interface DegradedTmuxGuardDeps {
   /** Raise ONE deduped agent-health Attention item for an episode. Wrapped in try/catch by the guard. */
   raiseAttention: (ep: DegradedTmuxEpisode) => void;
-  /** Current `loadavg[0]/cores` ratio (the same signal as SleepWakeDetector.maxLoadRatio). */
-  loadPerCore: () => number;
+  /** Current `loadavg[0]/cores` ratio; null when the denominator is unavailable. */
+  loadPerCore: () => number | null;
   /** Optional injectable clock (tests). Default Date.now. */
   now?: () => number;
+}
+
+/** Convert a load sample to a measured per-core ratio without inventing a zero denominator. */
+export function computeLoadPerCore(loadAverage: number, coreCount: number): number | null {
+  if (!Number.isFinite(loadAverage) || !Number.isFinite(coreCount) || coreCount <= 0) return null;
+  return loadAverage / coreCount;
 }
 
 /** Class defaults — absence of a config value falls back to these (runtime fallback, not config). */
@@ -123,6 +130,8 @@ export class DegradedTmuxGuard extends EventEmitter {
   /** A stall arriving this cycle forces the cycle degraded (a corroborating slow cycle). */
   private stallThisCycle = false;
   private openEpisode: DegradedTmuxEpisode | null = null;
+  /** The evidence row that opened the episode, graded when tmux recovers. */
+  private openEpisodeEvidenceId: string | null = null;
   private episodeCounter = 0;
   /** Wall-clock (ms) of the most recent onRefresh(); drives the settle-window exclusion. */
   private lastRefreshAt = 0;
@@ -218,17 +227,15 @@ export class DegradedTmuxGuard extends EventEmitter {
     if (durationMs >= this.slowCallThresholdMs) this.slowCallCount += 1;
   }
 
-  /** Current load ratio, defensively (a throw/non-finite ⇒ 0 = not load-gated). */
-  private currentLoadPerCore(): number {
+  /** Current load ratio, defensively; null means the load gate cannot be evaluated. */
+  private currentLoadPerCore(): number | null {
     try {
       const v = this.deps.loadPerCore();
-      return Number.isFinite(v) && v > 0 ? v : 0;
+      return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
     } catch {
-      // @silent-fallback-ok: a load-probe failure defaults to 0 (= not load-gated) so the
-      // signal-only guard never crashes the detector tick; the worst case is one calm,
-      // deduped agent-health Attention item raised under load that would otherwise have been
-      // gated — never a destructive action (the guard NEVER kills the shared socket).
-      return 0;
+      // @silent-fallback-ok: a load-probe failure makes this cycle unassessable, so it cannot
+      // advance corroboration. The signal-only guard still never throws or kills the socket.
+      return null;
     }
   }
 
@@ -247,7 +254,8 @@ export class DegradedTmuxGuard extends EventEmitter {
 
     // (1) Load gate — a busy host slows tmux for reasons unrelated to a sick socket; the
     // incident machine runs 5+ agents. Do NOT advance corroboration while over the threshold.
-    if (this.currentLoadPerCore() > this.loadGateMaxLoadPerCore) {
+    const loadPerCore = this.currentLoadPerCore();
+    if (loadPerCore === null || loadPerCore > this.loadGateMaxLoadPerCore) {
       return;
     }
 
@@ -258,6 +266,12 @@ export class DegradedTmuxGuard extends EventEmitter {
       // (3a) A clean cycle resets corroboration AND closes any open episode (recovery).
       this.consecutiveSlowCycles = 0;
       if (this.openEpisode) {
+        if (this.openEpisodeEvidenceId) {
+          const durationMs = ts - this.openEpisode.openedAtMs;
+          // A corroborated slowdown that lasted a minute and then cleared was real; a shorter blip is not proven either way.
+          featureEvidence.record('monitoring.degradedTmuxGuard', { kind: 'outcome', outcome: durationMs >= 60_000 ? 'right' : 'unknown', gradesEventId: this.openEpisodeEvidenceId, gradedBy: 'DegradedTmuxGuard', reason: 'tmux recovered: episode closed', context: { episodeId: this.openEpisode.id, durationMs, ewmaMs: Math.round(this.ewmaMs ?? 0), loadPerCore } });
+        }
+        this.openEpisodeEvidenceId = null;
         this.openEpisode = null;
       }
       return;
@@ -295,10 +309,14 @@ export class DegradedTmuxGuard extends EventEmitter {
   /** Wrap the operator-notify dep so a notify throw can never crash an ingest path. */
   private raiseEpisode(ep: DegradedTmuxEpisode): void {
     this.episodesRaised += 1;
+    const evidenceContext = { episodeId: ep.id, ageMs: ep.ageMs, ewmaMs: ep.ewmaMs, consecutiveSlowCycles: ep.consecutiveSlowCycles, slowCallThresholdMs: this.slowCallThresholdMs, escalation: ep.ageMs > 0 };
     try {
       this.deps.raiseAttention(ep);
+      const evidenceId = featureEvidence.record('monitoring.degradedTmuxGuard', { kind: 'fired', reason: ep.ageMs > 0 ? 'episode re-raised: still degraded' : 'episode raised', context: evidenceContext });
+      if (ep.ageMs === 0) this.openEpisodeEvidenceId = evidenceId;
     } catch {
       /* signal-only — a notify failure is swallowed; the episode state is already recorded */
+      featureEvidence.record('monitoring.degradedTmuxGuard', { kind: 'error', reason: 'episode raise failed', context: evidenceContext });
     }
     this.emit('episode', ep);
   }

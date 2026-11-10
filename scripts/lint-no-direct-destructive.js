@@ -21,8 +21,14 @@
  * for direct destructive `git <verb>` invocations (closed verb list).
  *
  * Exit codes:
- *   0 — no violations.
+ *   0 — every enumerated target file was inspected and none has a violation.
  *   1 — at least one violation.
+ *   2 — could not inspect: NONE of the scanned files parsed (an environment
+ *       problem, e.g. a missing `typescript`), or SOME target file could not be
+ *       read or parsed (or a directory could not be listed) and no violation was
+ *       found elsewhere. Each uninspected path is printed with its reason.
+ *       Distinct from 1 on purpose — "I could not look" is not "I looked and
+ *       found nothing".
  *
  * Usage:
  *   node scripts/lint-no-direct-destructive.js                # full repo
@@ -39,6 +45,14 @@ import { fileURLToPath } from 'node:url';
 // only when a TS file actually needs parsing.
 let _ts = null;
 function ts() {
+  // Test hook for the parsed-nothing refusal below. It can ONLY force the
+  // fail-closed path (every file fails to parse → the run refuses to report
+  // clean); there is no flag here that can make this lint pass something it
+  // would otherwise flag. Without it the refusal would be untested, which is
+  // the failure mode this whole guard exists to prevent.
+  if (process.env.INSTAR_LINT_FORCE_PARSE_FAILURE === '1') {
+    throw new Error('forced parse failure (INSTAR_LINT_FORCE_PARSE_FAILURE=1)');
+  }
   if (_ts) return _ts;
   _ts = require('typescript');
   return _ts;
@@ -61,6 +75,14 @@ const ALLOWLIST = new Set([
   'src/core/SafeFsExecutor.ts',
   'tests/unit/SafeGitExecutor.test.ts',
   'tests/unit/SafeFsExecutor.test.ts',
+  // Shared vitest setup: removes ITS OWN mkdtemp CODEX_HOME dir (under
+  // os.tmpdir()) at process exit. It cannot import SafeFsExecutor: setupFiles
+  // run before every test module, so the import would cache src/core + the
+  // real node:child_process ahead of any test's vi.mock and silently un-mock
+  // child_process suite-wide (observed 2026-10-20: GitSync, ProfileCompiler,
+  // server-supervisor-preflight all went red). Same tmpdir-only class as the
+  // tmux-resilience entries below.
+  'tests/vitest-setup.ts',
   // tmux-event-loop-resilience Increment 1 tests: per-test cleanup of
   // mkdtempSync dirs under os.tmpdir() (the cross-process marker round-trip
   // needs a real on-disk mirror dir; the e2e needs a throwaway stateDir). The
@@ -126,6 +148,18 @@ const ALLOWLIST = new Set([
   // Worktree-related git hooks — run before TS is compiled.
   'scripts/worktree-precommit-gate.js',
   'scripts/worktree-commit-msg-hook.js',
+  // audit-convergence-enforcement: the audit-report validator runs pre-compile
+  // (imported by the precommit hook), so it can't depend on the TS SafeGitExecutor
+  // funnel. All its git calls are READ-ONLY: `git rev-parse --show-toplevel` (repo
+  // root), `git ls-files --error-unmatch` (standing-guard tracked check), `git
+  // diff --cached --name-only` (staged set). Never a destructive git op.
+  'scripts/write-audit-convergence.mjs',
+  // audit-convergence tests: read-only `git rev-parse --show-toplevel` / `git
+  // ls-files` to resolve the repo root for reading committed files. No mutation.
+  'tests/unit/write-audit-convergence.test.ts',
+  'tests/unit/audit-convergence-reports.test.ts',
+  'tests/unit/audit-convergence-standard-conformance.test.ts',
+  'tests/unit/iterative-converging-audit-skill-single-source.test.ts',
   // Pre-command shim that wraps git invocations from outside the safe
   // executor — bootstraps the safety check, can't be inside the funnel.
   'scripts/destructive-command-shim.js',
@@ -134,6 +168,28 @@ const ALLOWLIST = new Set([
   // previous release. Build-time only; never executes on an agent's
   // machine. Per INSTAR-JOBS-AS-AGENTMD spec §Drift Classifier.
   'scripts/classify-default-drift.mjs',
+  // release-fragment-gate Layer 2 publish-side annotator — runs READ-ONLY git
+  // (`describe --tags`, `diff --name-only -z`, `log`, `ls-files`) inside the
+  // publish GitHub Action to detect unreleased release-relevant work on a skip.
+  // CI-only; never executes on an agent's machine, and TS isn't compiled there
+  // so it cannot import the SafeGitExecutor funnel. Per RELEASE-FRAGMENT-GATE-SPEC.
+  'scripts/release-skip-annotate.mjs',
+  // Release-cut recogniser for the pre-push gate (§3b). READ-ONLY git
+  // (`merge-base`, `diff --name-status --no-renames`, `show <rev>:<path>`). Runs
+  // pre-compile from scripts/pre-push-gate.js, so it cannot import the TS
+  // SafeGitExecutor funnel.
+  'scripts/release-cut-diff.mjs',
+  // Operator-run local release (the publish.yml publish job, run on a
+  // workstation when CI is starved). Runs before dist/ exists (preflight), so it
+  // cannot import the SafeGitExecutor funnel. Its only mutating git ops are the
+  // ones publish.yml's commit step runs: `add`/`commit` (WITH hooks), an atomic
+  // push of main + tag with a fetch + `rebase` retry (only over release cuts;
+  // ABORTS on conflict, never a force push), and `tag`; its fs.unlinkSync
+  // removes the consumed upgrades/next/*.md exactly as publish.yml's `rm -f`
+  // does, and a pre-publish failure restores only its own edits (`checkout HEAD
+  // -- package.json package-lock.json upgrades`, `clean -- upgrades`) after a
+  // clean-tree preflight. Never executes on an agent's machine.
+  'scripts/release-local.mjs',
   // Tier-3 CI ratchet for the cartographer doc-tree (cartographer-doc-freshness
   // spec #2). A standalone .mjs (parity with docs-coverage.mjs) that runs in CI
   // with NO build step, so it cannot import the TS SafeGitExecutor funnel. All
@@ -183,6 +239,54 @@ function hasAllowComment(text) {
 // ── Violation reporting ────────────────────────────────────────────
 
 const violations = [];
+
+/**
+ * Files (or directories) this run was meant to inspect but could not: unreadable,
+ * unparseable, or an unlistable directory. Each one is a hole in the scan, and a
+ * hole must not look like a clean file (#2190 / #2189) — any entry here refuses
+ * the run with the path and the reason.
+ */
+const uninspected = [];
+
+function recordUninspected(file, reason) {
+  uninspected.push({ file, reason });
+}
+
+/** Errors worth one more attempt: the file may be mid-write or the fd table momentarily full. */
+const TRANSIENT_READ_CODES = new Set(['EAGAIN', 'EBUSY', 'EINTR', 'EMFILE', 'ENFILE']);
+const READ_RETRY_DELAYS_MS = [50, 200];
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Read a file, briefly retrying transient errors. Throws the last error if every attempt fails. */
+function readFileWithRetry(file) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // Test hook, fail-closed only (same contract as INSTAR_LINT_FORCE_PARSE_FAILURE):
+      // it can only make a read fail, never make a file pass. `<basename>` fails
+      // every attempt; `<basename>:<n>` fails only the first n (exercises the retry).
+      const forced = process.env.INSTAR_LINT_FORCE_READ_FAILURE;
+      const [forcedName, forcedTimes] = (forced || '').split(':');
+      if (forcedName && path.basename(file) === forcedName
+        && (forcedTimes === undefined || attempt < Number(forcedTimes))) {
+        const err = new Error(`forced read failure (INSTAR_LINT_FORCE_READ_FAILURE=${forced})`);
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return fs.readFileSync(file, 'utf8');
+    } catch (err) {
+      if (attempt >= READ_RETRY_DELAYS_MS.length || !TRANSIENT_READ_CODES.has(err.code)) throw err;
+      sleepSync(READ_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+function describeError(err) {
+  const message = String(err && err.message ? err.message : err);
+  return err && err.code && !message.startsWith(err.code) ? `${err.code}: ${message}` : message;
+}
 
 /**
  * Per-callsite marker: `// safe-git-allow: incremental-migration` placed on
@@ -283,10 +387,24 @@ const FS_MODULE_NAMES = new Set([
  *   7. Dynamic property access used to evade the rule (`fs['rm' + 'Sync']`) — flag.
  */
 function lintTsFile(file, text) {
+  // Per-file variant of the INSTAR_LINT_FORCE_PARSE_FAILURE hook (a basename
+  // instead of '1'), for the partial-failure refusal. Fail-closed only.
+  const forcedParse = process.env.INSTAR_LINT_FORCE_PARSE_FAILURE;
+  if (forcedParse && forcedParse !== '1' && path.basename(file) === forcedParse) {
+    throw new Error(`forced parse failure (INSTAR_LINT_FORCE_PARSE_FAILURE=${forcedParse})`);
+  }
   const T = ts();
   const sf = T.createSourceFile(file, text, T.ScriptTarget.Latest, true);
   const ctx = { text };
-  const r = (f, l, c, m) => report(f, l, c, m, ctx);
+  // Declaration collection runs BEFORE reporting (see the collect/report loop at
+  // the foot of this function), so a binding declared after the function that
+  // uses it is still resolved. While collecting, findings are suppressed —
+  // otherwise every violation would be reported once per collection pass.
+  let collecting = true;
+  const r = (f, l, c, m) => {
+    if (collecting) return;
+    report(f, l, c, m, ctx);
+  };
 
   /** module name → local identifier (default + namespace + named) */
   const childProcessIdentifiers = new Set();
@@ -299,6 +417,34 @@ function lintTsFile(file, text) {
   function lineCol(node) {
     const lc = sf.getLineAndCharacterOfPosition(node.getStart(sf));
     return { line: lc.line + 1, col: lc.character + 1 };
+  }
+
+  /**
+   * Strip syntax that changes nothing at runtime but hides an identifier from a
+   * structural check — parentheses, `as` assertions, `<T>` assertions and `!`.
+   * `(fs as any)['rmSync'](p)` performs exactly the same delete as `fs.rmSync(p)`;
+   * without this it reached the computed-access branch as a ParenthesizedExpression
+   * and the `isIdentifier` test failed, so the call was invisible.
+   */
+  /**
+   * Idempotent: collection now runs more than once (see the collect/report loop
+   * below), and an array push is the one collector here that is not naturally
+   * idempotent — repeated passes would duplicate entries and keep the binding
+   * count growing, so the fixpoint would never be reached.
+   */
+  function addSimpleGitImport(localName) {
+    if (!simpleGitImports.some((s2) => s2.localName === localName)) {
+      simpleGitImports.push({ localName });
+    }
+  }
+
+  function unwrap(node) {
+    let n = node;
+    while (n && (T.isParenthesizedExpression(n) || T.isAsExpression(n)
+                 || T.isTypeAssertionExpression?.(n) || T.isNonNullExpression(n))) {
+      n = n.expression;
+    }
+    return n;
   }
 
   function visit(node) {
@@ -324,7 +470,7 @@ function lintTsFile(file, text) {
             } else if (FS_MODULE_NAMES.has(mod) && DESTRUCTIVE_FS_NAMES.has(importedName)) {
               fsNamedDestructiveImports.set(localName, importedName);
             } else if (mod === 'simple-git' && importedName === 'simpleGit') {
-              simpleGitImports.push({ localName });
+              addSimpleGitImport(localName);
             }
           }
         }
@@ -337,7 +483,7 @@ function lintTsFile(file, text) {
         } else if (FS_MODULE_NAMES.has(mod)) {
           fsNamespaceIdentifiers.add(localName);
         } else if (mod === 'simple-git') {
-          simpleGitImports.push({ localName });
+          addSimpleGitImport(localName);
         }
       }
     }
@@ -358,7 +504,7 @@ function lintTsFile(file, text) {
               fsNamespaceIdentifiers.add(localName);
               requireBindings.set(localName, mod);
             } else if (mod === 'simple-git') {
-              simpleGitImports.push({ localName });
+              addSimpleGitImport(localName);
             }
           }
           // Destructured: const { execFileSync } = require('child_process')
@@ -374,7 +520,7 @@ function lintTsFile(file, text) {
               } else if (FS_MODULE_NAMES.has(mod) && DESTRUCTIVE_FS_NAMES.has(importedName)) {
                 fsNamedDestructiveImports.set(localName, importedName);
               } else if (mod === 'simple-git' && importedName === 'simpleGit') {
-                simpleGitImports.push({ localName });
+                addSimpleGitImport(localName);
               }
             }
           }
@@ -423,6 +569,83 @@ function lintTsFile(file, text) {
       }
     }
 
+    // ── Local re-bindings of a banned namespace or function ────
+    // The sets above were populated ONLY from imports/requires, so one line of
+    // ordinary tidying disabled the funnel for a whole file:
+    //
+    //   const fsp = fs.promises;   await fsp.rm(p, { recursive: true });
+    //
+    // Aliasing `fs.promises` to a short name is idiomatic JavaScript, not an
+    // evasion — and `fs.promises.rm` written out IS caught, so the difference
+    // between flagged and invisible was a variable. Resolving the binding feeds
+    // the EXISTING checks below rather than adding a parallel rule.
+    if (T.isVariableDeclaration(node) && node.initializer) {
+      const init = unwrap(node.initializer);
+
+      // `const X = <expr>` where X is a plain identifier.
+      if (T.isIdentifier(node.name)) {
+        const local = node.name.text;
+
+        // Whole-namespace alias: `const f = fs` / `const fsp = fs.promises`.
+        if (T.isIdentifier(init) && fsNamespaceIdentifiers.has(init.text)) {
+          fsNamespaceIdentifiers.add(local);
+        } else if (T.isIdentifier(init) && childProcessIdentifiers.has(init.text)) {
+          childProcessIdentifiers.add(local);
+        } else if (T.isPropertyAccessExpression(init)) {
+          const base = unwrap(init.expression);
+          const member = init.name.text;
+
+          // `const fsp = fs.promises` — still the fs namespace, so the member
+          // checks below apply to it unchanged.
+          if (T.isIdentifier(base) && fsNamespaceIdentifiers.has(base.text) && member === 'promises') {
+            fsNamespaceIdentifiers.add(local);
+          } else if (T.isIdentifier(base) && fsNamespaceIdentifiers.has(base.text)
+                     && DESTRUCTIVE_FS_NAMES.has(member)) {
+            // `const del = fs.rmSync`
+            fsNamedDestructiveImports.set(local, member);
+          } else if (T.isIdentifier(base) && childProcessIdentifiers.has(base.text)
+                     && CHILD_PROCESS_FNS.has(member)) {
+            // `const ex = cp.execFileSync`
+            childProcessNamedImports.set(local, member);
+          } else if (T.isPropertyAccessExpression(base) && T.isIdentifier(unwrap(base.expression))
+                     && fsNamespaceIdentifiers.has(unwrap(base.expression).text)
+                     && base.name.text === 'promises'
+                     && DESTRUCTIVE_FS_NAMES.has(member)) {
+            // `const del = fs.promises.rm`
+            fsNamedDestructiveImports.set(local, member);
+          }
+        }
+      }
+
+      // `const { rmSync, unlink: del } = fs` / `... = fs.promises`
+      if (T.isObjectBindingPattern(node.name)) {
+        const init2 = unwrap(node.initializer);
+        let isFsSource = false;
+        let isCpSource = false;
+        if (T.isIdentifier(init2)) {
+          isFsSource = fsNamespaceIdentifiers.has(init2.text);
+          isCpSource = childProcessIdentifiers.has(init2.text);
+        } else if (T.isPropertyAccessExpression(init2) && init2.name.text === 'promises') {
+          const base = unwrap(init2.expression);
+          isFsSource = T.isIdentifier(base) && fsNamespaceIdentifiers.has(base.text);
+        }
+        if (isFsSource || isCpSource) {
+          for (const el of node.name.elements) {
+            if (!T.isBindingElement(el) || !T.isIdentifier(el.name)) continue;
+            const original = el.propertyName && T.isIdentifier(el.propertyName)
+              ? el.propertyName.text
+              : el.name.text;
+            const local = el.name.text;
+            if (isFsSource && DESTRUCTIVE_FS_NAMES.has(original)) {
+              fsNamedDestructiveImports.set(local, original);
+            } else if (isCpSource && CHILD_PROCESS_FNS.has(original)) {
+              childProcessNamedImports.set(local, original);
+            }
+          }
+        }
+      }
+    }
+
     // ── Member call on namespace identifier ────────────────────
     if (T.isCallExpression(node) && T.isPropertyAccessExpression(node.expression)) {
       const obj = node.expression.expression;
@@ -461,7 +684,7 @@ function lintTsFile(file, text) {
 
     // ── Dynamic / computed access: fs['rm' + 'Sync'](...) ──────
     if (T.isCallExpression(node) && T.isElementAccessExpression(node.expression)) {
-      const obj = node.expression.expression;
+      const obj = unwrap(node.expression.expression);
       const arg = node.expression.argumentExpression;
       if (T.isIdentifier(obj) && fsNamespaceIdentifiers.has(obj.text)) {
         // Any computed member access on the fs namespace is suspicious;
@@ -495,6 +718,19 @@ function lintTsFile(file, text) {
     return false;
   }
 
+  // Collect, then report. Collection repeats until the binding sets stop
+  // growing, so a chain (`const a = fs; const b = a.promises`) resolves however
+  // it is ordered in the file, and a binding declared BELOW the function that
+  // uses it is still known. Bounded so a pathological file cannot spin.
+  const bindingCount = () =>
+    fsNamespaceIdentifiers.size + fsNamedDestructiveImports.size
+    + childProcessIdentifiers.size + childProcessNamedImports.size + simpleGitImports.length;
+  for (let pass = 0; pass < 5; pass += 1) {
+    const before = bindingCount();
+    visit(sf);
+    if (bindingCount() === before) break;
+  }
+  collecting = false;
   visit(sf);
 }
 
@@ -549,7 +785,9 @@ function lintPackageJsonScripts(file, text) {
   let pkg;
   try {
     pkg = JSON.parse(text);
-  } catch {
+  } catch (err) {
+    // An unparseable package.json hides every npm script from the git-verb check.
+    recordUninspected(file, `could not parse as JSON: ${describeError(err)}`);
     return;
   }
   const scripts = pkg.scripts || {};
@@ -572,7 +810,10 @@ function walkDir(dir, out) {
   let entries;
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    // A target dir that does not exist has nothing to inspect; one that exists
+    // but cannot be listed hides every file beneath it.
+    if (err.code !== 'ENOENT') recordUninspected(dir, `could not list directory: ${describeError(err)}`);
     return;
   }
   for (const e of entries) {
@@ -630,6 +871,18 @@ function gatherAll() {
   return out;
 }
 
+function writeUninspected() {
+  if (uninspected.length === 0) return;
+  process.stderr.write('\n');
+  process.stderr.write(
+    `[lint-no-direct-destructive] COULD NOT INSPECT ${uninspected.length} path(s) — `
+    + 'these were NOT checked, so this run cannot report them clean:\n'
+  );
+  for (const u of uninspected) {
+    process.stderr.write(`  ${path.relative(ROOT, u.file) || u.file}\n    ${u.reason}\n`);
+  }
+}
+
 // ── Main ───────────────────────────────────────────────────────────
 
 function main() {
@@ -643,11 +896,15 @@ function main() {
     files = gatherAll();
   }
 
+  // Scan-coverage counters: a run that parsed nothing inspected nothing.
+  let astAttempted = 0;
+  let astParsed = 0;
   for (const file of files) {
     let text;
     try {
-      text = fs.readFileSync(file, 'utf8');
-    } catch {
+      text = readFileWithRetry(file);
+    } catch (err) {
+      recordUninspected(file, `could not read: ${describeError(err)}`);
       continue;
     }
 
@@ -667,11 +924,54 @@ function main() {
     if (hasAllowComment(text)) continue;
 
     // AST lint for ts/js/mjs/cjs
+    astAttempted += 1;
     try {
       lintTsFile(file, text);
+      astParsed += 1;
     } catch (err) {
-      // Parse failure → emit a soft warning, not a violation.
-      process.stderr.write(`[lint-no-direct-destructive] failed to parse ${rel}: ${err.message}\n`);
+      // A thrown parse is a file this run did not inspect (#2190). It used to be a
+      // stderr warning with exit 0, so an unchecked file looked exactly like a
+      // clean one. Syntax the parser dislikes does NOT land here —
+      // createSourceFile recovers and returns a tree — so this cannot fail a
+      // build over one odd-but-valid file; it fires when inspection itself broke.
+      recordUninspected(file, `failed to parse: ${describeError(err)}`);
+    }
+  }
+
+  // A run in which NOTHING parsed did not inspect anything, and "no violations
+  // found" would be a statement about a scan that never happened. Measured live
+  // on 2026-08-15: in a checkout without node_modules the `typescript` require
+  // fails for every file, so this guard against unaudited deletes reported
+  // clean and exited 0, with only stderr lines a CI log buries.
+  //
+  // This is deliberately the TOTAL-failure case only, so it cannot fail a build
+  // over one file the parser dislikes: in any working checkout, files parse.
+  if (astAttempted > 0 && astParsed === 0) {
+    writeUninspected();
+    process.stderr.write('\n');
+    process.stderr.write(
+      `[lint-no-direct-destructive] COULD NOT INSPECT — ${astAttempted} file(s) were scanned `
+      + 'and NONE could be parsed, so nothing was actually inspected. This is an environment '
+      + "problem (most often a missing `typescript` dependency — run `npm install`), not a clean "
+      + 'tree. Reporting success here would silently disable the destructive-operation funnel.\n'
+    );
+    // Exit 2, NOT 1. "I could not inspect" and "I found violations" are
+    // different facts and callers act on them differently: pre-push-gate.js
+    // already treats a lint that FAILED TO RUN as a warning and a lint that
+    // found VIOLATIONS as a push-blocking error. Returning 1 here reported an
+    // uninstalled scratch tree as violations — which is how this was caught,
+    // by three pre-push-gate tests going red in CI.
+    return 2;
+  }
+
+  // Partial holes (#2190): some files could not be inspected. Name each one and
+  // its reason. Exit 2 ("could not inspect") unless violations were also found,
+  // which stay exit 1 — a definite finding outranks an incomplete scan.
+  if (uninspected.length > 0) {
+    writeUninspected();
+    if (violations.length === 0) {
+      process.stderr.write('Fix the cause (permissions, encoding, a broken install) and re-run.\n');
+      return 2;
     }
   }
 

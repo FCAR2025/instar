@@ -1,3 +1,5 @@
+import { notificationStamper, withNotificationEnvelope } from '../messaging/notificationStampers.js';
+const stampNotification = notificationStamper('src/monitoring/StallTriageNurse.ts');
 /**
  * StallTriageNurse — LLM-powered session recovery for stalled sessions.
  *
@@ -13,12 +15,15 @@
  */
 
 import { EventEmitter } from 'events';
+import { OriginAuthorCall, type OriginAutomationAuthor } from '../messaging/telegram-origin/OriginAutomationAuthor.js';
 import type { IntelligenceProvider, IntelligenceOptions } from '../core/types.js';
 import type { StateManager } from '../core/StateManager.js';
 import { DegradationReporter } from './DegradationReporter.js';
 import { ANTHROPIC_MODELS, resolveModelId } from '../core/models.js';
 import type { IntelligenceFramework } from '../core/intelligenceProviderFactory.js';
 import { resolveModelForFramework } from '../core/frameworkSessionLaunch.js';
+import { buildBoundedContext, buildStructuredSha256Identity } from '../core/JudgmentProvenanceLog.js';
+import { DP_STALL_TRIAGE_DIAGNOSIS } from '../data/provenanceCoverage.js';
 import { getActivitySignal, type FrameworkActivitySignal } from './frameworkActivitySignals.js';
 import type {
   StallTriageConfig,
@@ -31,6 +36,7 @@ import type {
   TriageDeps,
   ProcessInfo,
 } from './StallTriageNurse.types.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
 
 // Re-export types for convenience
 export type {
@@ -48,6 +54,30 @@ export type {
 // ─── Constants ──────────────────────────────────────────────
 
 const DEFAULT_POST_INTERVENTION_DELAY_MS = 3000;
+
+export const STALL_TRIAGE_DIAGNOSIS_PROMPT_ID = 'stall-triage-diagnosis-v1';
+
+/** Identity-only envelope for the model-visible stall diagnosis evidence. */
+export function buildStallTriageDecisionContext(input: {
+  promptText: string;
+  context: TriageContext;
+}): Record<string, unknown> {
+  const { context } = input;
+  return buildBoundedContext({
+    promptIdentitySha256: buildStructuredSha256Identity(input.promptText),
+    promptChars: input.promptText.length,
+    promptBytes: Buffer.byteLength(input.promptText, 'utf8'),
+    sessionIdentitySha256: buildStructuredSha256Identity(context.sessionName),
+    topicId: context.topicId,
+    sessionStatus: context.sessionStatus,
+    waitMinutes: context.waitMinutes,
+    terminalIdentitySha256: buildStructuredSha256Identity(context.tmuxOutput),
+    terminalChars: context.tmuxOutput.length,
+    pendingMessageIdentitySha256: buildStructuredSha256Identity(context.pendingMessage),
+    recentMessageSetIdentitySha256: buildStructuredSha256Identity(JSON.stringify(context.recentMessages)),
+    recentMessageCount: context.recentMessages.length,
+  });
+}
 
 const DEFAULT_CONFIG: Required<StallTriageConfig> = {
   framework: 'claude-code',
@@ -189,8 +219,7 @@ export class StallTriageNurse extends EventEmitter {
       ? resolveModelId(tierResolved)
       : tierResolved;
     this.config = {
-      ...DEFAULT_CONFIG,
-      ...opts?.config,
+      ...mergeDefaults(DEFAULT_CONFIG, opts?.config),
       framework: mergedFramework,
       model: finalModel,
     };
@@ -367,7 +396,7 @@ export class StallTriageNurse extends EventEmitter {
       actionsTaken.push(lastDiagnosis.action);
 
       // Execute the recommended action
-      await this.executeAction(lastDiagnosis.action, context, lastDiagnosis.userMessage);
+      await this.executeAction(lastDiagnosis.action, context, lastDiagnosis.userMessage, lastDiagnosis.originAuthor);
       this.emit('triage:treated', { topicId, action: lastDiagnosis.action });
 
       // Verify the action worked
@@ -440,11 +469,11 @@ export class StallTriageNurse extends EventEmitter {
 
       // Exhausted all escalations — notify user with actionable instructions
       const failReason = 'max_escalations_reached';
-      await this.deps.sendToTopic(topicId,
+      await withNotificationEnvelope(stampNotification(), async () => (this.deps)!.sendToTopic(topicId,
         `I wasn't able to recover the session automatically. You can:\n` +
         `• Send a new message to this topic (will auto-spawn a fresh session)\n` +
         `• Use /restart to force a fresh start`
-      ).catch(() => {});
+      )).catch(() => {});
       this.emit('triage:failed', { topicId, reason: failReason, actionsTaken });
       const result: TriageResult = {
         resolved: false, actionsTaken, diagnosis: lastDiagnosis,
@@ -606,13 +635,20 @@ export class StallTriageNurse extends EventEmitter {
         // Triage must route through an IntelligenceProvider.
         throw new Error('No IntelligenceProvider configured (direct Anthropic API path removed)');
       }
-      rawResponse = await this.intelligence.evaluate(prompt, {
+      const authorCall = new OriginAuthorCall();
+      rawResponse = await this.intelligence.evaluate(prompt, authorCall.options({
         model: 'balanced',
         maxTokens: this.config.maxTokens,
         attribution: { component: 'StallTriageNurse' }, // attribution for /metrics/features
-      });
+        provenance: {
+          decisionPoint: DP_STALL_TRIAGE_DIAGNOSIS,
+          context: buildStallTriageDecisionContext({ promptText: prompt, context }),
+          optionsPresented: ['status-update', 'nudge', 'interrupt', 'unstick', 'restart'],
+          promptId: STALL_TRIAGE_DIAGNOSIS_PROMPT_ID,
+        },
+      }));
 
-      return this.parseDiagnosis(rawResponse);
+      return this.parseDiagnosis(rawResponse, authorCall.snapshot());
     } catch (err) {
       console.warn(`[StallTriageNurse] LLM diagnosis failed, trying process-tree fallback:`, err);
       DegradationReporter.getInstance().report({
@@ -703,7 +739,7 @@ export class StallTriageNurse extends EventEmitter {
     ].join('\n');
   }
 
-  parseDiagnosis(rawResponse: string): TriageDiagnosis {
+  parseDiagnosis(rawResponse: string, originAuthor?: OriginAutomationAuthor): TriageDiagnosis {
     const fallback: TriageDiagnosis = {
       summary: 'Could not parse LLM response',
       action: 'nudge',
@@ -739,6 +775,7 @@ export class StallTriageNurse extends EventEmitter {
         action: parsed.action as TreatmentAction,
         confidence: validConfidences.includes(parsed.confidence) ? parsed.confidence : 'low',
         userMessage: String(parsed.userMessage || fallback.userMessage),
+        ...(parsed.userMessage && originAuthor ? { originAuthor: structuredClone(originAuthor) } : {}),
       };
     } catch {
       // @silent-fallback-ok — JSON parse in heuristic path
@@ -750,26 +787,29 @@ export class StallTriageNurse extends EventEmitter {
     action: TreatmentAction,
     context: TriageContext,
     userMessage: string,
+    originAuthor?: OriginAutomationAuthor,
   ): Promise<void> {
     console.log(`[StallTriageNurse] Executing ${action} for session "${context.sessionName}" (topic ${context.topicId})`);
+    const send = () => originAuthor ? withNotificationEnvelope(stampNotification(), async () => (this.deps)!.sendToTopic(context.topicId, userMessage, { ...(originAuthor) }))
+      : withNotificationEnvelope(stampNotification(), async () => (this.deps)!.sendToTopic(context.topicId, userMessage));
 
     switch (action) {
       case 'status_update':
-        await this.deps.sendToTopic(context.topicId, userMessage).catch(err => {
+        await send().catch(err => {
           console.warn(`[StallTriageNurse] sendToTopic failed:`, err);
         });
         break;
 
       case 'nudge':
         this.deps.sendInput(context.sessionName, '');  // sendInput adds Enter
-        await this.deps.sendToTopic(context.topicId, userMessage).catch(err => {
+        await send().catch(err => {
           console.warn(`[StallTriageNurse] sendToTopic failed:`, err);
         });
         break;
 
       case 'interrupt':
         this.deps.sendKey(context.sessionName, 'Escape');
-        await this.deps.sendToTopic(context.topicId, userMessage).catch(err => {
+        await send().catch(err => {
           console.warn(`[StallTriageNurse] sendToTopic failed:`, err);
         });
         await this.sendPostInterventionFollowUp(context, 'interrupt');
@@ -777,14 +817,14 @@ export class StallTriageNurse extends EventEmitter {
 
       case 'unstick':
         this.deps.sendKey(context.sessionName, 'C-c');
-        await this.deps.sendToTopic(context.topicId, userMessage).catch(err => {
+        await send().catch(err => {
           console.warn(`[StallTriageNurse] sendToTopic failed:`, err);
         });
         await this.sendPostInterventionFollowUp(context, 'unstick');
         break;
 
       case 'restart':
-        await this.deps.sendToTopic(context.topicId, userMessage).catch(err => {
+        await send().catch(err => {
           console.warn(`[StallTriageNurse] sendToTopic failed:`, err);
         });
         await this.deps.respawnSession(context.sessionName, context.topicId, { silent: true });

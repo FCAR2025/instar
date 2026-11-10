@@ -150,12 +150,43 @@ export function readSpecHeads(specsDir: string): Array<{ file: string; head: str
   return out;
 }
 
+/**
+ * RULE 3.1 rationale — criticality x frequency x stability x fallback.
+ *
+ * CRITICALITY: lowest band. This detector answers "is another PR or approved spec already
+ *   claiming these files?" before a build starts. It is ADVISORY — it never gates, blocks,
+ *   or decides. A wrong answer costs a duplicated build (the 2026-06-05 collision this
+ *   command exists to prevent), never a wrong verdict on someone else's change.
+ * FREQUENCY: once per `instar dev:claim-check` invocation, at build start. Not a hot path,
+ *   no loop, no retry amplification.
+ * STABILITY: the highest available for an external read. `gh --json <fields>` is GitHub
+ *   CLI's documented machine-readable contract, not prose scraped from stdout, and the
+ *   fields are requested explicitly — so an upstream format change surfaces as a `gh`
+ *   error rather than as a silently reshaped object. Deterministic parsing is therefore
+ *   acceptable here without a canary or an LLM check.
+ * FALLBACK: asymmetric, and the asymmetry is the reason this rationale is worth reading.
+ *   A THROWN error (gh missing, auth, network, malformed JSON) degrades LOUDLY — the
+ *   caller records `ghDegraded` and reports spec-scan-only, so the user knows the PR half
+ *   of the check did not run. But EMPTY stdout parses to `null`, which the caller's
+ *   `?? []` renders as "zero PRs claim these files" with no degradation flag: a check that
+ *   could not run becomes indistinguishable from one that ran clean. That path is narrow
+ *   (`gh pr list --json` emits `[]` on success, not empty) but real, and it is tracked
+ *   separately rather than papered over here.
+ */
 function defaultGhJson(args: string[]): Promise<unknown> {
   return new Promise((resolve, reject) => {
     execFile('gh', args, { maxBuffer: 32 * 1024 * 1024, timeout: 30_000 }, (err, stdout) => {
       if (err) return reject(err);
+      // `gh … --json <fields>` ALWAYS emits JSON — zero results is the two-byte array `[]`, never
+      // an empty string. So empty stdout on a ZERO EXIT is absence of data, not absence of PRs.
+      // The old code did `JSON.parse(stdout || 'null')`, which turned that into `null` and let the
+      // caller coerce it to `[]` — a confident "no claims" built out of nothing.
+      const raw = (stdout ?? '').trim();
+      if (raw === '') {
+        return reject(new Error('gh exited 0 but produced no output — PR overlap is UNKNOWN, not zero.'));
+      }
       try {
-        resolve(JSON.parse(stdout || 'null'));
+        resolve(JSON.parse(raw));
       } catch (parseErr) {
         reject(parseErr instanceof Error ? parseErr : new Error(String(parseErr)));
       }
@@ -166,6 +197,25 @@ function defaultGhJson(args: string[]): Promise<unknown> {
 function isoDaysAgo(days: number): string {
   const d = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * A `gh --json` call that SUCCEEDS must still hand back a JSON ARRAY.
+ *
+ * Anything else — `null` from empty stdout, an object, a string — is ABSENCE OF DATA, and coercing
+ * it to `[]` makes "we learned nothing" indistinguishable from "nobody claims these paths". That is
+ * the whole defect: this tool exists to tell an agent whether a sibling already owns the files it is
+ * about to touch, so a false "✓ No claims found" is exactly the two-agents-one-branch collision it
+ * is supposed to prevent.
+ *
+ * Throwing here routes absence into the EXISTING degrade path, which is already loud, rather than
+ * inventing a second reporting channel. A genuine zero — `[]` — passes straight through, which is
+ * what keeps this a guard rather than a permanent alarm.
+ */
+function asPrList(value: unknown, label: 'open' | 'merged'): ClaimPr[] {
+  if (Array.isArray(value)) return value as ClaimPr[];
+  const got = value === null || value === undefined ? 'no output' : typeof value;
+  throw new Error(`gh returned no usable ${label}-PR list (${got}) — PR overlap is UNKNOWN, not zero.`);
 }
 
 /**
@@ -192,13 +242,13 @@ export async function runDevClaimCheck(options: DevClaimCheckOptions): Promise<n
   let ghDegraded: string | null = null;
   if (options.paths.length > 0) {
     try {
-      openPrs = (await ghJson([
+      openPrs = asPrList(await ghJson([
         'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', fields,
-      ])) as ClaimPr[] ?? [];
-      mergedPrs = (await ghJson([
+      ]), 'open');
+      mergedPrs = asPrList(await ghJson([
         'pr', 'list', '--repo', repo, '--state', 'merged', '--limit', '50', '--json', fields,
         '--search', `merged:>=${isoDaysAgo(mergedDays)}`,
-      ])) as ClaimPr[] ?? [];
+      ]), 'merged');
     } catch (err) {
       // Advisory tool: a network/gh failure degrades to spec-scan-only, LOUDLY.
       ghDegraded = err instanceof Error ? err.message : String(err);

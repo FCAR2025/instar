@@ -11,11 +11,11 @@
  *   reachability). No LLM-mediated judgment lives here. The drift checker
  *   (Phase 1.4) emits a *signal* but does NOT call into this validator.
  *
- * Path safety:
- *   All filesystem references (specPath, convergence-report path) are
- *   realpath-resolved and must stay under `targetRepoPath` (or under
- *   `docs/specs/reports/` for the convergence report). Symlinks that
- *   escape are rejected.
+ * Evidence world:
+ *   Spec and convergence-report evidence is read from one explicit canonical
+ *   git ref, never from whichever branch happens to be checked out at
+ *   `targetRepoPath`. The working tree supplies the repository/object store;
+ *   it is not evidence about what canonical main contains.
  *
  * Reconciler-only transitions (`*-> regressed`) require
  * `ctx.bypassMode === 'reconciler'` to succeed; user-initiated requests
@@ -27,8 +27,34 @@ import path from 'node:path';
 import type { PipelineStage } from './InitiativeTracker.js';
 import { extractFrontmatter } from './SafeYaml.js';
 
+/**
+ * What a PASSING `building → merged` verdict established. The validator proves
+ * these four things (PR merged, a real merge-commit sha, that sha reachable from
+ * canonical main, CI rollup green) and until 2026-07-26 returned a bare
+ * `{ ok: true }` — one bit. So the caller could not persist what had just been
+ * checked, and the record ended up asserting `merged` while unable to say what
+ * merged it.
+ *
+ * The asymmetry is the point: a REFUSAL already carried `reason` + `code`, so the
+ * validator explained itself when it said no and said nothing when it said yes.
+ * Evidence on the success path restores the symmetry — and it is what the
+ * merged-state reconcilers consume, so without it they select nothing and their
+ * silence is indistinguishable from "no regressions found".
+ */
+export interface MergedEvidence {
+  prNumber: number;
+  /** GitHub-reported merge commit sha, format-validated above. */
+  mergeCommitOid: string;
+  /** The canonical-main ref the sha was proven reachable from — NOT assumed to
+   *  be `origin/main`, which is the agent's FORK on a dev-agent home. A later
+   *  re-check must use the SAME ref or it will contradict this verdict. */
+  mergeBaseBranch: string;
+  /** ISO instant this evidence was established. */
+  verifiedAt: string;
+}
+
 export type StageTransitionResult =
-  | { ok: true }
+  | { ok: true; evidence?: MergedEvidence }
   | { ok: false; reason: string; code: string };
 
 /**
@@ -52,23 +78,50 @@ export interface ValidationContext {
   unskippedAt?: string;
   /** Special-cased reconciler bypass for `*-> regressed` edges. */
   bypassMode?: 'reconciler';
+  /** The one canonical ref used by BOTH spec and merge evidence. */
+  canonicalMainRef?: string;
+  /** Resolve and memoize one immutable canonical-main snapshot for this request. */
+  resolveCanonicalMainRef?: () => string;
+  /**
+   * Read a regular repository file from `canonicalMainRef`.
+   *
+   * `null` means the path is authoritatively absent from that ref. Throwing
+   * means the evidence source could not be checked and MUST NOT be translated
+   * into a domain claim that the file is absent.
+   */
+  readRepositoryArtifact?: (ref: string, repoRelativePath: string) => Promise<string | null>;
   // Helpers (overridable for tests):
-  readSpecFrontmatter?: (absPath: string) => Promise<unknown>;
   ghPrView?: (prNumber: number) => Promise<GhPrView>;
   gitMergeBaseIsAncestor?: (sha: string, branch: string) => boolean;
-  /**
-   * The canonical-main ref the merge commit must be reachable from. Defaults to
-   * `origin/main`. On a fork-origin checkout (dev-agent home: origin = the
-   * fork, merges on the upstream remote) the route resolves the upstream
-   * remote and passes `<remote>/main` here. (#866 sibling fix.)
-   */
-  mergeBaseBranch?: string;
+}
+
+/** A caller omitted infrastructure, rather than a project failing a gate. */
+export class StageTransitionWiringError extends Error {
+  readonly code = 'STAGE_VALIDATOR_WIRING_ERROR';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'StageTransitionWiringError';
+  }
 }
 
 export interface GhPrView {
   state: string;
   mergeCommit: { oid: string } | null;
-  statusCheckRollup: Array<{ conclusion?: string | null; status?: string | null; state?: string | null }>;
+  /**
+   * GitHub returns EVERY check run, including SUPERSEDED ones — a check that failed
+   * and was then re-run appears TWICE. `name`/`context` and the timestamps are needed
+   * to tell the current run from the stale one (see `ciIsGreen`).
+   */
+  statusCheckRollup: Array<{
+    conclusion?: string | null;
+    status?: string | null;
+    state?: string | null;
+    name?: string | null;
+    context?: string | null;
+    startedAt?: string | null;
+    completedAt?: string | null;
+  }>;
 }
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -149,15 +202,19 @@ export async function validateStageTransition(
     if (!ctx.specPath || !ctx.specPath.trim()) {
       return { ok: false, reason: 'specPath required', code: 'SPEC_PATH_MISSING' };
     }
-    const jailed = jailPath(ctx.targetRepoPath, ctx.specPath);
+    const jailed = jailRepositoryPath(ctx.targetRepoPath, ctx.specPath);
     if (!jailed.ok) return { ok: false, reason: jailed.reason, code: 'SPEC_PATH_ESCAPE' };
-    if (!fs.existsSync(jailed.absPath)) {
+    const spec = await readRepositoryEvidence(ctx, jailed.repoRelativePath, 'spec');
+    if (!spec.ok) {
+      return { ok: false, reason: spec.error, code: 'SPEC_EVIDENCE_UNVERIFIABLE' };
+    }
+    if (spec.text === null) {
       return { ok: false, reason: `spec file does not exist: ${ctx.specPath}`, code: 'SPEC_FILE_MISSING' };
     }
-    if (!jailed.absPath.toLowerCase().endsWith('.md')) {
+    if (!jailed.repoRelativePath.toLowerCase().endsWith('.md')) {
       return { ok: false, reason: 'spec must be a markdown (.md) file', code: 'SPEC_NOT_MARKDOWN' };
     }
-    const fm = await loadFrontmatter(jailed.absPath, ctx.readSpecFrontmatter);
+    const fm = loadFrontmatter(spec.text);
     if (!fm.ok) return { ok: false, reason: fm.error, code: 'SPEC_FRONTMATTER_INVALID' };
     return { ok: true };
   }
@@ -167,9 +224,16 @@ export async function validateStageTransition(
     if (!ctx.specPath) {
       return { ok: false, reason: 'specPath required for convergence', code: 'SPEC_PATH_MISSING' };
     }
-    const jailed = jailPath(ctx.targetRepoPath, ctx.specPath);
+    const jailed = jailRepositoryPath(ctx.targetRepoPath, ctx.specPath);
     if (!jailed.ok) return { ok: false, reason: jailed.reason, code: 'SPEC_PATH_ESCAPE' };
-    const fm = await loadFrontmatter(jailed.absPath, ctx.readSpecFrontmatter);
+    const spec = await readRepositoryEvidence(ctx, jailed.repoRelativePath, 'spec');
+    if (!spec.ok) {
+      return { ok: false, reason: spec.error, code: 'SPEC_EVIDENCE_UNVERIFIABLE' };
+    }
+    if (spec.text === null) {
+      return { ok: false, reason: `spec file does not exist: ${ctx.specPath}`, code: 'SPEC_FILE_MISSING' };
+    }
+    const fm = loadFrontmatter(spec.text);
     if (!fm.ok) return { ok: false, reason: fm.error, code: 'SPEC_FRONTMATTER_INVALID' };
     const data = fm.data;
     if (!isConvergenceTagPresent(data['review-convergence'])) {
@@ -189,11 +253,15 @@ export async function validateStageTransition(
       };
     }
     const reportRel = path.join('docs/specs/reports', `${slug}-convergence.md`);
-    const reportJailed = jailPathUnderSubdir(ctx.targetRepoPath, 'docs/specs/reports', reportRel);
+    const reportJailed = jailRepositoryPathUnderSubdir(ctx.targetRepoPath, 'docs/specs/reports', reportRel);
     if (!reportJailed.ok) {
       return { ok: false, reason: reportJailed.reason, code: 'CONVERGENCE_REPORT_ESCAPE' };
     }
-    if (!fs.existsSync(reportJailed.absPath)) {
+    const report = await readRepositoryEvidence(ctx, reportJailed.repoRelativePath, 'convergence report');
+    if (!report.ok) {
+      return { ok: false, reason: report.error, code: 'CONVERGENCE_REPORT_UNVERIFIABLE' };
+    }
+    if (report.text === null) {
       return {
         ok: false,
         reason: `convergence report missing: ${reportRel}`,
@@ -208,9 +276,16 @@ export async function validateStageTransition(
     if (!ctx.specPath) {
       return { ok: false, reason: 'specPath required for approval', code: 'SPEC_PATH_MISSING' };
     }
-    const jailed = jailPath(ctx.targetRepoPath, ctx.specPath);
+    const jailed = jailRepositoryPath(ctx.targetRepoPath, ctx.specPath);
     if (!jailed.ok) return { ok: false, reason: jailed.reason, code: 'SPEC_PATH_ESCAPE' };
-    const fm = await loadFrontmatter(jailed.absPath, ctx.readSpecFrontmatter);
+    const spec = await readRepositoryEvidence(ctx, jailed.repoRelativePath, 'spec');
+    if (!spec.ok) {
+      return { ok: false, reason: spec.error, code: 'SPEC_EVIDENCE_UNVERIFIABLE' };
+    }
+    if (spec.text === null) {
+      return { ok: false, reason: `spec file does not exist: ${ctx.specPath}`, code: 'SPEC_FILE_MISSING' };
+    }
+    const fm = loadFrontmatter(spec.text);
     if (!fm.ok) return { ok: false, reason: fm.error, code: 'SPEC_FRONTMATTER_INVALID' };
     const data = fm.data;
     if (data.approved !== true) {
@@ -246,9 +321,7 @@ export async function validateStageTransition(
     if (typeof ctx.prNumber !== 'number' || !Number.isInteger(ctx.prNumber) || ctx.prNumber <= 0) {
       return { ok: false, reason: 'prNumber required for building → merged', code: 'PR_NUMBER_MISSING' };
     }
-    if (!ctx.ghPrView) {
-      return { ok: false, reason: 'ghPrView helper not provided', code: 'GH_PR_VIEW_UNAVAILABLE' };
-    }
+    if (!ctx.ghPrView) throw new StageTransitionWiringError('ghPrView dependency was not assembled');
     let view: GhPrView;
     try {
       view = await ctx.ghPrView(ctx.prNumber);
@@ -270,21 +343,37 @@ export async function validateStageTransition(
       return { ok: false, reason: 'mergeCommit.oid is not a sha', code: 'MERGE_COMMIT_INVALID' };
     }
     if (!ctx.gitMergeBaseIsAncestor) {
+      throw new StageTransitionWiringError('gitMergeBaseIsAncestor dependency was not assembled');
+    }
+    // Use the SAME immutable canonical-main snapshot as the spec/report gates.
+    // A fork remote, stale remote-tracking ref, missing gh binary, or unavailable
+    // network is unverifiable — never silently collapsed to origin/main.
+    let mergeBaseBranch: string;
+    try {
+      mergeBaseBranch = resolveContextCanonicalMainRef(ctx);
+    } catch (err) {
+      if (err instanceof StageTransitionWiringError) throw err;
       return {
         ok: false,
-        reason: 'gitMergeBaseIsAncestor helper not provided',
-        code: 'MERGE_BASE_HELPER_UNAVAILABLE',
+        reason: `could not resolve canonical main: ${err instanceof Error ? err.message : String(err)}`,
+        code: 'MERGE_BASE_UNVERIFIABLE',
       };
     }
-    // The canonical-main ref defaults to `origin/main`, but on a dev-agent
-    // home `origin` is the agent's FORK (instar-echo) while merges land on the
-    // upstream remote (JKHeadley/instar) — so origin/main never contains the
-    // merge commit and every advance failed MERGE_COMMIT_UNREACHABLE. The
-    // route now resolves the remote whose URL matches the gh-resolved PR repo
-    // and passes it as `mergeBaseBranch`; this default preserves prior behavior
-    // for canonical-origin installs.
-    const mergeBaseBranch = ctx.mergeBaseBranch ?? 'origin/main';
-    const ancestor = ctx.gitMergeBaseIsAncestor(oid, mergeBaseBranch);
+    // "I could not check" is NOT "it is not there" (found 2026-07-25: the route's
+    // helper swallowed a SourceTreeGuard REFUSAL and returned false, so a merge that
+    // was demonstrably on main reported as unreachable — a refusal rendered as a
+    // fact). A helper that cannot complete the check must throw; that becomes a
+    // DISTINCT verdict the caller can act on, never a fabricated negative.
+    let ancestor: boolean;
+    try {
+      ancestor = ctx.gitMergeBaseIsAncestor(oid, mergeBaseBranch);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `could not verify whether mergeCommit.oid ${oid} is reachable from ${mergeBaseBranch}: ${err instanceof Error ? err.message : String(err)}`,
+        code: 'MERGE_BASE_UNVERIFIABLE',
+      };
+    }
     if (!ancestor) {
       return {
         ok: false,
@@ -295,7 +384,17 @@ export async function validateStageTransition(
     if (!ciIsGreen(view.statusCheckRollup)) {
       return { ok: false, reason: 'CI rollup is not green', code: 'CI_NOT_GREEN' };
     }
-    return { ok: true };
+    // Hand back WHAT was proven, not just THAT something was. The caller
+    // persists this onto the item so the record can name its own evidence.
+    return {
+      ok: true,
+      evidence: {
+        prNumber: ctx.prNumber,
+        mergeCommitOid: oid,
+        mergeBaseBranch,
+        verifiedAt: new Date().toISOString(),
+      },
+    };
   }
 
   // ── outline (creation default) ───────────────────────────────────
@@ -314,6 +413,11 @@ export async function validateStageTransition(
 interface JailResult {
   ok: true;
   absPath: string;
+}
+
+interface RepositoryJailResult {
+  ok: true;
+  repoRelativePath: string;
 }
 
 interface JailFail {
@@ -371,6 +475,50 @@ function jailPathUnderSubdir(root: string, subdir: string, rel: string): JailRes
   return outer;
 }
 
+/**
+ * Lexically confine a path to the repository for git-tree reads.
+ *
+ * This deliberately does not inspect working-tree descendants: doing so would
+ * let a stale checkout decide whether a path on the canonical ref is safe or
+ * present. Git-tree reads never follow filesystem symlinks, and the production
+ * reader separately rejects symlink/tree/submodule entries at the ref.
+ */
+export function jailRepositoryPath(root: string, requested: string): RepositoryJailResult | JailFail {
+  if (!root || !path.isAbsolute(root)) {
+    return { ok: false, reason: `targetRepoPath must be absolute, got "${root}"` };
+  }
+  if (requested.includes('\0')) return { ok: false, reason: 'repository path contains NUL' };
+  try {
+    fs.realpathSync(root);
+  } catch {
+    return { ok: false, reason: `targetRepoPath does not exist: ${root}` };
+  }
+
+  const lexicalRoot = path.resolve(root);
+  const absolute = path.isAbsolute(requested)
+    ? path.resolve(requested)
+    : path.resolve(lexicalRoot, requested);
+  const relative = path.relative(lexicalRoot, absolute);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return { ok: false, reason: `path "${requested}" escapes targetRepoPath` };
+  }
+  return { ok: true, repoRelativePath: relative.split(path.sep).join('/') };
+}
+
+function jailRepositoryPathUnderSubdir(
+  root: string,
+  subdir: string,
+  requested: string,
+): RepositoryJailResult | JailFail {
+  const outer = jailRepositoryPath(root, requested);
+  if (!outer.ok) return outer;
+  const normalizedSubdir = path.posix.normalize(subdir.split(path.sep).join('/')).replace(/\/$/, '');
+  if (!outer.repoRelativePath.startsWith(`${normalizedSubdir}/`)) {
+    return { ok: false, reason: `path "${requested}" is not under ${subdir}` };
+  }
+  return outer;
+}
+
 function realpathToNearestExisting(p: string): string {
   let cur = p;
   // Walk up until a path exists, realpath it, then re-join the tail.
@@ -388,36 +536,116 @@ function realpathToNearestExisting(p: string): string {
   return p;
 }
 
-async function loadFrontmatter(
-  absPath: string,
-  injected?: (absPath: string) => Promise<unknown>
-): Promise<{ ok: true; data: Record<string, unknown> } | { ok: false; error: string }> {
+async function readRepositoryEvidence(
+  ctx: ValidationContext,
+  repoRelativePath: string,
+  label: string,
+): Promise<{ ok: true; text: string | null } | { ok: false; error: string }> {
+  if (!ctx.readRepositoryArtifact) {
+    throw new StageTransitionWiringError('readRepositoryArtifact dependency was not assembled');
+  }
+  let canonicalMainRef: string;
   try {
-    let raw: unknown;
-    if (injected) {
-      raw = await injected(absPath);
-    } else {
-      const text = fs.readFileSync(absPath, 'utf-8');
-      const fm = extractFrontmatter(text);
-      if (fm.error) return { ok: false, error: fm.error };
-      raw = fm.frontmatter ?? {};
-    }
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      return { ok: false, error: 'frontmatter is not a mapping' };
-    }
-    return { ok: true, data: raw as Record<string, unknown> };
+    canonicalMainRef = resolveContextCanonicalMainRef(ctx);
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    if (err instanceof StageTransitionWiringError) throw err;
+    return {
+      ok: false,
+      error: `could not resolve canonical main: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  try {
+    return { ok: true, text: await ctx.readRepositoryArtifact(canonicalMainRef, repoRelativePath) };
+  } catch (err) {
+    return {
+      ok: false,
+      error: `could not read ${label} "${repoRelativePath}" from ${canonicalMainRef}: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
-function ciIsGreen(rollup: GhPrView['statusCheckRollup']): boolean {
-  if (!Array.isArray(rollup) || rollup.length === 0) {
+function resolveContextCanonicalMainRef(ctx: ValidationContext): string {
+  if (ctx.canonicalMainRef?.trim()) return ctx.canonicalMainRef;
+  if (!ctx.resolveCanonicalMainRef) {
+    throw new StageTransitionWiringError('canonicalMainRef dependency was not assembled');
+  }
+  const resolved = ctx.resolveCanonicalMainRef();
+  if (!resolved?.trim()) {
+    throw new Error('canonical-main resolver returned an empty ref');
+  }
+  return resolved;
+}
+
+function loadFrontmatter(
+  text: string,
+): { ok: true; data: Record<string, unknown> } | { ok: false; error: string } {
+  const fm = extractFrontmatter(text);
+  if (fm.error) return { ok: false, error: fm.error };
+  const raw = fm.frontmatter ?? {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, error: 'frontmatter is not a mapping' };
+  }
+  return { ok: true, data: raw as Record<string, unknown> };
+}
+
+type RollupEntry = GhPrView['statusCheckRollup'][number];
+
+/** Completion time of a check run, for ordering. 0 when unknown. */
+function runTime(c: RollupEntry): number {
+  const t = Date.parse(c.completedAt ?? c.startedAt ?? '');
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/**
+ * Collapse the rollup to the LATEST run per check name.
+ *
+ * GitHub's `statusCheckRollup` returns every run of every check, INCLUDING superseded
+ * ones. A check that failed and was then re-run to green appears twice, and the failed
+ * entry never goes away. Found 2026-07-25: PR #1641 merged legitimately (branch
+ * protection saw the passing `eli16` run) yet its rollup still carried
+ * `eli16: FAILURE` from 01:43:52 alongside `eli16: SUCCESS` from 01:45:22 — four check
+ * names were duplicated. The old `ciIsGreen` iterated every entry and refused on the
+ * stale failure, so the tracker could never record a correct merge whose CI had ever
+ * been red. A superseded check-run is a stale SYMBOL; the check's current state is the
+ * latest run, which is exactly what GitHub's own merge gate uses.
+ *
+ * Two deliberate safety choices, because a dedupe must never become a way to HIDE a
+ * real failure:
+ *  - Unnamed entries (bare status contexts with neither `name` nor `context`) are keyed
+ *    individually, so none is silently collapsed into another.
+ *  - When two runs of the same name cannot be ORDERED (equal or missing timestamps),
+ *    the FAILING one wins. Unorderable runs fail closed rather than letting an
+ *    undatable success mask a red.
+ */
+function latestRunPerCheck(rollup: GhPrView['statusCheckRollup']): RollupEntry[] {
+  const byKey = new Map<string, RollupEntry>();
+  let unnamed = 0;
+  const isBad = (c: RollupEntry): boolean => {
+    const concl = (c.conclusion ?? c.state ?? '').toUpperCase();
+    const status = (c.status ?? '').toUpperCase();
+    if (status && status !== 'COMPLETED' && status !== 'SUCCESS' && status !== 'NEUTRAL') return true;
+    return Boolean(concl) && concl !== 'SUCCESS' && concl !== 'SKIPPED' && concl !== 'NEUTRAL';
+  };
+  for (const c of rollup) {
+    const name = (c.name ?? c.context ?? '').trim();
+    const key = name || `\u0000unnamed-${unnamed++}`;
+    const prev = byKey.get(key);
+    if (!prev) { byKey.set(key, c); continue; }
+    const dt = runTime(c) - runTime(prev);
+    if (dt > 0) byKey.set(key, c);
+    else if (dt === 0 && isBad(c)) byKey.set(key, c); // unorderable → the failure wins
+  }
+  return [...byKey.values()];
+}
+
+function ciIsGreen(rollupRaw: GhPrView['statusCheckRollup']): boolean {
+  if (!Array.isArray(rollupRaw) || rollupRaw.length === 0) {
     // Empty rollup = no checks defined. Per spec we treat green as
     // "no failing checks" — an empty rollup is acceptable (small repos
     // without CI). This matches `gh pr merge --auto` semantics.
     return true;
   }
+  const rollup = latestRunPerCheck(rollupRaw);
   for (const check of rollup) {
     const concl = (check.conclusion ?? check.state ?? '').toUpperCase();
     const status = (check.status ?? '').toUpperCase();

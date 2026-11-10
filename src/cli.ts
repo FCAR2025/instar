@@ -24,6 +24,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { initProject } from './commands/init.js';
+import { SUPPORTED_FRAMEWORKS } from './core/TopicFrameworksStore.js';
 import { SafeFsExecutor } from './core/SafeFsExecutor.js';
 // setup.ts is imported dynamically — it depends on @inquirer/prompts which requires Node 20.12+
 import { startServer, stopServer, restartServer } from './commands/server.js';
@@ -32,6 +33,7 @@ import { addUser, listUsers } from './commands/user.js';
 import { addJob, listJobs } from './commands/job.js';
 import { listRelationships, importRelationships, exportRelationships } from './commands/relationship.js';
 import { listMachines, removeMachine, whoami, startPairing, joinMesh, leaveMesh, wakeup, doctor } from './commands/machine.js';
+import { identityAdopt, identityInit, identityStatus } from './commands/identity.js';
 import pc from 'picocolors';
 import { getInstarVersion } from './core/Config.js';
 import { resolveAgentDir } from './core/Config.js';
@@ -270,6 +272,26 @@ async function addQuota(opts: { stateFile?: string }): Promise<void> {
 
 const program = new Command();
 
+async function callLocalContinuation(pathname: string, method = 'GET', body?: unknown): Promise<unknown> {
+  const cfgPath = path.join(process.cwd(), '.instar', 'config.json');
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as { port?: number; authToken?: string | { env?: string } };
+  const configuredToken = typeof cfg.authToken === 'string'
+    ? cfg.authToken
+    : (cfg.authToken?.env ? process.env[cfg.authToken.env] : undefined);
+  const authToken = process.env.INSTAR_AUTH_TOKEN ?? configuredToken ?? '';
+  const response = await fetch(`http://127.0.0.1:${cfg.port ?? 4040}${pathname}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${authToken}`,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const parsed = await response.json() as Record<string, unknown>;
+  if (!response.ok) throw new Error(String(parsed.error ?? `HTTP ${response.status}`));
+  return parsed;
+}
+
 function rejectUnknownTopLevelCommand(program: Command, argv: string[]): void {
   const firstArg = argv[2];
   if (!firstArg || firstArg.startsWith('-')) {
@@ -321,6 +343,15 @@ program
 // ── Setup (explicit alias) ────────────────────────────────────────
 
 program
+  .command('set-claude-key')
+  .description('Put a new Claude sign-in key in place. Reads it from stdin or a hidden prompt.')
+  .option('-d, --dir <path>', 'Agent directory')
+  .action(async (opts) => {
+    const { setClaudeKey } = await import('./commands/setClaudeKey.js');
+    await setClaudeKey(opts);
+  });
+
+program
   .command('setup')
   .description('Interactive setup wizard (same as running `instar` with no args)')
   .option('--non-interactive', 'Run setup without LLM wizard (requires all flags)')
@@ -336,9 +367,15 @@ program
   .option('--scenario <number>', 'Scenario number 1-8 (non-interactive)')
   .option(
     '--framework <name>',
-    'AI runtime to host the setup wizard: claude-code (default), codex-cli, or gemini-cli',
+    `AI runtime to host the setup wizard: ${SUPPORTED_FRAMEWORKS.join(', ')} (claude-code default)`,
     (v: string) => {
-      const allowed = ['claude-code', 'codex-cli', 'gemini-cli'];
+      // ROUND-21: this was a hand-written list, stale since pi-cli landed, so
+      // `setup --framework grok-build` exited 1 while `init --framework
+      // grok-build` (35 lines below, fixed by hand) worked. Fixing one
+      // sibling and not the other is the whole failure mode — so both now
+      // DERIVE, and the help text derives too rather than being a second
+      // copy that can rot on its own.
+      const allowed: readonly string[] = SUPPORTED_FRAMEWORKS;
       if (!allowed.includes(v)) {
         console.error(`\n  --framework must be one of: ${allowed.join(', ')}\n`);
         process.exit(1);
@@ -364,16 +401,42 @@ program
 // ── Init ─────────────────────────────────────────────────────────
 
 program
+  .command('install')
+  .description('Install Instar and create your first agent: the path that needs the fewest choices')
+  .option('--resume', 'Continue an install that stopped or is waiting on you')
+  .option('--yes', 'Agree to what the installer lists, without asking')
+  .option('--answers <file>', 'A JSON file with name, purpose, door and autostart, for AI tools')
+  .option('--status', 'Print the install status as JSON')
+  .option('--restart', 'Begin again instead of continuing an unfinished install')
+  .action(async (opts) => {
+    const [major, minor] = process.versions.node.split('.').map(Number);
+    if (major < 20 || (major === 20 && minor < 12)) {
+      console.error(`\n  Instar needs Node.js 20.12 or later, and you're running ${process.versions.node}.`);
+      console.error(`  Upgrade: https://nodejs.org/en/download\n`);
+      process.exit(1);
+    }
+    const { runInstallCommand, INSTALL_EXIT_CODES } = await import('./commands/install.js');
+    const status = await runInstallCommand(opts);
+    process.exit(INSTALL_EXIT_CODES[status]);
+  });
+
+program
   .command('init [project-name]')
   .description('Initialize agent infrastructure (fresh project, existing, or standalone)')
   .option('-d, --dir <path>', 'Project directory (default: current directory)')
   .option('--port <port>', 'Server port (default: 4040)', (v: string) => parseInt(v, 10))
   .option('--standalone', 'Create a standalone agent at ~/.instar/agents/<name>/')
+  .option('--autostart', 'Allow the agent to install its own start-on-login job even though init runs without a terminal')
+  .option('--expires-in <duration>', 'Make this a throwaway agent that tears itself down after a duration (e.g. 30m, 6h, 2d)')
+  .option('--keep', 'Never expire this agent, even if it lives in a temporary folder')
   .option(
     '--framework <name>',
-    'AI runtime to target: claude-code (default), codex-cli, gemini-cli, or both',
+    `AI runtime to target: ${SUPPORTED_FRAMEWORKS.join(', ')}, or both (claude-code default)`,
     (v: string) => {
-      const allowed = ['claude-code', 'codex-cli', 'gemini-cli', 'both'];
+      // Round-21: was kept "in lockstep" by hand — which is how it went stale
+      // when pi-cli landed and stayed stale until grok-build tripped it
+      // (2026-08-14). Derived now, so a sixth framework needs no edit here.
+      const allowed = [...SUPPORTED_FRAMEWORKS, 'both'];
       if (!allowed.includes(v)) {
         console.error(`\n  --framework must be one of: ${allowed.join(', ')}\n`);
         process.exit(1);
@@ -384,6 +447,56 @@ program
   .action((projectName, opts) => {
     return initProject({ ...opts, name: projectName });
   });
+
+// ── Codex ordinary-work continuation ─────────────────────────────
+
+const continuationCmd = program
+  .command('continuation')
+  .description('Manage the bounded Codex task-continuation ledger');
+
+continuationCmd
+  .command('start')
+  .requiredOption('--topic <id>', 'Topic id')
+  .requiredOption('--task <text...>', 'One or more explicit tasks')
+  .option('--duration <seconds>', 'Duration ceiling', (v: string) => Number(v))
+  .option('--max-continuations <count>', 'Turn ceiling', (v: string) => Number(v))
+  .action(async (opts) => {
+    const result = await callLocalContinuation('/continuation/start', 'POST', {
+      topicId: opts.topic,
+      tasks: opts.task,
+      durationSeconds: opts.duration,
+      maxContinuations: opts.maxContinuations,
+    });
+    console.log(JSON.stringify(result));
+  });
+
+continuationCmd.command('status <topic>').action(async (topic) => {
+  console.log(JSON.stringify(await callLocalContinuation(`/continuation/${encodeURIComponent(topic)}/status`)));
+});
+
+continuationCmd
+  .command('renew <topic>')
+  .description('Mint a fresh bounded generation while preserving the existing task checklist')
+  .option('--duration <seconds>', 'Duration ceiling', (v: string) => Number(v))
+  .option('--max-continuations <count>', 'Turn ceiling', (v: string) => Number(v))
+  .action(async (topic, opts) => {
+    console.log(JSON.stringify(await callLocalContinuation(`/continuation/${encodeURIComponent(topic)}/renew`, 'POST', {
+      durationSeconds: opts.duration,
+      maxContinuations: opts.maxContinuations,
+    })));
+  });
+
+continuationCmd.command('complete <topic> <ordinal>').action(async (topic, ordinal) => {
+  console.log(JSON.stringify(await callLocalContinuation(`/continuation/${encodeURIComponent(topic)}/complete`, 'POST', { ordinal: Number(ordinal) })));
+});
+
+continuationCmd.command('stop <topic>').action(async (topic) => {
+  console.log(JSON.stringify(await callLocalContinuation(`/continuation/${encodeURIComponent(topic)}/stop`, 'POST')));
+});
+
+continuationCmd.command('stop-all').action(async () => {
+  console.log(JSON.stringify(await callLocalContinuation('/continuation/stop-all', 'POST')));
+});
 
 // ── Add ───────────────────────────────────────────────────────────
 
@@ -442,6 +555,35 @@ addCmd
   .option('--state-file <path>', 'Path to quota state file (default: .instar/state/quota.json)')
   .action((opts) => addQuota(opts));
 
+// ── Mobile: owner introducers (docs/specs/mobile-pairing-introducer.md) ──
+
+const mobileCmd = program
+  .command('mobile')
+  .description('Phone pairing settings for the Instar app');
+const introducerCmd = mobileCmd
+  .command('introducer')
+  .description('Agents whose owner phones may add this agent with Face ID');
+introducerCmd.command('show')
+  .description("Print this agent's own introducer entry, to add to an agent it creates")
+  .option('--dir <path>', 'Agent directory (default: detected)')
+  .option('--json', 'Print the entry as JSON')
+  .action(async (opts) => { const m = await import('./commands/mobileIntroducer.js'); m.showIntroducer(opts); });
+introducerCmd.command('add')
+  .description("Trust an introducer's owner phones on this agent (restart to apply)")
+  .requiredOption('--name <name>', 'The introducing agent\'s name')
+  .requiredOption('--key <publicKey>', 'Its introducer key (from `instar mobile introducer show` on it)')
+  .option('--dir <path>', 'Agent directory (default: detected)')
+  .action(async (opts) => { const m = await import('./commands/mobileIntroducer.js'); m.addIntroducer(opts); });
+introducerCmd.command('remove')
+  .description('Stop trusting an introducer (restart to apply)')
+  .requiredOption('--key <publicKey>', 'The introducer key to remove')
+  .option('--dir <path>', 'Agent directory (default: detected)')
+  .action(async (opts) => { const m = await import('./commands/mobileIntroducer.js'); m.removeIntroducer(opts); });
+introducerCmd.command('list')
+  .description('List the introducers this agent trusts')
+  .option('--dir <path>', 'Agent directory (default: detected)')
+  .action(async (opts) => { const m = await import('./commands/mobileIntroducer.js'); m.listIntroducers(opts); });
+
 // ── Remove ──────────────────────────────────────────────────────
 
 const removeAdapterCmd = program
@@ -493,6 +635,9 @@ worktreeCmd
     'Create a git worktree of the shared instar repo inside the agent home ' +
       '(~/.instar/agents/<agent>/.worktrees/<slug>). Agent home is resolved from ' +
       'INSTAR_AGENT_HOME (set by the agent launcher) or by walking up from the CWD. ' +
+      'The instar repo itself is resolved from INSTAR_REPO, then the CWD, then ' +
+      'INSTAR_AGENT_HOME, then the default checkout locations — so run this from inside ' +
+      'your checkout, or set INSTAR_REPO when it lives elsewhere. ' +
       'Caveat: GIT_AUTHOR_NAME / GIT_COMMITTER_EMAIL in the environment override the ' +
       "per-worktree identity this command sets — agents that need attribution must avoid exporting those vars.",
   )
@@ -510,6 +655,37 @@ worktreeCmd
       });
     } catch (err) {
       console.error(pc.red(`worktree create failed: ${(err as Error).message}`));
+      process.exit(1);
+    }
+  });
+
+// ── Codex (hand-started Codex CLI) ────────────────────────────────
+
+const codexCmd = program
+  .command('codex')
+  .description(
+    'Tools for a Codex CLI the operator starts BY HAND. `connect <agent>` writes that ' +
+      "agent's Threadline MCP entry into the shared Codex user config " +
+      '($CODEX_HOME/config.toml, default ~/.codex/config.toml). Codex sessions Instar ' +
+      'launches never need this — each gets its own entry per session.',
+  );
+
+codexCmd
+  .command('connect <agent>')
+  .description(
+    "Point a hand-started Codex at ONE agent's Threadline MCP server by writing " +
+      '[mcp_servers."threadline"] into the shared Codex user config. The file is shared by ' +
+      'every Codex on this machine, so the entry names one agent at a time — the last one ' +
+      'connected. Honors CODEX_HOME.',
+  )
+  .option('--dry-run', 'Print the entry that would be written; write nothing')
+  .action(async (agent: string, opts: { dryRun?: boolean }) => {
+    const { connectCodex, formatConnectCodexReport } = await import('./commands/codex.js');
+    try {
+      const result = await connectCodex({ agent, dryRun: !!opts.dryRun });
+      console.log(formatConnectCodexReport(result));
+    } catch (err) {
+      console.error(pc.red(`codex connect failed: ${(err as Error).message}`));
       process.exit(1);
     }
   });
@@ -1676,7 +1852,7 @@ lifelineCmd
   .action(async (opts) => {
     const { loadConfig } = await import('./core/Config.js');
     const { readStartupMarker } = await import('./lifeline/startupMarker.js');
-    const { execFileSync, execSync } = await import('node:child_process');
+    const { execFileSync } = await import('node:child_process');
     const fs = await import('node:fs');
     const path = await import('node:path');
     const config = loadConfig(opts.dir);
@@ -1713,27 +1889,43 @@ lifelineCmd
       const uid = process.getuid?.() ?? 0;
       execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${label}`], { stdio: 'inherit' });
     } catch (err) {
-      // Fallback: maybe running under tmux (dev). Try SIGTERM via pkill.
+      // Fallback: maybe running under tmux (dev). Try SIGTERM directly.
       // The b2lead incident showed that SIGTERM-only fallback leaves
       // sleeping lifeline processes holding lifeline.lock, blocking the
       // respawn loop indefinitely. Escalate to SIGKILL after a short
       // grace period so the lock is released and the new lifeline can
       // take over.
-      console.warn(pc.yellow(`launchctl kickstart failed (${err instanceof Error ? err.message : err}); falling back to pkill`));
-      const pattern = `${config.projectName}.*lifeline`;
-      try {
-        execSync(`pkill -TERM -f '${pattern}'`);
-      } catch {
-        /* no process to kill — escalation below is a no-op */
-      }
-      // Grace period for clean exit (signal handlers, queue flush, etc.).
-      // After this, anything still alive is stuck and holding the lock.
-      await new Promise(r => setTimeout(r, 3000));
-      try {
-        execSync(`pkill -KILL -f '${pattern}'`);
-        console.warn(pc.yellow(`escalated to SIGKILL — old lifeline did not exit on SIGTERM`));
-      } catch {
-        /* nothing left to kill — SIGTERM did its job */
+      // The fallback signals ONLY the lifeline's own recorded processes — the
+      // lock holder (`lifeline.lock`, the process actually wedging the respawn)
+      // and the startup-marker pid — and only while the live process at each pid
+      // is PROVEN to be the one that wrote the record (same process start time).
+      // It used to be `pkill -f '<projectName>.*lifeline'`, which matches ANY
+      // command line carrying both words — e.g. a `claude -p` builder whose
+      // prompt names the agent's home and mentions the lifeline — and SIGKILLed
+      // it. A keyword check on the command line is no better: a reused pid can
+      // belong to such a builder. Legacy records without a start time are
+      // never signalled.
+      console.warn(pc.yellow(`launchctl kickstart failed (${err instanceof Error ? err.message : err}); falling back to signalling the recorded lifeline processes`));
+      const { provenLifelineRecords } = await import('./lifeline/lifelineLock.js');
+      const { checkRecordedProcess } = await import('./core/processIdentity.js');
+      const targets = provenLifelineRecords(path.join(config.stateDir, 'lifeline.lock'), baseline);
+      if (targets.length === 0) {
+        console.warn(pc.yellow('no lifeline process proven at the recorded pids — nothing to signal'));
+      } else {
+        for (const t of targets) {
+          try { process.kill(t.pid, 'SIGTERM'); } catch { /* already exited */ }
+        }
+        // Grace period for clean exit (signal handlers, queue flush, etc.).
+        // After this, anything still alive is stuck and holding the lock.
+        await new Promise(r => setTimeout(r, 3000));
+        // Re-prove identity before escalating — a pid freed during the grace
+        // window may already belong to another process.
+        for (const t of targets.filter(r => checkRecordedProcess(r) === 'same')) {
+          try {
+            process.kill(t.pid, 'SIGKILL');
+            console.warn(pc.yellow(`escalated to SIGKILL — old lifeline ${t.pid} did not exit on SIGTERM`));
+          } catch { /* exited in between */ }
+        }
       }
     }
 
@@ -1827,15 +2019,35 @@ autostartCmd
   .command('install')
   .description('Install auto-start so your agent starts on login')
   .option('-d, --dir <path>', 'Project directory')
+  .option('--force', 'Install even for a throwaway agent (temporary folder, sandboxed HOME, or expired)')
   .action(async (opts) => {
     const { loadConfig } = await import('./core/Config.js');
-    const { installAutoStart } = await import('./commands/setup.js');
+    const { installAutoStart, takeLastLingerOutcome, describeLingerOutcome, currentSystemdUser } =
+      await import('./commands/setup.js');
+    const { markAutoStartExplicit, takeLastAutoStartRefusal } = await import('./core/ThrowawayAgentGuard.js');
     const config = loadConfig(opts.dir);
     const hasTelegram = config.messaging?.some((m: { type: string }) => m.type === 'telegram') ?? false;
-    const installed = installAutoStart(config.projectName, config.projectDir, hasTelegram);
+    const installed = installAutoStart(config.projectName, config.projectDir, hasTelegram, { force: opts.force === true });
+    const refusal = takeLastAutoStartRefusal();
     if (installed) {
+      // The explicit request: the startup self-heals may maintain it from now on.
+      markAutoStartExplicit(config.projectDir, { forced: opts.force === true });
+      if (opts.force === true) console.log(pc.yellow('Auto-start installed with --force (throwaway safeguards bypassed for this install).'));
       console.log(pc.green(`Auto-start installed for "${config.projectName}".`));
-      console.log(pc.dim('Your agent will start automatically when you log in.'));
+      // On Linux, "installed" and "starts at boot" are different facts: an
+      // enabled user service only runs while that user holds a login session
+      // unless lingering is on. Report which one is actually true rather than
+      // the old unconditional "starts when you log in" (2026-08-25, headless
+      // Linux host — the message was true in a way that meant never).
+      const linger = takeLastLingerOutcome();
+      if (linger) {
+        const line = describeLingerOutcome(linger, currentSystemdUser());
+        console.log(linger === 'needs-privilege' ? pc.yellow(line) : pc.dim(line));
+      } else {
+        console.log(pc.dim('Your agent will start automatically when you log in.'));
+      }
+    } else if (refusal) {
+      console.log(pc.yellow(`Auto-start not installed: ${refusal}`));
     } else {
       console.log(pc.red('Failed to install auto-start.'));
       console.log(pc.dim(`Platform: ${process.platform} — auto-start supports macOS and Linux.`));
@@ -1916,6 +2128,8 @@ const migrateCmd = program
         port: config.port,
         hasTelegram,
         projectName: config.projectName,
+        claudeCodePath: config.sessions?.frameworkBinaryPaths?.['claude-code'] ?? config.sessions?.claudePath ?? null,
+        host: config.host,
       });
       const result = await migrator.migrateAsync();
 
@@ -2036,6 +2250,46 @@ machineCmd
   .option('-d, --dir <path>', 'Project directory')
   .action(removeMachine);
 
+// ── Telegram message origin: reviewed browser re-enrollment ───────────
+// Local-only on purpose: the enrollment entrypoint is never an HTTP route.
+program
+  .command('telegram-origin')
+  .description('Telegram message-origin maintenance (trusted, local-only)')
+  .command('enroll-browser <profileId>')
+  .description('After a Telegram Web K update: run the read-only canary on the managed profile and enroll the build if it is on the reviewed list (keeps one prior reviewed build). Sends nothing.')
+  .option('-d, --dir <path>', 'Project directory')
+  .option('--evidence-out <file>', 'Write the canary result as JSON to this file')
+  .action(async (profileId: string, opts) => {
+    const { telegramOriginEnrollBrowser } = await import('./commands/telegramOrigin.js');
+    return telegramOriginEnrollBrowser(profileId, opts);
+  });
+
+// ── Agent identity (a2a-single-agent-identity §1.4) ──────────────────
+const identityCmd = program
+  .command('identity')
+  .description('This machine\'s AGENT identity: adopt it from a sibling, or mint a standalone one');
+
+identityCmd
+  .command('status')
+  .description('The on-disk posture + routing fingerprint (never key material)')
+  .option('-d, --dir <path>', 'Project directory')
+  .action(identityStatus);
+
+identityCmd
+  .command('adopt')
+  .description('Move this machine\'s existing identity aside and adopt the one a named sibling publishes (run ON the affected machine, after the operator\'s yes)')
+  .requiredOption('--from <machine-name-or-id>', 'The sibling to adopt the identity from')
+  .option('-d, --dir <path>', 'Project directory')
+  .action(identityAdopt);
+
+identityCmd
+  .command('init')
+  .description('Mint a NEW agent identity on a fleet with no usable candidate (peers must re-pin)')
+  .option('--standalone', 'Required: this is a standalone recovery mint')
+  .option('--i-understand-peers-must-repin', 'Required: acknowledge every peer must re-pin the new address')
+  .option('-d, --dir <path>', 'Project directory')
+  .action(identityInit);
+
 program
   .command('whoami')
   .description("Show this machine's identity and role")
@@ -2052,8 +2306,10 @@ program
 program
   .command('join <url>')
   .description('Join an existing agent mesh (run on the new machine)')
+  .option('-d, --dir <path>', 'Directory to clone/join into (default for a git URL: ./<repo-name>)')
   .option('--code <code>', 'Pairing code from `instar pair`')
   .option('--name <name>', 'Display name for this machine')
+  .option('--port <port>', 'Server port for this machine (default: inherited/4040)', (v) => parseInt(v, 10))
   .action(joinMesh);
 
 program
@@ -2105,6 +2361,33 @@ program
   .description('Diagnose multi-machine health and connectivity')
   .option('-d, --dir <path>', 'Project directory')
   .action(doctor);
+
+// ── Playwright physical-seat lease ──────────────────────────────
+
+const playwrightSeatCmd = program
+  .command('playwright-seat')
+  .description('Voluntarily coordinate standalone Playwright scripts with the host-wide operator-seat lease');
+
+playwrightSeatCmd
+  .command('acquire')
+  .requiredOption('--holder <id>', 'Unique drive-invocation id reused only for its release')
+  .option('--label <label>', 'Human-readable drive label', 'standalone Playwright script')
+  .action(async (opts) => {
+    const { PlaywrightSeatLease } = await import('./core/PlaywrightSeatLease.js');
+    const result = new PlaywrightSeatLease().acquire(opts.holder, opts.label);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!result.acquired) process.exitCode = 2;
+  });
+
+playwrightSeatCmd
+  .command('release')
+  .requiredOption('--holder <id>', 'Same unique drive-invocation id used to acquire')
+  .action(async (opts) => {
+    const { PlaywrightSeatLease } = await import('./core/PlaywrightSeatLease.js');
+    const result = new PlaywrightSeatLease().release(opts.holder);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!result.released && result.reason === 'ownership-mismatch') process.exitCode = 2;
+  });
 
 // ── Channels ─────────────────────────────────────────────────────
 
@@ -2437,15 +2720,42 @@ gateCmd
     return gateLog(opts);
   });
 
+gateCmd
+  .command('reset-breaker')
+  .description('Clear the durable authority breaker after repairing a provider')
+  .option('-d, --dir <path>', 'Project directory')
+  .action(async (opts) => {
+    const { gateResetBreaker } = await import('./commands/gate.js');
+    return gateResetBreaker(opts);
+  });
+
+gateCmd
+  .command('between-window')
+  .description('Evaluate the W27 between-window charter-admission package against the Telegram store')
+  .requiredOption('--package <path>', 'Admission package JSON')
+  .option('--store <path>', 'Override telegram-messages.jsonl path')
+  .option('--json', 'Emit the raw JSON result')
+  .option('-d, --dir <path>', 'Project directory')
+  .action(async (opts) => {
+    const { gateBetweenWindowAdmission } = await import('./commands/gate.js');
+    return gateBetweenWindowAdmission(opts);
+  });
+
 // ── `instar dev:preflight` — contributor ship-gate verifier ────────
 
 program
   .command('dev:preflight')
   .description('Run the verify-only new-surface friction guard for contributor PRs')
   .option('--base <ref>', 'Diff base ref for the route heuristic (default: main remote candidates)')
-  .action(async (opts: { base?: string }) => {
+  .option('--body <file>', 'Path to the PR body; runs the gates that read the PR description (ELI16, UX impact)')
+  .option('--title <text>', 'PR title, used by the ELI16 gate exemption logic')
+  .action(async (opts: { base?: string; body?: string; title?: string }) => {
     const { runDevPreflight } = await import('./commands/devPreflight.js');
-    const exitCode = await runDevPreflight({ baseRef: opts.base });
+    const exitCode = await runDevPreflight({
+      baseRef: opts.base,
+      bodyPath: opts.body,
+      prTitle: opts.title,
+    });
     process.exit(exitCode);
   });
 

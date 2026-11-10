@@ -27,6 +27,7 @@ const mockTmuxSessions = new Set<string>();
 const newSessionArgvs: string[][] = [];
 /** Toggled by the completion test: capture-pane returns the sentinel. */
 let capturePaneOutput = '';
+const maintenanceTicks = new WeakMap<SessionManager, () => Promise<void>>();
 
 vi.mock('node:child_process', () => {
   const handle = (args?: string[]) => {
@@ -70,6 +71,7 @@ import os from 'node:os';
 import request from 'supertest';
 import { AgentServer } from '../../src/server/AgentServer.js';
 import { SessionManager } from '../../src/core/SessionManager.js';
+import { ReapGuard } from '../../src/core/ReapGuard.js';
 import { StateManager } from '../../src/core/StateManager.js';
 import type { InstarConfig, Session } from '../../src/core/types.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
@@ -122,7 +124,11 @@ describe('Headless-spawn reroute E2E (V6)', () => {
         ? { subscriptionReroutedLifetimeMinutes: subscriptionPathCfg.maxReroutedLifetimeMinutes }
         : {}),
     };
-    const manager = new SessionManager(sessionManagerConfig as never, state);
+    let maintenanceTick!: () => Promise<void>;
+    const manager = new SessionManager(sessionManagerConfig as never, state, {
+      bindMaintenanceTickForTesting: (tick) => { maintenanceTick = tick; },
+    });
+    maintenanceTicks.set(manager, maintenanceTick);
     stubReadyWait(manager);
     return manager;
   }
@@ -201,10 +207,52 @@ describe('Headless-spawn reroute E2E (V6)', () => {
     // the session as a SUCCESS (status not 'killed'; JobScheduler finalizes
     // success off exactly this, spec F1).
     capturePaneOutput = `some output\n${sentinel}\n`;
-    await (manager as unknown as { monitorTick: () => Promise<void> }).monitorTick();
+    await maintenanceTicks.get(manager)!();
     const done = await completed;
     expect(done.status).not.toBe('killed');
     capturePaneOutput = '';
+  });
+
+  it('an expired spawned reroute releases its live slot despite active-process evidence', async () => {
+    const state = new StateManager(stateDir);
+    const config = baseConfig('force');
+    const manager = productionSessionManager(config, state);
+    const session = await manager.spawnSession({
+      name: 'e2e-expired-job', prompt: 'work until deadline',
+      jobSlug: 'e2e-expired-job', framework: 'claude-code',
+    });
+    expect(session.launchLane).toBe('rerouted-interactive');
+    expect(session.maxLifetimeMinutes).toBeGreaterThan(0);
+
+    manager.setReapGuard(new ReapGuard({
+      protectedSessions: () => [], isRecoveryActive: () => false,
+      hasPendingInjection: () => false, isRelayLeaseActive: () => false,
+      topicBinding: () => null, recentUserMessage: () => false,
+      activeCommitmentForTopic: () => false, activeSubagentCount: () => 0,
+      buildOrAutonomousActive: () => false, hasActiveProcesses: () => true,
+      mainProcessActive: () => true,
+    }));
+    session.startedAt = new Date(Date.now() - (session.maxLifetimeMinutes! + 1) * 60_000).toISOString();
+    state.saveSession(session);
+    capturePaneOutput = 'still working without sentinel';
+
+    const server = new AgentServer({ config, sessionManager: manager as never, state });
+    await server.start();
+    try {
+      await maintenanceTicks.get(manager)!();
+      const res = await request(server.getApp())
+        .get('/sessions')
+        .query({ include: 'all' })
+        .set('Authorization', `Bearer ${AUTH_TOKEN}`);
+      expect(res.status).toBe(200);
+      const entry = (res.body as Array<{ id: string; status: string; endedReason?: string }>)
+        .find((s) => s.id === session.id);
+      expect(entry).toMatchObject({ status: 'killed', endedReason: 'rerouted-lifetime' });
+      expect(mockTmuxSessions.has(session.tmuxSession)).toBe(false);
+    } finally {
+      capturePaneOutput = '';
+      await server.stop();
+    }
   });
 
   it('GET /sessions (real HTTP pipeline) surfaces launchLane — the machine-checkable soak criterion', async () => {

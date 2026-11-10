@@ -1,0 +1,23 @@
+{
+  "ts": "2026-11-07T19:43:10.786Z",
+  "slug": "job-digest-entity-upsert",
+  "suggestedTier": 2,
+  "declaredTier": 1,
+  "riskFloor": 1,
+  "riskFloorReasons": [],
+  "belowFloor": false,
+  "files": 2,
+  "loc": 167,
+  "scope": {
+    "basis": "staged-in-scope-paths-including-deleted",
+    "files": [
+      "src/memory/SemanticMemory.ts",
+      "src/monitoring/SessionActivitySentinel.ts"
+    ],
+    "addedLines": 146,
+    "deletedLines": 21
+  },
+  "causalAutopsy": null,
+  "classClosure": null,
+  "verdict": "pass"
+}

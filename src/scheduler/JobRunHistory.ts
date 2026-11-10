@@ -18,7 +18,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { capacityOutcome, type CapacityEnforcementResult } from '../core/CapacityEnforcement.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
+
+// capacity-enforcement-contract: job-run-history-row@1
 
 export interface JobRunReflection {
   /** High-level summary of what the job did */
@@ -51,11 +54,20 @@ export interface JobRun {
   /** Duration in seconds (computed on completion) */
   durationSeconds?: number;
   /** Result of the run */
-  result: 'pending' | 'success' | 'failure' | 'timeout' | 'spawn-error';
+  /** `skipped` (job-cost-reduction §5.2) — a script reported nothing to do
+   *  (feature dark, prober absent). Neither success nor failure: excluded
+   *  from stats, leaves consecutiveFailures unchanged, no retry. */
+  result: 'pending' | 'success' | 'failure' | 'timeout' | 'spawn-error' | 'skipped';
   /** Error message if failed */
   error?: string;
   /** Model tier used */
   model?: string;
+  /** Framework actually used for this session, when known. */
+  framework?: string;
+  /** How the model route was chosen; older rows have unknown provenance. */
+  routeBasis?: 'bench' | 'category-default' | 'default' | 'fallback' | 'unknown';
+  /** First failed pin check, when routeBasis is fallback. */
+  reason?: string;
   /** Machine ID that ran this job (multi-machine) */
   machineId?: string;
   /** Condensed output from the session (last ~1000 chars) */
@@ -69,10 +81,18 @@ export interface JobRun {
   // ── Phase 1b observability (jobs-as-agentmd spec §"Run-record observability") ──
   /** Where the job came from. "legacy" = traditional jobs.json entry,
    *  "instar" or "user" = per-slug manifest entry with the matching origin. */
-  origin?: 'instar' | 'user' | 'legacy';
+  /** `triage` (job-cost-reduction F13) marks a triage investigation session's
+   *  row — recorded under the job's slug but OUTSIDE the slug's stats. */
+  origin?: 'instar' | 'user' | 'legacy' | 'triage';
+  /** job-cost-reduction §5.1 — `script` for a no-session script run. */
+  runner?: 'script';
+  /** Lock-file trust verdict at run time (script runs). */
+  lockTrust?: string;
+  /** LLM tokens used by the run. Always 0 for a script run. */
+  tokens?: number;
   /** Absolute path the agentmd body was resolved from; null for non-agentmd. */
   resolvedPath?: string | null;
-  /** SHA-256 of the cached body. null for non-agentmd. */
+  /** SHA-256 of the body validated for this run. null for non-agentmd. */
   bodyHash?: string | null;
   /** SHA-256 of the canonicalized frontmatter object. null for non-agentmd. */
   frontmatterHash?: string | null;
@@ -97,12 +117,41 @@ export interface JobRunStats {
   totalRuns: number;
   successes: number;
   failures: number;
-  successRate: number;
-  avgDurationSeconds: number;
+  /** Percentage of completed runs that succeeded, or null when none completed. */
+  successRate: number | null;
+  /** Average duration of runs with a measured positive duration, or null when absent. */
+  avgDurationSeconds: number | null;
   lastRun?: JobRun;
   longestRun?: { durationSeconds: number; runId: string; startedAt: string };
   /** Runs per day over the stats window */
   runsPerDay: number;
+  /** Completed rows that were intentionally condensed to the storage budget. */
+  budgetCondensedRuns: number;
+}
+
+/** Average only measured per-job success rates; never turn an unrun job into 0% or 100%. */
+export function averageMeasuredJobSuccessRates(
+  stats: Array<Pick<JobRunStats, 'successRate'>>,
+): number | null {
+  const measured = stats
+    .map((row) => row.successRate)
+    .filter((rate): rate is number => rate !== null);
+  if (measured.length === 0) return null;
+  return measured.reduce((sum, rate) => sum + rate, 0) / measured.length;
+}
+
+/** Trigger stamped on canary rows (job-cost-reduction §5.6.4). */
+export const SCRIPT_CANARY_TRIGGER = 'script-canary';
+
+/**
+ * A "side run" is recorded under a job's slug but is not the job doing its
+ * work: a triage investigation session (`origin: 'triage'`, F13) or a daily
+ * must-fail canary (`trigger: 'script-canary'`, §5.6.4). Side runs are excluded
+ * from stats and must be excluded from any failure-streak / crash-loop
+ * counting — a canary is SUPPOSED to fail.
+ */
+export function isSideRun(r: Pick<JobRun, 'origin' | 'trigger'>): boolean {
+  return r.origin === 'triage' || r.trigger === SCRIPT_CANARY_TRIGGER;
 }
 
 /** Monotonic counter to ensure unique runIds even within the same millisecond */
@@ -110,10 +159,12 @@ let runCounter = 0;
 
 /** Per-row size cap from spec §"Run-record observability". When a row's
  *  serialized JSON exceeds this many bytes, non-essential fields are
- *  truncated and a degradation event is reported. The essential set —
+ *  condensed and the row carries durable outcome telemetry. The essential set —
  *  runId, slug, sessionId, trigger, startedAt, result, origin — is
  *  always preserved so query results remain coherent. */
 const ROW_SIZE_CAP_BYTES = 2 * 1024;
+const ERROR_OMISSION_MARKER_PREFIX = '\n...[omitted ';
+const ERROR_OMISSION_MARKER_SUFFIX = ' bytes to fit JobRunHistory row cap]...\n';
 
 /** Fields that are dropped first when a row exceeds the size cap.
  *  Ordered loosely by user-visibility: bulky outputs first, summaries last. */
@@ -122,7 +173,6 @@ const TRUNCATABLE_FIELDS = [
   'stateSnapshot',
   'handoffNotes',
   'reflection',
-  'error',
 ] as const;
 
 export class JobRunHistory {
@@ -153,6 +203,10 @@ export class JobRunHistory {
   private cachedRuns: JobRun[] | null = null;
   private cachedSize = 0;
   private cachedMtimeMs = 0;
+  private lastReadHealthy = true;
+
+  /** Lets coverage reporters distinguish an empty ledger from a failed read. */
+  isReadHealthy(): boolean { return this.lastReadHealthy; }
 
   constructor(stateDir: string) {
     this.ledgerDir = path.join(stateDir, 'ledger');
@@ -173,8 +227,14 @@ export class JobRunHistory {
     sessionId: string;
     trigger: string;
     model?: string;
+    framework?: string;
+    routeBasis?: JobRun['routeBasis'];
+    reason?: string;
     // Phase 1b observability extensions (jobs-as-agentmd spec)
-    origin?: 'instar' | 'user' | 'legacy';
+    origin?: 'instar' | 'user' | 'legacy' | 'triage';
+    runner?: 'script';
+    lockTrust?: string;
+    tokens?: number;
     resolvedPath?: string | null;
     bodyHash?: string | null;
     frontmatterHash?: string | null;
@@ -192,8 +252,14 @@ export class JobRunHistory {
       startedAt: new Date().toISOString(),
       result: 'pending',
       model: opts.model,
+      ...(opts.framework !== undefined ? { framework: opts.framework } : {}),
+      ...(opts.routeBasis !== undefined ? { routeBasis: opts.routeBasis } : {}),
+      ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
       machineId: this.machineId ?? undefined,
       origin: opts.origin,
+      ...(opts.runner !== undefined ? { runner: opts.runner } : {}),
+      ...(opts.lockTrust !== undefined ? { lockTrust: opts.lockTrust } : {}),
+      ...(opts.tokens !== undefined ? { tokens: opts.tokens } : {}),
       resolvedPath: opts.resolvedPath ?? null,
       bodyHash: opts.bodyHash ?? null,
       frontmatterHash: opts.frontmatterHash ?? null,
@@ -219,7 +285,7 @@ export class JobRunHistory {
    */
   recordCompletion(opts: {
     runId: string;
-    result: 'success' | 'failure' | 'timeout';
+    result: 'success' | 'failure' | 'timeout' | 'skipped';
     error?: string;
     outputSummary?: string;
   }): void {
@@ -307,6 +373,8 @@ export class JobRunHistory {
     sinceHours?: number;
     limit?: number;
     offset?: number;
+    /** Drop triage + canary rows (see isSideRun). Default false. */
+    excludeSideRuns?: boolean;
   }): { runs: JobRun[]; total: number } {
     const all = this.getDeduplicatedRuns();
     const cutoff = opts?.sinceHours
@@ -316,6 +384,7 @@ export class JobRunHistory {
     const filtered = all.filter(r => {
       if (opts?.slug && r.slug !== opts.slug) return false;
       if (opts?.result && r.result !== opts.result) return false;
+      if (opts?.excludeSideRuns && isSideRun(r)) return false;
       if (cutoff && r.startedAt < cutoff) return false;
       return true;
     });
@@ -326,9 +395,22 @@ export class JobRunHistory {
     const total = filtered.length;
     const offset = opts?.offset ?? 0;
     const limit = opts?.limit ?? 50;
+    // Preserve the exact capped row. Adding a default field after persistence
+    // can push a 2 KB row over its bound; absent provenance means unknown.
     const runs = filtered.slice(offset, offset + limit);
 
     return { runs, total };
+  }
+
+  /**
+   * This machine's rows for one slug, newest first (job-cost-reduction §13:
+   * each machine triages the runs it executed). Rows with no machineId count
+   * as local only when this history has no machine id either.
+   */
+  localRunsForSlug(slug: string, limit: number): JobRun[] {
+    const { runs } = this.query({ slug, limit: 10000 });
+    const mine = runs.filter(r => (r.machineId ?? null) === (this.machineId ?? null));
+    return mine.slice(0, Math.max(0, limit));
   }
 
   /**
@@ -337,9 +419,13 @@ export class JobRunHistory {
   stats(slug: string, sinceHours?: number): JobRunStats {
     const { runs } = this.query({ slug, sinceHours, limit: 10000 });
 
-    const completed = runs.filter(r => r.result !== 'pending');
+    // `skipped` runs and side runs (triage sessions, canaries) are neither
+    // successes nor failures (job-cost-reduction §5.2, F13, §5.6.4): out of
+    // numerator AND denominator.
+    const completed = runs.filter(r => r.result !== 'pending' && r.result !== 'skipped' && !isSideRun(r));
     const successes = completed.filter(r => r.result === 'success').length;
     const failures = completed.filter(r => r.result !== 'success').length;
+    const budgetCondensedRuns = completed.filter(r => r.truncated === true).length;
     const withDuration = completed.filter(r => r.durationSeconds != null && r.durationSeconds > 0);
     const totalDuration = withDuration.reduce((sum, r) => sum + (r.durationSeconds ?? 0), 0);
 
@@ -372,11 +458,12 @@ export class JobRunHistory {
       totalRuns: completed.length,
       successes,
       failures,
-      successRate: completed.length > 0 ? Math.round((successes / completed.length) * 1000) / 10 : 0,
-      avgDurationSeconds: withDuration.length > 0 ? Math.round(totalDuration / withDuration.length) : 0,
+      successRate: completed.length > 0 ? Math.round((successes / completed.length) * 1000) / 10 : null,
+      avgDurationSeconds: withDuration.length > 0 ? Math.round(totalDuration / withDuration.length) : null,
       lastRun: runs[0],
       longestRun,
       runsPerDay,
+      budgetCondensedRuns,
     };
   }
 
@@ -542,7 +629,12 @@ export class JobRunHistory {
 
   private appendLine(data: JobRun): void {
     try {
-      const capped = this.applyRowSizeCap(data);
+      const outcome = this.applyRowSizeCap(data);
+      if (outcome.kind === 'invariant-failure') {
+        this.reportCapacityInvariantFailure(data, outcome);
+        return;
+      }
+      const capped = outcome.value;
       const serialized = JSON.stringify(capped) + '\n';
       fs.appendFileSync(this.file, serialized);
       // Keep the in-memory cache coherent with our own append so the read that
@@ -572,38 +664,97 @@ export class JobRunHistory {
   /**
    * Enforce the 2 KB per-row cap from spec §"Run-record observability".
    * If the serialized row exceeds the cap, non-essential fields are
-   * progressively dropped (longest first by TRUNCATABLE_FIELDS order) and
-   * a degradation event is reported. Essential fields are always preserved.
+   * progressively dropped (longest first by TRUNCATABLE_FIELDS order).
+   * Essential fields are always preserved. Successful budget enforcement is
+   * recorded durably on the row (`truncated: true`) and in aggregate stats; it
+   * is not a degradation because the bounded write path completed as designed.
    */
-  private applyRowSizeCap(row: JobRun): JobRun {
+  private applyRowSizeCap(row: JobRun): CapacityEnforcementResult<JobRun> {
     const initialSize = Buffer.byteLength(JSON.stringify(row), 'utf-8');
-    if (initialSize <= ROW_SIZE_CAP_BYTES) return row;
+    if (initialSize <= ROW_SIZE_CAP_BYTES) {
+      return capacityOutcome({
+        value: row,
+        originalBytes: initialSize,
+        storedBytes: initialSize,
+        capBytes: ROW_SIZE_CAP_BYTES,
+        condensed: false,
+      });
+    }
 
-    // Clone and truncate iteratively. Always preserve the essential set.
-    const truncated: JobRun = { ...row, truncated: true };
+    const limited: JobRun = { ...row, ["truncated"]: true };
     for (const field of TRUNCATABLE_FIELDS) {
-      if (truncated[field] === undefined) continue;
-      delete (truncated as unknown as Record<string, unknown>)[field];
-      if (Buffer.byteLength(JSON.stringify(truncated), 'utf-8') <= ROW_SIZE_CAP_BYTES) {
+      if (limited[field] === undefined) continue;
+      delete (limited as unknown as Record<string, unknown>)[field];
+      if (Buffer.byteLength(JSON.stringify(limited), 'utf-8') <= ROW_SIZE_CAP_BYTES) {
         break;
       }
     }
 
-    const finalSize = Buffer.byteLength(JSON.stringify(truncated), 'utf-8');
-    try {
-      DegradationReporter.getInstance().report({
-        feature: 'JobRunHistory.appendLine',
-        primary: 'Write full run record with all fields',
-        fallback: `Truncate non-essential fields (dropped: ${TRUNCATABLE_FIELDS
-          .filter(f => row[f] !== undefined && truncated[f] === undefined)
-          .join(', ')})`,
-        reason: `Row size ${initialSize}B exceeded ${ROW_SIZE_CAP_BYTES}B cap for run ${row.runId} (slug=${row.slug})`,
-        impact: `Run record stored at ${finalSize}B with truncated:true flag set`,
-      });
-    } catch {
-      // @silent-fallback-ok — degradation reporting is best-effort
+    const originalError = limited.error;
+    if (Buffer.byteLength(JSON.stringify(limited), 'utf-8') > ROW_SIZE_CAP_BYTES &&
+        typeof originalError === 'string') {
+      const fitted = this.fitStringFieldToRowCap(limited, 'error', originalError);
+      if (fitted !== null) {
+        limited.error = fitted;
+      }
     }
-    return truncated;
+
+    const finalSize = Buffer.byteLength(JSON.stringify(limited), 'utf-8');
+    if (finalSize > ROW_SIZE_CAP_BYTES && limited.error !== undefined) {
+      delete (limited as unknown as Record<string, unknown>).error;
+    }
+    const storedSize = Buffer.byteLength(JSON.stringify(limited), 'utf-8');
+    return capacityOutcome({
+      value: limited,
+      originalBytes: initialSize,
+      storedBytes: storedSize,
+      capBytes: ROW_SIZE_CAP_BYTES,
+      condensed: true,
+    });
+  }
+
+  private reportCapacityInvariantFailure(
+    row: JobRun,
+    outcome: Extract<CapacityEnforcementResult<JobRun>, { kind: 'invariant-failure' }>,
+  ): void {
+    const safeSlug = row.slug.slice(0, 120);
+    // @unexpected-capacity-degradation contract=job-run-history-row@1
+    DegradationReporter.getInstance().report({
+      feature: 'JobRunHistory.appendLine',
+      primary: `Store a run-history row at or below ${outcome.capBytes}B`,
+      fallback: 'Refuse the over-budget row; no partial or oversized JSONL write was made',
+      reason: `Capacity invariant failed for slug=${safeSlug}: essential row remained ${outcome.storedBytes}B after condensing (${outcome.originalBytes}B original)`,
+      impact: 'This run-history transition was not persisted; the failure is explicit and operator-visible',
+    });
+  }
+
+  private fitStringFieldToRowCap(row: JobRun, field: 'error', value: string): string | null {
+    let low = 0;
+    let high = value.length;
+    let best: string | null = null;
+
+    while (low <= high) {
+      const keepChars = Math.floor((low + high) / 2);
+      const candidate = this.headTailFit(value, keepChars);
+      const candidateRow = { ...row, [field]: candidate };
+      if (Buffer.byteLength(JSON.stringify(candidateRow), 'utf-8') <= ROW_SIZE_CAP_BYTES) {
+        best = candidate;
+        low = keepChars + 1;
+      } else {
+        high = keepChars - 1;
+      }
+    }
+
+    return best;
+  }
+
+  private headTailFit(value: string, keepChars: number): string {
+    if (keepChars >= value.length) return value;
+    const headChars = Math.ceil(keepChars / 2);
+    const tailChars = Math.floor(keepChars / 2);
+    const omittedBytes = Buffer.byteLength(value.slice(headChars, value.length - tailChars), 'utf-8');
+    const marker = `${ERROR_OMISSION_MARKER_PREFIX}${omittedBytes}${ERROR_OMISSION_MARKER_SUFFIX}`;
+    return `${value.slice(0, headChars)}${marker}${tailChars > 0 ? value.slice(value.length - tailChars) : ''}`;
   }
 
   /**
@@ -641,6 +792,7 @@ export class JobRunHistory {
    */
   private readLines(): JobRun[] {
     if (!fs.existsSync(this.file)) {
+      this.lastReadHealthy = true;
       this.cachedRuns = [];
       this.cachedSize = 0;
       this.cachedMtimeMs = 0;
@@ -648,6 +800,7 @@ export class JobRunHistory {
     }
 
     try {
+      this.lastReadHealthy = true;
       const stat = fs.statSync(this.file);
       const size = stat.size;
       const mtimeMs = stat.mtimeMs;
@@ -688,6 +841,7 @@ export class JobRunHistory {
       this.cachedMtimeMs = mtimeMs;
       return runs;
     } catch (error) {
+      this.lastReadHealthy = false;
       console.error(`[JobRunHistory] Failed to read:`, error);
       DegradationReporter.getInstance().report({
         feature: 'JobRunHistory.readLines',

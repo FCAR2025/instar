@@ -20,6 +20,13 @@
 
 import os from 'node:os';
 import type { ClockSkewStatus, MachineCapacity, MachineHardware } from './types.js';
+import { isLoadReportFresh, loadReportAgeMs, type MachineLoadReport } from './machineLoadReport.js';
+import {
+  appendAttempt,
+  deriveLiveness,
+  type DirectAttempt,
+  type PullFailureShape,
+} from './machineLiveness.js';
 
 // ── Hardware capture (pure-ish: reads `os`, no other I/O) ────────────
 
@@ -103,6 +110,19 @@ export interface HeartbeatObservation {
   /** The machine's own timestamp from its heartbeat (ISO) — advisory. */
   selfReportedLastSeen?: string;
   /**
+   * COARSE liveness beat (e.g. the git-synced file-based MachineHeartbeat, written
+   * every ~30min and tolerant of 48h staleness). When true, the clock-skew FSM is
+   * NOT driven from this beat: `selfReportedLastSeen` here is a coarse, possibly
+   * 30-min-old file timestamp, NOT a live clock reading, so comparing it against the
+   * 5-min clock-skew tolerance produces a PERMANENT false-positive quarantine that
+   * the fresh live (PeerPresencePuller) beats can never undo (root-caused live
+   * Laptop↔Mini, 2026-06-30: a stale file ts re-diverged before the 2 clean beats
+   * needed to re-admit, stranding the peer in suspect-clock-removed forever). A
+   * coarse beat still refreshes liveness (routerReceivedAt) — it only abstains from
+   * the precise clock-skew judgement, which belongs to the live beat path. Absent =
+   * a live beat = the skew FSM runs as before. */
+  coarseHeartbeat?: boolean;
+  /**
    * B5 (multimachine-lease-poll-robustness, Decision 11) — whether this machine's
    * LIFELINE is ACTUALLY polling Telegram (sourced from its lifeline-poll-active
    * file, the truth — not the server's intent). Absent = an older peer that
@@ -130,9 +150,21 @@ export interface HeartbeatObservation {
    *  field is the peer's self-reported DATA, never its identity. Absent =
    *  older peer / no posture (renders "unknown"). */
   guardPosture?: MachineCapacity['guardPosture'];
+  /** Machine-coherence advert (machine-coherence-guard §3.2), ALREADY
+   *  clamp-passed by the puller's narrowing step (M4). Absent = a sparse
+   *  liveness beat (carry the last advert forward WITHOUT refreshing its
+   *  receipt time — M5) or a pre-guard peer. */
+  coherenceAdvert?: MachineCapacity['coherenceAdvert'];
+  /** Clamp-rejection marker (M4): the peer sent an advert that FAILED the
+   *  receive clamp. Replaces the stored advert for evaluation purposes. */
+  coherenceAdvertRejected?: { atMs: number; reason: string };
   /** Durable Inbound Message Queue heartbeat fields (spec §5.1). Absent =
    *  older peer / queue dark — depth honestly unknown. */
   inboundQueue?: MachineCapacity['inboundQueue'];
+  /** Multi-signal load report (trustworthy-machine-load B1), already clamped by
+   *  the puller. Kept in its OWN receipt-stamped slot (like posture) so a coarse
+   *  beat carries it forward without refreshing its age. Absent = unknown load. */
+  loadReport?: MachineLoadReport;
 }
 
 export interface MachinePoolRegistryDeps {
@@ -151,6 +183,8 @@ export interface MachinePoolRegistryDeps {
   failoverThresholdMs: number;
   /** Wall clock (injectable for tests). */
   now?: () => number;
+  /** Monotonic clock used only for live peer-receipt freshness. */
+  monoNow?: () => number;
   /** Fired when a machine is removed from placement for clock skew (Attention item). */
   onClockQuarantine?: (machineId: string, reason: string) => void;
   logger?: (msg: string) => void;
@@ -162,6 +196,14 @@ export interface MachinePoolRegistryDeps {
     record: (machineId: string, posture: NonNullable<MachineCapacity['guardPosture']>, receivedAtMs: number) => void;
     get: (machineId: string) => { posture: NonNullable<MachineCapacity['guardPosture']>; receivedAtMs: number } | null;
   } | null;
+  /** Durable last DIRECT contact per peer (trustworthy-machine-load A3). Display
+   *  only: a saved record renders `stale` with its original age, never `live`. */
+  evidenceStore?: {
+    record: (machineId: string, ev: { receivedAtMs: number; originAt?: string; loadAvg?: number }) => void;
+    get: (machineId: string) => { receivedAtMs: number; originAt?: string; loadAvg?: number } | null;
+  } | null;
+  /** This machine's id (resolved lazily — the server learns it after construction). */
+  selfMachineId?: () => string | null | undefined;
 }
 
 /**
@@ -181,8 +223,34 @@ export class MachinePoolRegistry {
        *  posture-less beat carries the old block forward without refreshing
        *  its age (the age must reflect when the POSTURE was received). */
       posture?: { block: NonNullable<MachineCapacity['guardPosture']>; receivedAtMs: number };
+      /** Coherence-advert receipt, tracked SEPARATELY like posture (spec M5):
+       *  `receivedAtMs` stamps ONLY when a beat actually CARRIES an advert —
+       *  carry-forward must never impersonate freshness (git beats refresh
+       *  liveness without an advert; the evaluator needs the REAL advert age). */
+      coherence?: { advert: NonNullable<MachineCapacity['coherenceAdvert']>; receivedAtMs: number };
+      /** Clamp-rejection marker (spec M4): REPLACES the advert for evaluation
+       *  purposes while set (the last good advert above is retained for
+       *  forensics only); cleared by the next clean advert. */
+      coherenceRejected?: { atMs: number; reason: string };
+      /** Load-report receipt, tracked SEPARATELY (B1): stamps ONLY when a beat
+       *  CARRIES a report; the age shown is the report's, never the beat's. */
+      load?: { report: MachineLoadReport; receivedAtMs: number };
     }
   >();
+  private readonly liveReceivedMonoMs = new Map<string, number>();
+  /** Last direct pull's quota and channel signals, for reports only; placement never reads this. */
+  private readonly directAdverts = new Map<string, { quotaState?: MachineCapacity['quotaState']; servesChannels?: MachineCapacity['servesChannels'] }>();
+  /**
+   * Evidence slots (trustworthy-machine-load A1), kept APART and never merged:
+   * the last direct success (wall receipt time), the recent direct attempts
+   * (successes + failure shapes), the freshest relayed (git-synced) beat's
+   * ORIGINAL time, and the freshest other-machine sighting. Display only — the
+   * `online` field above keeps its existing semantics (A2).
+   */
+  private readonly directSuccess = new Map<string, { atMs: number; originAt?: string; loadAvg?: number; rttMs?: number }>();
+  private readonly attempts = new Map<string, DirectAttempt[]>();
+  private readonly relayedOriginMs = new Map<string, number>();
+  private readonly sightings = new Map<string, { observerMachineId: string; ageMs: number; receivedAtMs: number }>();
 
   constructor(deps: MachinePoolRegistryDeps) {
     this.d = deps;
@@ -192,18 +260,41 @@ export class MachinePoolRegistry {
     return (this.d.now ?? Date.now)();
   }
 
+  private monoNow(): number {
+    return this.d.monoNow?.() ?? Number(process.hrtime.bigint() / 1_000_000n);
+  }
+
+  /** Last direct PeerPresencePuller receipt in this process incarnation. */
+  lastLiveReceiptMono(machineId: string): number | undefined {
+    return this.liveReceivedMonoMs.get(machineId);
+  }
+
   /** Record a heartbeat arrival: stamp router-clock receipt + run the clock-skew FSM. */
-  recordHeartbeat(obs: HeartbeatObservation): ClockSkewSideEffect {
+  recordHeartbeat(obs: HeartbeatObservation & { rttMs?: number }): ClockSkewSideEffect {
     const nowMs = this.now();
+    if (!obs.coarseHeartbeat) this.liveReceivedMonoMs.set(obs.machineId, this.monoNow());
+    if (!obs.coarseHeartbeat && obs.loadReport) {
+      this.directAdverts.set(obs.machineId, { quotaState: obs.quotaState, servesChannels: obs.servesChannels });
+    }
+    this.recordEvidence(obs, nowMs);
     const prev = this.observed.get(obs.machineId);
+    // COARSE beats (the git-synced file MachineHeartbeat) NEVER drive the clock-skew
+    // FSM: their `selfReportedLastSeen` is a coarse, possibly-30-min-old file timestamp,
+    // not a live clock reading, so judging it against the 5-min tolerance is a category
+    // error that produces a permanent false-positive quarantine (the live Laptop↔Mini
+    // bug, 2026-06-30). A coarse beat carries the prior skew state forward untouched and
+    // only refreshes liveness (routerReceivedAt, below).
     let divergent = false;
-    if (obs.selfReportedLastSeen) {
+    if (!obs.coarseHeartbeat && obs.selfReportedLastSeen) {
       const selfMs = Date.parse(obs.selfReportedLastSeen);
       if (Number.isFinite(selfMs)) {
         divergent = Math.abs(selfMs - nowMs) > this.d.clockSkewToleranceMs;
       }
     }
-    const { next, sideEffect } = clockSkewTransition(prev?.skew ?? INITIAL_CLOCK_SKEW_STATE, divergent);
+    const { next, sideEffect }: { next: ClockSkewFsmState; sideEffect: ClockSkewSideEffect } =
+      obs.coarseHeartbeat
+        ? { next: prev?.skew ?? INITIAL_CLOCK_SKEW_STATE, sideEffect: 'none' }
+        : clockSkewTransition(prev?.skew ?? INITIAL_CLOCK_SKEW_STATE, divergent);
     // Posture handling (GUARD-POSTURE-ENDPOINT-SPEC §2.3): a beat WITH a block
     // stamps a fresh receiver-side receipt time and persists durably; a beat
     // WITHOUT one (older peer / lighter beat) carries the previous block
@@ -213,6 +304,23 @@ export class MachinePoolRegistry {
     if (obs.guardPosture) {
       posture = { block: obs.guardPosture, receivedAtMs: nowMs };
       this.d.postureStore?.record(obs.machineId, obs.guardPosture, nowMs);
+    }
+    // Coherence-advert handling (machine-coherence-guard §3.2 M4/M5, the same
+    // separate-receipt pattern as posture above): a beat WITH a clamp-passed
+    // advert stamps a fresh receipt AND clears any standing rejection; a beat
+    // WITH a rejection marker records it (replacing the advert for evaluation —
+    // the last good advert is retained for forensics only); a beat with NEITHER
+    // carries both forward UNCHANGED — including the original receipt time, so
+    // carry-forward can never impersonate freshness (M5).
+    let load = prev?.load;
+    if (obs.loadReport) load = { report: obs.loadReport, receivedAtMs: nowMs };
+    let coherence = prev?.coherence;
+    let coherenceRejected = prev?.coherenceRejected;
+    if (obs.coherenceAdvert) {
+      coherence = { advert: obs.coherenceAdvert, receivedAtMs: nowMs };
+      coherenceRejected = undefined;
+    } else if (obs.coherenceAdvertRejected) {
+      coherenceRejected = obs.coherenceAdvertRejected;
     }
     // seamlessnessFlags carry-forward (the SAME pattern as `posture` above): a
     // LIGHT/liveness beat that OMITS seamlessnessFlags (e.g. refreshPool's 30s
@@ -227,11 +335,22 @@ export class MachinePoolRegistry {
     // one. Field-specific (not a generic deep-merge) by design: merging stale
     // fail-OPEN fields like quotaState forward would regress placement. A fully
     // offline peer still ages out via routerReceivedAtMs → online:false.
-    const obsToStore: HeartbeatObservation =
+    let obsToStore: HeartbeatObservation =
       obs.seamlessnessFlags === undefined && prev?.obs.seamlessnessFlags !== undefined
         ? { ...obs, seamlessnessFlags: prev.obs.seamlessnessFlags }
         : obs;
-    this.observed.set(obs.machineId, { routerReceivedAtMs: nowMs, obs: obsToStore, skew: next, posture });
+    // selfReportedLastSeen carry-forward for COARSE beats: a coarse (stale, git-synced
+    // file) beat must NOT overwrite a FRESHER live `selfReportedLastSeen` from the
+    // PeerPresencePuller path — keep the newer of the two so the displayed last-seen
+    // stays honest and a coarse beat can't visually "age" a peer that is live.
+    if (obs.coarseHeartbeat && obs.selfReportedLastSeen && prev?.obs.selfReportedLastSeen) {
+      const coarseMs = Date.parse(obs.selfReportedLastSeen);
+      const prevMs = Date.parse(prev.obs.selfReportedLastSeen);
+      if (Number.isFinite(coarseMs) && Number.isFinite(prevMs) && prevMs > coarseMs) {
+        obsToStore = { ...obsToStore, selfReportedLastSeen: prev.obs.selfReportedLastSeen };
+      }
+    }
+    this.observed.set(obs.machineId, { routerReceivedAtMs: nowMs, obs: obsToStore, skew: next, posture, coherence, coherenceRejected, load });
     if (sideEffect === 'removed') {
       this.d.onClockQuarantine?.(
         obs.machineId,
@@ -242,6 +361,79 @@ export class MachinePoolRegistry {
       this.d.logger?.(`[pool] machine ${obs.machineId} clock recovered — re-admitted to placement`);
     }
     return sideEffect;
+  }
+
+  /** Evidence-slot bookkeeping for one heartbeat (A1). Self beats are not peer evidence. */
+  private recordEvidence(obs: HeartbeatObservation & { rttMs?: number }, nowMs: number): void {
+    if (obs.machineId === this.selfId()) return;
+    if (obs.coarseHeartbeat) {
+      // Relayed evidence keeps its ORIGINAL time: re-recording the same git
+      // file every 30 s must never make it look younger (spec A1).
+      const origin = obs.selfReportedLastSeen ? Date.parse(obs.selfReportedLastSeen) : NaN;
+      if (Number.isFinite(origin)) {
+        const prev = this.relayedOriginMs.get(obs.machineId);
+        if (prev === undefined || origin > prev) this.relayedOriginMs.set(obs.machineId, Math.min(origin, nowMs));
+      }
+      return;
+    }
+    this.directSuccess.set(obs.machineId, {
+      atMs: nowMs,
+      ...(obs.selfReportedLastSeen ? { originAt: obs.selfReportedLastSeen } : {}),
+      ...(typeof obs.loadAvg === 'number' ? { loadAvg: obs.loadAvg } : {}),
+      ...(typeof obs.rttMs === 'number' ? { rttMs: obs.rttMs } : {}),
+    });
+    this.attempts.set(obs.machineId, appendAttempt(this.attempts.get(obs.machineId) ?? [], { atMs: nowMs, ok: true }, nowMs));
+    this.d.evidenceStore?.record(obs.machineId, {
+      receivedAtMs: nowMs,
+      ...(obs.selfReportedLastSeen ? { originAt: obs.selfReportedLastSeen } : {}),
+      ...(typeof obs.loadAvg === 'number' ? { loadAvg: obs.loadAvg } : {}),
+    });
+  }
+
+  private selfId(): string | null | undefined {
+    try { return this.d.selfMachineId?.(); } catch { return undefined; /* @silent-fallback-ok — unresolved self id: treat every machine as a peer (display only) */ }
+  }
+
+  /** Record a failed direct attempt and its shape (A1 `lastDirectFailure`). */
+  recordPullFailure(machineId: string, shape: PullFailureShape): void {
+    if (machineId === this.selfId()) return;
+    const nowMs = this.now();
+    this.attempts.set(machineId, appendAttempt(this.attempts.get(machineId) ?? [], { atMs: nowMs, ok: false, shape }, nowMs));
+  }
+
+  /**
+   * Record another machine's report of ITS OWN direct contacts (A4). Ages are
+   * on the observer's clock, so skew cannot make a sighting look fresh. Display
+   * only: a sighting never refreshes our own slots and is never re-relayed.
+   */
+  recordPeerSightings(observerMachineId: string, sightings: Record<string, { ageMs: number }>): void {
+    const nowMs = this.now();
+    const self = this.selfId();
+    // Bounded by the REGISTRY's membership: a peer-supplied id that is not a
+    // known machine is dropped, so the map can never grow past the pool.
+    const known = new Set(this.d.listMachines().map((m) => m.machineId));
+    for (const [machineId, s] of Object.entries(sightings)) {
+      if (machineId === observerMachineId || machineId === self || !known.has(machineId)) continue;
+      if (!s || typeof s.ageMs !== 'number' || !Number.isFinite(s.ageMs) || s.ageMs < 0) continue;
+      const prev = this.sightings.get(machineId);
+      const prevAge = prev ? prev.ageMs + (nowMs - prev.receivedAtMs) : Infinity;
+      if (s.ageMs <= prevAge) this.sightings.set(machineId, { observerMachineId, ageMs: s.ageMs, receivedAtMs: nowMs });
+    }
+  }
+
+  /**
+   * This machine's own direct contacts as ages (A4 advert). Only in-process
+   * direct successes; never relayed, saved, or other machines' sightings.
+   * Ages use the monotonic clock so a wall-clock jump cannot shrink them.
+   */
+  getSightingsAdvert(): Record<string, { ageMs: number }> {
+    const mono = this.monoNow();
+    const out: Record<string, { ageMs: number }> = {};
+    for (const [machineId, at] of this.liveReceivedMonoMs) {
+      if (machineId === this.selfId()) continue;
+      out[machineId] = { ageMs: Math.max(0, mono - at) };
+    }
+    return out;
   }
 
   /** Current clock-skew status for a machine (defaults to ok if unseen). */
@@ -262,6 +454,18 @@ export class MachinePoolRegistry {
     return this.assemble(known);
   }
 
+  /**
+   * The capacity row with the last direct pull's quota and channel signals restored. Those two
+   * fields are deliberately not carried across a coarse beat for placement (see recordHeartbeat),
+   * but a report must not read a coarse beat as "this peer stopped serving". Read-only.
+   */
+  getCapacityForReport(machineId: string): MachineCapacity | null {
+    const row = this.getCapacity(machineId);
+    if (!row) return null;
+    const advert = this.directAdverts.get(machineId);
+    return advert ? { ...row, quotaState: advert.quotaState, servesChannels: advert.servesChannels } : row;
+  }
+
   /** Assemble the full pool view (§L2) — the data behind GET /pool. */
   getCapacities(): MachineCapacity[] {
     return this.d.listMachines().map((m) => this.assemble(m));
@@ -279,6 +483,21 @@ export class MachinePoolRegistry {
     const nowMs = this.now();
     const online =
       !!live && nowMs - live.routerReceivedAtMs < this.d.failoverThresholdMs;
+    const direct = this.directSuccess.get(known.machineId);
+    const saved = direct ? null : this.d.evidenceStore?.get(known.machineId) ?? null;
+    const freshReport = live?.load && isLoadReportFresh(live.load.report, live.load.receivedAtMs, nowMs)
+      ? live.load.report
+      : null;
+    const liveness = deriveLiveness({
+      isSelf: known.machineId === this.selfId(),
+      nowMs,
+      failoverThresholdMs: this.d.failoverThresholdMs,
+      lastDirectSuccessAtMs: direct?.atMs,
+      attempts: this.attempts.get(known.machineId) ?? [],
+      relayedOriginAtMs: this.relayedOriginMs.get(known.machineId),
+      savedDirectAtMs: saved?.receivedAtMs,
+      peerSighting: this.sightings.get(known.machineId),
+    });
     return {
       machineId: known.machineId,
       nickname: known.nickname,
@@ -287,13 +506,35 @@ export class MachinePoolRegistry {
       routerReceivedAt: live ? new Date(live.routerReceivedAtMs).toISOString() : undefined,
       loadAvg: live?.obs.loadAvg,
       memPressure: live?.obs.memPressure,
-      activeSessionCount: live?.obs.activeSessionCount,
-      maxSessions: live?.obs.maxSessions,
+      // A peer's beat carries the load report, not these fields, so a fresh report
+      // fills them. A stale one fills nothing: an old count must never make a machine
+      // look free (Overload shed needs `maxSessions` to accept a target at all).
+      activeSessionCount: live?.obs.activeSessionCount ?? freshReport?.sessionsActive ?? undefined,
+      maxSessions: live?.obs.maxSessions ?? freshReport?.sessionsMax ?? undefined,
       capabilities: known.capabilities,
       modelsAvailable: known.modelsAvailable,
       agentsResident: known.agentsResident,
       hardware: known.hardware,
       clockSkewStatus: live?.skew.status ?? 'ok',
+      liveness,
+      // The last direct contact's load, kept with its own age so a restart or a
+      // coarse beat never erases it (A3; the git beat carries no load).
+      ...(direct?.loadAvg !== undefined
+        ? { lastDirectLoadAvg: { value: direct.loadAvg, at: new Date(direct.atMs).toISOString() } }
+        : saved?.loadAvg !== undefined
+          ? { lastDirectLoadAvg: { value: saved.loadAvg, at: new Date(saved.receivedAtMs).toISOString() } }
+          : {}),
+      ...(direct?.rttMs !== undefined ? { lastPullRttMs: direct.rttMs } : {}),
+      // Load report (B1): the report's OWN age (sampleAge + time since receipt);
+      // past 60 s the verdict reads `unknown` however fresh the transport contact.
+      ...(live?.load
+        ? {
+            loadReport: live.load.report,
+            loadReportReceivedAt: new Date(live.load.receivedAtMs).toISOString(),
+            loadReportAgeMs: loadReportAgeMs(live.load.report, live.load.receivedAtMs, nowMs),
+            loadVerdict: isLoadReportFresh(live.load.report, live.load.receivedAtMs, nowMs) ? live.load.report.verdict : 'unknown',
+          }
+        : { loadVerdict: 'unknown' as const }),
       quotaState: live?.obs.quotaState,
       pollingActive: live?.obs.pollingActive,
       servesChannels: live?.obs.servesChannels,
@@ -308,6 +549,18 @@ export class MachinePoolRegistry {
       // withdrawal flips a boolean inside a still-present object and DOES
       // propagate.
       seamlessnessFlags: live?.obs.seamlessnessFlags,
+      // Machine-coherence advert (§3.2): rejection REPLACES the advert for
+      // evaluation purposes (M4 — rejected ≠ absent; the evaluator classifies
+      // `advert-rejected`, a loud named condition). The receipt time is the
+      // ADVERT's own receipt, never the beat's (M5 carry-forward honesty).
+      ...(live?.coherenceRejected
+        ? { coherenceAdvertRejected: live.coherenceRejected }
+        : live?.coherence
+          ? {
+              coherenceAdvert: live.coherence.advert,
+              coherenceAdvertReceivedAt: new Date(live.coherence.receivedAtMs).toISOString(),
+            }
+          : {}),
       // Guard posture: live observation first, durable last-known second —
       // a machine with no posture EVER received carries neither field
       // (renders "guards: unknown", never "0 on / 0 off").

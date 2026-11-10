@@ -1,0 +1,214 @@
+{
+  "$comment": [
+    "Declared blocking-decision surfaces authored OUTSIDE the TypeScript population the",
+    "ratchets walk. Enforces the constitutional standard 'A Decision That Can Block Must",
+    "Live Where the Checks Can See It' (Standards Registry, The Substrate).",
+    "",
+    "blocking[] is SHRINK-ONLY against blockingCeiling: migrate a decision into TypeScript",
+    "and lower the ceiling. Raising the ceiling is a deliberate, reviewable act.",
+    "",
+    "nonBlocking[] is CONTENT-PINNED: a declared non-blocking script whose bytes change must",
+    "be re-declared. That closes the gap the declaration alone leaves open -- a file declared",
+    "non-blocking could otherwise silently acquire a refusal and stay unwatched.",
+    "",
+    "Seeded 2026-08-06 from the controlled 2026-08-05 F10 census",
+    "(docs/audits/phase-b/f10-triage.md): 26 files, 12 genuine decision surfaces,",
+    "MUST-BE-SHELL 0 / INCIDENTALLY-SHELL 12 / UNKNOWN 0 -- every one of the twelve can move."
+  ],
+  "population": "src/templates/**/*.{sh,js,mjs}",
+  "censusRef": "docs/audits/phase-b/f10-triage.md",
+  "seededAt": "2026-08-06",
+  "blockingCeiling": 12,
+  "blocking": [
+    {
+      "path": "src/templates/hooks/build-stop-hook.sh",
+      "decision": "blocks the owning session's Stop while a build is active"
+    },
+    {
+      "path": "src/templates/hooks/dangerous-command-guard.sh",
+      "decision": "blocks catastrophic commands always; risky commands at safety level 1"
+    },
+    {
+      "path": "src/templates/hooks/free-text-guard.sh",
+      "decision": "blocks AskUserQuestion for free-text credential/identity input"
+    },
+    {
+      "path": "src/templates/hooks/grounding-before-messaging.sh",
+      "decision": "blocks Bash messaging commands when convergence-check reports issues"
+    },
+    {
+      "path": "src/templates/hooks/intercept-imsg-send.js",
+      "decision": "blocks direct/indirect iMessage send attempts from Bash"
+    },
+    {
+      "path": "src/templates/scripts/convergence-check.sh",
+      "decision": "exits non-zero to stop outbound messaging on heuristic quality issues"
+    },
+    {
+      "path": "src/templates/scripts/git-sync-gate.sh",
+      "decision": "stops/skips the git-sync job when preconditions are not met"
+    },
+    {
+      "path": "src/templates/scripts/imessage-reply.sh",
+      "decision": "refuses send unless the server validates and returns a single-use token"
+    },
+    {
+      "path": "src/templates/scripts/serendipity-capture.sh",
+      "decision": "refuses capture when disabled, rate-limited, invalid, or secrets present"
+    },
+    {
+      "path": "src/templates/scripts/slack-reply.sh",
+      "decision": "blocks send on malformed delivery id, absent binding, or tone-gate denial; reports NOT SENT when the server could not record the message origin"
+    },
+    {
+      "path": "src/templates/scripts/telegram-reply.sh",
+      "decision": "refuses misplaced flags, live-credential exposure, and reasonless tone overrides"
+    },
+    {
+      "path": "src/templates/scripts/whatsapp-reply.sh",
+      "decision": "blocks send on server tone-gate denial"
+    }
+  ],
+  "nonBlocking": [
+    {
+      "path": "src/templates/scripts/browser/xdrive.sh",
+      "sha256": "d11b7de0dad9621ca8b54ab249412c23cd974027de894678688409e99ed261bc",
+      "reason": "normal-chrome-linux: operator-invoked browser helper; refuses its own bad arguments or an unsafe moment on the invariant floors of docs/specs/normal-chrome-linux.md, and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/x-drive.py",
+      "sha256": "9fcb321165f91a89d5f80105622116e96d110547d37ef53f9c7f9e12b82fb8bf",
+      "reason": "normal-chrome-linux: operator-invoked browser helper; refuses its own bad arguments or an unsafe moment on the invariant floors of docs/specs/normal-chrome-linux.md, and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/xdrive-provision.sh",
+      "sha256": "765bcc3500a449c7ec8092a8b813e139dd84cc1f0371b8f72ac05a83a7746a2f",
+      "reason": "normal-chrome-linux: the detached installer the agent's own boot starts; it refuses only its own failed steps (a wrong key fingerprint installs nothing) and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/smart-fetch.py",
+      "sha256": "e9cf76eacafad745549deb0dc5f27a810a9e4724b20bd738946668dcb859b89c",
+      "reason": "Newly in the population when the lint widened to .py (normal-chrome-linux): a page-fetching helper an agent runs; it reports fetch results and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/app-reply.sh",
+      "sha256": "989a677291ac3c066d5063e91f5f43dea6a5c105fdec39309e38c6d56fc5b815",
+      "reason": "Declared 2026-11-01 (mobile-native-conversations inc 1): a thin relay. Every send decision (bind token, ownership, tone gate, duplicate suppression) is made by POST /app/session-reply in TypeScript; the script only reads stdin, JSON-escapes, posts, and reports the server answer. It refuses nothing on its own (a missing binding or malformed delivery id is passed through for the server to refuse or replace). Re-declared 2026-11-01 (mobile-native-chat-media inc 1): --file only turns paths into absolute paths for the JSON body; which files may be sent (confinement, key material, hard links, the credential wall) is decided by the server route. The only local exits are usage errors (--file with no path, no text and no file). Re-declared 2026-11-03 (message-origin-all-platforms): the script now also forwards the session's origin credential header (read from its own tmux environment when present, dropped unless it carries the ior1_ prefix); it refuses nothing on that basis, and the server records unknown evidence when the header is absent."
+    },
+    {
+      "path": "src/templates/hooks/compaction-recovery.sh",
+      "sha256": "ffbdc114a6845550085e282d2da08dd8790dc584539110f11c4bb2c8365b6e57",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/hooks/model-tier-reconciler.js",
+      "sha256": "445550f4904ea45da8382c1bb1b5b461c298622d5fbddb87256ecb6d57a37d78",
+      "reason": "states 'never blocks the turn'; exits 0 on missing prerequisites"
+    },
+    {
+      "path": "src/templates/hooks/model-tier-skill-entry.sh",
+      "sha256": "29a6dc1f5b1fd4f86017c203746f1f81a0fd02de4817071a4eeec6c1810ea90f",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/hooks/session-start.sh",
+      "sha256": "985941e22ff1b68fdaab400c96e55320d8ed345a1ed154cac178d032076031bc",
+      "reason": "injects startup context; exits open when config/port/health are unavailable"
+    },
+    {
+      "path": "src/templates/hooks/skill-usage-telemetry.sh",
+      "sha256": "77fb4080da1555c4961b22a0cb27cb71c5384718991a7ed14ceba7801a77e60f",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/hooks/slack-channel-context.sh",
+      "sha256": "37ef4b95dac95e4b9b682913706809b30ff9e07754d2925196dc4860767896d9",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change anchors the config read on CLAUDE_PROJECT_DIR and passes that path to Python as argv; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/hooks/telegram-topic-context.sh",
+      "sha256": "c4af64e9364ed241b3480fd07e4822faf036612ac73a9d8b4afb22a1ea7fdc15",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-js.sh",
+      "sha256": "034db30dd4d962f9376ed690fc8e3e55e1b11a9f81848ddeb99316f325064fbd",
+      "reason": "normal-chrome-builtin-skill: an operator-invoked helper the agent runs by hand; it refuses only its own bad arguments (non-macOS, profile outside the agent home, wrong origin) and gates no message, session or agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-launch.sh",
+      "sha256": "f22fb68c00d9705b6de194e64a7c960f315160b99e18d8e62dfa6c62e12f1de6",
+      "reason": "normal-chrome-builtin-skill: an operator-invoked helper the agent runs by hand; it refuses only its own bad arguments (non-macOS, profile outside the agent home, wrong origin) and gates no message, session or agent action; normal-chrome-cross-platform: also refuses a non-URL in the url slot (a launch flag) and launches in the background; chrome-keep-drawing-when-locked: adds two fixed rendering flags, still no decision"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-mainworld.sh",
+      "sha256": "94463cecf72307831390ee8e94355cda9f50d41c262c40efd21ba91f9d843342",
+      "reason": "normal-chrome-builtin-skill: an operator-invoked helper the agent runs by hand; it refuses only its own bad arguments (non-macOS, profile outside the agent home, wrong origin) and gates no message, session or agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/native-drive.ps1",
+      "sha256": "9bacd88a373fe524c31173906f6a667084031fd3e0b232de9b1db14bc0c99e0e",
+      "reason": "normal-chrome-cross-platform: PP's Windows normal-Chrome driver, shipped byte-identical to the live-tested v5 (Mama PC, 2026-10-21, VERDICT PASS); it refuses only its own bad arguments or an unsafe moment (no bound target, focus not on the target, operator active, a flag outside its allowlist) and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/ndrive.sh",
+      "sha256": "d14c4fb79764308e26413b439214ffd9334df5823bfb6f4bbc8da74543266265",
+      "reason": "normal-chrome-cross-platform: the WSL wrapper for native-drive.ps1 (the Instar entry point on Windows); it refuses only its own bad arguments (no powershell.exe, the operator's Chrome profile folder, a non-local or malformed profile path, a non-URL in a url slot, a non-chrome.exe executable, an unattended-machine override with no operator record) or an unsafe moment (canfocus before invoke), and gates no message, session or other agent action"
+    },
+    {
+      "path": "src/templates/scripts/emit-session-clock.sh",
+      "sha256": "6111425eed298b093b95677bd8dc8f0c751344e103b3b4fed7042b327852663b",
+      "reason": "states 'signal-only: pure stdout, never blocks'; exits 0 on unsupported modes"
+    },
+    {
+      "path": "src/templates/scripts/health-watchdog.sh",
+      "sha256": "4be25bb6180bc16e0039359ed15688e3c6c1fc99fe369297d5e100c0eb1bad18",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/scripts/instar-watchdog.sh",
+      "sha256": "207d3cf08ac5bd1030dd35f6d30f472aef9c087e5635e23d92bd574d6291af6b",
+      "reason": "monitors/self-heals/escalates; recovery, not refusal of a user or tool action"
+    },
+    {
+      "path": "src/templates/scripts/instar-worktree-create.sh",
+      "sha256": "c258707dafb41518f376ffbab4ea3c5a824d6ab7dc9b1df5f8b8a2f7f99fbaee",
+      "reason": "boundary case: constrains its own fallback path; accepts no alternate destination to refuse"
+    },
+    {
+      "path": "src/templates/scripts/load-assess.sh",
+      "sha256": "0d8c335b167a7e46099b8636692849a48d4c0ca5722853a453d1a963427c9b88",
+      "reason": "Re-reviewed 2026-09-29 (hook-paths-project-dir): the change only anchors the config read on CLAUDE_PROJECT_DIR; the hook injects context and makes no blocking decision"
+    },
+    {
+      "path": "src/templates/scripts/secret-drop-retrieve.mjs",
+      "sha256": "ef56b003da3f252ea526e0f88e99d7066059e476fc9a42d90c5215e555430178",
+      "reason": "Re-declared 2026-11-04 (normal-chrome-linux: for a browser password it refuses stdout, --run and --consume, which is a refusal of its own operation on a value the person marked for one site; it gates no message or session). boundary case: secret-handoff error/consume semantics, not an enforcement block"
+    },
+    {
+      "path": "src/templates/scripts/secret-get.mjs",
+      "sha256": "c6acba715f339c63d53a889bcea35b5e7de4b46a51de375093631189668447c4",
+      "reason": "boundary case: retrieval failure containment (emits zero secret bytes), not a policy block"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-ledger.sh",
+      "sha256": "a2f6cbbcbbfca746b279718013e277cda8bd8a63eefced1c1b1b03b297a3c84b",
+      "reason": "machine-self-maintenance Part B: writes this agent's browser-instance ledger for the helpers that call it; refuses only a directory outside the profiles folder and gates no message, session or agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-close.sh",
+      "sha256": "59da66ae11a5f679a244d910a79de1577534b54615f51520774a5b8325eaec8b",
+      "reason": "machine-self-maintenance Part B: dry-run in this release; records the completion signal and reports what a close would do. It closes nothing and gates no message, session or agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-renew.sh",
+      "sha256": "bb78aab49c0c20d77a70e8a6e0ada351b509540476651f9fc62687093a25b50a",
+      "reason": "machine-self-maintenance Part B: an agent-invoked helper that renews a browser's ledger lease; refuses only its own bad arguments and gates no message, session or agent action"
+    },
+    {
+      "path": "src/templates/scripts/browser/chrome-unsaved.sh",
+      "sha256": "972b35531c891c778af57e5fd9172a055588c662d34693315ea196cb43da70cc",
+      "reason": "machine-self-maintenance Part B: a read-only per-tab unsaved-input check; prints yes/no/unreadable per tab and gates nothing itself (the watch-only sweep and chrome-close.sh only record its answer)"
+    }
+  ]
+}

@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SafeFsExecutor } from '../../core/SafeFsExecutor.js';
+import type { MessageProvenance } from './MessageProvenance.js';
 
 export interface LogEntry {
   messageId: number | string;
@@ -24,6 +25,16 @@ export interface LogEntry {
   platformUserId?: number | string;
   /** Platform name (telegram, whatsapp, etc.) */
   platform?: string;
+  /** Platform-authenticated forwarding provenance. Undefined means unknown. */
+  forwarded?: boolean;
+  /** Set on a message typed in the native app (mobile-operator-chat). */
+  via?: 'mobile-device';
+  deviceId?: string;
+  eventId?: string;
+  /** Slack: the thread this message sits in (absent for a channel-level message and on older rows). */
+  threadTs?: string;
+  /** Structural message origin. Undefined only for legacy/non-migrated writers. */
+  provenance?: MessageProvenance;
 }
 
 /** Legacy Telegram-specific log entry shape for backward compatibility */
@@ -37,6 +48,12 @@ export interface TelegramLogEntry {
   senderName?: string;
   senderUsername?: string;
   telegramUserId?: number;
+  forwarded?: boolean;
+  /** Set on a message typed in the native app (mobile-operator-chat). */
+  via?: 'mobile-device';
+  deviceId?: string;
+  eventId?: string;
+  provenance?: MessageProvenance;
 }
 
 export interface MessageLoggerConfig {
@@ -82,12 +99,13 @@ export class MessageLogger {
   /**
    * Append a log entry to the JSONL file.
    */
-  append(entry: LogEntry): void {
+  append(entry: LogEntry): boolean {
     try {
       fs.appendFileSync(this.logPath, JSON.stringify(entry) + '\n');
       this.maybeRotate();
     } catch (err) {
       console.error(`[message-logger] Failed to append to log: ${err}`);
+      return false;
     }
 
     // Notify subscribers
@@ -98,6 +116,7 @@ export class MessageLogger {
         console.error(`[message-logger] onMessageLogged callback failed: ${err}`);
       }
     }
+    return true;
   }
 
   /**

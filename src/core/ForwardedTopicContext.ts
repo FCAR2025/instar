@@ -15,6 +15,7 @@
  */
 
 import { formatLocalTimestamp } from '../utils/localTime.js';
+import { historySenderLabel } from '../messaging/shared/signedInbound.js';
 
 /** One historical message, matching TelegramAdapter.getTopicHistory()'s shape. */
 export interface ForwardedHistoryMessage {
@@ -22,6 +23,10 @@ export interface ForwardedHistoryMessage {
   text?: string;
   senderName?: string;
   timestamp?: string | number;
+  /** Read-time ASP authorship from the previous machine's history read. */
+  authorship?: string;
+  authorshipAgentId?: string | null;
+  messageId?: number;
 }
 
 /**
@@ -38,10 +43,11 @@ export function formatForwardedTopicContext(
   lines.push(`--- Thread History (last ${messages.length} messages, relayed from the previous machine) ---`);
   lines.push(`IMPORTANT: Read this history carefully before taking any action.`);
   lines.push(`Your task is to continue THIS conversation, not start something new.`);
+  lines.push('This is a recent pool history excerpt. Earlier replies or messages on an unavailable machine may be missing. Check before saying an earlier message went unanswered.');
   if (topicName) lines.push(`Topic: ${topicName}`);
   lines.push('');
   for (const m of messages) {
-    const sender = m.fromUser ? (m.senderName || 'User') : 'Agent';
+    const sender = historySenderLabel(m);
     // Local time + tz label — unlabeled UTC here caused the 2026-06-05
     // "9:23pm" incoherency (see src/utils/localTime.ts).
     const ts = formatLocalTimestamp(m.timestamp);
@@ -51,4 +57,34 @@ export function formatForwardedTopicContext(
   lines.push('');
   lines.push('--- End Thread History ---');
   return lines.join('\n');
+}
+
+/** Evidence about a specific inbound from a merged pool history read. */
+export function replyEvidenceForInbound(
+  messages: ForwardedHistoryMessage[],
+  inboundMessageId: number,
+  failedPeerRead: boolean,
+): 'answered' | 'unanswered' | 'unknown' {
+  const target = messages.find(m => m.fromUser && m.messageId === inboundMessageId);
+  if (!target) return 'unknown';
+  const received = Date.parse(String(target.timestamp));
+  if (!Number.isFinite(received)) return 'unknown';
+  if (messages.some(m => !m.fromUser && Number.isFinite(Date.parse(String(m.timestamp))) && Date.parse(String(m.timestamp)) >= received)) return 'answered';
+  return failedPeerRead ? 'unknown' : 'unanswered';
+}
+
+export const INCOMPLETE_TOPIC_HISTORY_WARNING =
+  'WARNING: This topic previously lived on another machine. Its conversation history may be incomplete. Check the pool topic history before claiming a message was unanswered or repeating work.';
+
+/** Positive owner-read proof for replay. A reply is only a hold signal. */
+export function crossMachineReplyEvidence(
+  messages: ForwardedHistoryMessage[],
+  inboundMessageId: number,
+  priorOwners: string[],
+  queriedOwners: string[],
+  failedOwners: string[],
+  completeResponse: boolean,
+): 'answered' | 'unanswered' | 'unknown' {
+  const complete = completeResponse && priorOwners.every(owner => queriedOwners.includes(owner) && !failedOwners.includes(owner));
+  return replyEvidenceForInbound(messages, inboundMessageId, !complete);
 }

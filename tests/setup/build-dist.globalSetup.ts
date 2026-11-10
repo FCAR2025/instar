@@ -14,6 +14,8 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { registryAssetIsStale } from './registryAssetFreshness.js';
+import { analyzeVitestArgv } from '../../src/core/testRunnerRunClassifier.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -31,14 +33,96 @@ function newestSrcMtime(dir: string): number {
   return newest;
 }
 
+/**
+ * TWO steps, in this order, and the ORDER IS LOAD-BEARING IN BOTH DIRECTIONS — which is
+ * the whole lesson of this function's history:
+ *
+ *   1. `ensureDistBuilt()` — conditional (skipped when dist is already fresh).
+ *   2. `ensureRegistryAsset()` — UNCONDITIONAL, and necessarily AFTER step 1.
+ *
+ * The generator imports `dist/core/StandardsRegistryParser.js` and its own header says it
+ * must run after `tsc`. So it cannot go first. But it also cannot live INSIDE step 1,
+ * because step 1 returns early on a freshness probe of an unrelated artifact (the
+ * cartographer worker) — so a fresh dist skipped the asset entirely.
+ *
+ * Both orderings have now been shipped and both were wrong, in opposite directions:
+ * originally the call sat below the early return (unreachable whenever dist was fresh);
+ * the fix for that hoisted it above `tsc` (fatal on CI, where `npm ci` → `npm run test:*`
+ * runs with NO build, so `dist/` does not exist, the generator exits 1, and `execSync`
+ * throws out of globalSetup before a single test runs). Locally both bugs are invisible
+ * because `dist/` happens to exist. Separating the two concerns is what makes the
+ * constraint expressible instead of accidental.
+ */
 export default function setup(): void {
+  // `vitest list` runs every globalSetup but executes no test, so it needs no dist.
+  // Building here made the pre-push smoke's affected-test listing run a full `tsc`
+  // and time out, which skipped the smoke tier on every push.
+  if (analyzeVitestArgv(process.argv).isList) return;
+  ensureDistBuilt();
+  ensureRegistryAsset();
+}
+
+function ensureDistBuilt(): void {
   const distWorker = path.join(ROOT, 'dist', 'core', 'cartographerDetect.worker.js');
   const fresh = fs.existsSync(distWorker) &&
     fs.statSync(distWorker).mtimeMs >= newestSrcMtime(path.join(ROOT, 'src'));
   if (fresh) return;
   // tsc only (skip manifest-gen/sign-lockfile from the full `build` — we just need dist).
-  execSync('npx tsc', { cwd: ROOT, stdio: 'inherit' });
+  // The same TypeScript 7 compiler `npm run build` uses, by path: `npx tsc` resolves
+  // whichever of the two installed TypeScript packages npm linked last.
+  execSync('node node_modules/typescript-native/bin/tsc', { cwd: ROOT, stdio: 'inherit' });
   // Restore the bin exec bit the full build script applies (tsc emits 0644) — the
   // package-completeness guard asserts every package.json bin ships executable.
   try { fs.chmodSync(path.join(ROOT, 'dist', 'cli.js'), 0o755); } catch { /* dist/cli.js absent in partial builds */ }
+}
+
+/**
+ * Generate the packed constitution if it is absent.
+ *
+ * `src/data/standards-registry.{md,meta.json}` are gitignored BUILD OUTPUT, and any test
+ * that exercises the production resolver (rather than injecting a fixture path) needs
+ * them. On a fresh CI checkout — `npm ci`, no `npm run build` — they do not exist, and the
+ * `npx tsc` in `ensureDistBuilt()` does not create them either: the generator is a separate
+ * step of the full build. (`ensureDistBuilt` runs FIRST — the generator needs its output.
+ * The word here used to be "above", which stopped being true the moment the reorder moved
+ * the build into its own function; naming the function instead of a direction is what stops
+ * that recurring.)
+ *
+ * WHY THIS IS HERE AND NOT IN A `beforeAll` (measured, and I got it wrong first):
+ * exactly one test file carried a self-bootstrapping `beforeAll`. When a review round
+ * raised "CI cannot run this green", I tested THAT file, saw it pass, and recorded the
+ * finding as unreproducible. Then I added a production-path block to a sharded
+ * INTEGRATION file — which has no such bootstrap — making the finding concrete.
+ * Reproduced afterwards with both asset copies moved aside: exactly 2 failures.
+ *
+ * The lesson is about the rebuttal, not the bug: I disproved a claim by measuring a
+ * different subject than the one it was about. A per-file bootstrap is invisible to the
+ * next file that needs it, so the guarantee belongs at the setup layer where every file
+ * inherits it.
+ *
+ * It runs AFTER the dist build above, never before — see the ordering note on `setup()`.
+ */
+function ensureRegistryAsset(): void {
+  // BOTH output dirs, not just `src/data`. The generator writes the pair to each, and
+  // they are consumed by different readers: tests resolving through TS source read
+  // `src/data`, while the migrator's mirror sources `dist/data` (the copy that actually
+  // ships). A `dist` clean therefore leaves `src/data` present and the mirror's source
+  // gone — and probing only `src/data` would return early over exactly that state.
+  const needed = [
+    path.join(ROOT, 'src', 'data', 'standards-registry.md'),
+    path.join(ROOT, 'src', 'data', 'standards-registry.meta.json'),
+    path.join(ROOT, 'src', 'data', 'standards-guard-index.json'),
+    path.join(ROOT, 'src', 'data', 'standards-guard-index.meta.json'),
+    path.join(ROOT, 'dist', 'data', 'standards-registry.md'),
+    path.join(ROOT, 'dist', 'data', 'standards-registry.meta.json'),
+    path.join(ROOT, 'dist', 'data', 'standards-guard-index.json'),
+    path.join(ROOT, 'dist', 'data', 'standards-guard-index.meta.json'),
+  ];
+  // PRESENCE IS NOT FRESHNESS. This used to return whenever every output existed,
+  // so an asset generated from an older source was accepted forever — while
+  // `ensureDistBuilt()` twelve lines up already compared mtimes. Measured cost:
+  // three test files, eight assertions, in a checkout whose asset was three hours
+  // behind its source. See tests/setup/registryAssetFreshness.ts.
+  if (!registryAssetIsStale(ROOT, needed)) return;
+  execSync('node scripts/generate-standards-registry-asset.mjs', { cwd: ROOT, stdio: 'inherit' });
 }

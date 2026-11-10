@@ -72,11 +72,42 @@ describe('subscription-account-meta schema (WS5.2 §6.1a)', () => {
     expect(validate(wellFormed({ status: 'pwned' }))).toBeNull();
   });
 
+  it('accepts the noQuotaWindow display marker as a strict boolean, and rejects any other type', () => {
+    // Ships with the entitlement-record reader fix: an account that answered
+    // but reports no usage window carries this display-only marker, and it
+    // must survive replication (the receive clamp rejects unknown keys, so
+    // omitting it here would strand the whole projection on peers).
+    const ok = validate(wellFormed({ quota: { noQuotaWindow: true, measuredAt: '2026-09-20T18:00:00Z' } }));
+    expect(ok).not.toBeNull();
+    expect((ok as Record<string, any>).quota.noQuotaWindow).toBe(true);
+    expect(validate(wellFormed({ quota: { noQuotaWindow: 'yes' } }))).toBeNull();
+    expect(validate(wellFormed({ quota: { noQuotaWindow: 1 } }))).toBeNull();
+  });
+
   it('REJECTS a malformed quota (non-numeric utilizationPct, unparseable resetsAt, extra key)', () => {
     expect(validate(wellFormed({ quota: { fiveHour: { utilizationPct: 'lots', resetsAt: '2026-06-17T00:00:00Z' } } }))).toBeNull();
     expect(validate(wellFormed({ quota: { fiveHour: { utilizationPct: 1, resetsAt: 'not-a-date' } } }))).toBeNull();
     expect(validate(wellFormed({ quota: { mysteryField: true } }))).toBeNull();
     expect(validate(wellFormed({ quota: { source: 'made-up-source' } }))).toBeNull();
+  });
+
+  it('accepts a fable window and round-trips it (so peers keep Fable-5 usage)', () => {
+    const projection = wellFormed({
+      quota: {
+        fiveHour: { utilizationPct: 42.5, resetsAt: '2026-06-17T00:00:00Z' },
+        fable: { utilizationPct: 100, resetsAt: '2026-07-15T00:00:00Z' },
+        source: 'oauth-usage-endpoint-fallback',
+      },
+    });
+    const out = validate(projection);
+    expect(out).not.toBeNull();
+    expect((out as Record<string, any>).quota.fable).toEqual({ utilizationPct: 100, resetsAt: '2026-07-15T00:00:00Z' });
+  });
+
+  it('REJECTS a malformed fable window (non-numeric pct / bad date / extra key)', () => {
+    expect(validate(wellFormed({ quota: { fable: { utilizationPct: 'lots', resetsAt: '2026-07-15T00:00:00Z' } } }))).toBeNull();
+    expect(validate(wellFormed({ quota: { fable: { utilizationPct: 1, resetsAt: 'not-a-date' } } }))).toBeNull();
+    expect(validate(wellFormed({ quota: { fable: { utilizationPct: 1, resetsAt: '2026-07-15T00:00:00Z', extra: true } } }))).toBeNull();
   });
 
   it('clamps an over-long nickname to 256 chars rather than rejecting', () => {
@@ -118,6 +149,25 @@ describe('projectAccountToMeta — credential boundary (R2, the load-bearing sec
     expect(meta).not.toHaveProperty('enrolledAt');
     expect(meta).not.toHaveProperty('version');
     expect(Object.keys(meta).sort()).toEqual(['email', 'framework', 'id', 'nickname', 'provider', 'quota', 'status']);
+  });
+
+  it('keeps every machine-local device-limit field out of the projection (codex-device-limit-tripwire §10)', () => {
+    const benched = {
+      ...(fullAccount as unknown as Record<string, unknown>),
+      status: 'needs-reauth',
+      statusCause: 'codex-device-limit',
+      deviceLimitSince: '2026-10-31T20:06:00.000Z',
+      deviceLimitSuspectedAt: '2026-10-31T20:00:00.000Z',
+      deviceLimitNextReadAt: '2026-10-31T21:06:00.000Z',
+      deviceLimitRefusedReads: 3,
+      deviceLimitReadsStopped: true,
+    } as unknown as Parameters<typeof projectAccountToMeta>[0];
+    const meta = projectAccountToMeta(benched);
+    for (const field of ['statusCause', 'deviceLimitSince', 'deviceLimitSuspectedAt', 'deviceLimitNextReadAt',
+      'deviceLimitRefusedReads', 'deviceLimitReadsStopped']) {
+      expect(meta).not.toHaveProperty(field);
+    }
+    expect(meta.status).toBe('needs-reauth');
   });
 
   it('the projection passes its OWN receive-side schema (round-trip safe)', () => {

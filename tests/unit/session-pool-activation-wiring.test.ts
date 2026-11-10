@@ -17,6 +17,14 @@ const SERVER = path.join(process.cwd(), 'src/commands/server.ts');
 describe('Session Pool activation wiring (§L4)', () => {
   const src = fs.readFileSync(SERVER, 'utf-8');
 
+  const ownerAcceptedBlock = (): string => {
+    const idx = src.indexOf('onAccepted: (cmd) => {');
+    expect(idx).toBeGreaterThan(0);
+    const end = src.indexOf('// ── WS1.2 owner-side drain runner', idx);
+    expect(end).toBeGreaterThan(idx);
+    return src.slice(idx, end);
+  };
+
   it('the inbound interception is GATED on a non-dark rollout stage (default-dark → inert)', () => {
     expect(src).toContain("_sessionRouter && _sessionPoolStage() !== 'dark'");
     // The stage getter defaults to dark until startServer wires it to liveConfig.
@@ -24,8 +32,12 @@ describe('Session Pool activation wiring (§L4)', () => {
   });
 
   it('the interception FAILS SAFE — any route error falls back to local dispatch', () => {
-    const idx = src.indexOf("_sessionRouter && _sessionPoolStage() !== 'dark'");
-    const block = src.slice(idx, idx + 5200);
+    const idx = src.indexOf("_sessionRouter && (_sessionPoolStage() !== 'dark' || _routingOnly)");
+    // Window 6500 (was 5200): the silent-loss-refusal-conservation `rejected`
+    // outcome branch (a first-class refusal short-circuit added before the
+    // isRemotelyHandled check) sits inside this block and pushed the
+    // fail-safe fallback log line further down.
+    const block = src.slice(idx, idx + 7000);
     expect(block).toContain('try {');
     expect(block).toContain('await _sessionRouter.route(');
     expect(block).toContain('falling back to local dispatch');
@@ -42,8 +54,10 @@ describe('Session Pool activation wiring (§L4)', () => {
     // pairing (spec §3.3), the TOPIC-PROFILE-SPEC §5.3 acquire seam, and then
     // the WS1.1 ownerSupportsForward skew gate (MULTI-MACHINE-SEAMLESSNESS-SPEC)
     // added lines inside the construction, pushing the later assertions out
-    // (deliverMessage: now sits ~4200 chars in).
-    const block = src.slice(idx, idx + 5000);
+    // (deliverMessage: now sits ~4200 chars in). Window 5500: the
+    // trustworthy-machine-load C5 `overloadAwareRanking` placement seam
+    // (one line) moved it to ~5075.
+    const block = src.slice(idx, idx + 5500);
     // The registry dep filters suspect machines from placement candidates
     // (owner-suspect breaker, P19) with an all-suspect unfiltered fallback —
     // still sourced from the REAL machinePoolRegistry capacities.
@@ -57,7 +71,7 @@ describe('Session Pool activation wiring (§L4)', () => {
 
   it('the owner-suspect breaker is wired into BOTH halves (mark + responsive) and the aliveness check', () => {
     const idx = src.indexOf('new routerMod.SessionRouter({');
-    const block = src.slice(idx, idx + 3000);
+    const block = src.slice(idx, idx + 4000);
     expect(block).toContain('markOwnerSuspect: (m) => ownerSuspectBreaker.markSuspect(m)');
     expect(block).toContain('onOwnerResponsive: (m) => ownerSuspectBreaker.recordSuccess(m)');
     expect(block).toContain('!ownerSuspectBreaker.isSuspect(m)');
@@ -68,12 +82,38 @@ describe('Session Pool activation wiring (§L4)', () => {
     expect(src).toContain('_sessionRouter = new routerMod.SessionRouter(');
   });
 
+  it('confirms a self-placement only after the local delivery tail succeeds', () => {
+    expect(src).toContain('let _confirmLocalSessionPoolClaim: ((sessionKey: string) => boolean) | null = null');
+    expect(src).toContain('return confirmLocalPlacementAfterDelivery({');
+    expect(src).toContain('local claim confirmation errored for topic ${topicId}; ownership outcome will be re-read');
+
+    const liveInject = src.indexOf('const injected = sessionManager.injectTelegramMessage(\n          targetSession');
+    const liveConfirm = src.indexOf('if (injected) confirmLocalSessionPoolClaim();', liveInject);
+    expect(liveInject).toBeGreaterThan(0);
+    expect(liveConfirm).toBeGreaterThan(liveInject);
+
+    const coldSpawn = src.indexOf('spawnSessionForTopic(sessionManager, telegram, spawnName, topicId, text');
+    const coldThen = src.indexOf('.then((newSessionName) => {', coldSpawn);
+    const coldConfirm = src.indexOf('confirmLocalSessionPoolClaim();', coldThen);
+    const coldCatch = src.indexOf('}).catch((err) => {', coldThen);
+    expect(coldConfirm).toBeGreaterThan(coldThen);
+    expect(coldConfirm).toBeLessThan(coldCatch);
+  });
+
+  it('does not confirm a self-placement when local respawn rejects', () => {
+    for (const callsite of ['telegram-respawn-context-exhausted', 'telegram-respawn-dead']) {
+      const gate = src.indexOf(`admitLocalSpawn('${callsite}')`);
+      const respawn = src.indexOf('respawnSessionForTopic(', gate);
+      const thenConfirm = src.indexOf('.then(() => confirmLocalSessionPoolClaim())', respawn);
+      const reject = src.indexOf('.catch(err => {', respawn);
+      expect(respawn).toBeGreaterThan(gate);
+      expect(thenConfirm).toBeGreaterThan(respawn);
+      expect(thenConfirm).toBeLessThan(reject);
+    }
+  });
+
   it('the owner-side bridge resumes the local session on a forwarded message, gated + fail-safe', () => {
-    const idx = src.indexOf('onAccepted: (cmd) => {');
-    expect(idx).toBeGreaterThan(0);
-    // Window widened 4200→5000: the working-set move trigger (WORKING-SET-HANDOFF §3.3)
-    // now prefixes the onAccepted body before the stage gate.
-    const block = src.slice(idx, idx + 7500);
+    const block = ownerAcceptedBlock();
     // Gated on a non-dark stage (early return), then the Telegram arm requires
     // Telegram present. (WS1.1 split the combined gate so a Slack routing key
     // branches between the two: dark-gate stays shared, the !telegram gate now
@@ -87,14 +127,13 @@ describe('Session Pool activation wiring (§L4)', () => {
     expect(block).toContain('spawnSessionForTopic(sessionManager, tg, spawnName, topicId, text');
     // Fire-and-forget + fail-safe (the receipt is already durably ACKed before this).
     expect(block).toContain('owner-side resume failed');
+    const resumeFailureIdx = block.indexOf('owner-side resume failed');
+    expect(block.indexOf('_inboundQueue?.reportPeerInjectError(cmd.session, cmd.messageId', resumeFailureIdx))
+      .toBeGreaterThan(resumeFailureIdx);
   });
 
   it('bug #13: a forwarded follow-up to an already-running moved session INJECTS, never re-spawns', () => {
-    const idx = src.indexOf('onAccepted: (cmd) => {');
-    expect(idx).toBeGreaterThan(0);
-    // Window widened 4200→5000: the working-set move trigger (WORKING-SET-HANDOFF §3.3)
-    // now prefixes the onAccepted body before the stage gate.
-    const block = src.slice(idx, idx + 7500);
+    const block = ownerAcceptedBlock();
     // A live session for the topic short-circuits to injection BEFORE the spawn IIFE.
     const injectIdx = block.indexOf('sessionManager.isSessionAlive(existing)');
     const spawnIdx = block.indexOf('spawnSessionForTopic(sessionManager, tg, spawnName');

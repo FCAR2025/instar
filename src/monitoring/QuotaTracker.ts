@@ -17,6 +17,7 @@ import { DegradationReporter } from './DegradationReporter.js';
 import path from 'node:path';
 import type { QuotaState, JobPriority, JobSchedulerConfig } from '../core/types.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
+import { frameworkHasNoUsageSurface } from '../core/frameworkFacts.js';
 
 /**
  * Live pool-placeability signal for the POOL-AWARE quota throttle. Returned by an
@@ -35,6 +36,14 @@ export interface PoolQuota {
   /** Best placeable account's 5-hour utilization (0-100), or null if unknown. */
   fiveHourPercent?: number | null;
   /**
+   * Framework of the account those percentages describe (round-13 lessons).
+   * Lets the throttle distinguish "this framework exposes NO usage surface"
+   * (permanently unreadable — the grok case) from "the reading is merely not in
+   * yet" (every other framework), which must keep its historical allow so a
+   * non-opted-in agent's job scheduling is unchanged.
+   */
+  bestFramework?: string;
+  /**
    * True when the pool has a placeable account by STATUS but no trustworthy live
    * quota reading for it (e.g. a freshly-enrolled or just-after-an-outage pool
    * whose per-account snapshots are missing/stale). The throttle then applies the
@@ -52,6 +61,8 @@ export interface QuotaTrackerConfig {
   thresholds: JobSchedulerConfig['quotaThresholds'];
   /** How stale (in ms) the quota data can be before we treat it as unknown */
   maxStalenessMs?: number;
+  /** Active framework. Codex uses fail-safe missing-data semantics. */
+  framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
 }
 
 export class QuotaTracker {
@@ -103,7 +114,17 @@ export class QuotaTracker {
     try {
       if (!fs.existsSync(this.config.quotaFile)) {
         if (!this.warnedNoFile) {
-          console.warn('[quota] No quota state file found — all jobs will run (fail-open)');
+          console.warn(this.config.framework === 'codex-cli'
+            ? '[quota] No Codex quota state file found — jobs will shed fail-safe until collection succeeds'
+            : this.config.framework === 'grok-build'
+              // grok-build: the weekly pool is UNOBSERVABLE in advance (no
+              // usage command exists; 1.3M tokens registered 0% on the meter
+              // — grok-build spec §0.3/§6.1). There is no collector to wait
+              // for, so this file will never exist. Jobs run fail-open with
+              // the call-time QuotaError as the only wall signal, and our
+              // own token accounting (FeatureMetricsLedger) as the ledger.
+              ? '[quota] grok-build weekly pool is unobservable (no vendor usage surface) — quota state is UNKNOWN, jobs run fail-open with call-time quota errors as the only wall'
+              : '[quota] No quota state file found — all jobs will run (fail-open)');
           this.warnedNoFile = true;
         }
         return null;
@@ -118,7 +139,11 @@ export class QuotaTracker {
       const maxStale = this.config.maxStalenessMs ?? 30 * 60 * 1000; // 30 min default
       const lastUpdated = new Date(state.lastUpdated).getTime();
       if ((now - lastUpdated) > maxStale) {
-        console.warn(`[quota] Stale data (${Math.round((now - lastUpdated) / 60000)}m old) — discarding, will fail open`);
+        console.warn(
+          `[quota] Stale data (${Math.round((now - lastUpdated) / 60000)}m old) — discarding, ` +
+          (this.config.framework === 'codex-cli' ? 'Codex will shed fail-safe' : 'will fail open'),
+        );
+        if (this.config.framework === 'codex-cli') this.cachedState = null;
         this.lastRead = now; // Prevent re-reading stale file on every call
         return null;
       }
@@ -126,8 +151,14 @@ export class QuotaTracker {
       this.cachedState = state;
       this.lastRead = now;
       return state;
-    } catch {
+    } catch { // @silent-fallback-ok — Codex clears cached headroom and sheds; Claude preserves established last-known-good behavior.
       this.lastRead = Date.now(); // Prevent hammering a corrupt file
+      if (this.config.framework === 'codex-cli') {
+        // A previously healthy cache must not survive a broken Codex state
+        // file: unreadable is uncertainty, and Codex uncertainty sheds.
+        this.cachedState = null;
+        return null;
+      }
       return this.cachedState; // Return last-known-good rather than null
     }
   }
@@ -203,17 +234,61 @@ export class QuotaTracker {
         // selectAccount already vouched for placeability; gate the best placeable
         // account's effective usage (weekly + 5h, both checked in evaluateAccountQuota)
         // by priority so load-shedding still applies. An allow here is guaranteed
-        // placeable. A null percent means "unknown but placeable" → treated as 0.
-        const r = this.evaluateAccountQuota(weekly ?? 0, pool.fiveHourPercent ?? undefined, priority);
+        // placeable.
+        //
+        // A null percent is UNKNOWN, not 0% (grok-build spec §6.1 / lessons
+        // review: `weekly ?? 0` made a permanently-unreadable account look
+        // like the BEST candidate — "unknown but placeable → treated as 0"
+        // was absence-of-evidence resolving to the healthiest possible
+        // state). Unknown now takes the SAME bounded degraded-mode cap as an
+        // untrustworthy reading: still placeable for medium+ priority work
+        // (never a hard block on a fresh pool), but never preferred as
+        // phantom "0% fresh" headroom.
+        if (weekly === null || weekly === undefined) {
+          // FRAMEWORK-SCOPED (round-13 lessons). The round-9 fix routed EVERY
+          // null weekly reading here, which changed job scheduling for agents
+          // that never opted into grok: a freshly-enrolled Claude account, or
+          // any account with a 5-hour reading but no seven-day one, took the
+          // bounded-degraded path and started shedding low-priority work where
+          // it previously ran. That is a fleet-wide behaviour change hiding
+          // inside an additive-only spec, with no knob and no rollback.
+          //
+          // The distinction that matters is WHY the reading is absent:
+          //   - a framework with NO usage surface at all (grok-build) is
+          //     permanently unreadable — treating it as 0% fresh is the
+          //     absence-of-evidence bug the original fix was for;
+          //   - every other framework HAS a usage surface and the reading is
+          //     merely not in yet — the historical allow is correct there, and
+          //     is what a non-opted-in agent must keep getting.
+          // Round-21: was an inline literal here; now the one shared fact,
+          // because SubscriptionPool must refuse to STORE a reading for the
+          // same set of frameworks this refuses to trust.
+          const noUsageSurface = frameworkHasNoUsageSurface(pool.bestFramework);
+          if (!noUsageSurface) {
+            return { allowed: true, reason: 'Pool headroom — no weekly reading yet for the best placeable account' };
+          }
+          return this.boundedDegradedDecision(pool.fiveHourPercent ?? undefined, priority,
+            'pool quota reading is unknown (this framework exposes no usage surface)');
+        }
+        const r = this.evaluateAccountQuota(weekly, pool.fiveHourPercent ?? undefined, priority);
         return r.allowed
-          ? { allowed: true, reason: `Pool headroom — best placeable account at ${Math.round(weekly ?? 0)}% weekly` }
+          ? { allowed: true, reason: `Pool headroom — best placeable account at ${Math.round(weekly)}% weekly` }
           : r;
       }
       // provider threw / returned null → fall through to the file-based logic below.
     }
 
     const state = this.getState();
-    if (!state) return { allowed: true, reason: 'No quota data — fail open' };
+    if (!state) {
+      if (this.config.framework === 'codex-cli') {
+        return { allowed: false, reason: 'Codex quota data unavailable — fail-safe load shed' };
+      }
+      return { allowed: true, reason: 'No quota data — fail open' };
+    }
+
+    if (state.source === 'codex-rollout' && state.quotaUnknown) {
+      return { allowed: false, reason: 'Codex quota reading is missing or incomplete — fail-safe load shed' };
+    }
 
     // DEGRADED-DATA HARDENING (bounded): a non-authoritative estimate (JSONL
     // token-counting) or an implausible >100% value must NOT slam the brake on the
@@ -222,7 +297,9 @@ export class QuotaTracker {
     // BOUNDED — we shed the lowest-priority work and still honor a genuine
     // authoritative 5-hour wall. An AUTHORITATIVE source (anthropic-oauth) is never
     // treated as degraded, so a real wall still stops. Spec §3.
-    const authoritative = state.source === 'anthropic-oauth';
+    const authoritative = state.source === 'anthropic-oauth' ||
+      state.source === 'gemini-cli-capacity' ||
+      state.source === 'codex-rollout';
     const degraded = !authoritative &&
       (state.source === 'claude-jsonl' || (typeof state.usagePercent === 'number' && state.usagePercent > 100));
     if (degraded) {

@@ -20,9 +20,17 @@
  *     item per stall episode above it, keyed on the OLDEST unreleased commit
  *     SHA (stable across ticks — not a resettable per-tick id), priority scaled
  *     by backlog age, 12h hysteresis on re-raise after an auto-resolve.
- *   - Fail-loud: any evaluation failure (fetch error, analyzer error) raises a
- *     low-priority Attention item — never a silent catch (that would re-create
- *     the exact bug this fixes).
+ *   - Fail-loud: any evaluation failure (fetch error, analyzer error, top-level
+ *     tick error) writes a structured audit entry (sentinel-events.jsonl) and a
+ *     dedup-keyed `eval-failed` emit — never a silent catch (that would re-create
+ *     the exact bug this fixes). User-facing Telegram escalation of these
+ *     evaluator-self-failures is HOUSEKEEPING by default, gated behind
+ *     `escalateEvalFailures` (config: `monitoring.releaseReadiness.escalateEvalFailures`,
+ *     default false), per the sentinel-trio standard ("Sentinel Notifications"
+ *     in CLAUDE.md, post-2026-05-22 topic-spam fix). The audit log + server.log
+ *     are the canonical observability surface; only the user-actionable
+ *     "release blocked / unreleased work piling up" signal posts to Attention
+ *     by default — that one is genuinely actionable.
  *   - Lifecycle owner: detect → surface → auto-resolve → reap, with
  *     resolveEpisodesInRange consulted by the publish-finalize path.
  *   - Repo-gated: needs an analyzable instar git repo (dev/maintainer env). On
@@ -31,6 +39,8 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { featureEvidence } from './FeatureEvidenceLog.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
 
 /** Parsed subset of `analyze-release.js --json` the sentinel needs. */
 export interface AnalyzerReport {
@@ -120,6 +130,25 @@ export interface ReleaseReadinessSentinelConfig {
   backlogAgeDaysHigh?: number;
   hysteresisHours?: number;
   staleEpisodeTtlDays?: number;
+  /**
+   * Fast-trigger (RELEASE-FRAGMENT-GATE-SPEC Layer 2, D7): when the block is
+   * specifically a missing release-note fragment (guideBlocksPublish) WITH
+   * unreleased feature/fix work — the case where publish.yml would SILENTLY
+   * SKIP — surface at LOW IMMEDIATELY instead of waiting out the multi-day age
+   * floor. This closes the "fresh fragment-less merge sits silent for 2 days"
+   * gap that the 2026-06-27 incident exposed. Default on.
+   */
+  fastTriggerOnGuideBlock?: boolean;
+  /**
+   * When true, evaluator-self-failures (fetch / analyzer / top-level tick stages)
+   * post a low-priority Attention item in addition to the audit log. Default
+   * false: housekeeping per the sentinel-trio standard — the audit log
+   * (logs/sentinel-events.jsonl) + server.log are the canonical observability
+   * surface for internal-plumbing failures, so the user is not spammed with a
+   * Telegram topic per stage that breaks. The user-actionable "release blocked"
+   * signal is unaffected by this flag and always posts to Attention.
+   */
+  escalateEvalFailures?: boolean;
 }
 
 const DEFAULTS: Required<ReleaseReadinessSentinelConfig> = {
@@ -131,6 +160,8 @@ const DEFAULTS: Required<ReleaseReadinessSentinelConfig> = {
   backlogAgeDaysHigh: 7,
   hysteresisHours: 12,
   staleEpisodeTtlDays: 30,
+  fastTriggerOnGuideBlock: true,
+  escalateEvalFailures: false,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -139,13 +170,15 @@ const HOUR_MS = 60 * 60 * 1000;
 export class ReleaseReadinessSentinel extends EventEmitter {
   private readonly cfg: Required<ReleaseReadinessSentinelConfig>;
   private tickHandle: ReturnType<typeof setInterval> | null = null;
+  /** Set by failLoud, so a failed tick records its error row and no outcome row. */
+  private evalFailedThisTick = false;
 
   constructor(
     private readonly deps: ReleaseReadinessSentinelDeps,
     cfg: ReleaseReadinessSentinelConfig = {},
   ) {
     super();
-    this.cfg = { ...DEFAULTS, ...cfg };
+    this.cfg = mergeDefaults(DEFAULTS, cfg);
   }
 
   start(): void {
@@ -177,11 +210,27 @@ export class ReleaseReadinessSentinel extends EventEmitter {
     state.lastTickAt = this.deps.now();
     if (state.disabled) {
       this.deps.audit({ kind: 'release-readiness', event: 'tick-skipped-disabled' });
+      featureEvidence.record('monitoring.releaseReadiness', { kind: 'held', reason: 'rolled-back-disabled', context: { rollbacks: state.rollbackHistory?.length ?? 0 } });
       this.deps.saveState(state);
       return;
     }
     try {
+      const signalBefore = state.lastSignalAt;
+      this.evalFailedThisTick = false;
       await this.evaluate(state);
+      if (!this.evalFailedThisTick) {
+        const raised = state.lastSignalAt !== signalBefore;
+        const open = state.episodes.filter((e) => !e.resolvedMs);
+        featureEvidence.record('monitoring.releaseReadiness', {
+          kind: raised ? 'fired' : 'held',
+          reason: raised ? 'signal-raised' : open.length > 0 ? 'blocked-no-new-signal' : 'release-not-blocked',
+          context: {
+            openEpisodes: open.length,
+            surfacedEpisodes: open.filter((e) => e.openedMs).length,
+            priorities: open.map((e) => e.lastPriority ?? 'silent').join(','),
+          },
+        });
+      }
       this.deps.saveState(state);
     } catch (err) {
       // Fail-loud — a silent catch here would re-create the very silent-failure
@@ -209,6 +258,7 @@ export class ReleaseReadinessSentinel extends EventEmitter {
     state.rollbackHistory ??= [];
     state.rollbackHistory.push({ ts: this.deps.now(), sessionId: meta.sessionId, sourceIp: meta.sourceIp, reason: 'rollback' });
     this.deps.audit({ kind: 'release-readiness', event: 'rollback', sessionId: meta.sessionId, sourceIp: meta.sourceIp });
+    featureEvidence.record('monitoring.releaseReadiness', { kind: 'error', reason: 'alarm-rolled-back', context: { rollbacks: state.rollbackHistory.length, sessionId: meta.sessionId ?? null } });
     await this.deps.postAttention({
       id: 'release-readiness-rolled-back',
       title: 'Release-readiness alarm disabled',
@@ -250,7 +300,8 @@ export class ReleaseReadinessSentinel extends EventEmitter {
       return;
     }
 
-    const blocked = this.isBlocked(report, await this.deps.guideBlocksPublish());
+    const guideBlocks = await this.deps.guideBlocksPublish();
+    const blocked = this.isBlocked(report, guideBlocks);
     if (!blocked) {
       // Backlog clear — resolve any open episodes.
       await this.resolveAll(state, 'cleared');
@@ -269,7 +320,17 @@ export class ReleaseReadinessSentinel extends EventEmitter {
     }
 
     const ageDays = (this.deps.now() - oldest.dateMs) / DAY_MS;
-    const priority = this.priorityForAge(ageDays);
+    const ageBasedPriority = this.priorityForAge(ageDays);
+
+    // Fast-trigger (D7): a missing-fragment block with unreleased feature/fix
+    // work is the SILENT-SKIP case — surface at LOW immediately, bypassing the
+    // multi-day age floor, instead of letting a fresh fragment-less merge sit
+    // silent for days (the 2026-06-27 gap).
+    const featureOrFix =
+      report.analysis.commitClassification.features + report.analysis.commitClassification.fixes;
+    const fastTriggered =
+      this.cfg.fastTriggerOnGuideBlock && guideBlocks && featureOrFix > 0 && !ageBasedPriority;
+    const priority: ReadinessPriority | null = ageBasedPriority ?? (fastTriggered ? 'LOW' : null);
 
     let episode = state.episodes.find((e) => e.oldestSha === oldest.sha && !e.resolvedMs);
     if (!episode) {
@@ -278,7 +339,7 @@ export class ReleaseReadinessSentinel extends EventEmitter {
     }
 
     if (!priority) {
-      // Below the silent threshold — recorded, no message.
+      // Below the silent threshold AND not a fast-trigger case — recorded, no message.
       this.reap(state);
       return;
     }
@@ -307,8 +368,8 @@ export class ReleaseReadinessSentinel extends EventEmitter {
       episode.attentionId = id;
       episode.lastPriority = priority;
       state.lastSignalAt = this.deps.now();
-      this.deps.audit({ kind: 'release-readiness', event: 'signal', oldestSha: oldest.sha, priority, ageDays: days, delivered });
-      this.emit('signal', { oldestSha: oldest.sha, priority });
+      this.deps.audit({ kind: 'release-readiness', event: 'signal', oldestSha: oldest.sha, priority, ageDays: days, delivered, fastTriggered });
+      this.emit('signal', { oldestSha: oldest.sha, priority, fastTriggered });
     }
     this.reap(state);
   }
@@ -346,17 +407,34 @@ export class ReleaseReadinessSentinel extends EventEmitter {
 
   private async failLoud(state: ReadinessState, stage: string, err: unknown): Promise<void> {
     const key = `failure:${stage}`;
+    // Always audit — the audit log is the canonical observability surface for
+    // evaluator-self-failures. Both the dedup-suppressed and the un-suppressed
+    // paths produce an audit line so frequency is countable from disk.
     this.deps.audit({ kind: 'release-readiness', event: 'eval-failed', stage, error: String(err) });
+    this.evalFailedThisTick = true;
+    featureEvidence.record('monitoring.releaseReadiness', {
+      kind: 'error',
+      reason: `check-failed:${stage}`,
+      context: { stage, repeatOfLastFailure: state.lastFailureKey === key, errorName: err instanceof Error ? err.name : 'unknown' },
+    });
     if (state.lastFailureKey === key) return; // dedupe per failure episode
     state.lastFailureKey = key;
-    await this.deps.postAttention({
-      id: `release-readiness-eval-failure-${stage}`,
-      title: 'Release-readiness check could not evaluate',
-      summary: `The release-readiness check failed at the "${stage}" stage: ${String(err)}. Last evaluated ${state.lastSignalAt ? new Date(state.lastSignalAt).toISOString() : 'never'}.`,
-      category: 'degradation',
-      priority: 'LOW',
-    });
-    state.lastSignalAt = this.deps.now();
+    // HOUSEKEEPING by default: do NOT post a per-stage Attention item (which
+    // would create a per-event Telegram topic — the exact anti-pattern banned
+    // by the sentinel-trio standard post-2026-05-22 topic-spam fix). The user
+    // hears about this kind of failure only when escalateEvalFailures is
+    // explicitly enabled. The audit emission above + the `eval-failed` event
+    // remain the supported observability handles.
+    if (this.cfg.escalateEvalFailures) {
+      await this.deps.postAttention({
+        id: `release-readiness-eval-failure-${stage}`,
+        title: 'Release-readiness check could not evaluate',
+        summary: `The release-readiness check failed at the "${stage}" stage: ${String(err)}. Last evaluated ${state.lastSignalAt ? new Date(state.lastSignalAt).toISOString() : 'never'}.`,
+        category: 'degradation',
+        priority: 'LOW',
+      });
+      state.lastSignalAt = this.deps.now();
+    }
     this.emit('eval-failed', { stage });
   }
 

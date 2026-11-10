@@ -66,7 +66,74 @@ const EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs']);
 // `new <ProviderClass>(` — the construction. An IMPORT of the class is fine
 // (the factory imports them); only a direct `new …(` outside the funnel is a
 // bypass.
-const PATTERNS = PROVIDER_CLASSES.map((cls) => new RegExp(`\\bnew\\s+${cls}\\s*\\(`));
+//
+// ALIAS + NAMESPACE AWARE (2026-08-14). The original matched the class NAME as
+// literal text, so two ordinary import styles walked straight past a SAFETY
+// floor — the spawn cap added after the 2026-06-20 OOM fork-bomb:
+//
+//   import { ClaudeCliIntelligenceProvider as Provider } from '...';
+//   new Provider(...)                       // real uncapped construction, invisible
+//
+//   import * as mod from '...';
+//   new mod.ClaudeCliIntelligenceProvider(...)   // also invisible: `\bnew\s+Cls`
+//                                                // cannot match across `mod.`
+//
+// Found by a peer-agent audit for checks defeatable by renaming. Resolve the
+// local bindings FIRST, then match constructions under any of them.
+
+/** Every local name a provider class is bound to in this file, plus namespace forms.
+ *
+ *  Widened 2026-08-14 after a peer-agent SABOTAGE pass against the first version
+ *  found two SAME-FILE evasions the alias resolution missed:
+ *    const C = ClaudeCliIntelligenceProvider; new C({});   // plain re-binding
+ *    new Providers['ClaudeCliIntelligenceProvider']({});    // computed access
+ *  The first is probably the easiest bypass of all to write. Re-binding is
+ *  resolved to a FIXPOINT so chains (`const C = Cls; const D = C;`) close too. */
+export function localProviderBindings(content, cls) {
+  const names = new Set([cls]);
+  // `import { Cls as Alias }` and `const { Cls: Alias } = await import(...)`
+  for (const m of content.matchAll(new RegExp(`\\b${cls}\\s+as\\s+([A-Za-z_$][\\w$]*)`, 'g'))) names.add(m[1]);
+  for (const m of content.matchAll(new RegExp(`\\b${cls}\\s*:\\s*([A-Za-z_$][\\w$]*)`, 'g'))) names.add(m[1]);
+  // `const|let|var Alias = <knownName>;` — plain re-binding, resolved to a
+  // fixpoint so a chain of re-bindings cannot walk out of the set.
+  for (let pass = 0; pass < 10; pass++) {
+    const before = names.size;
+    for (const known of [...names]) {
+      const re = new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${known}\\s*[;,\\n]`, 'g');
+      for (const m of content.matchAll(re)) names.add(m[1]);
+    }
+    if (names.size === before) break;
+  }
+  return [...names];
+}
+
+/**
+ * Line numbers (1-based) in `content` that construct a spawn-capable provider,
+ * under ANY local binding or namespace qualifier. Comment-only lines excluded.
+ */
+export function findProviderConstructions(content, classes = PROVIDER_CLASSES) {
+  const hits = [];
+  const lines = content.split('\n');
+  const perClass = classes.map((cls) => ({
+    cls,
+    names: localProviderBindings(content, cls),
+  }));
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart();
+    if (/^(\/\/|\*|\/\*|#)/.test(trimmed)) continue;
+    for (const { cls, names } of perClass) {
+      const bare = names.some((n) => new RegExp(`\\bnew\\s+${n}\\s*\\(`).test(lines[i]));
+      // `new <ns>.<Cls>(` — a namespace import the bare form cannot see.
+      const viaNs = new RegExp(`\\bnew\\s+[A-Za-z_$][\\w$]*\\.${cls}\\s*\\(`).test(lines[i]);
+      // `new <ns>['<Cls>'](` — computed access; found by sabotage 2026-08-14.
+      const viaComputed = new RegExp(
+        `\\bnew\\s+[A-Za-z_$][\\w$]*\\s*\\[\\s*['"\`]${cls}['"\`]\\s*\\]\\s*\\(`,
+      ).test(lines[i]);
+      if (bare || viaNs || viaComputed) { hits.push({ line: i + 1, cls }); break; }
+    }
+  }
+  return hits;
+}
 
 function listFiles() {
   const staged = process.argv.includes('--staged');
@@ -96,6 +163,15 @@ function listFiles() {
   return files;
 }
 
+// ── CLI body ─────────────────────────────────────────────────────────────
+// Guarded so the exported detector above can be imported by tests WITHOUT
+// running the scan — this module calls process.exit(1) on a violation, so an
+// unguarded import would kill any test run the moment the repo had one.
+// Same pattern as scripts/eli16-pr-description-check.mjs.
+const invokedDirectly =
+  process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href;
+
+if (invokedDirectly) {
 let violations = 0;
 for (const rel of listFiles()) {
   const normalized = rel.split(path.sep).join('/');
@@ -111,21 +187,13 @@ for (const rel of listFiles()) {
   } catch {
     continue;
   }
-  const lines = content.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    // Comment-only mentions are documentation, not a construction.
-    const trimmed = lines[i].trimStart();
-    if (/^(\/\/|\*|\/\*|#)/.test(trimmed)) continue;
-    for (const pattern of PATTERNS) {
-      if (pattern.test(lines[i])) {
-        console.error(
-          `${normalized}:${i + 1} — direct LLM-CLI provider construction outside the spawn-cap funnel. ` +
-          `Build it through buildIntelligenceProvider() (which installs the host-wide spawn cap + circuit breaker), ` +
-          `or add an allowlist entry here with a spawn-bounding justification.`,
-        );
-        violations++;
-      }
-    }
+  for (const hit of findProviderConstructions(content)) {
+    console.error(
+      `${normalized}:${hit.line} — direct LLM-CLI provider construction outside the spawn-cap funnel. ` +
+      `Build it through buildIntelligenceProvider() (which installs the host-wide spawn cap + circuit breaker), ` +
+      `or add an allowlist entry here with a spawn-bounding justification.`,
+    );
+    violations++;
   }
 }
 
@@ -135,3 +203,4 @@ if (violations > 0) {
   process.exit(1);
 }
 console.log('lint-no-unbounded-llm-spawn: clean');
+}

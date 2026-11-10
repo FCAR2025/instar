@@ -32,6 +32,13 @@ import {
   getLlmCircuitBreaker,
   classifyRateLimit,
 } from './LlmCircuitBreaker.js';
+import {
+  DECISION_CORRELATION_ID,
+  DECISION_MINT_MARKER,
+  mintBreakerCorrelationId,
+  bumpProvenanceStrippedAtBreaker,
+  bumpInboundCorrelationIdDiscarded,
+} from './decisionQualityTypes.js';
 
 /**
  * Minimal structural recorder the funnel writes per-call metrics to. Kept as a
@@ -43,7 +50,7 @@ export interface FeatureMetricsRecorder {
   record(entry: {
     feature: string;
     kind?: 'llm' | 'event';
-    outcome: 'fired' | 'noop' | 'error' | 'shed';
+    outcome: 'fired' | 'noop' | 'unclassified' | 'error' | 'shed';
     latencyMs?: number;
     waited?: boolean;
     waitMs?: number;
@@ -70,6 +77,10 @@ export interface FeatureMetricsRecorder {
     framework?: string;
     /** Correlates a 'fired' verdict to a downstream record (e.g. a commitment id). */
     verdictId?: string;
+    /** Job-cost attribution (job-cost-reduction §9.1), passed through from options.attribution. */
+    jobSlug?: string;
+    machineId?: string;
+    runId?: string;
   }): void;
 }
 
@@ -125,6 +136,7 @@ export function _resetUnlabeledEmissionForTest(): void {
 }
 
 export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider {
+  get frameworkId(): string | undefined { return this.inner.frameworkId; }
   constructor(
     private readonly inner: IntelligenceProvider,
     private readonly breaker: LlmCircuitBreaker = getLlmCircuitBreaker(),
@@ -134,8 +146,9 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
    * Record one funnel call to the per-feature metrics ledger (Phase 1b). Pure
    * side-channel: it MUST never throw into the LLM path (observability must not
    * break what it observes — the Close the Loop principle applied to itself).
-   * outcome here is funnel-level: 'noop' = the call completed (the fired-vs-noop
-   * VERDICT is the caller's interpretation → Phase 2); 'error' = it failed;
+   * outcome here separates result completion from verdict interpretation:
+   * 'unclassified' = the call completed without a usable classifier;
+   * 'fired'/'noop' = the classifier reported acted/not-acted; 'error' = failed;
    * 'shed' = the circuit was open so NO call ran (no token cost, no network
    * round-trip). Keeping 'shed' distinct from 'noop' is what makes the metric
    * honest: 'calls' minus 'shed' = real round-trips, so the breaker shedding
@@ -143,7 +156,7 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
    */
   private recordMetric(
     feature: string,
-    outcome: 'fired' | 'noop' | 'error' | 'shed',
+    outcome: 'fired' | 'noop' | 'unclassified' | 'error' | 'shed',
     latencyMs: number,
     waited: boolean,
     waitMs: number | undefined,
@@ -155,6 +168,7 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
       framework?: string;
       verdictId?: string;
     },
+    job?: { jobSlug?: string; machineId?: string; runId?: string },
   ): void {
     // Runtime backstop: an unlabeled llm row is a real escape past the
     // zero-baseline attribution ratchet. Signal-only, once per process.
@@ -169,15 +183,47 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
         tokensCached: extra?.tokensCached,
         model: extra?.model, framework: extra?.framework,
         verdictId: extra?.verdictId,
+        ...(job?.jobSlug ? { jobSlug: job.jobSlug, machineId: job.machineId, runId: job.runId } : {}),
       });
     } catch {
       /* never break the LLM path on a metrics write */
     }
   }
 
+  /**
+   * Decision-quality correlation floor (llm-decision-quality-meter §5.1.2,
+   * FD1/FD8). An INBOUND correlation id is honored ONLY when it carries the
+   * router's per-call mint marker, which is CONSUMED single-use on acceptance —
+   * a reused options object cannot replay a stale marked id into a later
+   * decision's chain (the second use is discarded and re-minted locally). Any
+   * unmarked / marker-less inbound id is discarded (+counted); router-bypassing
+   * callers get a local `b-<machineId8>-<uuid>` mint. The accepted-or-minted id
+   * lands on EVERY `kind:'llm'` metric row's `verdict_id` — always-on, ungated
+   * (§5.1.3): provenance-of-mint is derivable from the id prefix alone.
+   */
+  private acceptOrMintCorrelationId(options: IntelligenceOptions | undefined): string {
+    const bag = options as Record<PropertyKey, unknown> | undefined;
+    const inbound = bag?.[DECISION_CORRELATION_ID];
+    if (typeof inbound === 'string' && inbound.length > 0) {
+      if (bag && bag[DECISION_MINT_MARKER] === true) {
+        try {
+          delete bag[DECISION_MINT_MARKER]; // consume single-use on acceptance
+          return inbound;
+        } catch {
+          /* frozen/exotic options — the marker cannot be consumed, so refuse the
+             inbound id (fail toward a local mint, never toward replayability) */
+        }
+      }
+      bumpInboundCorrelationIdDiscarded();
+    }
+    return mintBreakerCorrelationId();
+  }
+
   async evaluate(prompt: string, options?: IntelligenceOptions): Promise<string> {
     const feature = options?.attribution?.component ?? 'unlabeled';
     const startedAt = Date.now();
+    // Accepted at entry so even 'shed' rows (no call ran) carry the decision's id.
+    const correlationId = this.acceptOrMintCorrelationId(options);
     let waited = false;
     let gate = this.breaker.acquire();
     if (!gate.allow) {
@@ -195,7 +241,9 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
         // window). Recorded as 'shed' (NOT 'noop'): no round-trip happened, so it
         // must not count toward real calls. `waited` marks whether a bounded wait
         // was engaged.
-        this.recordMetric(feature, 'shed', Date.now() - startedAt, waited, options?.rateLimitWaitMs);
+        this.recordMetric(feature, 'shed', Date.now() - startedAt, waited, options?.rateLimitWaitMs, {
+          verdictId: correlationId,
+        }, options?.attribution);
         throw new LlmCircuitOpenError(gate.retryAfterMs);
       }
     }
@@ -223,20 +271,37 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
           callerOnModel?.(info);
         },
       };
+      // Strip the provenance block + correlation plumbing before the inner
+      // adapter sees the options (llm-decision-quality-meter §5.1.6 — the
+      // cannot-leak claim holds at BOTH layers, not just the router's): a
+      // router-BYPASSED call that carries `options.provenance` gets it
+      // stripped-and-counted here, and the marker/id can never escape below the
+      // funnel into an adapter that might store-and-replay its options.
+      if (innerOptions.provenance !== undefined) {
+        bumpProvenanceStrippedAtBreaker();
+        delete innerOptions.provenance;
+      }
+      delete (innerOptions as Record<PropertyKey, unknown>)[DECISION_CORRELATION_ID];
+      delete (innerOptions as Record<PropertyKey, unknown>)[DECISION_MINT_MARKER];
       const result = await this.inner.evaluate(prompt, innerOptions);
       this.breaker.onResolved();
       // Observable Intelligence: let the caller classify whether the system ACTED
       // on this call (fired) vs took no action (noop). Pure side-channel — a
       // throw here must never change what evaluate() returns.
-      let outcome: 'fired' | 'noop' = 'noop';
-      let verdictId: string | undefined;
+      // NOTE (llm-decision-quality-meter FD8): a caller-supplied
+      // `classifyVerdict.verdictId` NO LONGER lands in the metric row —
+      // `verdict_id` on kind:'llm' rows is single-writer for the correlation id
+      // (the router's settlement seam relocates the caller's value to
+      // `callerRef` inside the provenance context when a provenance row is
+      // written; it is dropped for llm rows otherwise). Event-kind rows keep
+      // their existing semantic verdictId use untouched.
+      let outcome: 'fired' | 'noop' | 'unclassified' = 'unclassified';
       if (options?.classifyVerdict) {
         try {
           const v = options.classifyVerdict(result);
-          if (v?.acted) outcome = 'fired';
-          verdictId = v?.verdictId;
+          outcome = v?.acted ? 'fired' : 'noop';
         } catch {
-          /* @silent-fallback-ok: a verdict-classification throw falls back to 'noop'; never break the observed path */
+          /* @silent-fallback-ok: a verdict-classification throw stays explicitly unclassified; never break the observed path */
         }
       }
       this.recordMetric(
@@ -247,8 +312,9 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
           tokensCached: usage?.cachedTokens,
           model: resolved?.model,
           framework: resolved?.framework,
-          verdictId,
+          verdictId: correlationId,
         },
+        options?.attribution,
       );
       return result;
     } catch (err) {
@@ -265,7 +331,8 @@ export class CircuitBreakingIntelligenceProvider implements IntelligenceProvider
         tokensCached: usage?.cachedTokens,
         model: resolved?.model,
         framework: resolved?.framework,
-      });
+        verdictId: correlationId,
+      }, options?.attribution);
       if (err instanceof RateLimitError || parsed.isLimit) {
         // Pass the parsed retry-after hint through so the breaker can shorten
         // the open window when the provider told us when it resets.

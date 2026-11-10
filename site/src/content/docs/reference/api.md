@@ -12,6 +12,30 @@ The Instar server exposes a REST API on `localhost:4040` (configurable). All end
 | GET | `/health` | Health check (public, no auth). Returns version, session count, scheduler status, memory usage |
 | GET | `/status` | Running sessions + scheduler status |
 
+## Machine Maintenance (Development Agent)
+
+These authenticated reads are watch-only when machine maintenance is enabled on a development agent. They return 503 while the feature is dark; reading them cannot restart the machine, stop work, or close a browser.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/machine-maintenance` | Uptime, next possible window, safety holds, a recorded paper rehearsal, and which agent-owned browsers a dry-run sweep would keep or close |
+| GET | `/machine-maintenance/lock-state` | The Mac's lock reading with the underlying signals and reason; `unknown` is not treated as locked, and Linux is `not-applicable` |
+
+## Remote Desktop
+
+The dashboard uses these authenticated endpoints after the operator enters the existing dashboard PIN. The [Remote Desktop guide](/guides/remote-desktop/) explains target readiness, the Mac permissions, mobile controls, and revocation. A stream ticket is short lived and scoped to one target and controller.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/desktop/availability` | Report whether this installation can offer desktop access |
+| GET | `/desktop/targets` | List installed machine targets and readiness |
+| POST | `/desktop/requests` | Request access to one target under the operator's dashboard session |
+| GET | `/desktop/requests/:id` | Read the request and grant state |
+| POST | `/desktop/requests/:id/resume` | Resume a disconnected stream while its grant remains valid |
+| GET | `/desktop/requests/:id/cursor` | Read pointer position for viewer feedback |
+| POST | `/desktop/requests/:id/ticket` | Issue a short-lived ticket for the encrypted stream |
+| POST | `/desktop/requests/:id/revoke` | Revoke the grant and end screen capture and input |
+
 ## Sessions
 
 | Method | Path | Description |
@@ -28,8 +52,14 @@ The Instar server exposes a REST API on `localhost:4040` (configurable). All end
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/jobs` | List jobs + queue |
+| GET | `/jobs` | List jobs + queue (includes `hasUserFork` per job) |
 | POST | `/jobs/:slug/trigger` | Manually trigger a job |
+| POST | `/jobs/:slug/save` | Save a job's frontmatter + body (atomic two-rename commit; `manifestVersion` is an optimistic-concurrency token — a stale save is refused with 409) |
+| POST | `/jobs/:slug/disable` | Disable a job (stamps `disabledAtBodyHash`) |
+| POST | `/jobs/:slug/enable` | Re-enable a disabled job |
+| POST | `/jobs/:slug/override` | Fork an instar default into the user namespace (idempotent) |
+| POST | `/jobs/:slug/unfork` | Archive the user copy to `.unfork-backups/<slug>-<ts>.md`, then restore the instar default |
+| GET | `/jobs/:slug/unfork-backups` | List retained unfork backups for a slug (30 days OR last 10, whichever is more generous) |
 
 ## Relationships
 
@@ -67,6 +97,8 @@ The Instar server exposes a REST API on `localhost:4040` (configurable). All end
 | GET | `/evolution/actions` | List action items |
 | POST | `/evolution/actions` | Create an action item |
 | GET | `/evolution/actions/overdue` | List overdue actions |
+| GET | `/evolution/actions/undated-resurfacer` | Read the bounded undated-action resurfacer's health and durable cadence state |
+| POST | `/evolution/actions/undated-resurfacer/pass` | Trigger one authenticated pass without bypassing its durable cadence floor |
 | PATCH | `/evolution/actions/:id` | Update action status |
 
 ## Memory & Search
@@ -89,6 +121,7 @@ The Instar server exposes a REST API on `localhost:4040` (configurable). All end
 | POST | `/intent/journal` | Record a decision |
 | GET | `/intent/drift` | Detect behavioral drift |
 | GET | `/intent/alignment` | Alignment score |
+| GET | `/goal-realignment` | Bounded dry-run `GoalRealignment` status: priority intake, source completeness, and latest review verdict (development agents only) |
 | GET | `/project-map` | Auto-generated project territory map |
 | POST | `/coherence/check` | Pre-action coherence verification |
 
@@ -127,6 +160,8 @@ The endpoints behind the [EXO 3.0 Alignment](/features/exo3/) capabilities. See 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/capabilities` | Feature guide and metadata |
+| GET | `/capability-registry` | Read the advisory local capability projection; distinguishes dark, unavailable, unobserved, stale, and classified evidence |
+| GET | `/capability-registry/health` | Read advisory capability-registry observation counts and status measurements |
 | GET | `/events` | Query events (`?limit=50&since=24&type=`) |
 | GET | `/quota` | Quota usage + recommendation |
 | GET | `/agents` | List all agents on this machine |
@@ -157,6 +192,20 @@ These tools are registered as an MCP server and called by Claude Code (or any MC
 | GET | `/messages/outbox` | Inter-agent outbox |
 | GET | `/messages/dead-letter` | Dead letter queue |
 | POST | `/messages/send` | Send a message (used internally by MCP tools) |
+| POST | `/threadline/pairing/invites` | Make a pairing invite (`ttlMinutes`, optional `bindFp`) |
+| GET | `/threadline/pairing/invites` | List own invites, pending accepts and known peers |
+| DELETE | `/threadline/pairing/invites/:iid` | Revoke an open invite |
+| POST | `/threadline/pairing/invites/inspect` | Recipient: check and hold a received invite |
+| POST | `/threadline/pairing/invites/:iid/approve` | Recipient approves (PIN) |
+| POST | `/threadline/pairing/invites/:iid/decline` | Recipient declines |
+| POST | `/threadline/pairing/invites/:iid/finish` | Inviter confirms the acceptor (PIN) |
+| POST | `/threadline/pairing/invites/:iid/not-them` | Inviter rejects the acceptor (PIN) |
+
+## Parallel-Work Awareness
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/parallel-work/sentinel` | Is the overlap sentinel ticking? Live counters, `tickAgeMs`, `cadenceMinutes`; 503 when dark |
 
 ## Serendipity Protocol
 
@@ -213,12 +262,26 @@ Rich profiles let agents present meaningful, differentiated identities -- not ju
 | POST | `/feedback` | Submit feedback |
 | GET | `/feedback` | List feedback |
 | POST | `/feedback/retry` | Retry un-forwarded feedback |
+| GET | `/feedback-factory/readiness-authorities/proposal` | Preview readiness authority and blockers |
+| GET | `/feedback-factory/triage/queue` | List ranked work items and execution states |
+| GET | `/feedback-factory/triage/summary` | Read triage counts and authority health |
+| GET | `/feedback-factory/triage/authority/proposal` | Preview triage authority and blockers |
+| POST | `/feedback-factory/triage/authority` | Governed create, replace, revoke or restore of triage authority |
+| POST | `/feedback-factory/triage/plan` | Prepare a reviewable operator plan |
+| POST | `/feedback-factory/triage/commit` | Apply a PIN-approved plan |
+| GET | `/feedback-factory/execute/status` | Read executor availability, admission and attempts |
+| POST | `/feedback-factory/execute/stop` | Stop an Initiative's attempts and disarm its PR |
+| POST | `/feedback-factory/execute/revoke-acceptance` | Withdraw approver-dependence acceptance |
+| POST | `/feedback-factory/execute/release` | Return a parked Initiative to triage |
+| POST | `/feedback-factory/execute/canary-retry` | Retry the sandbox canary after its wait; the canary must still pass |
+
+The feedback factory's mutation routes require their own operator-intent and owner checks in addition to normal API authentication. See [Feedback-Factory Processing](/features/feedback-factory-processing/) for the path from intake to a reviewed fix.
 
 ---
 
 ## Full route inventory
 
-The sections above describe the most commonly-used endpoints with curl examples and parameter notes. The full registered route surface is much larger — 460 routes across roughly 80 prefixes. This inventory lists every route by category so you can find the right endpoint when you need it. For curl examples on routes not detailed above, the route name is usually enough to guess the shape — `GET /resource` lists, `GET /resource/:id` reads, `POST /resource` creates, `PATCH /resource/:id` updates, `DELETE /resource/:id` removes.
+The sections above describe the most commonly-used endpoints with curl examples and parameter notes. The full registered route surface is much larger. This inventory lists routes by category so you can find the right endpoint when you need it. For curl examples on routes not detailed above, consult the feature guide or route contract before sending a mutation.
 
 ## /.well-known
 - `GET /.well-known/instar.json`
@@ -256,6 +319,23 @@ with respect to behavior; the ratio is a signal, never a gate.
 - `POST /attention/:id/remote-ack` — durable operator-bound ack for a pooled attention item owned by ANOTHER machine (WS4.1 follow-up). Delivers immediately when the owner is reachable, else persists the intent (bound to the authenticated operator) and re-delivers when the owner returns; the owner revalidates at apply time and rejects a stale resolve against a since-escalated HIGH/URGENT item. Ships dark behind `multiMachine.seamlessness.ws41DurableAck`.
 - `GET /attention/_remote-ack/pending` — list still-pending durable remote-acks (observability).
 - `POST /attention/_remote-ack/drain` — manually drain pending durable remote-acks to their owning machines.
+
+## /autonomous
+- `POST /autonomous/register` — server-side start snapshot for an autonomous run (scope-accretion R30): the server mints the runId, snapshots the `scopeAccretion` config + sweep base-root start-SHAs, and clamps `endAt` to `now + maxDurationMs`. One registration per active run (409 while the existing record is active).
+- `POST /autonomous/:topic/run-end` — every exit surface reports here (scope-accretion R44): runs the non-blocking advisory sweep and enumerates any unbuilt accreted work loudly; marks the run record ended.
+- `POST /autonomous/:topic/ratify-deferral` — dashboard-PIN-gated operator ratification of deferred accreted artifacts (`{"artifacts": [...]}` or `{"all": true}`; the response echoes exactly what was ratified).
+- `POST /autonomous/:topic/scope-accretion-override` — dashboard-PIN-gated live mid-run lever (`{"enabled": false, "reason": "…"}`): overrides the registration-time snapshot for the running session; audited.
+
+## Codex task continuation
+
+These authenticated endpoints manage the bounded, per-topic Codex checklist. The server caps each generation's duration and continuation count; they do not activate an autonomous run on their own.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/continuation/:topic/status` | Show whether the ledger is enabled and active, its expiry, and the number of open tasks. |
+| POST | `/continuation/start` | Start a new checklist with `topicId`, `tasks`, and optional `sessionId`, `durationSeconds`, and `maxContinuations`. |
+| POST | `/continuation/:topic/renew` | Mint a fresh bounded generation for an existing checklist with open tasks after its prior duration expires; the tasks are preserved. This is not an operator-stop override. |
+| POST | `/continuation/:topic/complete` | Mark one task complete with its one-based `ordinal`. |
 
 ## /autonomy
 - `GET /autonomy`
@@ -341,6 +421,15 @@ itself is the operator's manual click; there is no fire-cutover route by design.
 - `GET /context/active-job`
 - `GET /context/dispatch`
 - `GET /context/working-memory`
+
+## /decision-quality
+- `GET /decision-quality`
+- `POST /decision-quality/grade-pass`
+
+## /benchmark-divergence
+- `GET /benchmark-divergence`
+- `POST /benchmark-divergence/analyze`
+- `GET /benchmark-divergence/rollup-aggregates`
 
 ## /delivery-queue
 - `GET /delivery-queue`
@@ -503,18 +592,21 @@ itself is the operator's manual click; there is no fire-cutover route by design.
 - `GET /internal/stop-gate/kill-switch`
 - `GET /internal/stop-gate/log`
 - `POST /internal/compaction-resume`
+- `POST /internal/lifeline-proof` — the lifeline proves to its own server that it sends the ingress secret (Bearer + `X-Instar-Lifeline-Secret`); carries no Telegram input.
 - `POST /internal/prompt-recall`
 - `POST /internal/slack-forward`
 - `POST /internal/stop-gate/annotations`
 - `POST /internal/stop-gate/evaluate`
 - `POST /internal/stop-gate/kill-switch`
 - `POST /internal/stop-gate/mode`
-- `POST /internal/telegram-callback`
-- `POST /internal/telegram-forward`
+- `POST /internal/stop-gate/reset-breaker` — clear the authenticated authority breaker after provider repair.
+- `POST /internal/telegram-callback` — lifeline only: requires the `X-Instar-Lifeline-Secret` header as well as the Bearer token.
+- `POST /internal/telegram-forward` — lifeline only: requires the `X-Instar-Lifeline-Secret` header as well as the Bearer token.
 
 ## /jobs
 - `GET /jobs`
 - `GET /jobs/:slug/history`
+- `GET /jobs/:slug/unfork-backups`
 - `GET /jobs/categories`
 - `GET /jobs/category-report/:category`
 - `GET /jobs/events`
@@ -522,9 +614,14 @@ itself is the operator's manual click; there is no fire-cutover route by design.
 - `GET /jobs/migration-status`
 - `GET /jobs/reconcile`
 - `PATCH /jobs/:slug`
+- `POST /jobs/:slug/disable`
+- `POST /jobs/:slug/enable`
+- `POST /jobs/:slug/override`
 - `POST /jobs/:slug/reset-state`
 - `POST /jobs/:slug/run`
+- `POST /jobs/:slug/save`
 - `POST /jobs/:slug/trigger`
+- `POST /jobs/:slug/unfork`
 - `POST /jobs/migration-abandon`
 - `POST /jobs/migration-confirm`
 
@@ -604,6 +701,24 @@ never the agent. With no mandate issued, every evaluation denies. Every decision
 ## /ping
 - `GET /ping`
 
+## /pool
+- `GET /pool` — the machine pool: router, nicknames, hardware, online status, load, quota state
+- `GET /pool/placement` — which machine owns a topic + the reason (`pinned`/`placed`/`unowned`) + the U4.1 verified pin state (`pinState`: `actuated`/`pending`/`diverged`/`suspended-pending-owner-return`, `pinHeldSince`, `pendingReason`, `pinnedBy`)
+- `POST /pool/transfer` — deterministic topic move to a nickname/machineId (the validated planner)
+- `POST /pool/unpin` — deliberately clear a topic's placement pin; the clear replicates as a tombstone so a stale copy can never re-pin it (U4.1)
+- `GET /pool/pin-quarantine` — the sticky skew-quarantine set (clock-skewed pin records excluded from pin resolution) + fold status (503 when pin replication is dark)
+- `POST /pool/pin-quarantine/readmit` — the deliberate, explicit per-record re-admission of a quarantined pin record (dismissing the alert never re-admits)
+- `GET /pool/queue` — durable inbound-queue counts, tenure start, dry-run shadow-custody evidence, explicit durability-detection posture, and hold/flap state (503 while dark)
+- `GET /pool/reconciler` — WS1.3 ownership reconciler status (+ `?topic=N` per-topic explain)
+- `GET /pool/stale-owner-release` — U4.2 stale-owner release telemetry: attempts, would-claims (dry-run), refusals by reason, evidence classes, P19 give-ups, probe-breaker state, open episodes (503 when dark; see [Multi-machine](/features/multi-machine/))
+- `GET /pool/lease-handback` — U4.4 lease hand-back reconciler status: state, hysteresis window, operator-latch visibility, last episode, counters (503 when the mesh is dark)
+- `POST /pool/lease-handback/latch` — write the operator-flip latch marker (the captain-flip playbook's POST step; suppresses automated hand-back — the human always wins)
+- `DELETE /pool/lease-handback/latch` — clear the latch early (PIN-gated: re-enables automation against a human decision, so the dashboard PIN is required)
+- `GET /pool/poll-cache` — the shared per-peer pool-scope poll cache (WS4.4(f))
+- `GET /pool/duplicate-reconciler` — ownership-gated-spawn unified status: duplicate-reconciler posture + substrate readiness, owner-dark notice episodes, spawn-admission counters, breaker state, audit-log locations (503 while dark; see [Ownership-Gated Spawn](/features/ownership-gated-spawn/))
+- `GET /pool/ownership-view?key=<topic>` — THIS machine's own ownership record for a conversation (proxy-free; the reconciler's peer-echo verification read)
+- `GET /judgment-provenance` — redacted judgment-provenance decision rows (`?limit=`, `?sinceHours=`, `?scope=pool` merges peers' redacted rows as clamped untrusted data; full context never leaves the deciding machine)
+
 ## /project-map
 - `GET /project-map`
 - `POST /project-map/refresh`
@@ -671,6 +786,46 @@ never the agent. With no mandate issued, every evaluation denies. Every decision
 - `POST /review/canary`
 - `POST /review/evaluate`
 - `POST /review/test`
+
+## /routing-spend (money-layer enable surface)
+
+The **six PRE-GATE routes** of the money-layer operator enable surface
+(`docs/specs/money-layer-operator-enable-surface.md`). Unlike every other
+`/routing-spend/*` route, these answer `200` while the money layer is OFF — they are the door
+to turning it on, and a surface only reachable once the thing it enables is already enabled
+would be a switch inside the locked room. Served by `MoneyLayerEnableSurface`, backed by
+`MoneyLayerEnableStore` (the durable operator flag + failure record) and `MoneyLayerAuditLog`
+(two channels distinguished by interface, sharing one JSONL).
+
+- `GET /routing-spend/enable-status` — Bearer. `{ lifecycleState, enforcementReady,
+  enableSources, configSnapshotAt, machineId, lastTransitionAt, failingComponent?,
+  settlingCount, restartEligible, anyKeyFrozen, freezeRecordProvisional }`. Genuinely
+  read-only: no audit append, no nonce mint, no observed-state update. `Cache-Control:
+  no-store`.
+- `POST /routing-spend/plan-money-layer` — Bearer. `{ action }` ∈ `money-layer-enable` ·
+  `money-layer-mirror-config` · `money-layer-disable` · `money-layer-disable-store-only`.
+  Returns `{ planId, nonce, renderedText, action, sourceStateAtRender, machineId,
+  machineNickname, expiresAt }`. Requires the single-instance lock. `400` for an action
+  outside the enum (syntax); `409` without the lock or with nothing to mirror.
+- `POST /routing-spend/money-layer/commit` — Bearer **+** PIN. `{ pin, planId, nonce }` →
+  `{ lifecycleState, enforcementReady, enableSources, storeCleared, probe, message }`. The
+  action is read from the STORED plan and refused unless it is on the pre-gate allowlist.
+  `401` bad PIN · `409` unknown/expired/consumed plan, wrong machine, source-state drift, or
+  lock not held · `429` PIN lockout.
+- `POST /routing-spend/money-layer/restart-nonce` — Bearer. `{}` → `{ nonce, expiresAt,
+  confirmationText }`. `409` outside the three restartable states.
+- `POST /routing-spend/money-layer/restart` — Bearer **+** PIN. `{ pin, nonce,
+  confirmationTextHash, force? }`. Uses the server's existing supervised-restart path; the
+  `restart-requested` audit row is flushed BEFORE the handoff, and a failed flush returns
+  `503` with the restart NOT initiated. `409` stale nonce / hash mismatch / wrong state /
+  money still settling · `429` cooldown (durable across the restart it authorizes).
+- `POST /routing-spend/config-inspect` — Bearer; **+ PIN** for the limit values. `{ pin? }` →
+  `{ differs, configSnapshotAt, fields, note }`. Non-adopting: it mutates no authority, config
+  or process state. There is deliberately no route that adopts on-disk config into the running
+  process.
+
+`GET /routing-spend/caps/log` is likewise reachable in every state, but a pre-gate reader sees
+only enable/disable/status rows plus redacted freeze reasons.
 
 ## /review-exchange
 
@@ -752,6 +907,9 @@ changes-requested, terminal). Deny-by-default inherited: no mandate → 403.
 - `DELETE /sessions/:id`
 - `GET /sessions`
 - `GET /sessions/:name/output`
+- `GET /sessions/reaper` — this machine's live pressure and per-session reaper verdicts; `?scope=pool` adds peer snapshots plus classified peer failures while preserving the local snapshot at the top level
+- `GET /sessions/reaper/audit` — the bounded decision-audit tail; `?includePage=1` adds local `returned`/`truncated` metadata, while `?scope=pool` merges machine-tagged entries, lists that metadata per machine in `pool.sources`, and distinguishes a failed peer read from a genuinely empty trail
+- `GET /sessions/reap-log` — the bounded history of completed and refused shutoffs; `?includePage=1` adds local `returned`/`truncated` metadata, while `?scope=pool` merges all answering machines chronologically, lists each bounded source in `pool.sources`, and classifies peer failures
 - `GET /sessions/tmux`
 - `POST /sessions/:name/input`
 - `POST /sessions/:name/remote-close`
@@ -928,6 +1086,7 @@ user-usable.
 | POST | `/subscription-pool/proactive-swap/check` | Run one proactive pass now (refresh the poll if near the wall, then pre-emptively swap at-pressure sessions). The deterministic "show me it works" lever. |
 | POST | `/subscription-pool/enroll` | Start a mobile-first new-account login. Body: `id`, `label`, `provider`, `framework`, optional `kind`, `configHome`. Returns the pending login (public code/URL + TTL — never a token). |
 | GET | `/subscription-pool/pending-logins` | The "Pending Logins" surface — active logins awaiting approval (code/URL + TTL). |
+| POST | `/subscription-pool/enroll/:id/cancel` | Safely abandon a pending or expired login and best-effort stop its waiting login pane. Completed/already-abandoned logins return idempotently; an in-flight completion returns `409`. |
 | POST | `/subscription-pool/enroll/:id/complete` | Mark a login completed once the operator approved + the account enrolled. |
 | POST | `/subscription-pool/enroll/reissue-expired` | Sweep + auto-reissue every expired login with a fresh code/URL (the background tick calls the same path). |
 | GET | `/subscription-pool/in-use` | Which pooled accounts are currently serving a live session. |
@@ -945,6 +1104,61 @@ Cross-machine account setup from the dashboard's Subscriptions-tab grid. Dark be
 | POST | `/subscription-pool/follow-me/enroll/:id/cancel` | Target-local: cancel a mis-tapped in-flight cell — abandon the pending login + tear down its login pane (raw `tmux kill-session`). Idempotent on a terminal record (200 `alreadyTerminal`); unknown/malformed id → 404; stands aside (409) while a code is mid-submit. Bearer-only. |
 | POST | `/subscription-pool/follow-me/cancel` | Fronting relay for cancel — dispatches to self/peer by `machineId` (offline peer → 502). The route the dashboard Cancel button calls. Body: `machineId`, `id`. |
 | POST | `/subscription-pool/follow-me/enroll/:id/complete` | Mark a follow-me login completed once the freshly-minted account passes the S7 email-gate. |
+| GET | `/subscription-relogin` | List bounded assisted re-login episodes and their current state. Add `?scope=pool` to merge machine-tagged episodes from reachable peers with typed peer failures. Returns disabled state while the dev-gated feature is dark. |
+| GET | `/subscription-relogin/:episodeId/events` | Read the bounded, redacted event history for one repair episode. |
+| POST | `/subscription-relogin/repair-cell` | Central-dashboard one-click repair. Recent operator-session proof authorizes one exact `accountId` + `machineId` + `episodeId`; Instar issues and delivers a signed re-mint mandate, then starts the target-local autonomous repair. |
+| POST | `/subscription-relogin/:episodeId/approve` | Approve the exact immutable repair plan shown in the dashboard. Approval cannot broaden identity, origin, or requested scope. |
+| POST | `/subscription-relogin/:episodeId/approve-with-mandate` | Target-local point-of-use route for a signed exact-bounds repair mandate. Intended for the fronting repair-cell orchestrator, not direct dashboard use. |
+| POST | `/subscription-relogin/:episodeId/cancel` | Cancel an active repair episode. Cancellation is durable and checked again before every side effect. |
+| POST | `/subscription-relogin/:episodeId/retry` | Retry an eligible failed episode within its durable attempt, reissue, and wall-clock budgets. Uncertain non-idempotent outcomes remain operator-only. |
+| POST | `/subscription-relogin/:episodeId/code` | Loopback-only door for a skill-driven sign-in helper (macOS, `navigation: agent-session`). Authenticated by the per-episode `X-Relogin-Helper-Token` held in memory by `SubscriptionReloginHelper`, not the API bearer token. The body is exactly one of `{"code"}`, `{"notify":"phone-tap"}` or `{"notify":"macos-permission","permission"}`, capped at 1 KB, with no CORS. Answers 409 when no live helper holds the episode and 503 when the path is off. |
+
+### Window lifecycle obligation ledger (Echo-local)
+
+The enforcement plane behind governance windows (`core/WindowLifecycleObligationLedger`): duties compiled from source documents, evidence-gated admission/closure, per-duty executor-liveness, maturation-gated enforcement. Echo-local by design — every route refuses a foreign agent/scope before state access. See the [Window Lifecycle Obligation Ledger feature page](/features/window-lifecycle-ledger/).
+
+| Method | Route | Description |
+|---|---|---|
+| GET | `/window-lifecycle` | Ledger status: compiled obligations, per-instance statuses, lifecycle state, executor bindings. |
+| POST | `/window-lifecycle/compile` | Compile the obligation ledger from the current source-document bytes (SHA-recorded, source-spanned; uncompiled operative clauses fail). |
+| POST | `/window-lifecycle/evidence` | Submit instance-bound evidence for a duty (nonce-bound; wrong-window or replayed evidence rejected). |
+| POST | `/window-lifecycle/evaluate` | Evaluate duty predicates and executor-liveness without mutating state. |
+| POST | `/window-lifecycle/tick` | Run one lifecycle tick — re-query evidence and executors, surface `open-unexecuted` findings. |
+| POST | `/window-lifecycle/transition` | Request a lifecycle state transition; refused while any gating duty lacks evidence. |
+| POST | `/window-lifecycle/native-admission` | Run the shipped between-window admission gate through the versioned adapter; exact input/output persisted, structural verdict never promoted to semantic proof. |
+| POST | `/window-lifecycle/waiver` | Apply an operator waiver — exact payload digest approved post-creation by the locally auth-bound operator; core duties non-waivable. |
+| POST | `/window-lifecycle/rollback` | Audited Echo-local rollback: ledger preserved read-only, manual ritual resumes, enforcement reported disabled. |
+| POST | `/window-lifecycle/reenable` | Re-enable after rollback; requires repair evidence and a passing dry-run suite. |
+| GET | `/window-lifecycle/enforcement` | Enforcement mode (`off` / `dry-run` / `enforced`) + maturation state. |
+| POST | `/window-lifecycle/enforcement/record-shadow` | Server-derived graduation report from the stored ledger and adjudicated shadow audit (dry-run only; unadjudicated or hash-chain-broken rows refuse). |
+| POST | `/window-lifecycle/enforcement/graduate` | Graduate dry-run → enforced on valid dual-lifecycle evidence; forged, reused, or caller-written provenance refused. |
+| POST | `/window-lifecycle/enforcement/off` | Turn the enforcement plane off (neither ticks nor blocks). |
+
+### Dedicated browser profiles
+
+| Method | Route | Description |
+|---|---|---|
+| POST | `/playwright-profiles/provision` | Recent-dashboard-PIN route that creates a jailed, machine-local Chrome profile for one Google identity. The request accepts vault secret **names**, never secret values, and returns a phone-complete next step when password or MFA help is needed. |
+| GET | `/passkeys/grants` | Agent-held Google passkeys (⚗️ dark, dev-gated `passkeys.enabled`): this machine's per-account passkey **grants**, the non-secret copies of grants it issued to peers, its confirmed **issuers** (machines whose signed passkey instructions it accepts), the revoke high-water mark, and whether the first grant is still blocked on issuer bootstrap. |
+| POST | `/passkeys/grant` | Dashboard-PIN route (rate-limited like the mandate PIN routes). Body `{pin, email, googleCreatedAt?, targetMachineId?}`. Writes one grant for (account × THIS machine); with `targetMachineId` it signs a `passkey-cell` mandate with this machine's identity key and delivers it to the peer's `/passkeys/cell-action`. On a multi-machine agent the first grant answers `409 issuer-bootstrap-required` until a peer issuer is confirmed here. |
+| POST | `/passkeys/revoke` | Dashboard-PIN route. Body `{pin, email, revokesGrantSeq?, targetMachineId?}`. Revokes the cell's grant instances up to a sequence (a later re-grant survives an older revoke), raises the local revoke high-water mark, drops the profile's passkey binding and — if a credential store exists — the stored credential. Stops THIS agent's passkey path only; live sessions and stored passwords remain. |
+| POST | `/passkeys/issuer-add` | Dashboard-PIN route. Body `{pin, machineId, targetMachineId?}`. Confirms a paired, ACTIVE machine as a trusted issuer of passkey instructions on THIS machine (no trust-on-first-use; the peer is named from this machine's own registry). |
+| POST | `/passkeys/issuer-remove` | Dashboard-PIN route. Body `{pin, machineId, targetMachineId?}`. Removes a machine from this machine's trusted-issuer set. |
+| GET | `/passkeys/outbox` | This machine's durable **revoke outbox**: every peer revoke it issued with state (`pending` / `applied` / `escalated` / `closed`), attempt count, next attempt time and last result — never the signed bundle itself. |
+| POST | `/passkeys/outbox/tick` | Run one re-delivery pass now (the server timer does this every 10 minutes): due entries are re-sent UNCHANGED on 1h → 6h → daily backoff, a peer seen online is pulled forward (never below a 15-minute floor), entries 30 days past issue escalate to one aggregated attention item per machine and stop, apart from one attempt when that machine is next online. |
+| POST | `/passkeys/cell-action` | The signed-instruction receiver (Bearer transport; the Ed25519 signature, the expected-issuer set and the nonce ledger are the authority). Accepts a `passkey-cell` bundle only from a confirmed issuer, addressed to this machine, within 15 minutes (revokes never expire), once per nonce; refuses `account-follow-me` bundles. |
+| POST | `/passkeys/revert-method` | Dashboard-PIN route. Body `{pin, accounts?}`. Restores a browser-profile account to the login method its passkey enrollment replaced; accounts with none are listed as `noPriorMethod`, never guessed. |
+| GET | `/passkeys` | Per-cell view of THIS machine (granted, custody state, attempt rows, pauses, grant echoes, outbox rows, whether it is the secret-sync push authority) plus its peer exclusions. `?scope=pool` merges every peer through the pool reader's memo (marked with `ageMs`): each peer's condition — `observed`, `peer-offline` (rows still count), `excluded`, or `partitioned` (blocks enrollment and proofs) — its current-or-last-known rows, `degraded` + `degradedReasons`, and `singleMachine`. |
+| GET | `/passkeys/pool-state` | What a peer reads (Bearer transport): this machine's publishable passkey state — canonical emails only, never a credential, entry key or signed bundle. A caller naming itself with `X-Instar-Machine-Id` must be an ACTIVE paired machine in this machine's registry (revoked, pending, de-paired and unknown machines answer 403). |
+| POST | `/passkeys/pool-state/tick` | Run one pool read pass now (the server timer does this every 5 minutes): every peer queried once in parallel (5 s per peer, 5 s overall), classified with rope health, last-known rows persisted, one memo produced. |
+| GET | `/passkeys/admission` | Read-only: `?action=enroll|prove|canary|repair|revoke&email=…` evaluates the pool-wide table (partitioned peer ⇒ no enroll/prove; suspended ⇒ canary only; stopped/kill switch ⇒ repair by degraded override only), the enrollment rate limit (one per cell per 30 min, three per account per day pool-wide), the same-account proof gap (6 h across machines) and any active throttle/risk pause. Honest about its inputs: the suspension record and lease-holder state are not published on this build and are reported as such. |
+| POST | `/passkeys/exclude-peer` | Dashboard-PIN route. Body `{pin, machineId, targetMachineId?}`. Excludes a long-unobserved peer from THIS machine's pool checks (treated like `peer-offline`: its last-known rows still count); clears automatically when the peer is observed again. Also a `passkey-cell` mandate op for another machine. |
+| POST | `/passkeys/include-peer` | Dashboard-PIN route. Body `{pin, machineId, targetMachineId?}`. Re-includes an excluded peer. |
+| GET | `/passkeys/health` | This machine's per-cell **health** records (`healthy` / `degraded` / `breaker-open` / `unverified` / `unverified-stopped` / `rejected` / `security`, the next proof due time, the unknown backoff rung, the flapping flag, the Google-side removal state) plus the digest ledger (last buzz, last upsert, resolved). |
+| POST | `/passkeys/health/outcome` | Bearer. Body `{email, outcome, origin?, reenrolled?, pin?}`. Records one proof outcome (`ready` / `failed` / `unknown` / `credential-rejected` / `removed-on-google` / `security`) for a LOCAL cell with an active grant (404 otherwise) and moves it through the health table; the two permissive provenances — `origin: "operator"` and `reenrolled: true` — additionally require the dashboard PIN: a `failed` arms one confirming proof an hour later; three confirmed weekly failures open the breaker; three unknowns make the cell unverified with a 7 → 14 → 28-day backoff and three more at the cap stop it; `security` is terminal until re-enrollment. Every transition is audited as states only. |
+| POST | `/passkeys/health/digest/refresh` | Bearer. Run one digest pass now (the server timer does this every 5 minutes): advance the clocks (paused while the pool read path is degraded), build the ONE digest under `passkey-health:digest`, and upsert it when its ledger says so — a buzz at most once per 24 hours, security and suspension once per tick, peer-list changes silently; nothing left to report resolves the episode. Only the serving-lease holder narrates the pool; a non-holder narrates its own machine. |
+| POST | `/passkeys/attest-google-removed` | Dashboard-PIN route. Body `{pin, email, targetMachineId?}`. Records the operator's attestation that the passkey was removed on Google when the read-only list check cannot run — shown as **attested**, never as removed; applies only to a cell that has a health record on the target machine (`no-cell-record` otherwise). Also a `passkey-cell` mandate op. |
+| POST | `/passkeys/prove` | Dashboard-PIN route. Body `{pin, email}`. Runs the **cold proof** of THIS machine's cell for the account now: admission first (the pool-wide table, the 6 h same-account gap across machines, any active risk/throttle pause — a refusal is 409 `proof-refused` naming the reason; a peer that cannot be read refuses before any browser opens), then the host-wide browser seat (409 `seat-busy`), then the proof in the cell's own proof-only Chrome profile: cleared, confirmed signed out, the stored credential added to a virtual authenticator, the identifier filled, the passkey prompt's Continue pressed, the signed-in identity read, the credential removed and the profile signed out. `ready` needs all three: an observed assertion for the stored id, a single credential, the expected identity signed in; otherwise `failed` / `credential-rejected` (`removed-on-google` while a removal is pending/attested) / `security` (a different identity) / `unknown` (transport, risk page, throttled). The outcome is recorded into the cell's health with `origin: "operator"`; a risk page pauses the account for 7 days, a throttled prompt pauses the account for 24 h and the machine for 1 h. 404 without an active grant; 409 `no-credential` without a stored key (never creates a store); 501 for a `targetMachineId` other than this machine on this build; 503 without a proof browser. |
 
 The quota-aware scheduler picks accounts reset-date-optimally ("use before reset")
 and guarantees a long-lived session that hits its account's quota resumes on
@@ -1026,3 +1240,10 @@ The Slack org permission gate (dark/observe-only by default — these routes are
 ## /whoami
 - `GET /whoami`
 
+## /work-queue
+
+The unified work-intake and prioritization registry (`WorkQueue` — see the Work Intake &
+Prioritization Queue feature page). Development-agent gated; 503 when dark.
+
+- `GET /work-queue` — the current deterministic ranked list of normalized work items.
+- `POST /work-queue/rescore` — recompute the ranking from live sources (pure compute, no durable writes).

@@ -31,6 +31,7 @@ import type { RouteContext } from '../../src/server/routes.js';
 import { authMiddleware } from '../../src/server/middleware.js';
 import { SecretStore } from '../../src/core/SecretStore.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { PlaywrightSeatLease } from '../../src/core/PlaywrightSeatLease.js';
 
 const AUTH_TOKEN = 'test-pw-registry-bearer';
 
@@ -59,11 +60,15 @@ function ctxFor(projectDir: string, opts: { developmentAgent?: boolean } = {}): 
   } as unknown as RouteContext;
 }
 
-function appWith(projectDir: string, opts: { developmentAgent?: boolean } = {}): express.Express {
+function appWith(projectDir: string, opts: { developmentAgent?: boolean; seatFile?: string; operatorProof?: string; runningSessions?: Array<{ name: string; tmuxSession: string; triggeredBy?: string }> } = {}): express.Express {
   const app = express();
   app.use(express.json());
   app.use(authMiddleware(AUTH_TOKEN));
-  app.use('/', createRoutes(ctxFor(projectDir, opts)));
+  const ctx = ctxFor(projectDir, opts);
+  if (opts.runningSessions) ctx.sessionManager = { listRunningSessions: () => opts.runningSessions } as any;
+  ctx.verifyDashboardOperatorSession = (proof) => proof === opts.operatorProof;
+  if (opts.seatFile) ctx.playwrightSeatLease = () => new PlaywrightSeatLease({ filePath: opts.seatFile, ttlMs: 10_000 });
+  app.use('/', createRoutes(ctx));
   return app;
 }
 
@@ -148,6 +153,52 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     expect(full.body.full).toBe(true);
   });
 
+  it('seat acquire renews one drive and blocks a competing drive', async () => {
+    const app = appWith(projectDir, {
+      developmentAgent: true,
+      seatFile: path.join(stateDir, 'shared-host-seat.json'),
+    });
+    const first = await request(app).post('/playwright-profiles/seat/acquire').set(auth())
+      .send({ holderId: 'agent-a:topic-1', holderLabel: 'topic-1' });
+    expect(first.status).toBe(200);
+    expect(first.body.acquired).toBe(true);
+
+    const renewed = await request(app).post('/playwright-profiles/seat/acquire').set(auth())
+      .send({ holderId: 'agent-a:topic-1', holderLabel: 'topic-1' });
+    expect(renewed.status).toBe(200);
+    expect(renewed.body.lease.acquiredAt).toBe(first.body.lease.acquiredAt);
+
+    const conflict = await request(app).post('/playwright-profiles/seat/acquire').set(auth())
+      .send({ holderId: 'agent-b:topic-2', holderLabel: 'topic-2' });
+    expect(conflict.status).toBe(409);
+    expect(conflict.body.holderLabel).toBe('topic-1');
+    expect(conflict.body.retryAfterMs).toBeGreaterThan(0);
+
+    const wrongRelease = await request(app).post('/playwright-profiles/seat/release').set(auth())
+      .send({ holderId: 'agent-b:topic-2' });
+    expect(wrongRelease.status).toBe(409);
+
+    const release = await request(app).post('/playwright-profiles/seat/release').set(auth())
+      .send({ holderId: 'agent-a:topic-1' });
+    expect(release.status).toBe(200);
+    expect(release.body).toEqual({ released: true });
+
+    const successor = await request(app).post('/playwright-profiles/seat/acquire').set(auth())
+      .send({ holderId: 'agent-b:topic-2', holderLabel: 'topic-2' });
+    expect(successor.status).toBe(200);
+  });
+
+  it('seat safety remains available when the optional profile registry is dark', async () => {
+    const app = appWith(projectDir, {
+      developmentAgent: false,
+      seatFile: path.join(stateDir, 'dark-registry-shared-host-seat.json'),
+    });
+    const acquired = await request(app).post('/playwright-profiles/seat/acquire').set(auth())
+      .send({ holderId: 'spawn-unique-id', holderLabel: 'drive' });
+    expect(acquired.status).toBe(200);
+    expect(acquired.body.acquired).toBe(true);
+  });
+
   it('create → 409 on a duplicate id', async () => {
     const app = appWith(projectDir, { developmentAgent: true });
     const first = await request(app).post('/playwright-profiles').set(auth()).send({ id: 'justin-google' });
@@ -155,6 +206,33 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     expect(first.body.profile.id).toBe('justin-google');
     const dup = await request(app).post('/playwright-profiles').set(auth()).send({ id: 'justin-google' });
     expect(dup.status).toBe(409);
+  });
+
+  it('PIN-scoped provisioning materializes an idempotent dedicated Google profile without secret values', async () => {
+    seedVault({ google_password_echo: 'NEVER_RETURN_THIS' });
+    const app = appWith(projectDir, { developmentAgent: true, operatorProof: 'recent-pin-proof' });
+    const denied = await request(app).post('/playwright-profiles/provision').set(auth()).send({
+      profileId: 'echo-google', identity: 'echo@example.test', loginMethod: 'password',
+    });
+    expect(denied.status).toBe(401);
+
+    const payload = {
+      profileId: 'echo-google', identity: 'echo@example.test', loginMethod: 'password',
+      passwordVaultName: 'google_password_echo',
+    };
+    const first = await request(app).post('/playwright-profiles/provision').set(auth())
+      .set('X-Instar-Operator-Session', 'recent-pin-proof').send(payload);
+    expect(first.status).toBe(201);
+    expect(first.body.readyForAutomation).toBe(true);
+    expect(first.body.profile.dirExists).toBe(true);
+    expect(first.body.account.vaultBindings).toEqual({ password: 'google_password_echo' });
+    expect(fs.statSync(first.body.profile.userDataDir).mode & 0o777).toBe(0o700);
+    expect(JSON.stringify(first.body)).not.toContain('NEVER_RETURN_THIS');
+
+    const replay = await request(app).post('/playwright-profiles/provision').set(auth())
+      .set('X-Instar-Operator-Session', 'recent-pin-proof').send(payload);
+    expect(replay.status).toBe(200);
+    expect(replay.body.profile.accounts).toHaveLength(1);
   });
 
   it('create → 400 on a flag-shaped (rejected) userDataDir', async () => {
@@ -181,6 +259,24 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     expect(ok.body.account.owner).toBe('agent');
     // Vault VALUES never appear in the response (D3).
     expect(JSON.stringify(ok.body)).not.toContain('ghp_INTEGRATIONSECRET');
+  });
+
+  it('assigns only strict vault-name role bindings and never returns secret values', async () => {
+    seedVault({ google_password_justin: 'TOP_SECRET_VALUE' });
+    const app = appWith(projectDir, { developmentAgent: true });
+    const ok = await request(app).post('/playwright-profiles/default/accounts').set(auth()).send({
+      service: 'google', identity: 'person@example.test', owner: 'operator',
+      vaultRefs: ['google_password_justin'], vaultBindings: { password: 'google_password_justin' },
+      loginMethod: 'password',
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.account.vaultBindings).toEqual({ password: 'google_password_justin' });
+    expect(JSON.stringify(ok.body)).not.toContain('TOP_SECRET_VALUE');
+    const malformed = await request(app).post('/playwright-profiles/default/accounts').set(auth()).send({
+      service: 'google', identity: 'bad@example.test', owner: 'operator',
+      vaultRefs: ['google_password_justin'], vaultBindings: { recovery: 'google_password_justin' },
+    });
+    expect(malformed.status).toBe(400);
   });
 
   it('resolve → exact match, ambiguous multi-profile, and no-match', async () => {
@@ -231,6 +327,20 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     expect(delCustom.status).toBe(200);
   });
 
+  it('refuses automation activation for registered Google sign-in profiles without changing MCP config', async () => {
+    seedPlaywrightSettings();
+    const before = fs.readFileSync(settingsPath, 'utf8');
+    const app = appWith(projectDir, { developmentAgent: true });
+    await request(app).post('/playwright-profiles').set(auth()).send({ id: 'signin' });
+    const assigned = await request(app).post('/playwright-profiles/signin/accounts').set(auth())
+      .send({ service: 'google', identity: 'dawn@example.test', owner: 'agent', vaultRefs: [] });
+    expect(assigned.status).toBe(200);
+    const refused = await request(app).post('/playwright-profiles/signin/activate').set(auth());
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toContain('sign-in profile refuses automation');
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(before);
+  });
+
   it('activate dry-run (default) performs NO write and NO refresh; reports wouldWriteFile', async () => {
     seedPlaywrightSettings(['@playwright/mcp@latest']);
     const before = fs.readFileSync(settingsPath, 'utf8');
@@ -272,6 +382,26 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     expect(again.body.alreadyActive).toBe(true);
   });
 
+  it('refuses to activate a profile for a session the feedback executor started (it could hold the approver account), before any write', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({ playwrightRegistry: { enabled: true, dryRun: false } }, null, 2) + '\n');
+    seedPlaywrightSettings(['@playwright/mcp@latest']);
+    const before = fs.readFileSync(settingsPath, 'utf8');
+    const app = appWith(projectDir, { developmentAgent: true, runningSessions: [
+      { name: 'feedback-specconverge-x', tmuxSession: 'proj-feedback-specconverge-x', triggeredBy: 'feedback-executor' },
+      { name: 'ordinary', tmuxSession: 'proj-ordinary', triggeredBy: 'telegram' },
+    ] });
+    await request(app).post('/playwright-profiles').set(auth()).send({ id: 'custom' });
+    const refused = await request(app).post('/playwright-profiles/custom/activate').set(auth()).send({ sessionName: 'proj-feedback-specconverge-x' });
+    expect(refused.status).toBe(403);
+    expect(fs.readFileSync(settingsPath, 'utf8')).toBe(before);
+    // Addressed by its logical name too.
+    expect((await request(app).post('/playwright-profiles/custom/activate').set(auth()).send({ sessionName: 'feedback-specconverge-x' })).status).toBe(403);
+    // Any other session is unaffected.
+    const ok = await request(app).post('/playwright-profiles/custom/activate').set(auth()).send({ sessionName: 'proj-ordinary' });
+    expect(ok.status).toBe(200);
+    expect(ok.body.activated).toBe(true);
+  });
+
   it('writes an audit line per write to logs/playwright-profiles.jsonl (NAMES only)', async () => {
     seedVault({ github_token: 'ghp_AUDITSECRET' });
     const app = appWith(projectDir, { developmentAgent: true });
@@ -289,5 +419,21 @@ describe('Playwright Profile Registry routes (integration, real createRoutes + a
     const audit = fs.readFileSync(auditPath, 'utf8');
     expect(audit).toContain('github_token');
     expect(audit).not.toContain('ghp_AUDITSECRET');
+  });
+
+  it('PATCH /:id records a Windows folder, refuses a bad one and any other field, and clears with null', async () => {
+    const app = appWith(projectDir, { developmentAgent: true });
+    await request(app).post('/playwright-profiles').set(auth()).send({ id: 'winp' }).expect(200);
+    const set = await request(app).patch('/playwright-profiles/winp').set(auth()).send({ windowsUserDataDir: 'C:\\Users\\Public\\winp' });
+    expect(set.status).toBe(200);
+    const listed = await request(app).get('/playwright-profiles').set(auth());
+    expect(listed.body.profiles.find((p: { id: string }) => p.id === 'winp').windowsUserDataDir).toBe('C:\\Users\\Public\\winp');
+    expect((await request(app).patch('/playwright-profiles/winp').set(auth()).send({ windowsUserDataDir: '/mnt/c/x' })).status).toBe(400);
+    expect((await request(app).patch('/playwright-profiles/winp').set(auth()).send({})).status).toBe(400);
+    expect((await request(app).patch('/playwright-profiles/winp').set(auth()).send({ windowsUserDataDir: 'C:\\a\\b', userDataDir: '/x' })).status).toBe(400);
+    expect((await request(app).patch('/playwright-profiles/nope').set(auth()).send({ windowsUserDataDir: 'C:\\a\\b' })).status).toBe(404);
+    await request(app).patch('/playwright-profiles/winp').set(auth()).send({ windowsUserDataDir: null }).expect(200);
+    const cleared = await request(app).get('/playwright-profiles').set(auth());
+    expect(cleared.body.profiles.find((p: { id: string }) => p.id === 'winp').windowsUserDataDir).toBeUndefined();
   });
 });

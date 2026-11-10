@@ -5,6 +5,11 @@
  * Everything flows from these — sessions, jobs, users, messaging.
  */
 
+// Type-only import (erased at compile time — types.ts stays runtime-import-free).
+import type { DecisionProvenanceBlock } from './decisionQualityTypes.js';
+import type { AnomalyDecl } from '../scheduler/jobScriptProtocol.js';
+import type { IntelligenceFramework } from './intelligenceProviderFactory.js';
+
 // ── Provider Credentials ────────────────────────────────────────────
 
 /**
@@ -47,6 +52,10 @@ export interface Session {
   jobSlug?: string;
   /** tmux session name */
   tmuxSession: string;
+  /** Telegram topic routing ID, retained with the session so display-name reads can verify its title. */
+  telegramTopicId?: number;
+  /** The Slack channel this session serves, when it serves one. */
+  slackChannelId?: string;
   /** When the session was created */
   startedAt: string;
   /** When the session ended (if completed) */
@@ -62,18 +71,34 @@ export interface Session {
   /** The AI framework/engine powering this session. Carried so the dashboard
    *  renders engine-aware (a Codex session must not display as a Claude one).
    *  Populated at spawn from the resolved framework; undefined on legacy records. */
-  framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
+  framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
   /** The initial prompt/instruction sent to the framework's CLI */
   prompt?: string;
   /** Maximum duration in minutes before the session is killed */
   maxDurationMinutes?: number;
   /** Claude Code's own session UUID (from hook events). Populated lazily on first hook event. */
   claudeSessionId?: string;
+  /** Confined (feedback executor) sessions only: the Claude config home the session writes its
+   *  transcript under (`<home>/projects/<key>/<--session-id>.jsonl`), so trusted code can judge the
+   *  sandbox canary by what actually reached the model. */
+  confinedConfigHome?: string;
+  /** Confined sessions on the rerouted interactive lane only: when the fixed prompt line was typed
+   *  (docs/specs/confined-spawn-subscription-reroute.md, Restart boundary). Absent on a surviving
+   *  confined rerouted session ⇒ its startup never completed, and boot reconciliation kills it. */
+  confinedDeliveredAt?: string;
   /** Subscription & Auth Standard P1.3: which subscription-pool account this
    *  session is running under (the account whose config home it launched/resumed
    *  with). Set at spawn + updated on a quota-aware account swap. Undefined on
    *  legacy records and single-account agents. */
   subscriptionAccountId?: string;
+  /** Memory privacy: the audience this session was started for (`audienceKey`). */
+  memoryAudience?: string;
+  /** Memory privacy: this session's own folder; set only inside the boundary. */
+  memoryScopeDir?: string;
+  /** Memory privacy: the launch settings file, removed at session end. */
+  memorySettingsPath?: string;
+  /** Memory privacy: what the place was computed from, so a recheck uses the same inputs. */
+  memoryPlaceInput?: import('../users/MemoryPrivacy.js').SessionPlaceInput;
   /** Why the session ended. Set by the single-writer terminateSession() path
    *  (e.g. 'idle-zombie', 'reaped-idle', 'manual-kill'). Undefined on records
    *  ended before this field existed. */
@@ -85,6 +110,16 @@ export interface Session {
   /** The clamped work-evidence names behind endedMidWork (enum-clamped at the
    *  chokepoint — see src/core/WorkEvidence.ts). */
   endedWorkEvidence?: string[];
+  /** When this session was first observed idle at a prompt (ISO-8601), persisted
+   *  so the idle clock survives a server restart. `SessionManager.idlePromptSince`
+   *  is in-memory, so without this an agent that restarts more often than the
+   *  topic-bound idle threshold (240m) can never close an idle conversation and
+   *  fills its session slots (sagemind, 2026-10-22: 20/20, 17 sessions idle
+   *  17-64h). Cleared the moment the session is observed active. Absent on
+   *  legacy records and on sessions that have never been seen idle; seeding from
+   *  it is corroborated against the framework transcript — see
+   *  src/core/idleSincePersistence.ts. */
+  idleSince?: string;
   /** Working directory the session was spawned with (reap-notify R2.8/L13 —
    *  recorded so a resume-queue entry can revive the session in ITS tree).
    *  Absent on legacy records ⇒ the module project dir. */
@@ -124,6 +159,13 @@ export interface Session {
    * soak's success criterion (zero 'headless' under force) is machine-checkable. */
   launchLane?: 'headless' | 'rerouted-interactive';
   /**
+   * Threadline MCP over local HTTP (docs/specs/threadline-mcp-local-http.md D4):
+   * the transport this session's Threadline tools were given at spawn. Persisted
+   * so `/health`'s transport counts survive a restart; absent on a record that
+   * predates the feature (counted as unknown) and on a stripped spawn.
+   */
+  threadlineMcpTransport?: 'http' | 'stdio';
+  /**
    * Credential provenance (live-credential-repointing-rebalancer §2.10). Records,
    * at spawn, WHERE this session's Anthropic credential comes from:
    * - 'store' — the per-`CLAUDE_CONFIG_DIR` credential store (steerable by the
@@ -156,8 +198,19 @@ export type SessionStatus = 'starting' | 'running' | 'completed' | 'failed' | 'k
 export type ModelTier = 'opus' | 'sonnet' | 'haiku';
 
 export interface SessionManagerConfig {
+  /** Actual agent state directory; inbound attachments may live outside projectDir/.instar. */
+  stateDir?: string;
   /** Project name used as the stable local agent id for auth-bound calls. */
   projectName: string;
+  /**
+   * durable-conversation-identity §7 (R4-M3): mint the per-session
+   * SELF-AUTHENTICATING bind token delivered through the spawn env
+   * (`INSTAR_BIND_TOKEN` in the tmux -e block — never over a route). The
+   * payload carries the session's authenticated bootstrap conversation ids;
+   * a durable-state open on a minted id is validated against that set.
+   * Absent → no token env is injected (legacy spawns).
+   */
+  mintBindToken?: (sessionName: string, bootstrapConversationIds: number[]) => string | null;
   /** Path to tmux binary */
   tmuxPath: string;
   /**
@@ -168,6 +221,22 @@ export interface SessionManagerConfig {
    * stands) so genuine outages aren't masked. Future-spawn only.
    */
   claudeCodeMaxRetries?: number;
+  /**
+   * Resume Follows the Account (docs/specs/resume-follows-account.md §3.4).
+   * `enabled: false` turns off transcript placement at launch and the
+   * dead-pane checks, restoring the previous behaviour. Absent = on.
+   */
+  resumeFollowsAccount?: { enabled?: boolean };
+  /**
+   * Retained per-version Claude Code executable (CMT-798). claude-code
+   * sessions launch from `<dir>/<version>/claude` (a one-time copy per
+   * version) instead of the mutable npm path, so a Claude Code update can no
+   * longer unlink a live session's executable and leak kernel memory on
+   * macOS. Absent = ON. `dir` defaults to `<projectDir>/.instar/state/claude-bin`;
+   * `pruneGraceMs` (default 6 h) is how long an unused old version must sit
+   * idle before it is a prune candidate (prune never removes a mapped one).
+   */
+  retainedClaudeBinary?: { enabled?: boolean; dir?: string; pruneGraceMs?: number };
   /** Path to the framework CLI binary for the agent's primary framework.
    *  Misnamed for v0.x compat — actually holds whichever framework binary
    *  was selected (claude OR codex OR …). New code should consult
@@ -189,7 +258,7 @@ export interface SessionManagerConfig {
    * without re-running detection. Missing keys mean that framework
    * isn't installed.
    */
-  frameworkBinaryPaths?: { 'claude-code'?: string; 'codex-cli'?: string; 'gemini-cli'?: string; 'pi-cli'?: string };
+  frameworkBinaryPaths?: { 'claude-code'?: string; 'codex-cli'?: string; 'gemini-cli'?: string; 'pi-cli'?: string; 'grok-build'?: string };
   /**
    * Per-framework default model override. Lets the agent's
    * `instar.config.json` choose a specific Codex / Claude model id
@@ -198,7 +267,22 @@ export interface SessionManagerConfig {
    * raw model ids. Missing keys fall back to each builder's hardcoded
    * subscription-safe default.
    */
-  frameworkDefaultModels?: { 'claude-code'?: string; 'codex-cli'?: string; 'gemini-cli'?: string; 'pi-cli'?: string };
+  frameworkDefaultModels?: { 'claude-code'?: string; 'codex-cli'?: string; 'gemini-cli'?: string; 'pi-cli'?: string; 'grok-build'?: string };
+  /**
+   * grok-build interactive step-3 opt-in (grok-build spec §7): DISTINCT
+   * from enabledFrameworks (the reviewer/registration lever) so a
+   * reviewer-only opt-in stays reviewer-only. Absent ⇒ interactive grok
+   * launches refuse with grok-interactive-ungated. Lifted from
+   * `fileConfig.sessions.grokInteractiveSessions` in loadConfig — the
+   * fourth documented load-path-gap lift.
+   */
+  grokInteractiveSessions?: boolean;
+  /**
+   * Copy of the top-level enabledFrameworks (loadConfig lifts it into this
+   * slice because SessionManager's grok interactive gate reads it here —
+   * the slice is all SessionManager receives).
+   */
+  enabledFrameworks?: ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build')[];
   /**
    * pi-cli only (PI-HARNESS-INTEGRATION-SPEC §4.3): explicit opt-in for
    * Anthropic-routed pi model patterns. Sourced from `.instar/config.json`
@@ -221,9 +305,9 @@ export interface SessionManagerConfig {
    * topicFrameworks/resolveTopicFramework.
    */
   componentFrameworks?: {
-    default?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
-    categories?: Partial<Record<'sentinel' | 'gate' | 'job' | 'reflector' | 'other', 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli'>>;
-    overrides?: Record<string, 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli'>;
+    default?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
+    categories?: Partial<Record<'sentinel' | 'gate' | 'job' | 'reflector' | 'other', 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build'>>;
+    overrides?: Record<string, 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build'>;
     fallback?: 'default' | 'none';
     /**
      * Ordered fallback frameworks a SAFETY-GATING call tries when its primary
@@ -232,7 +316,7 @@ export interface SessionManagerConfig {
      * set (sentinel/gate/reflector → first active off-Claude, remaining active as the
      * tail) when this whole block is unset; an operator who sets the block supplies it.
      */
-    failureSwap?: Array<'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli'>;
+    failureSwap?: Array<'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build'>;
   };
   /**
    * The agent's resolved runtime framework — the single source of
@@ -244,13 +328,108 @@ export interface SessionManagerConfig {
    * EVERY path — scheduled jobs AND user messages. Before this
    * field existed, spawnInteractiveSession hardcoded 'claude-code',
    * so messaging a Codex-only agent spawned a Claude session. */
-  framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
+  framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
+  /**
+   * Dynamic MCP Lifecycle (DYNAMIC-MCP-LIFECYCLE-SPEC). When enabled, a
+   * claude-code interactive session launches with a lean MCP subset
+   * (`keepWarm`) instead of the full `.mcp.json`, and heavy servers load on
+   * demand / offload when idle. ABSENT by default ⇒ full `.mcp.json` (today's
+   * behavior). TYPE-ONLY and intentionally NOT in ConfigDefaults (a default here
+   * would inject the block into every existing config and break the
+   * absent-equals-unchanged guarantee). Consumed only by the claude-code spawn
+   * path; other frameworks ignore it. */
+  dynamicMcp?: import('./dynamicMcpConfig.js').DynamicMcpConfig;
+  /**
+   * S4 — Nature-Axis Routing (docs/specs/nature-axis-routing.md). Resolves the internal
+   * LLM router's `(door, model)` selection by a call's TASK NATURE + a door-availability
+   * chain, instead of only its category. TYPE-ONLY and intentionally NOT in ConfigDefaults
+   * (a default here would deep-merge into every config and break absent-equals-unchanged);
+   * `migrateConfig` seeds it DARK on update.
+   *
+   * MATURATION LADDER (FD11): `enabled` is OMITTED from the shipped config so it rides
+   * `resolveDevAgentGate` — LIVE (in dryRun) on a development agent, DARK on the fleet.
+   * Absent OR `enabled:false` ⇒ the nature router is inert and routing is BYTE-IDENTICAL
+   * to today. `dryRun` (default true on first enable) observes + logs the resolved plan
+   * without re-routing. `metered.goLive` is Increment B (metered doors + PIN money gate)
+   * — DEFERRED; it stays false and does nothing in this increment.
+   */
+  natureRouting?: {
+    /** Config schema version for versioned chain-forward migration (Int2). */
+    schemaVersion?: number;
+    /** OMITTED in the shipped config so the dev-agent gate decides (LIVE-dev / DARK-fleet). */
+    enabled?: boolean;
+    /** Observe-only (default true): compute + log the plan; do NOT re-route. */
+    dryRun?: boolean;
+    /**
+     * Optional per-chain wholesale override of the built-in v3 defaults. A chain left
+     * unset keeps its default. (The FD4 resolve-time validation of an override is a
+     * tracked A2.2 remainder; the FD4 runtime allowlist clamp already keeps the banned
+     * harness-door route closed on every resolved position regardless.)
+     */
+    chains?: Partial<
+      Record<
+        'FAST' | 'SORT' | 'JUDGE' | 'WRITE',
+        Array<{
+          door:
+            | 'pi-cli'
+            | 'grok-build'
+            | 'codex-cli'
+            | 'gemini-cli'
+            | 'claude-code'
+            | 'gemini-api'
+            | 'openrouter-api'
+            | 'groq-api';
+          model: string;
+          keyRef?: string;
+          moneyGated?: boolean;
+          injectionSafe?: boolean;
+          claudeBanned?: boolean;
+        }>
+      >
+    >;
+    /** Increment B — metered-door money/PIN go-live. DEFERRED; stays false in A2. */
+    metered?: { goLive?: boolean };
+  };
   /** Project directory (where CLAUDE.md lives) */
   projectDir: string;
   /** Maximum concurrent sessions */
   maxSessions: number;
   /** Protected session names that should never be reaped */
   protectedSessions: string[];
+  /**
+   * Standing sessions: long-lived coordinators (e.g. a desk that drives a build
+   * pipeline) that must never be ended by an AUTONOMOUS lifecycle path — idle
+   * reaping, the age limit, completion-pattern / sentinel-complete detection —
+   * yet must stay RESTARTABLE. Unlike `protectedSessions` (never touch: it also
+   * refuses `killSession`, so a refresh/respawn fails), a standing session is
+   * still killable by an explicit kill-to-respawn (`/sessions/refresh`, inbound
+   * respawn, operator close), and a topic-moved closeout still closes it.
+   * Each entry is a tmux session name (`echo-desk`) or a Telegram topic
+   * (`topic:52075`). Optional; absent ⇒ none. Snapshotted at boot.
+   */
+  standingSessions?: string[];
+  /**
+   * Finished-session registry retention (session-listing hygiene, CMT-1936).
+   * Bounds how long TERMINAL session records (completed / failed / killed)
+   * stay in the on-disk registry after they end, and hard-caps how many are
+   * retained at once. All optional; absence preserves the shipped defaults
+   * (killed/failed 60 min, completed background 60 min, completed interactive
+   * 24 h, cap 50). SessionManager snapshots config at boot — a change here
+   * takes effect at the next server restart.
+   */
+  retention?: {
+    /** Minutes a killed OR failed record is retained (default 60). */
+    killedTtlMinutes?: number;
+    /** Minutes a completed BACKGROUND record is retained — a scheduler job
+     *  (`jobSlug`) or a headless one-shot (`launchLane === 'headless'`, e.g.
+     *  the mentor Stage-A compose runs). Default 60. */
+    completedJobTtlMinutes?: number;
+    /** Hours a completed INTERACTIVE record is retained (default 24). */
+    completedTtlHours?: number;
+    /** Hard cap on retained terminal records regardless of age — oldest-ended
+     *  pruned first (default 50). The unbounded-accumulation backstop. */
+    maxFinished?: number;
+  };
   /** Patterns in tmux output that indicate session completion */
   completionPatterns: string[];
   /** Auth token for the Instar server — passed to sessions as INSTAR_AUTH_TOKEN
@@ -287,6 +466,10 @@ export interface SessionManagerConfig {
    * `credentials` via `getProviderCredential()`.
    */
   anthropicApiKey?: string;
+  /** Off switch for handing the sign-in key to server-side `claude` children (spec cloud-key-internal-calls). */
+  claudeChildAuth?: { enabled?: boolean };
+  /** Off switch for dead-key detection and recovery (spec cloud-key-internal-calls). */
+  claudeKeyHealth?: { enabled?: boolean };
   /**
    * @deprecated v1.0.0 — use `credentials.anthropic.baseUrl` instead.
    * Anthropic base URL for spawned sessions.
@@ -349,6 +532,18 @@ export interface JobDefinition {
   expectedDurationMinutes: number;
   /** Model tier to use */
   model: ModelTier;
+  /** Benchmark-backed session pin. Both fields must be present; otherwise the
+   *  job stays on its existing default model and framework. */
+  framework?: IntelligenceFramework;
+  frameworkModel?: string;
+  /** Opt-in to reviewed, non-safety session-start context omissions. */
+  leanContext?: boolean;
+  /** Explicit missed-work handling after a verified lease promotion. Absent means ask. */
+  catchUpPolicy?: 'skip' | 'run-once' | 'ask';
+  /** Explicit project-relative prerequisites. Never interpreted as commands. */
+  requiredPaths?: string[];
+  /** Source intent to offer this user job for private peer transfer; execution still requires exact-root approval. */
+  portable?: boolean;
   /** Whether this job is currently enabled */
   enabled: boolean;
   /** The skill or prompt to execute */
@@ -377,6 +572,22 @@ export interface JobDefinition {
    *  Default-absent = NOT state-writing → never guarded (additive-safe; older
    *  agents' parsers ignore the unknown field). */
   writesState?: boolean;
+  /** DOORWAY-MODEL-KNOWLEDGE-REGISTRY-SPEC §2.8 / Frontloaded Decision D11 —
+   *  run this job on EVERY machine independently, skipping the global
+   *  `jobSlug`-keyed claim/lease negotiation (the same way `script`-type jobs
+   *  skip it). Needed for a per-machine scan whose result is a physical fact of
+   *  THAT machine's disk (the doorway scan), which the lease would otherwise
+   *  elect exactly one machine to run — silently starving the others.
+   *
+   *  ⚠ MISUSE WARNING (load-bearing): setting this `true` means EVERY machine
+   *  runs the job on every fire, UNTRACKED by the lease — so the job MUST be
+   *  per-machine-idempotent and cheap. A scan that only reads local disk +
+   *  writes local scan-state qualifies. A job that mutates shared/canonical
+   *  state, spends metered budget on the cadence, or spawns duplicated
+   *  cross-machine side-effects must NOT set it. Default-absent = `false` =
+   *  today's exact claim/lease behavior (additive-safe; older parsers ignore
+   *  the unknown field). */
+  perMachineIndependent?: boolean;
   /** Tags for filtering/grouping */
   tags?: string[];
   /** Telegram topic ID this job reports to (auto-created if not set) */
@@ -392,6 +603,22 @@ export interface JobDefinition {
   grounding?: JobGrounding;
   /** LLM supervision tier — see docs/LLM-SUPERVISED-EXECUTION.md */
   supervision?: SupervisionTier;
+  /** Jev job-completion audit eligibility (spec: jev-job-supervision.md).
+   *  Deliberately SEPARATE from `supervision` — audit eligibility must not
+   *  overload the constitutional execution-tier field.
+   *  'excluded' = never audited · absent/'eligible' = auditable ·
+   *  'priority' = audited first from the reserved cap slice. */
+  completionAudit?: 'excluded' | 'eligible' | 'priority';
+  /** Repo-relative paths (jailed to the job's working directory) the job is
+   *  expected to produce — the audit's deterministic corroboration signal. */
+  declaredEffects?: string[];
+  /** Repo-relative paths (same jail) the job produces ONLY when it did work.
+   *  Verified by the audit only if the run CLAIMS them on stdout with an
+   *  `EFFECT: <path>` line — so a legitimate quiet run is never a false
+   *  failure, and a run that claims work it did not do is the strongest
+   *  false-success signal the audit can record. Spec:
+   *  docs/specs/jev-audit-claimed-effects.md */
+  conditionalEffects?: string[];
   /** MCP access for the spawned job session (claude-code spawns only).
    *  - 'none': spawn with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`
    *    so the headless session starts with ZERO project MCP servers. Right for
@@ -460,6 +687,32 @@ export interface JobDefinition {
     | 'untrusted-bad-signature'
     | 'untrusted-not-in-lockfile'
     | 'untrusted-hash-mismatch';
+  /** Job cost reduction §5.1 — `'script'` makes an instar-origin template run
+   *  its shipped node script (`scriptFile`) with no session. Accepted ONLY on
+   *  instar-origin templates in v1; user-origin `execute.type: 'script'` jobs
+   *  keep their shell behaviour. */
+  runner?: 'script';
+  /** Bare filename of the shipped script (`<slug>.mjs`, `^[a-z0-9-]+\.mjs$`).
+   *  Never a command line — the scheduler rebuilds the absolute path. */
+  scriptFile?: string;
+  /** The script's real bound; the execution timeout is twice this. */
+  scriptTimeoutMinutes?: number;
+  /** Declared anomaly kinds (§5.3). Undeclared kinds are ignored + logged. */
+  anomalies?: AnomalyDecl[];
+  /** Supervision class for a script job (§5.6.1). */
+  scriptSupervision?: 'triage' | 'deterministic';
+  /** Triage evidence projection (§5.6.2, F17). */
+  triageEvidence?: 'full' | 'structured-only';
+  /** Allowed `JOB_FIELD` keys (§5.2). */
+  triageFields?: string[];
+  /** Exact `JOB_RESULT ok` summaries that are bare-ok (no triage call). */
+  triageBareOk?: string[];
+  /** Skipped reason codes that are bare (no triage call). */
+  triageBareSkipped?: string[];
+  /** The signed lock-file's scriptHash for this job, set by the loader only
+   *  when the job is `trusted`. The scheduler re-hashes the script against it
+   *  immediately before every execution. */
+  scriptHashExpected?: string;
 }
 
 /** A pre-confirmed resolution for a common blocker pattern. */
@@ -551,17 +804,42 @@ export interface AgentMdExecute {
 
 export interface JobState {
   slug: string;
+  /**
+   * When this job was first REGISTERED with the scheduler (ISO). Distinct from
+   * `lastRun`: it answers "how long has this job existed?" for a job that has
+   * never run.
+   *
+   * WHY IT EXISTS: the startup missed-job sweep treated every job with no
+   * `lastRun` as overdue, so a brand-new job whose first window was months away
+   * fired immediately on the next boot (ACT-724 defect (a) — an annual reminder
+   * discharged itself the day it was created). The intended rule was already
+   * written in the comment above that branch — "trigger on startup if their
+   * first expected run time has already passed" — but nothing recorded when the
+   * job started existing, so the condition was uncheckable and the code simply
+   * fired everything. This is the missing fact.
+   */
+  firstSeenAt?: string;
   lastRun?: string;
-  lastResult?: 'success' | 'failure' | 'timeout' | 'pending';
+  /** `skipped` (job-cost-reduction §5.2): a script reported nothing to do.
+   *  It neither raises nor resets consecutiveFailures. */
+  lastResult?: 'success' | 'failure' | 'timeout' | 'pending' | 'skipped';
   /** Error message from the last failure (cleared on success) */
   lastError?: string;
   /** Handoff notes from the last successful run — claims to verify, not facts */
   lastHandoff?: string;
+  /** Source-reported measurement state from the last script run, when present. */
+  lastAssessment?: import('./InstrumentAssessment.js').InstrumentAssessment;
   nextScheduled?: string;
   consecutiveFailures: number;
 }
 
 export interface JobSchedulerConfig {
+  /**
+   * Test-agent leak guard: a throwaway-located agent refuses every scheduled
+   * job (it cannot prove a session would not use the operator's real login).
+   * true is the explicit override for a test that arranged its own login.
+   */
+  allowOnThrowawayAgent?: boolean;
   /** Path to jobs definition file */
   jobsFile: string;
   /** Whether the scheduler is active */
@@ -590,6 +868,9 @@ export interface JobSchedulerConfig {
   authToken?: string;
   /** Project name exposed as $INSTAR_AGENT_ID so gate shells can bind bearer auth to this agent. */
   projectName?: string;
+  /** Agent HTTP port exposed to script-runner jobs as $INSTAR_PORT
+   *  (job-cost-reduction §5.1). Falls back to `.instar/config.json` port. */
+  port?: number;
   /** Wake-time job reaper — closes runs left pending after the host wakes from sleep. */
   wakeReaper?: {
     /** Minimum sleep duration (seconds) to trigger a reap pass. Defaults to 60. */
@@ -600,6 +881,16 @@ export interface JobSchedulerConfig {
 }
 
 // ── User Management ─────────────────────────────────────────────────
+
+/** Attribution paper trail settings (docs/specs/attribution-paper-trail.md section 6). */
+export interface AttributionConfig {
+  enabled?: boolean;
+  mode?: 'record' | 'enforce';
+  /** Extra notes in scope, confined to roots under the agent home. Lanes are opt-in here. */
+  paths?: string[];
+  /** Date ranges whose records are known to be missing. A ref inside one is `unverifiable`. */
+  recordGaps?: Array<{ from: string; to: string }>;
+}
 
 export interface UserProfile {
   id: string;
@@ -638,6 +929,15 @@ export interface UserProfile {
    * absent it is derived from `permissions`. See src/permissions/SlackPrincipalResolver.ts.
    */
   orgRole?: string;
+  /**
+   * Signed override allowing a profile that legitimately COLLIDES with a
+   * `TEST_IDENTITY_MARKERS` fixture id to persist + load (silent-loss-refusal-
+   * conservation §2.D). Minted only on a dashboard-PIN-authed request; the load
+   * path VERIFIES the HMAC (no PIN). On the WS2.6 field-clamp denylist — a
+   * legitimately-overridden fixture-collision profile does NOT replicate its
+   * marker (re-mint on the peer if it ever occurs). NOT a bare boolean.
+   */
+  allowTestIdentity?: { marker: string; sig: string };
 }
 
 export interface UserChannel {
@@ -774,13 +1074,15 @@ export interface QuotaState {
   /** 5-hour rolling rate limit utilization (0-100), if available */
   fiveHourPercent?: number;
   /** Provider/framework that produced this quota snapshot, if known */
-  source?: 'anthropic-oauth' | 'claude-jsonl' | 'gemini-cli-capacity';
+  source?: 'anthropic-oauth' | 'claude-jsonl' | 'gemini-cli-capacity' | 'codex-rollout';
   /** Provider model whose capacity window is currently blocked, if known */
   model?: string;
   /** When a provider-specific capacity block is expected to clear */
   blockedUntil?: string;
   /** Human-readable reason from the provider capacity signal */
   blockReason?: string;
+  /** Provider reading is unavailable/incomplete; framework policy decides conservatively. */
+  quotaUnknown?: boolean;
   /** When usage data was last updated */
   lastUpdated: string;
   /** Per-account breakdown if multi-account */
@@ -841,6 +1143,8 @@ export interface ComponentHealth {
  * Born from the "heuristics are pre-filters, not decision-makers" lesson.
  */
 export interface IntelligenceProvider {
+  /** Optional concrete implementation identity for callers that require an exact route. */
+  frameworkId?: string;
   /**
    * Ask the LLM to evaluate a judgment call.
    * Returns a structured response that the caller parses.
@@ -853,8 +1157,30 @@ export interface IntelligenceProvider {
 }
 
 export interface IntelligenceOptions {
+  /** Optional shared-queue cancellation signal for preemptible background work. */
+  signal?: AbortSignal;
   /** Model tier preference (implementations may override based on availability) */
   model?: 'fast' | 'balanced' | 'capable';
+  /**
+   * Reviewer inbound-safety hardening (REVIEWER-DOOR-REWIRING §1.4). When set,
+   * `ClaudeCliIntelligenceProvider` runs the call LOCKED DOWN for reviewing
+   * untrusted spec text: EMPTY allowed-tools (`--allowedTools ''`, an allow-list
+   * — NOT a denylist), `--strict-mcp-config` (no user MCP servers), a NEUTRAL
+   * scratch cwd, the prompt via STDIN (not ps-visible argv), and an env
+   * ALLOWLIST that strips agent secrets (e.g. `INSTAR_AUTH_TOKEN`). `model` is
+   * the CONCRETE resolved pin the review must run on (never a tier word — a tier
+   * word resolves to opus, the penalized pair). Other providers ignore this
+   * field (they are already hardened by their own scratch/stdin/env allowlist).
+   */
+  reviewerHardening?: { model: string; jsonSchema?: string; noTools?: boolean };
+  /** Codex: run with its local tools disabled, for a call whose prompt holds outside text. */
+  noLocalTools?: boolean;
+  /** Audited decisions require one CLI model attempt per durable call row. */
+  strictModelPin?: boolean;
+  /** Execute this call only on the named CLI door and exact model, without router fallbacks. */
+  requiredRoute?: { framework: 'codex-cli'; modelId: string };
+  /** Checked immediately before a fenced model child is spawned. False refuses the launch. */
+  launchGuard?: () => boolean;
   /** Maximum tokens for the response */
   maxTokens?: number;
   /** Temperature (0-1, lower = more deterministic) */
@@ -873,6 +1199,18 @@ export interface IntelligenceOptions {
    * attribution lands under the `unknown::*` fallback keys so existing
    * callers keep working unchanged. New callers should set it.
    */
+  /**
+   * Force THIS call onto a specific provider account (its credential slot).
+   *
+   * Used by the failure tail: when a Codex call fails, the next thing tried should
+   * be the SIBLING Codex account, not the main subscription the second provider
+   * exists to protect. That retry has to name an account for one call only, which
+   * a provider-level resolver cannot express.
+   *
+   * Absent ⇒ the provider's own account resolution (usually: the ambient login).
+   * Honoured only by providers that support account selection; ignored elsewhere.
+   */
+  accountOverride?: { accountId: string; configHome: string };
   attribution?: {
     /** Stable source-side component label, e.g. "InputDetector", "MessagingToneGate". */
     component: string;
@@ -903,6 +1241,48 @@ export interface IntelligenceOptions {
      * (today's behavior: no backoff/queue rung).
      */
     deferrable?: boolean;
+    /**
+     * S4 A2 — OPT-IN, TIGHTENING-ONLY task nature (docs/specs/nature-axis-routing.md FD3).
+     * When the nature router is enabled, a caller MAY declare the call's nature to RAISE
+     * its routing tier (the safe direction, `E,B ≥ D ≥ A`): a same-tier or lower value is
+     * ignored (the static `LLM_ROUTING_NATURE` map wins) and a value outside {A,B,D,E} is
+     * ignored. It can only ever tighten (route a call onto the more-careful JUDGE ladder),
+     * never widen. MUST originate from callsite CODE, never from model/user content (Sec4
+     * trust boundary). Omitted ⇒ the static map is authoritative. Inert unless nature
+     * routing is enabled.
+     */
+    nature?: 'A' | 'B' | 'D' | 'E';
+    /**
+     * S4 FD5b — OPT-IN, TIGHTENING-ONLY injection-exposure flag
+     * (docs/specs/nature-axis-routing.md §289). When the nature router is enabled,
+     * a caller MAY declare `true` to mark an otherwise-statically-trusted call as
+     * carrying untrusted / injection-bearing content — so the door-availability walk
+     * SKIPS any non-injection-safe door (`injectionSafe: false`) for this call. It can
+     * only ever TIGHTEN: `true` raises exposure; it can NEVER relax a component that is
+     * statically `exposed: true` in LLM_ROUTING_INJECTION_EXPOSURE (fail-safe). MUST
+     * originate from callsite CODE, never from model/user content (Sec4 trust boundary).
+     * Omitted ⇒ the static exposure map is authoritative. Inert unless nature routing is enabled.
+     */
+    injectionExposed?: boolean;
+    /**
+     * F5 RESERVATION LANE (docs/specs/spawn-cap-interactive-priority.md).
+     * `interactive` requests the user-facing reserved headroom in the host spawn cap
+     * — set ONLY by a synchronous, user-blocking seam (the operator-facing tone gate /
+     * operator-inbound sentinel). It is HONORED only when the caller's component is on
+     * `INTERACTIVE_LANE_ALLOWLIST` AND interactive-priority is enabled; otherwise it is
+     * downgraded to `background` (the safe default). Omitted ⇒ background.
+     */
+    lane?: 'interactive' | 'background';
+    /**
+     * Job-cost attribution (docs/specs/job-cost-reduction.md §9.1): set ONLY by a
+     * call made FOR a scheduled job (anomaly narrator, triage referee, backup check,
+     * supervision pass). Recorded on the feature-metrics row so GET /jobs/cost can
+     * total per-slug spend exactly. Content-free labels; no routing effect.
+     */
+    jobSlug?: string;
+    machineId?: string;
+    /** The run id or anomaly-episode id the call was made for. */
+    runId?: string;
   };
   /**
    * Optional token-usage callback (Iris-audit item 1, spec
@@ -936,18 +1316,46 @@ export interface IntelligenceOptions {
    * sets it to feed model/framework into the metrics ledger.
    */
   onModel?: (info: { model: string; framework?: string }) => void;
+  /** Provider-reported served model, when the CLI response exposes one. */
+  onServedModel?: (info: { model: string; framework?: string }) => void;
   /**
    * Observable Intelligence standard: let the caller classify whether THIS call
    * led the system to ACT (fired) vs take no action (noop). The funnel calls it
    * on the successful result string and records 'fired' or 'noop' accordingly,
-   * so /metrics/features reports real effectiveness (fireRate = fired/realCalls)
-   * instead of every completed call reading as noop. OPTIONAL: when omitted the
-   * outcome defaults to 'noop' (today's behavior). The callback must be pure and
+   * so /metrics/features reports real effectiveness
+   * (fireRate = fired / (fired + noop))
+   * instead of every completed call reading as noop. OPTIONAL: when omitted (or
+   * when it throws), the outcome is `unclassified`, so the API reports no
+   * fire-rate denominator instead of manufacturing 0%. The callback must be pure and
    * cheap — it runs inside the funnel and is wrapped in try/catch so a throw can
-   * never break the observed path. `verdictId` optionally correlates the call to
-   * a downstream record (e.g. a commitment id).
+   * never break the observed path (it may be invoked more than once per call —
+   * the funnel classifies the metric outcome and the router's settlement seam
+   * classifies the decision row).
+   *
+   * `verdictId` (llm-decision-quality-meter FD8): a caller-supplied verdictId NO
+   * LONGER lands in `feature_metrics.verdict_id` on `kind:'llm'` rows — that
+   * column is single-writer for the seam-minted correlation id (`d-`/`b-`
+   * prefixed) on llm rows, always-on. If supplied, the router's settlement seam
+   * records it as `callerRef` inside the provenance row's context when a
+   * provenance row is being written (an enrolled call), and DROPS it for llm
+   * rows otherwise. Event-kind rows (`recordEvent`) keep their existing
+   * semantic verdictId use untouched.
    */
   classifyVerdict?: (result: string) => { acted: boolean; verdictId?: string };
+  /**
+   * LLM-Decision Quality Meter — Layer B provenance enrollment
+   * (docs/specs/llm-decision-quality-meter.md §5.1.4). An enrolling callsite
+   * supplies this block so its decision can later be reconstructed and graded.
+   * CONSUMED by the seam: the IntelligenceRouter strips it before every
+   * per-attempt option spread, and the CircuitBreaking funnel wrapper ALSO
+   * strips it before `inner.evaluate` — it never reaches an inner adapter on
+   * any path. `onCorrelationId` fires synchronously at mint, exactly once per
+   * `evaluate()` invocation (including calls that later throw), never after
+   * settlement; a throw in it is contained + counted. A router-BYPASSED call
+   * has the block stripped-and-counted at the breaker and fires no callback
+   * (such decision points are census-`pending` by rule, §5.6).
+   */
+  provenance?: DecisionProvenanceBlock;
 }
 
 // ── Drift Checker ───────────────────────────────────────────────────
@@ -1044,6 +1452,12 @@ export interface InteractionSummary {
 export interface RelationshipManagerConfig {
   /** Directory to store relationship files */
   relationshipsDir: string;
+  /**
+   * The agent state dir. When set, every delete/merge appends a deletion intent under
+   * `<stateDir>/state/reconcile/intents/` so the deletion replicates even from a process
+   * with no replication emitter (writer-agnostic reconciler). Absent ⇒ no intent written.
+   */
+  deletionIntentStateDir?: string;
   /** Maximum recent interactions to keep per relationship */
   maxRecentInteractions: number;
   /**
@@ -1062,11 +1476,15 @@ export type SkipReason =
   | 'paused'          // Scheduler is paused
   | 'quota'           // Quota constraints
   | 'memory-pressure' // Memory gate blocked the job (distinct from quota)
+  | 'overload'        // Machine overloaded: admission closed to new automatic work (trustworthy-machine-load C1)
   | 'capacity'        // No available session slots (queued instead of skipped, but tracked)
   | 'claimed'         // Another machine already claimed this job (Phase 4C — Gap 5)
   | 'machine-scope'   // Job is scoped to a different machine
   | 'already-running' // A live session already holds this jobSlug (june15-headless-spawn-reroute O3: per-slug double-run guard)
   | 'role-guard'      // WS4.3: state-writing job refused on a read-only standby (not the lease-holder)
+  | 'throwaway-agent' // test-agent-leak-guard: agent lives in a temp folder / sandboxed HOME
+  | 'script-cap'      // job-cost-reduction F8: 3 scripts already running on this server (retried in 1 min)
+  | 'definition-changed' // The job's definition changed while its gate ran; the next fire uses the new one
   | 'gate';           // Gate command returned non-zero (nothing to do)
 
 /**
@@ -1371,6 +1789,8 @@ export interface ActionItem {
   createdAt: string;
   /** When this should be done by (ISO date) */
   dueBy?: string;
+  /** Explicit reason this action was created without a due date. */
+  followThroughOptOutReason?: string;
   /** When completed */
   completedAt?: string;
   /** How it was resolved */
@@ -1383,6 +1803,31 @@ export interface ActionItem {
   };
   /** Tags for categorization */
   tags?: string[];
+  /** CMT-1132: exempts this action from auto-expiry until cleared. */
+  autoExpiryHold?: AutoExpiryHold;
+}
+
+/**
+ * A per-record exemption from auto-expiry (CMT-1132). Age proves nothing about
+ * a row a person or a review has said is still live, so a hold stops every
+ * expiry branch until it is cleared. No expiry date by design: a hold that
+ * lapsed by itself would hand the row back to the sweep unreviewed.
+ */
+export interface AutoExpiryHold {
+  reason: string;
+  setAt: string;
+}
+
+/** One action the auto-expiry sweep took out of the queue, with everything needed to put it back. */
+export interface ActionArchiveEntry {
+  /** The action exactly as it stood when it left the queue. */
+  action: ActionItem;
+  archivedAt: string;
+  ageDays: number;
+  class: string;
+  reason?: string;
+  /** Set when the action went back to the queue; the entry stays as history. */
+  restoredAt?: string;
 }
 
 /**
@@ -1393,14 +1838,25 @@ export interface EvolutionManagerConfig {
   stateDir: string;
   /** Whether auto-implementation of approved proposals is enabled */
   autoImplement?: boolean;
-  /** Maximum proposals before oldest get archived */
+  /** Stable archive origin identity, supplied by the server machine identity. */
+  archiveOrigin?: string;
+  /** Soft TOTAL retention targets; active work is always exempt. Zero is preserved. */
+  retentionTargets?: { proposals?: number; learnings?: number; gaps?: number; actions?: number };
+  /** @deprecated Use retentionTargets.proposals (soft total target). */
   maxProposals?: number;
-  /** Maximum learning entries before oldest get archived */
+  /** @deprecated Use retentionTargets.learnings (soft total target). */
   maxLearnings?: number;
-  /** Maximum gaps before oldest addressed get archived */
+  /** @deprecated Use retentionTargets.gaps (soft total target). */
   maxGaps?: number;
-  /** Maximum action items before oldest completed get archived */
+  /** @deprecated Use retentionTargets.actions (soft total target). */
   maxActions?: number;
+  /** Conservative stale pending-action cleanup. Server defaults are dry-run-first. */
+  autoExpiry?: {
+    enabled?: boolean;
+    maxAgeDays?: number;
+    sweepIntervalMs?: number;
+    dryRun?: boolean;
+  };
 }
 
 // ── Soul.md — Self-Authored Identity ─────────────────────────────────
@@ -1752,6 +2208,18 @@ export interface MachineIdentity {
   createdAt: string;
   /** What this machine can do */
   capabilities: MachineCapability[];
+  /** Monotonic signing-key generation. Legacy identities read as epoch 0. */
+  keyEpoch?: number;
+  /** Base64-encoded Ed25519 recovery public key. Absent means PIN/corroboration fallback. */
+  recoveryPublicKey?: string;
+  /** Monotonic recovery-key generation, independent from keyEpoch. */
+  recoveryEpoch?: number;
+  /** Whether this peer established the recovery key directly or learned a replicated copy. */
+  recoveryAnchorProvenance?: 'first-hand' | 'replicated';
+  /** ISO timestamp of a local signing-key rotation, when known. */
+  keysRotatedAt?: string;
+  /** Bounded machine-generated reason for the local signing-key rotation. */
+  keysRotatedReason?: string;
 }
 
 export type MachineCapability = 'telegram' | 'jobs' | 'tunnel' | 'sessions';
@@ -1776,6 +2244,10 @@ export interface MeshEndpoint {
   kind: 'tailscale' | 'lan' | 'cloudflare';
   /** http://100.x:PORT | http://192.168.x:PORT | https://<tunnel-host> */
   url: string;
+  /** Locally-observed endpoints are never accepted from peer advertisements. */
+  origin?: 'advertised' | 'observed';
+  /** Promotion time for a locally corroborated endpoint. */
+  observedAt?: string;
 }
 
 export interface MachineRegistryEntry {
@@ -1816,6 +2288,15 @@ export interface MachineRegistryEntry {
    * docs/specs/multi-transport-mesh-comms.md.
    */
   endpoints?: MeshEndpoint[];
+  /**
+   * routing-control-room-spend Increment C (FD-6 rung 2, pool-published half):
+   * the auto-created "💰 Routing & Spend Alerts" Telegram topic id this machine
+   * created/adopted — a CONTENT-FREE number riding the same replicated-registry
+   * path as `lastKnownUrl`, so every peer and any FUTURE serving-lease holder
+   * resolves the SAME id instead of re-creating (Telegram mints a fresh id per
+   * createForumTopic, so last-writer-wins can never merge two creations).
+   */
+  routingSpendAlertTopicId?: number;
   /** ISO timestamp of revocation (if revoked) */
   revokedAt?: string;
   /** Machine ID that revoked this one */
@@ -1945,6 +2426,23 @@ export interface MachineCapacity {
   nickname?: string;
   /** Liveness, computed as (now(router) − routerReceivedAt) < failoverThreshold. */
   online: boolean;
+  /**
+   * Honest display liveness (trustworthy-machine-load spec A2): live /
+   * unreachable / stale / unknown, with the age and source of its evidence.
+   * DISPLAY ONLY — `online` keeps its existing placement semantics.
+   */
+  liveness?: import('./machineLiveness.js').MachineLiveness;
+  /** Load average carried by the last DIRECT contact, with that contact's time (A3). */
+  lastDirectLoadAvg?: { value: number; at: string };
+  /** Round-trip time of the last successful direct pull, ms (B3). */
+  lastPullRttMs?: number;
+  /** Multi-signal load report from the machine itself (trustworthy-machine-load B1). */
+  loadReport?: import('./machineLoadReport.js').MachineLoadReport;
+  loadReportReceivedAt?: string;
+  /** The report's own age: sampleAgeMs + time since receipt. */
+  loadReportAgeMs?: number;
+  /** The machine's verdict (B2) while its report is fresh (≤60 s); `unknown` otherwise. */
+  loadVerdict?: import('./machineLoadReport.js').LoadVerdict;
   /** The machine's own last-heartbeat timestamp (ISO) — debugging only. */
   selfReportedLastSeen?: string;
   /** When the router last observed this machine, on the ROUTER's clock (ISO). */
@@ -2003,11 +2501,15 @@ export interface MachineCapacity {
    *  non-participant for every gated workstream (the conservative side —
    *  senders never forward to a peer that cannot durably receive; the journal
    *  applier's silently-drop-unknown-kinds behavior is the named skew-failure
-   *  mode this gate prevents). Fixed-size booleans only — never an inventory. */
+   *  mode this gate prevents). Fixed-size values only — never an inventory. */
   seamlessnessFlags?: {
     /** This machine can durably RECEIVE forwarded inbound messages (the
      *  'deliverMessage' receiver handler + live durable queue). */
     ws11DeliverReceive?: boolean;
+    /** dashboard-new-session-machine-choice §3.4 — this machine can run the
+     *  owner-side dashboard-create start (pool not dark, Telegram configured,
+     *  topic-profile context wired). */
+    dashboardCreateReceive?: boolean;
     /** WS1.2: this machine can execute the owner-side `drain` verb (bounded
      *  turn-boundary drain + claim handoff for an active-topic transfer).
      *  ABSENT/false → the transfer sender degrades to today's pin-and-
@@ -2032,6 +2534,11 @@ export interface MachineCapacity {
      *  Advertised only when the dark ws44PoolCache flag resolved on; ABSENT/false
      *  → the surfaces fan out per-route (today's behavior). */
     ws44PoolCache?: boolean;
+    /** Proposed stable owner for the undated-action cooldown ledger. This is
+     *  NOT authority by itself: the controller engages only when every registered
+     *  pool member's latest authenticated heartbeat advertises the same machine id. `null`
+     *  means deliberately unconfigured and therefore fail-closed. */
+    undatedActionStateOwnerMachineId?: string | null;
     /** WS2 replicated-store foundation (§10.2 capability advert). Per-store
      *  receive capability: `stateSyncReceive[store] === true` means this machine
      *  can durably RECEIVE + apply that store's replicated journal kind. ABSENT
@@ -2055,16 +2562,35 @@ export interface MachineCapacity {
    *  restarts via the durable last-known store, so a dark peer renders with
    *  its honest age. */
   guardPostureReceivedAt?: string;
+  /** Machine-coherence advert (machine-coherence-guard §3.2): running version,
+   *  protocol version, manifest hash, the guard's own posture, and the
+   *  manifest-resolved effective flag values. Emission is UNCONDITIONAL (M3 —
+   *  ships live with the code; only the evaluator/alarm are dev-gated); absent
+   *  = the peer predates the guard (classified `unknown` → version-class after
+   *  grace). Receive side is CLAMPED (M4) — a rejected advert is replaced by
+   *  `coherenceAdvertRejected`, never carried forward as current posture. */
+  coherenceAdvert?: import('./machineCoherenceAdvert.js').CoherenceAdvert;
+  /** RECEIVER-side receipt time (ISO) of the LAST beat that actually CARRIED a
+   *  coherenceAdvert (M5): carry-forward must never impersonate freshness — the
+   *  evaluator degrades an advert older than `advertStaleMs` to `advert-stale`
+   *  even while liveness (`routerReceivedAt`) stays fresh via git beats. */
+  coherenceAdvertReceivedAt?: string;
+  /** Clamp-rejection marker (M4): set when the peer's LAST advert failed the
+   *  receive clamp. REPLACES the stored advert for evaluation purposes
+   *  (rejected ≠ absent — surfaced as `advert-rejected`, a LOUD named
+   *  condition, never silence); cleared by the next clean advert. */
+  coherenceAdvertRejected?: { atMs: number; reason: string };
 }
 
 /** The compact posture block that rides the capacity heartbeat
- *  (GUARD-POSTURE-ENDPOINT-SPEC §2.3). Counts plus per-key detail for ONLY
- *  the two sharpest signals (offDeviantKeys, offRuntimeDivergentKeys) —
- *  bounded by the manifest size. */
+ *  (GUARD-POSTURE-ENDPOINT-SPEC §2.3). Counts plus bounded per-key detail for
+ *  the read surfaces that must not collapse an absent class into all-clear. */
 export interface GuardPostureSummary {
   onConfirmed: number;
   onUnverified: number;
   onStale: number;
+  /** Optional for wire back-compat: absent means the peer cannot report this class. */
+  onBlind?: number;
   onDryRun: number;
   offDeviant: number;
   offDeviantKeys: string[];
@@ -2073,6 +2599,17 @@ export interface GuardPostureSummary {
   divergedPendingRestart: number;
   errored: number;
   missing: number;
+  /** G3 (g3-dark-but-load-bearing-guards §2.6): load-bearing key-lists riding the
+   *  heartbeat so a peer gap is visible fleet-wide. Optional for wire back-compat —
+   *  an un-upgraded peer omits them and the probe Array.isArray-guards the read. */
+  loadBearingGapKeys?: string[];
+  /** Full count plus at most 16 deterministic keys. Read-surface context only:
+   *  probes and pool notifications deliberately ignore these fields because
+   *  the underlying missing/errored/stale/divergent classes already alarm. */
+  loadBearingUninspectable?: number;
+  loadBearingUninspectableKeys?: string[];
+  loadBearingSoakingKeys?: string[];
+  loadBearingAcceptedKeys?: string[];
   generatedAt: string;
 }
 
@@ -2129,7 +2666,37 @@ export interface LeaseSelfHealConfig {
    * self-fence stays armed otherwise. DARK + opt-in; no-op when no preferred
    * machine is set. Spec: docs/specs/multi-transport-mesh-comms.md.
    */
-  soloCaptainHold?: { enabled?: boolean };
+  /**
+   * `requireLastingLink`, `pairRole` and `pairedWith` are written only at a first pairing. Until a machine has
+   * proved a connection to its peer that survives a restart, the inviter serves as it always did
+   * and the joiner never takes the lease (session-pool-takeover-at-pairing).
+   */
+  soloCaptainHold?: { enabled?: boolean; requireLastingLink?: boolean; pairRole?: 'inviter' | 'joiner'; pairedWith?: string };
+  /**
+   * U4.4 (docs/specs/u4-4-lease-handback.md) — the reconciler for the F4
+   * preference: after a failover, the serving lease is handed BACK to the
+   * preferred captain once continuously healthy for `healthWindowMs`, at a
+   * clean boundary, claim-before-release via a signed single-use consent
+   * token. ACTION-BEARING lease authority: ships HARD-DARK (`enabled:false` +
+   * `dryRun:true`, DARK_GATE_EXCLUSIONS) like its F2/F3/L3 siblings;
+   * `dryRun:false` additionally REQUIRES pollFollowsLease live (validated at
+   * boot — a lease/ingress split is refused loudly).
+   */
+  preferredCaptainHandback?: {
+    enabled?: boolean;
+    /** Default true — logs would-hand-back without minting/sending offers. */
+    dryRun?: boolean;
+    /** Continuous preferred-captain health required to arm. Default 600000 (10m). */
+    healthWindowMs?: number;
+    /** Continuous deferral before ONE notice + boundary relaxation. Default 7200000 (2h). */
+    deferralCeilingMs?: number;
+    /** Operator-flip latch TTL (written BY the flip action). Default 86400000 (24h). */
+    operatorLatchMs?: number;
+    /** Episode cap (offers + hand-backs) per rolling windowMs. Default 2. */
+    maxPerWindow?: number;
+    /** Episode-cap rolling window. Default 21600000 (6h). */
+    windowMs?: number;
+  };
   /**
    * F4 — preferred-awake machine (opt-in). null = off (today's behavior). When
    * set, the named (SAS-verified) machine wins ties ONLY while healthy, applied
@@ -2188,17 +2755,87 @@ export interface MeshTransportConfig {
   maxProbeBackoffMs?: number;
   /** Bind host override (Decision 17). Default: '0.0.0.0' when enabled else '127.0.0.1'. */
   bindHost?: string;
+
+  // ── U4.3 — traffic-independent rope-health recovery probe (flat knobs,
+  //    docs/specs/u4-3-breaker-recovery-probe.md §5). ──
+  /**
+   * Recovery-probe master switch. DELIBERATELY OMITTED from ConfigDefaults so the
+   * developmentAgent gate resolves it (live-on-dev in dry-run day one, dark on
+   * the fleet) — see DEV_GATED_FEATURES `ropeRecoveryProbe`.
+   */
+  recoveryProbeEnabled?: boolean;
+  /** Dry-run SENDS real probes (harmless typed-refusal contract) and logs
+   *  would-close verdicts but never mutates the HealthRecord. Default true. */
+  recoveryProbeDryRun?: boolean;
+  /** P19 floor cadence for a permanently-dead / slow-but-alive rope. Default 900000 (15 min). */
+  recoveryProbeFloorMs?: number;
+  /** Consecutive probe failures before the exhaustion transition + escalate-once. Default 20. */
+  recoveryProbeExhaustAttempts?: number;
+  /** A probe-close→re-death inside this window counts as a probe failure for backoff. Default 600000. */
+  recoveryProbeReopenEpisodeWindowMs?: number;
+  /** Mid-recovery episode cadence (never the resolver's trivially-true ~5s). Default 45000. */
+  recoveryProbeMidIntervalMs?: number;
+  /** Consecutive successful probes WITHOUT lastKnownGood reclaim before floor cadence. Default 20. */
+  recoveryProbeMaxUnreclaimedSuccesses?: number;
 }
 
 export interface MultiMachineConfig {
   /** Whether multi-machine is enabled */
   enabled: boolean;
+  /** Private, approved user-job transfer. Dark until paired-machine proof. */
+  jobDefinitionSync?: { enabled?: boolean; dryRun?: boolean };
   /** Whether to auto-promote standby when awake goes silent */
   autoFailover: boolean;
   /** Minutes of silence before auto-failover (default: 15) */
   failoverTimeoutMinutes: number;
+  /** Live rollback switches for the lease-flap incident fix. Absent means on. */
+  leaseFlapFix?: {
+    liveness?: boolean;
+    mediumCheck?: boolean;
+    unconfirmedWriteAlert?: boolean;
+  };
   /** Whether to require human confirmation before auto-failover */
   autoFailoverConfirm: boolean;
+  /** Restricted mutual SSH-subsystem proof. Enabled is dev-gated; dryRun ships first. */
+  mutualSsh?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    requiredForEmployeeRole?: boolean;
+    freshnessMs?: number;
+    cadenceMs?: number;
+    probeDeadlineMs?: number;
+    concurrency?: number;
+  };
+  /** Standing peer execution via this agent account's authorized_keys. Dev-gated and dry-run-first. */
+  peerExecution?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    requiredForReadiness?: boolean;
+    port?: number;
+  };
+  /** Cryptographically-bound signing-key recovery. Dev-gated and dry-run first. */
+  identityReannounce?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Agent-wide recovery-route credential, minted once and conveyed only by
+     * the code-authenticated pairing response. Distinct from each machine's
+     * ordinary local API token. */
+    sharedBearerToken?: string;
+  };
+  /** Local-first direct endpoint observation. Dev-gated and dry-run first. */
+  observedEndpoints?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Optional operator-known stable address for a machine whose network
+     * namespace cannot see its externally reachable Tailscale/LAN address. */
+    advertisedAddress?: string;
+    corroborationObservations?: number;
+    corroborationWindowMinutes?: number;
+    ttlDays?: number;
+    rotationQuarantineHours?: number;
+  };
+  /** Keychain-only recovery private-key escrow. Dev-gated and dry-run first. */
+  recoveryKeyEscrow?: { enabled?: boolean; dryRun?: boolean };
   /**
    * Coordination mode (Gap 1 — Active/Active support).
    * - 'primary-standby': One awake, others standby with failover (default)
@@ -2269,6 +2906,17 @@ export interface MultiMachineConfig {
    * the single-awake seamlessness model above; a 1-machine agent is a no-op.
    */
   sessionPool?: SessionPoolConfig;
+  /**
+   * Standby-Write Reconciliation + Typed Refusal
+   * (docs/specs/standby-write-reconciliation.md §7): ownership-scoped write
+   * admission replacing the blanket lease-boolean standby guard. Dev-gated
+   * dark (`enabled` OMITTED from defaults → resolveDevAgentGate) and dry-run
+   * FIRST: while `dryRun` is true the layer only evaluates + logs
+   * would-verdicts and the LEGACY blanket guard keeps enforcing (§9.6).
+   * Refusal authority additionally requires the wave-2 write-surface
+   * inventory latch (WRITE_SURFACE_INVENTORY_COMPLETE, §9.14).
+   */
+  writeAdmission?: WriteAdmissionConfig;
   /**
    * Cross-machine secret-sync (spec Phase 4): a secret given to the agent on one
    * machine becomes usable on its other machines automatically (encrypted to the
@@ -2375,12 +3023,39 @@ export interface MultiMachineConfig {
     ws3OneVoice?: boolean;
     /** WS3 dwell window (ms) before the election re-evaluates. Default 60000. */
     ws3DwellMs?: number;
-    /** WS1.3 ownership reconcile (bounded pin/owner convergence). DARK default. */
+    /** WS1.3 ownership reconcile (bounded pin/owner convergence). Dev-gated
+     *  (resolveDevAgentGate) — OMITTED default. Post-U4.1 an explicit `false`
+     *  is the operator's DURABLE rollback lever (survives migration). */
     ws13Reconcile?: boolean;
     /** WS1.3 dry-run (logs intended CAS actions without performing them). Default true. */
     ws13DryRun?: boolean;
-    /** WS1.3 reconcile tick cadence (ms). Default 30000. */
+    /** WS1.3 reconcile tick cadence (ms). Default 30000 (floor 5000). */
     ws13TickMs?: number;
+    /** WS1.3 pin replication (the topic-pin-record advisory stream + fold read).
+     *  Dev-gated (resolveDevAgentGate) — OMITTED default. */
+    ws13PinReplicate?: boolean;
+    /** U4.1 §2.G: pin-stability debounce (ms) before the owner acts on a pin —
+     *  exposes the reconciler's existing debounceMs dep. Default 30000. */
+    ws13DebounceMs?: number;
+    /** U4.1 §2.G: transfer deadline (ms) before the owner aborts a transfer
+     *  toward an unreachable target (N4 abort). Default 120000. */
+    ws13TransferDeadlineMs?: number;
+    /** U4.1 §2.G: sustained-online hysteresis (ms) gating pin fulfilment AND
+     *  Case-A initiation toward a returning machine. Default 120000 (4 ticks). */
+    ws13SustainedOnlineMs?: number;
+    /** U4.1 §2.G: pending-pin age bound (ms) → the ONE deduped fulfil-or-unpin
+     *  attention item (`u41:pin-pending-aged`). Default 86400000 (24h). */
+    ws13PendingPinMaxAgeMs?: number;
+    /** U4.1 §2.G: bounded move-initiations per reconciler tick — a lease flap
+     *  can never trigger a transfer storm. Default 2. */
+    ws13MaxMovesPerTick?: number;
+    /** U4.1 §2.G: divergence window (ms) of persistent desired≠actual before
+     *  `pinState: diverged` + its attention item. Default 600000 (10min). */
+    ws13DivergedWindowMs?: number;
+    /** U4.1 §2.G (R-r3-3): fold byte-guard — on breach the pin fold truncates
+     *  NEWEST-FIRST and raises `u41:pin-fold-truncated` (never silent).
+     *  Default 67108864 (64MB). */
+    ws13FoldMaxBytes?: number;
     /**
      * WS4.4 "links that survive machine boundaries" (§WS4.4 / F6). When on, the
      * tunnel-fronting machine resolves the actual HOLDER of a `/view/:id` it does
@@ -2506,7 +3181,13 @@ export interface CoherenceJournalUserConfig {
    * (WORKING-SET-HANDOFF-SPEC §3.7: the pull is meaningless without
    * replication's mesh path and must never out-activate it).
    */
-  replication?: { enabled?: boolean; maxBatchBytes?: number };
+  replication?: {
+    enabled?: boolean;
+    maxBatchBytes?: number;
+    /** Explicit one-shot replicated-record journal compaction. Disabled by default;
+     * when enabled it still defaults to dry-run until deliberately flipped. */
+    compaction?: { run?: boolean; dryRun?: boolean };
+  };
   /**
    * Working-Set Handoff tunables (WORKING-SET-HANDOFF-SPEC §3.7). All
    * optional; ConfigDefaults carries the shipped literal. Gated on
@@ -2560,17 +3241,52 @@ export interface CoherenceJournalUserConfig {
  * later layers (placement, transfer, registry, clock-skew) are added to this
  * interface by their tracks as they land.
  */
+/**
+ * Standby-Write Reconciliation config (docs/specs/standby-write-reconciliation.md §7).
+ */
+export interface WriteAdmissionConfig {
+  /** OMITTED by default → resolveDevAgentGate: LIVE on a development agent,
+   *  DARK on the fleet (house Maturation Path). */
+  enabled?: boolean;
+  /** Dry-run FIRST even on dev (FD-7 telemetry pattern). Default true. While
+   *  true, the legacy blanket guard keeps enforcing; the new layer only logs
+   *  would-verdicts (§9.6). */
+  dryRun?: boolean;
+  /** ≥N refusals of one (route/op, code) within the window ⇒ ONE deduped
+   *  aggregate attention item (§6 — never per-event). Default 5. */
+  refusalAggregateThreshold?: number;
+}
+
 export interface SessionPoolConfig {
   /** Master switch. Default false — the entire session-pool layer is inert when false. */
   enabled?: boolean;
   /**
+   * Promotion activation selector. `off` is the fleet default; `auto-climb`
+   * drives one green-gated step per cadence; `operator` exposes only the manual
+   * one-step route. The manual route also remains available in auto-climb mode.
+   */
+  promotionModel?: 'auto-climb' | 'operator' | 'off';
+  /** Highest stage either promotion model may reach. Default dark (fail-closed). */
+  promotionCeiling?: 'dark' | 'shadow' | 'live-transfer' | 'rebalance';
+  /**
+   * Telegram topics the rebalance proof may move (session-pool-rebalancing-finish). Empty ⇒
+   * POST /session-pool/rebalance-proof refuses everything. Listed topics are never shed.
+   */
+  rebalanceProofTopics?: number[];
+  /** Auto-climb cadence in ms; runtime floor 60000. Default 60000. */
+  promotionTickMs?: number;
+  /**
    * Graduated rollout stage (spec §Rollout). 'dark' (code shipped, placement
-   * dry-run, always local) → 'shadow' (real placement + ownership, no transfer)
+   * dry-run, always local) → 'shadow' (real placement: a conversation can start on another machine; no moves of running ones)
    * → 'live-transfer' (failover + pin transfers) → 'rebalance' (load-driven).
    * Written ONLY by StageAdvancer via a Config.ts write-guard (Track H);
    * a direct write is rejected. Default 'dark'.
    */
   stage?: 'dark' | 'shadow' | 'live-transfer' | 'rebalance';
+  /** When sharing was turned on at a first pairing. Absent on every other pool. */
+  activatedAtPairing?: string;
+  /** `false` keeps a first pairing from turning sharing on. */
+  autoActivate?: boolean;
   /**
    * When true, the placement engine LOGS the decision it would make but always
    * places locally (Stage-0 behavior). Default true.
@@ -2603,6 +3319,108 @@ export interface SessionPoolConfig {
   /** Hold-for-stability policy (same spec §4) — trails inboundQueue one
    *  rollout stage behind by operator discipline. */
   holdForStability?: Partial<import('./inboundQueueConfig.js').HoldForStabilityConfig>;
+  /**
+   * U4.2 (docs/specs/u4-2-stale-owner-release.md §5) — the CMT-1786
+   * auto-failover: the serving-lease holder force-claims a provably-dead
+   * owner's topics behind the §2.2 evidence bar. `enabled` DELIBERATELY
+   * OMITTED from ConfigDefaults (developmentAgent gate — dev-live-in-dryRun,
+   * dark fleet; DEV_GATED_FEATURES). Subordinate to sessionPool being live
+   * AND ≥2 registered machines. The §2.3 TTL-ordering invariant
+   * (deathEvidenceMs > selfFenceTtlMs + tick + skew) is validated at startup.
+   */
+  staleOwnerRelease?: {
+    enabled?: boolean;
+    /** Default true — logs would-claims without landing a CAS. */
+    dryRun?: boolean;
+    /** Death-evidence bound (observer monotonic). Default 180000. */
+    deathEvidenceMs?: number;
+    /** Per-endpoint authenticated-probe timeout. Default 8000 (< lease 30s). */
+    probeTimeoutMs?: number;
+    /** Ambiguity escalates after this × deathEvidenceMs. Default 3. */
+    ambiguityCeilingMultiple?: number;
+    /** P19 per-tick claim cap. Default 2. */
+    maxClaimsPerTick?: number;
+    /** Bootstrap (R-r2-2): never-observed-since-boot expiry multiple. Default 3. */
+    bootstrapNonObservationMultiple?: number;
+    /** The owner self-fence TTL the §2.3 ordering invariant checks against. Default 60000. */
+    selfFenceTtlMs?: number;
+  };
+  /**
+   * Ownership-gated spawn seam (ownership-gated-spawn-and-judgment-within-floors
+   * spec §3.1 — Layer A). `enabled` DELIBERATELY OMITTED from ConfigDefaults
+   * (developmentAgent gate; DEV_GATED_FEATURES). dryRun:true = observe-only
+   * (journal would-block verdicts, never refuse a spawn). Structural invariant
+   * (§3.1 item 6): enforcement additionally REQUIRES the durable inbound queue
+   * live on this machine — dryRun:false alone cannot block a spawn.
+   */
+  ownershipGatedSpawn?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Bind a verified live-other-owner refusal when durable custody is live. */
+    enforceLiveOwner?: boolean;
+  };
+  /**
+   * Duplicate-session reconciler (same spec §3.2 — Layer B). `enabled` OMITTED
+   * (dev gate; DEV_GATED_FEATURES). Runs on the serving-lease holder only;
+   * refuses to arm on an in-memory ownership store (§3.2.0 substrate gate).
+   */
+  duplicateReconciler?: {
+    enabled?: boolean;
+    /** Default true — logs intended convergence writes, lands no CAS. */
+    dryRun?: boolean;
+    /** Tick cadence on the lease holder. Default 60000. */
+    reconcilerTickMs?: number;
+    /** P17 per-tick cap on topics reconciled. Default 3. */
+    maxReconcilesPerTick?: number;
+    /** P17 per-tick cap on convergence record writes. Default 5. */
+    maxConvergenceWritesPerTick?: number;
+    /** Peer-echo confirmation window, in reconciler ticks. Default 4. */
+    echoConfirmTicks?: number;
+    /** P19: re-duplications per topic per window before the breaker trips. Default 3. */
+    breakerThreshold?: number;
+    /** P19 breaker window. Default 86400000 (24h). */
+    breakerWindowMs?: number;
+  };
+  /**
+   * J1/J2 LLM arbiters (same spec §3.4 — Increment 3+). `enabled` OMITTED
+   * (dev gate; DEV_GATED_FEATURES). shadowMode:true = decide-and-log, never act.
+   */
+  judgmentArbiters?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    shadowMode?: boolean;
+  };
+  /**
+   * Commitment custody transfer on reconciled/moved closeouts (same spec
+   * §3.2.4a — Increment 2b, independently reversible sub-flag). `enabled`
+   * OMITTED (dev gate; DEV_GATED_FEATURES). While unavailable, an
+   * open-commitment duplicate escalates rather than auto-closes.
+   */
+  commitmentCustodyTransfer?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+  };
+  /**
+   * SessionPoolFailoverRunner boot-wiring (§Rollout, Track H) — the in-agent
+   * PRODUCER of a real failover-E2E green so a DEPLOYED dev agent can promote its
+   * own sessionPool stage instead of sitting at `shadow` forever. `enabled` is
+   * DELIBERATELY OMITTED from ConfigDefaults (developmentAgent gate — dev-live,
+   * dark fleet; DEV_GATED_FEATURES). Ships dryRun:true FIRST: the runner runs the
+   * real two-node failover E2E subprocess and records its verdict, but a recorded
+   * green PROMOTES the stage (real authority), so while dryRun holds the verdict
+   * lands in a SIDE store the promotion path never reads — nothing promotes until
+   * a deliberate dryRun:false. Config resolver + defaults live in
+   * `src/core/sessionPoolFailoverRunnerConfig.ts`.
+   */
+  failoverRunner?: {
+    enabled?: boolean;
+    /** Default true — record to a SIDE store, never the promotion store. */
+    dryRun?: boolean;
+    /** Slow cadence the heavy E2E runs on (ms). Default 3600000 (1h), floored at 60000. */
+    tickIntervalMs?: number;
+    /** Bounded wall-clock budget for the failover E2E subprocess (ms). Default 180000. */
+    checkTimeoutMs?: number;
+  };
   /**
    * MeshRpc (§L0) command timestamp tolerance (ms) — a signed command whose
    * timestamp is outside |now - ts| is rejected `stale-timestamp`. Default 30000.
@@ -2829,6 +3647,59 @@ export interface ExternalServicePermissions {
 // ── Server Configuration ────────────────────────────────────────────
 
 export interface InstarConfig {
+  /** Memory privacy (docs/specs/memory-privacy.md). On only when `enabled` is true. */
+  memoryPrivacy?: import('../users/MemoryPrivacy.js').MemoryPrivacyConfig;
+  /**
+   * Attribution paper trail (docs/specs/attribution-paper-trail.md). `enabled` is omitted so
+   * resolveDevAgentGate decides: live on a development agent, dark on the fleet. `mode` defaults to
+   * `record`, which never refuses anything; `enforce` is opt-in for every existing agent.
+   */
+  attribution?: AttributionConfig;
+  /**
+   * message-origin-all-platforms §5: the agent-wide origin display bits for an agent with no
+   * enabled Telegram entry (with one, the Telegram entry's messageOrigin.display is the setting),
+   * and the operator exception for the Slack recording refusal (§3). Absent ⇒ shown, fail-closed.
+   */
+  messageOrigin?: {
+    display?: { enabled?: boolean; machine?: boolean; harness?: boolean; model?: boolean };
+    recording?: { slackFailClosed?: boolean };
+  };
+  /** Machine self-maintenance (docs/specs/machine-self-maintenance.md). Watch-only: `enabled` is dev-gated, omit it to follow the gate. */
+  machineMaintenance?: {
+    enabled?: boolean;
+    cadenceDays?: number;
+    window?: { start: string; end: string };
+    maxIntervalDays?: number;
+    maxEpisodeDelayMinutes?: number;
+    /** tmux sessions that are not agent work: exact name, or a prefix ending in `*`. Default empty. */
+    nonAgentTmuxSessions?: string[];
+    /** Browser care (Part B). Watch-only in this build: the sweep records what it would close and closes nothing. */
+    browserCare?: {
+      enabled?: boolean;
+      maxPerAgent?: number;
+      maxPerHost?: number;
+      idleMinutes?: number;
+      ttlMinutes?: number;
+      /** Profile ids (folders under playwright-profiles) the sweep never picks. */
+      keepProfiles?: string[];
+    };
+  };
+  /** Operator-initiated native desktop access. Explicit opt-in on a
+   * development agent only; omitted and false both leave every route dark. */
+  remoteDesktop?: {
+    enabled?: boolean;
+    frontMachineId?: string;
+    /** macOS: keep one helper copy per Mac so an update with unchanged helper source keeps its grant. Default true. */
+    retainedHelper?: boolean;
+    /** Native Linux: the X display to share, e.g. ":1". Absent: this user's own lowest-numbered X server. */
+    linuxDisplay?: string;
+    /** Set when Remote Desktop was turned off on this machine itself: a peer cannot turn it back on. */
+    peerClaimRefused?: boolean;
+    /** Guided setup (docs/specs/desktop-guided-setup.md). `enabled` omitted ⇒ live on a development agent, dark on the fleet. */
+    guidedSetup?: { enabled?: boolean };
+    /** Absent is off everywhere. Set only by the PIN route, never PATCH /config. */
+    lockedScreen?: { enabled?: boolean; browserBox?: boolean; chime?: boolean };
+  };
   /** Project name (used in logging, tmux session names, etc.) */
   projectName: string;
   /** Project root directory */
@@ -2849,6 +3720,43 @@ export interface InstarConfig {
    * (Introduced 2026-06-02 — Justin's ask, topic 13481.)
    */
   developmentAgent?: boolean;
+  /**
+   * Lifeline ingress secret (docs/specs/telegram-internal-route-lifeline-secret.md).
+   * `POST /internal/telegram-forward` and `/internal/telegram-callback` require
+   * a secret only the lifeline and the server hold; the Bearer token alone is
+   * not proof. `enforce` OMITTED (the shipped default) ⇒ enforce on a
+   * development agent; on the fleet, observe (accept + count would-refuse)
+   * until the observe exit rule is met, then enforce. Explicit `false` pins
+   * observe (the rollback lever); explicit `true` enforces. Read live.
+   * Enforce only ever refuses after the running lifeline has proven it sends
+   * the secret.
+   */
+  telegramIngress?: {
+    lifelineSecret?: {
+      enforce?: boolean;
+      /**
+       * Full rollback: `true` restores the pre-change handling of every
+       * request on the internal Telegram routes (accepted, sender trusted,
+       * taps accepted). The check still runs and counts, and each unverified
+       * request is reported. File edit only; read live.
+       */
+      bypass?: boolean;
+    };
+  };
+  /** Crash-safe inbound observer rollout. Absence is dark; explicit false is preserved by migration. */
+  codexSessionLifecycle?: {
+    ledgerObserverEnabled?: boolean;
+    /** Explicit pre-release dogfood only; ignored unless developmentAgent=true. */
+    candidateCanaryEnabled?: boolean;
+    /** Set only after a build-bound signed RC passes; activation occurs on restart. */
+    stageBPendingActivation?: boolean;
+    /** Independently dark Stage C: exhausted-delivery server refresh/replay. */
+    stageCRecoveryEnabled?: boolean;
+  };
+  /** Unified work-intake registry rollout; omitted resolves live only on dev agents. */
+  workQueue?: { enabled?: boolean };
+  /** Capability registry read surface; omitted resolves via the dev-agent gate. */
+  capabilityRegistry?: { enabled?: boolean };
   /**
    * Session Boot Self-Knowledge (spec: session-boot-self-knowledge.md) — the
    * deterministic "what I already have" block injected at session start: vault
@@ -2871,21 +3779,101 @@ export interface InstarConfig {
      */
     operationalFacts?: Array<string | { fact: string; updatedAt?: string; machine?: string }>;
   };
+  commitments?: {
+    autoExpiry?: {
+      enabled?: boolean;
+      maxAgeDays?: number;
+      sweepIntervalMs?: number;
+      dryRun?: boolean;
+    };
+    /**
+     * attention-lifecycle-close-on-cause §3.5: a commitment waiting on the
+     * operator (owner:user / blocked on user-input or user-authorization)
+     * expires after `maxAgeDays` (default 14) instead of waiting forever.
+     * Own `dryRun`, default false. Rides the auto-expiry sweep cadence.
+     */
+    operatorWait?: {
+      enabled?: boolean;
+      maxAgeDays?: number;
+      dryRun?: boolean;
+    };
+    /** promise-review-and-priority — `enabled` omitted ⇒ developmentAgent gate. */
+    promiseReview?: {
+      enabled?: boolean;
+      closureDryRun?: boolean;
+      batchSize?: number;
+      maxClosuresPerRun?: number;
+      maxClosuresPerDay?: number;
+      rereviewAfterDays?: number;
+      highRereviewAfterDays?: number;
+      reopenWindowDays?: number;
+    };
+    agentOwnedFollowthrough?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+      externalBlockWindowMs?: number;
+      externalBlockCeilingMs?: number;
+      externalBlockSweepMs?: number;
+    };
+  };
+  evolutionActions?: {
+    autoExpiry?: EvolutionManagerConfig['autoExpiry'];
+    /**
+     * Bounded resurfacing for pending high/critical actions with no dueBy.
+     * `enabled` is dev-gated when omitted; user-facing emission remains
+     * dry-run-first until deliberately promoted.
+     */
+    undatedResurfacer?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+      runIntervalMs?: number;
+      cooldownMs?: number;
+      maxHighAgeMs?: number;
+      maxRaises?: number;
+      dispositionThreshold?: number;
+      maxLedgerBytes?: number;
+      /**
+       * Proposed stable owner of the machine-local cooldown ledger on a
+       * multi-machine agent. Every registered pool member's latest authenticated
+       * advert must carry the same proposal; absence or disagreement fails closed.
+       */
+      stateOwnerMachineId?: string;
+    };
+  };
+  /**
+   * Apprenticeship-program gates (docs/specs/framework-stall-coverage-matrix.md
+   * §3.4). `stallCoverageGate` is read LIVE at the gate callsite — no restart.
+   * Absence resolves to the inline code default {enabled: true, dryRun: true};
+   * a malformed block resolves to the safe default with a loud log line.
+   * Deliberately NO migrateConfig entry (absence = default, spec §3.4).
+   */
+  apprenticeship?: {
+    stallCoverageGate?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+    };
+  };
   /**
    * Feedback-factory operated-instance config (docs/specs/feedback-factory-migration.md).
    * `receiverPersistence` is the Option-B receiving end: the canonical front (Vercel)
    * writes accepted reports to a durable Blob inbox; the InboxDrainer on THIS machine
    * ingests them into the durable canonical JsonlFeedbackStore. Ships DARK
    * (enabled !== true ⇒ no drainer, route 503s). The Blob token is read from the env
-   * var named by `blobTokenEnv` (default FEEDBACK_INBOX_BLOB_TOKEN) — never stored in
-   * config.json.
+   * var named by `blobTokenEnv` (default FEEDBACK_INBOX_BLOB_TOKEN), else from the
+   * encrypted vault key named by `blobTokenVaultKey` (default feedback_inbox_blob_token)
+   * — never stored in config.json.
    */
   feedbackFactory?: {
+    /** Sole machine-registry owner of the canonical feedback drain. Nonowners
+     * proxy one authenticated hop to this machine and never execute locally. */
+    operatedHostMachineId?: string;
     receiverPersistence?: {
       /** Master switch. Dark default — nothing runs unless explicitly true. */
       enabled?: boolean;
       /** Env var holding the Vercel Blob read-write token. Default FEEDBACK_INBOX_BLOB_TOKEN. */
       blobTokenEnv?: string;
+      /** Vault key holding the token when the env var is unset. Default feedback_inbox_blob_token. */
+      blobTokenVaultKey?: string;
       /** Override the Blob API base (tests / fake server). */
       blobApiBase?: string;
       /** Drain poll cadence (default 60000). */
@@ -2913,6 +3901,67 @@ export interface InstarConfig {
        *  <stateDir>/state/feedback-factory/store). */
       dataDir?: string;
     };
+    /** Operated durable readiness/outbox drain. Dev-live, fleet-dark. */
+    drain?: {
+      enabled?: boolean;
+      /** Canonical SQLite path; defaults beside the canonical feedback store. */
+      dbPath?: string;
+      maxReadyScansPerTick?: number;
+      maxClaimsPerTick?: number;
+      maxWallClockMs?: number;
+      /** Candidates per readiness model call (default 10); a tick makes several calls up to the authority's maxBatch. */
+      readinessChunkSize?: number;
+    };
+    /** Initiative handoff consumer. Dev-live in simulation until promoted. */
+    consumer?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+      maxClaimsPerTick?: number;
+    };
+    /**
+     * Feedback triage (docs/specs/feedback-triage-and-execution.md §1–§3, §5–§7): a registered
+     * frontier-model authority decides work/hold/ignore for each feedback Initiative within
+     * deterministic floors. DEV-GATED: `enabled` is OMITTED in defaults so resolveDevAgentGate
+     * decides (live on a development agent, dark on the fleet). Read live per tick.
+     */
+    triage?: {
+      enabled?: boolean;
+      /** Staged account-specific quota selection. Missing or invalid values resolve to off. */
+      accountSelectionMode?: 'off' | 'observe' | 'on';
+      /** Explicit kill switch over a PIN-approved live ignore; true alone never turns ignore live. */
+      ignoreLive?: boolean;
+      maxBatchChars?: number;
+      reportsPerItem?: number;
+      charsPerReport?: number;
+      maxCallsPerDay?: number;
+    };
+    /**
+     * Feedback executor (§4). DEV-GATED: `enabled` is OMITTED in defaults so resolveDevAgentGate
+     * decides. `dryRun` (default true) evaluates admission and records the attempt it would start
+     * without spawning, pushing or merging. `actionTopicId` is also the daily action list's
+     * destination (the Attention hub when unset). Read live per tick.
+     */
+    execute?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+      actionTopicId?: number;
+      /** The source checkout the feedback is about (default: the agent home when it is an instar source checkout). */
+      sourceRepoPath?: string;
+      maxConcurrent?: number;
+      maxStartsPerDay?: number;
+      maxOpenPrs?: number;
+      /** The lint gate run confined in the attempt workspace (default `npm run lint`). */
+      lintCommand?: string;
+      /** A small unit smoke the base canary runs once per canary stamp. */
+      baseSmokeTests?: string[];
+      /** Build-session wall clock in minutes (≤ the 6 h lease; default 300). */
+      maxDurationMinutes?: number;
+      /**
+       * The fork (`owner/name`) attempt branches are pushed to; PRs are opened from it against the
+       * canonical repository. Unset, or equal to the canonical repository, publication is refused.
+       */
+      publishRepo?: string;
+    };
   };
   /**
    * Model-routing config. `tierEscalation` is the Model-Tier Escalation
@@ -2928,6 +3977,203 @@ export interface InstarConfig {
   models?: {
     tierEscalation?: Partial<import('./ModelTierEscalation.js').TierEscalationConfig>;
   };
+  /**
+   * Maintenance jobs config (docs/specs/DOORWAY-MODEL-KNOWLEDGE-REGISTRY-SPEC.md §D6).
+   * `doorwayScan` tunes the recurring doorway-scan job. NOTE `enabled` is DELIBERATELY
+   * omitted from the seeded defaults and default-absent: whether the scan RUNS is governed
+   * by the job-manifest `enabled` flag (seeded false); `maintenance.doorwayScan.enabled` is a
+   * master kill-switch with DENY-WINS semantics (the scan runs iff the job manifest is enabled
+   * AND `config.enabled !== false`). A seeded `false` would make `false !== false` false and
+   * permanently block the scan even after the job is enabled — the round-2/round-5 bug — so the
+   * migration seeds every field EXCEPT `enabled`.
+   */
+  maintenance?: {
+    doorwayScan?: {
+      /** Master kill-switch (deny-wins). Absent/undefined by default; NEVER seeded false. */
+      enabled?: boolean;
+      /** 'free-probes' (default; zero metered spend) | '+liveness' | '+web-verify' (manual-only). */
+      scope?: string;
+      /** Cron expression; default '0 4 * * 1' (weekly). */
+      cadence?: string;
+      /** Alert digest topic id; null → the default alerts/hub attention surface. */
+      digestTopicId?: number | null;
+      /** Fail-closed money cap (USD); default 0 → no metered probe ever runs (D6/D9). */
+      budgetCapUsd?: number;
+    };
+  };
+  /**
+   * Routing Control Room — spend/caps VIEW config (docs/specs/routing-control-room-spend-alerts.md).
+   * Increment A ships the READ-ONLY spend/caps view; Increments B (money authority),
+   * C (alerts), D (multi-machine slicing) are separate, dark, and NOT built here.
+   *
+   * MATURATION LADDER (FD-16): `enabled` is OMITTED from the shipped config so it rides
+   * `resolveDevAgentGate` — the read-only view is LIVE on a development agent, DARK on
+   * the fleet. An explicit value always wins (false force-darks; true is the fleet-flip).
+   * Only INERT knobs live here; NO money-authority value (caps, go-live, gate-consumed
+   * price) is ever config — those live in a dedicated PIN-only store (Increment B),
+   * NEVER a Bearer-`PATCH`able config key (S-F2).
+   */
+  /**
+   * Maturation board (docs/specs/maturation-board.md): a read-only, advisory page of every
+   * maturing feature. `enabled` is omitted by default so the developmentAgent gate decides.
+   */
+  /**
+   * Mobile pairing links (docs/specs/mobile-pairing-link.md): one-time links that add this
+   * agent to the Instar iPhone app. `enabled` is omitted by default so the developmentAgent
+   * gate decides; read live by the routes.
+   */
+  mobilePairing?: {
+    enabled?: boolean;
+    /** Code lifetime in minutes, default 10, clamped to 1–60. */
+    codeTtlMinutes?: number;
+    /** Native operator chat (docs/specs/mobile-operator-chat.md). `enabled` omitted ⇒ follows mobilePairing. */
+    chat?: { enabled?: boolean };
+    /**
+     * Native app conversations (docs/specs/mobile-native-conversations.md). `enabled` omitted ⇒
+     * the developmentAgent gate decides; read at boot.
+     */
+    native?: {
+      enabled?: boolean;
+      /**
+       * Media in app conversations (docs/specs/mobile-native-chat-media.md). `enabled` omitted ⇒
+       * the developmentAgent gate decides, read at boot; needs `native.enabled`.
+       * `maxStoreBytes` (default 20 GiB, read live) is the agent-wide admission cap.
+       */
+      media?: { enabled?: boolean; maxStoreBytes?: number };
+    };
+    /**
+     * Several routes per agent (docs/specs/mobile-multi-route.md): accept a phone's signature on
+     * any of this machine's proven own names (Cloudflare tunnel + Tailscale HTTPS) and serve
+     * GET /mobile/routes. `enabled` omitted ⇒ live on a development agent, off on the fleet.
+     * Read at boot.
+     */
+    multiRoute?: { enabled?: boolean };
+    /** Mobile push (docs/specs/mobile-push.md). `enabled` omitted ⇒ follows mobilePairing. */
+    push?: { enabled?: boolean; teamId?: string };
+    /**
+     * Console sign-in from an owner phone without the PIN (docs/specs/mobile-console-device-signin.md).
+     * `enabled` omitted ⇒ on wherever mobile pairing is on. Read live.
+     */
+    consoleTicket?: { enabled?: boolean };
+    /** Approve a waiting phone without a code (docs/specs/mobile-pairing-approve.md). Omitted ⇒ on wherever pairing is on; `false` keeps only the code. Read live. */
+    approve?: { enabled?: boolean };
+    /**
+     * Face ID-confirmed permission writes from the owner's phone (docs/specs/mobile-native-permissions.md).
+     * `enabled` omitted ⇒ live on a development agent, dark on the fleet (DEV_GATED_FEATURES). Read live.
+     */
+    permissionActions?: { enabled?: boolean };
+    /**
+     * The operator's Slack user id (`U…`), the sender a message typed in the Instar app speaks as
+     * in a Slack conversation (mobile-native-conversations §4.9). Never inferred: the agent
+     * proposes it from the Slack channel's verified operator and sets it after the operator says
+     * yes. Unset ⇒ the app's Slack routes answer 503 `slack-owner-unset` and Slack rows are withheld.
+     */
+    slackOwnerUserId?: string;
+  };
+  /** The measured path to default-on (docs/specs/feature-maturation-ladder.md). */
+  maturation?: {
+    ladder?: {
+      /** Omitted: the development-agent gate decides. */
+      enabled?: boolean;
+      /** Where a review reads what gets raised. Unset: this agent raises nothing. */
+      reviewTopic?: number;
+      /** Features this agent's operator holds, with the reason. Stops a move; never ends the ladder. */
+      holds?: Record<string, string>;
+    };
+  };
+  maturationBoard?: {
+    enabled?: boolean;
+    /** Review files directory, relative to the project dir. Default docs/research/feature-maturation/reviews. */
+    reviewsDir?: string;
+  };
+  /**
+   * Queue pace (docs/specs/queue-pace.md): arrivals vs completions for every work queue, and a
+   * bounded pace tuner for feedback sorting. `enabled` is omitted by default so the
+   * developmentAgent gate decides (measure-only). The tuner has its OWN explicit flag, never
+   * dev-gated, because extra ticks spend real quota.
+   */
+  /** docs/specs/ecosystem-idea-pipeline.md. Omitted `enabled` resolves through the dev gate. */
+  ecosystemIdeas?: {
+    enabled?: boolean;
+    sourceRoots?: Array<{ repo: string; ref?: string; docGlobs?: string[] }>;
+    purposeDoc?: { repo: string; file: string } | null;
+    cadenceHours?: number;
+    limits?: Partial<{ tokensPerProject: number; tokensPerRun: number; candidatesPerProject: number; charsPerPacket: number; charsPerFile: number; filesPerRun: number }>;
+    agentStartsSpecs?: boolean;
+  };
+  queuePace?: {
+    enabled?: boolean;
+    tuner?: {
+      /** Default false. */
+      enabled?: boolean;
+      /** Default true: log would-tick, tick nothing. */
+      dryRun?: boolean;
+      /** Minimum minutes between extra ticks (default 10, floor 10). */
+      minGapMinutes?: number;
+      /** Extra ticks per local day (default 12, ceiling 12). */
+      maxExtraRunsPerDay?: number;
+    };
+    notices?: {
+      /** Default true: log would-raise, raise nothing. */
+      dryRun?: boolean;
+    };
+  };
+  routingSpend?: {
+    /** OMITTED in the shipped config so the dev-agent gate decides (LIVE-dev / DARK-fleet). */
+    enabled?: boolean;
+    /** Daily-token-rollup retention (days); default 400. Governs the small spend-history table, NOT the raw 30d rows. */
+    tokenRollupRetentionDays?: number;
+    /**
+     * Increment B MONEY authority (ledger + gate + PIN caps/go-live routes +
+     * stale-price alerts). A documented DARK_GATE_EXCLUSIONS action-bearing case
+     * (FD-16): absent/false = DARK for EVERYONE including dev agents — it never
+     * rides resolveDevAgentGate. Enabling exposes the PIN-gated control routes;
+     * arming a door additionally requires the operator's PIN go-live per door
+     * (deny-by-default with no go-live record).
+     */
+    money?: {
+      enabled?: boolean;
+      /** Reserve-expiry sweep TTL override (ms); default 15 min. */
+      reserveTtlMs?: number;
+      /** Stale-price check cadence (hours); default 6. */
+      priceStaleCheckIntervalHours?: number;
+    };
+    /** Alert routing (resolver foundation ships with B; the channel abstraction is Increment C). */
+    alerts?: {
+      /**
+       * Increment C dispatcher gate: OMITTED ⇒ rides resolveDevAgentGate
+       * (LIVE on a development agent, DARK on the fleet — FD-16).
+       */
+      enabled?: boolean;
+      /**
+       * dryRun-FIRST (FD-16): default TRUE even on a dev agent — every dispatch
+       * decision is audited to logs/routing-spend-alerts.jsonl, nothing is
+       * delivered, until a deliberate `dryRun: false` flip.
+       */
+      dryRun?: boolean;
+      /** Dedicated "Routing Spend" Telegram topic id (rung 1 of the resolution ladder — never creates). */
+      telegramTopicId?: number | null;
+      /** Enabled alert channels; default ["telegram"]. A future Slack channel is a config add. */
+      channels?: string[];
+    };
+    /** Provider-report store retention (days); default 400 (Layer 1c — capture lands with the reconciliation PR). */
+    providerReportRetentionDays?: number;
+    /**
+     * Operator-declared subscription costs per CLI door (REPORTING-ONLY — never a
+     * gate input; operator decision 2026-07-07: "amortize but show the math").
+     * The spend view amortizes each declared monthly price over the reporting
+     * window by CALENDAR TIME (subscriptions bill by time, not tokens) and shows
+     * the full derivation next to the figure. Absent doors keep the honest
+     * "$0 (subscription — not per-token billed)" display.
+     */
+    subscriptions?: Record<string, { monthlyUsd: number; label?: string }>;
+
+    /** Provider-reconciliation sweep config (Layer 1c — inert until the reconciliation PR). */
+    reconciliation?: {
+      sweepIntervalHours?: number;
+      driftAlertPct?: number;
+    };
+  };
   /** Session manager config */
   sessions: SessionManagerConfig;
   /**
@@ -2938,7 +4184,7 @@ export interface InstarConfig {
    * Lets you flip a single topic to Codex without changing the whole
    * agent's framework.
    */
-  topicFrameworks?: Record<string, 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli'>;
+  topicFrameworks?: Record<string, 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build'>;
   /**
    * Topic Profile — per-topic model / thinking-mode / framework pins
    * (docs/specs/TOPIC-PROFILE-SPEC.md §12.5). The conversational surface
@@ -2972,6 +4218,8 @@ export interface InstarConfig {
      * conversation-key scheme (numeric topic id, or `slack:<channel>[:<thread>]`).
      */
     defaults?: Record<string, { model?: string; thinkingMode?: string; effort?: string }>;
+    /** Config-owned defaults for the Telegram issues group; operator pins still win. */
+    groupDefaults?: { issues?: { framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build'; model?: string } };
   };
   /**
    * Playwright Profile Registry (docs/specs/playwright-profile-registry.md).
@@ -2985,6 +4233,58 @@ export interface InstarConfig {
     enabled?: boolean;
     /** Activate dry-run canary — log the intended .mcp.json rewrite + refresh, perform neither (default true). */
     dryRun?: boolean;
+  };
+  /**
+   * Durable, channel-agnostic conversation identity
+   * (docs/specs/durable-conversation-identity.md §9). The FOUNDATION (registry
+   * + journal + eager mint) is always-on once shipped; `recording` is its
+   * runtime KILL-SWITCH (D1 — forces the §3.6 in-memory-candidate degradation,
+   * behavior-identical to legacy hashing, without a redeploy). `followThrough`
+   * gates DELIVERY only (the §5 funnel's id<0 arm) and is dev-gated:
+   * `enabled` is deliberately OMITTED from ConfigDefaults so
+   * resolveDevAgentGate decides — LIVE on a development agent, DARK on the
+   * fleet — with `dryRun: true` FIRST (delivery is externally visible).
+   */
+  /**
+   * Parallel-Work Awareness — action-derived activity notes (CMT-810; extends
+   * docs/specs/parallel-activity-coherence.md Phase A). When the action-claim observer
+   * classifies a concrete action claim or an operator-approval request for a topic, a
+   * durable note is written for that topic and the cross-topic activity index surfaces
+   * it immediately as the topic's focus/tags/lastAction. Signal-only; never gates.
+   */
+  parallelWork?: {
+    actionNotes?: {
+      /** Kill switch (default: true — absent means on). Read live. */
+      enabled?: boolean;
+      /** How long a note keeps shaping a topic's focus/tags, in hours (default 24). */
+      windowHours?: number;
+    };
+  };
+  conversationIdentity?: {
+    /** §3.1 fleet workspace pin (source 1 — authoritative when present): the ONE
+     *  Slack teamId this fleet mints concrete-workspace ids for. */
+    workspacePin?: string;
+    recording?: {
+      /** D1 kill-switch. Default true; migrateConfig existence-checks and NEVER
+       *  materializes a literal false (the #1001 mechanism). */
+      enabled?: boolean;
+      /** Narrower escape hatch: keep recording, skip the durable-path fsync. */
+      disableJournalFsync?: boolean;
+    };
+    followThrough?: {
+      /** Dev-gate switch. Omit to ride resolveDevAgentGate; NEVER written by
+       *  migrateConfig. */
+      enabled?: boolean;
+      /** Delivery dry-run canary (default true): typed §5.1 non-delivery +
+       *  would-deliver audit lines, no external send. */
+      dryRun?: boolean;
+    };
+    /** §3.3 mint-rate breaker (Bounded Blast Radius) — pinned defaults. */
+    mintBreaker?: {
+      windowMs?: number;
+      speculativePerWindow?: number;
+      durableBindingPerWindow?: number;
+    };
   };
   /**
    * Topic-intent auto-capture loop config (rung 0 of continuous-working-awareness).
@@ -3052,6 +4352,163 @@ export interface InstarConfig {
    * migration. See src/core/LlmCircuitBreaker.ts.
    */
   intelligence?: {
+    /**
+     * Jev signal-layer shadow (docs/specs/jev-signal-layer-shadow.md). DARK by
+     * default. Measure-only: compares Jev (TypeSafe AI) against the B1–B7
+     * deterministic detectors on real tone-gate candidates and decides nothing.
+     * Inert unless enabled AND soakEndsAt is a future ISO instant AND the vault
+     * holds `typesafe_api_key`. Read live per candidate (no restart).
+     */
+    jevSignalShadow?: {
+      enabled?: boolean;
+      /** 0..1 share of candidates shadowed (default 1). */
+      sampleRate?: number;
+      /** Pinned model id — never an alias (default "jev-1.13.0"). */
+      model?: string;
+      /** Hard abort per call (default 1500). */
+      timeoutMs?: number;
+      /** The mechanical soak bound: inert at or after this instant, and when null. */
+      soakEndsAt?: string | null;
+      /** Retain scrubbed excerpts on disagreeing rows (default off). */
+      retainDisagreementExcerpts?: boolean;
+      /** Daily bound on retained excerpts. */
+      maxExcerptsPerDay?: number;
+      /**
+       * Jev→referee cascade (src/core/JevCascade.ts), measure-only. Unsure-band
+       * answers plus an audit share of confident ones go to the Codex `fast`
+       * tier (GPT-6 Luna) and its verdicts are logged beside Jev's.
+       */
+      referee?: {
+        enabled?: boolean;
+        band?: { lo: number; hi: number };
+        bands?: Record<string, { lo: number; hi: number }>;
+        auditRate?: number;
+        timeoutMs?: number;
+        maxPerDay?: number;
+      };
+    };
+    /**
+     * Jev as a LIVE advisory input to the tone gate's B1–B7 artefact signals
+     * (docs/specs/jev-signal-live.md). `enabled` is OMITTED by default so the
+     * development-agent gate decides (live on a dev agent, dark on the fleet);
+     * explicit false is the kill switch. Only takes effect where the tone gate's
+     * advisory migration is on, and needs the vault `typesafe_api_key`. Confident
+     * Jev answers decide a kind; unsure/missing answers and every failure fall
+     * back to the deterministic detectors. Read live per candidate.
+     */
+    jevSignalLive?: {
+      enabled?: boolean;
+      /** Fetch abort for the live call (default 1000; clamped to 100–3000). */
+      timeoutMs?: number;
+      /** Confident-vs-unsure band (default 0.30–0.70), optionally per rule. */
+      band?: { lo: number; hi: number };
+      bands?: Record<string, { lo: number; hi: number }>;
+    };
+    /**
+     * Jev correction-detector shadow (docs/specs/jev-correction-shadow.md).
+     * LOG-ONLY: asks Jev whether each inbound user message is a correction, a
+     * standing preference, neither, or cannot tell, and logs a content-free row
+     * beside the Layer-0 verdict the correction sentinel gates on. Changes
+     * nothing the sentinel records. `enabled` OMITTED by default ⇒ the
+     * development-agent gate decides; explicit false is the kill switch, read
+     * live. Needs the vault `typesafe_api_key`.
+     */
+    jevCorrectionShadow?: {
+      enabled?: boolean;
+      /**
+       * Live input to the Correction & Preference Learning Sentinel
+       * (jev-correction-live.md): a Jev flag Layer 0 missed is distilled as a
+       * learning signal. Omitted ⇒ dev gate; explicit false is the kill switch.
+       */
+      feedSentinel?: boolean;
+      /** Pinned model id — never an alias (default "jev-1.13.0"). */
+      model?: string;
+      /** Hard abort per call (default 1500, max 10000). */
+      timeoutMs?: number;
+      /** Daily bound on attempted calls (default 500). */
+      maxChecksPerDay?: number;
+    };
+    /**
+     * Jev "going in circles" shadow (docs/specs/jev-circles-shadow.md). LOG-ONLY:
+     * every 5 tool actions per session, asks Jev the measured five-label question
+     * over the last 15 actions and appends a content-free row (would-nudge or
+     * not, with 30-min cooldown accounting). Delivers nothing. `enabled` is
+     * OMITTED by default so the development-agent gate decides (live on a dev
+     * agent, dark on the fleet); explicit false is the kill switch, read live.
+     * Needs the vault `typesafe_api_key`.
+     */
+    jevCirclesShadow?: {
+      enabled?: boolean;
+      /** Pinned model id — never an alias (default "jev-1.13.0"). */
+      model?: string;
+      /** Hard abort per call (default 1500, max 10000). */
+      timeoutMs?: number;
+      /** Daily bound on attempted calls (default 2000). */
+      maxChecksPerDay?: number;
+    };
+    /**
+     * Model assessment of machine load (trustworthy-machine-load B4). ADVISORY,
+     * LOG-ONLY: when a machine's own load verdict and the outside view disagree,
+     * or its readings contradict, Jev (Luna referee when unsure) labels it and
+     * the label is graded 15 min later. Acts on nothing. `enabled` OMITTED ⇒ the
+     * development-agent gate decides; explicit false is the kill switch, read
+     * live. Needs the vault `typesafe_api_key`.
+     */
+    jevLoadAssessment?: {
+      enabled?: boolean;
+      /** Pinned Jev model id (default "jev-1.13.0"). */
+      model?: string;
+      /** Hard abort per Jev call (default 1500, max 10000). */
+      timeoutMs?: number;
+      /** Daily bound on attempted Jev calls (default 200). */
+      maxChecksPerDay?: number;
+      /** The Luna referee for unsure answers; on unless `enabled: false`. */
+      referee?: { enabled?: boolean; timeoutMs?: number };
+    };
+    /**
+     * Jev job-completion audit (docs/specs/jev-job-supervision.md). DARK by
+     * default. Observe-only: captures an evidence pack when a scheduled job
+     * completes, and a batch job asks Jev whether the evidence shows the
+     * promised work happened. Records only; acts on nothing. Inert unless
+     * enabled AND soakEndsAt is a future ISO instant AND the vault holds
+     * `typesafe_api_key`. Read live per candidate (no restart).
+     */
+    jevJobCompletionAudit?: {
+      enabled?: boolean;
+      /** Pinned model id — never an alias (default "jev-1.13.0"). */
+      model?: string;
+      /** Hard abort per call (default 2500). */
+      timeoutMs?: number;
+      /** The mechanical soak bound: inert at or after this instant, and when null. */
+      soakEndsAt?: string | null;
+      /** Daily budget over ATTEMPTED calls (default 1500). */
+      dailyCallCap?: number;
+      /** Batch cadence for the built-in job (default 6). */
+      batchIntervalHours?: number;
+    };
+    /**
+     * Jev memory picker (docs/specs/jev-memory-picker.md). Ranks the Claude Code
+     * memory index against a session's opening context at session start.
+     * `enabled` omitted ⇒ the developmentAgent gate decides (live on a dev
+     * agent, dark on the fleet); false is the kill switch. Read live.
+     */
+    jevMemoryPicker?: {
+      enabled?: boolean;
+      /** "shadow" (default) logs only; "inject" prints the ranked entries. */
+      mode?: 'shadow' | 'inject';
+      /** Pinned model id (default "jev-1.13.0"). */
+      model?: string;
+      /** Fetch abort (default 1500; clamped 100–3000). */
+      timeoutMs?: number;
+      /** Ranked entries added beyond the load cut (default 40). */
+      injectLines?: number;
+      /** Character cap on the added entries (default 10000). */
+      injectMaxChars?: number;
+      /** Up to 20 short notes on internal names, sent with the context. */
+      glossary?: string[];
+      /** Jev calls per UTC day, per process (default 300). */
+      dailyCallCap?: number;
+    };
     circuitBreaker?: {
       /** Master switch for the rate-limit circuit breaker (default: true). */
       enabled?: boolean;
@@ -3073,6 +4530,131 @@ export interface InstarConfig {
      * so absence is the default state, never a persisted block.
      */
     swapAttemptTimeoutMs?: number;
+    /**
+     * Per-attempt swap timeout (ms) for NON-GATING failure-swap attempts only.
+     * Defaults to 15000ms via ConfigDefaults/migrateConfig so cold-start
+     * providers have enough time to serve advisory/background calls. Safety-gating
+     * swaps deliberately keep using `swapAttemptTimeoutMs` (default 5000ms) so
+     * fail-closed gates stay responsive.
+     */
+    nonGatingSwapTimeoutMs?: number;
+    /**
+     * Per-TARGET-framework swap-attempt caps in ms for the failure-swap loop
+     * (docs/specs/per-target-swap-timeout-spec.md). Resolution per swap target:
+     * `byFramework[target]` (if a valid finite number > 0) → the global
+     * `swapAttemptTimeoutMs` → no cap. An INVALID per-framework value (0, negative,
+     * NaN, non-number) FALLS THROUGH to the global — it never means "no cap" and
+     * never produces an immediate-0ms kill (FD5: per-framework config cannot
+     * express "unbounded"; only the global's ≤0/unset does). DEFAULT UNSET ⇒ the
+     * global cap applies to every target, byte-identical to today (dark ship;
+     * deliberately kept out of ConfigDefaults/migrateConfig like
+     * swapAttemptTimeoutMs, so absence is the default state).
+     * Recommended opt-in package (set TOGETHER with swapTotalBudgetMs — FD8, so
+     * the caps and their reachability ceiling arrive as one package):
+     * `{ "claude-code": 8000, "pi-cli": 9000, "gemini-cli": 18000, "codex-cli": 45000 }`
+     * with `swapTotalBudgetMs: 40000` (each cap ≥ the framework's measured p95 with
+     * margin — llm-pathway-bench N=30). NOTE: the swap loop is sequential, so
+     * `failureSwap` target ORDER is latency-load-bearing — order fastest-first
+     * (cap ≠ priority), and keep caps ≤ the circuit breaker's failure sensitivity
+     * so a chronically-slow target still trips the breaker.
+     */
+    swapAttemptTimeoutMsByFramework?: Partial<
+      Record<'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build', number>
+    >;
+    /**
+     * Clamp (ms) on any single resolved swap-attempt cap, so a huge/typo'd
+     * per-framework value cannot create an effectively unbounded subprocess that
+     * pins a host spawn-cap slot (per-target-swap-timeout-spec.md FD7). The value
+     * is itself validated (finite > 0); invalid/unset ⇒ 120000 (120s).
+     */
+    swapAttemptTimeoutMsMax?: number;
+    /**
+     * Wall-clock TOTAL budget (ms) over the WHOLE failure-swap tail
+     * (per-target-swap-timeout-spec.md FD6). UNSET ⇒ no total-budget enforcement —
+     * semantics unchanged from today (the dark default). When set, each swap
+     * attempt's effective cap is `min(resolvedCap, budgetRemaining)` on a MONOTONIC
+     * clock and the loop stops and falls closed once ≤ 250ms remains — so the
+     * worst-case swap-tail latency is literally ≤ this value. An invalid value
+     * (0, negative, NaN, non-number) is treated as unset (no enforcement).
+     * Recommended alongside the per-framework caps: 40000.
+     */
+    swapTotalBudgetMs?: number;
+    /**
+     * NON-GATING failure-swap (docs/specs/nongating-failure-swap.md). Extends the
+     * IntelligenceRouter failure-swap tail to NON-gating internal calls (e.g.
+     * TopicIntentExtractor, which showed a 28% codex INVOCATION-error rate in
+     * production while gating calls — which already ride the swap tail — errored at
+     * 1.5%). A non-gating primary INVOCATION failure (the primary threw AND produced
+     * ZERO tokens) gets ONE bounded, herd-safe swap onto the next active off-Claude
+     * framework instead of hard-erroring straight to the caller's heuristic. TIGHTER
+     * than the gating swap: at most `maxAttempts` (default 1) steps, NEVER onto
+     * claude-code / the default framework (the §6.2 "non-gating never herds onto the
+     * Claude tail" invariant), and NEVER on a content/parse error that carried tokens
+     * (the caller fail-opens that, §6.4). INLINE-DEFAULTED at the router construction
+     * site (`enabled` default TRUE — a strict, bounded error reduction). Set
+     * `{ enabled: false }` to restore today's behavior (a non-gating failure re-throws
+     * to the heuristic with no swap).
+     */
+    nonGatingFailureSwap?: { enabled?: boolean; maxAttempts?: number };
+    /**
+     * Unified self-action backpressure — the SelfActionGovernor (Increment B,
+     * docs/specs/unified-self-action-backpressure.md; the companion doc is the
+     * implementation authority). Ships OBSERVE-ONLY on every class,
+     * fleet-dark per the FD1 ladder. Defaults are CODE constants; this block
+     * carries ONLY the kill-switch + sparse per-class overrides (validated at
+     * LOAD — a malformed override falls back to the code default with an
+     * audit row; `migrateConfig` writes NOTHING here by design).
+     */
+    selfActionGovernor?: {
+      /**
+       * The ONE master kill-switch (read live; deliberately NO env override —
+       * an env-only disable would be posture-INVISIBLE to /guards + the
+       * Guard-Posture Tripwire). `true` degrades EVERY class to unconditional
+       * allow-token pass-through; the flip (either direction) is itself an
+       * immediately-audited attention event. The DISABLE direction on the
+       * PATCH /config API path is dashboard-PIN-gated; re-enable is Bearer-OK;
+       * a raw config-file edit remains the verifier-independent floor.
+       */
+      emergencyDisable?: boolean;
+      /**
+       * Sparse per-class overrides keyed by controllerId. Overridable numeric
+       * fields: perTargetCountCeiling, totalCountCeiling, windowMs,
+       * queueMaxDepth, queueMaxTargets, staleTtlMs; plus `mode`
+       * ('observe' | 'enforce' — the FD8 per-class flip; pool-shared classes
+       * auto-demote when the registered machine count > 1 per FD9). The
+       * last-resort errored floor is NOT overridable (hard code constant);
+       * censusAbsoluteMax may only TIGHTEN below the code ceiling.
+       */
+      classes?: Record<string, Record<string, unknown>>;
+    };
+    /**
+     * Pinned-callsite model overrides (docs/LLM-ROUTING-REGISTRY.md "Risk items"
+     * #3/#5/#6/#7 — the hardcoded-model callsites that bypass the router).
+     * INLINE-DEFAULTED at each callsite (the codexExecJson/swapAttemptTimeoutMs
+     * precedent): section absent ⇒ the shipped default applies, byte-for-byte;
+     * present ⇒ the operator's value wins. Deliberately kept out of
+     * ConfigDefaults/migrateConfig so absence is the default state, never a
+     * persisted block. (The mentor loop's model is NOT here — it was already
+     * config-driven via `mentor.autonomousFix.model`, default 'opus'.)
+     */
+    pinnedModels?: {
+      /**
+       * Model tier for DispatchExecutor.runAgentic's spawned dispatch session
+       * (src/core/DispatchExecutor.ts). Default 'haiku' — dispatch steps are
+       * bounded follow-instructions work.
+       */
+      dispatchAgentic?: string;
+      /**
+       * Model id for the anthropic-headless credential-probe validation ping
+       * (a 4-token Messages-API "ping" that verifies a credential works).
+       * Default: ANTHROPIC_MODELS.haiku from src/core/models.ts — the probe
+       * only needs the cheapest valid model on the account.
+       * (The setup-wizard narrative models are env-overridable instead —
+       * INSTAR_WIZARD_CODEX_MODEL / INSTAR_WIZARD_GEMINI_MODEL — because the
+       * wizard runs BEFORE this config file exists.)
+       */
+      anthropicCredentialProbe?: string;
+    };
     /**
      * Resilient Degradation Ladder (docs/specs/resilient-degradation-ladder.md). Ships DARK /
      * dev-gated: each rung's `enabled` is OMITTED so `resolveDevAgentGate` resolves it
@@ -3185,6 +4767,41 @@ export interface InstarConfig {
       acquireMs?: number;
       /** Concurrent-poller ceiling (bounds the waiters, no queue-node heap). Default 64. */
       waitersMax?: number;
+      /**
+       * F5 interactive-priority reservation (docs/specs/spawn-cap-interactive-priority.md).
+       * SUBDIVIDES the cap into reserved interactive/background headroom so a user-facing
+       * (gate) call is not starved by background work; NEVER raises the total cap.
+       * `enabled` is OMITTED from ConfigDefaults so it rides the dev-agent gate
+       * (live-on-dev / dark-fleet); off ⇒ byte-identical to the all-or-nothing cap.
+       */
+      interactivePriority?: {
+        enabled?: boolean;
+        /** Slots reserved for the interactive lane (clamped to [0, N-1]). Default 2. */
+        ri?: number;
+        /** Slots reserved for background (clamped to [0, N-1-Ri]). Default 2. */
+        rb?: number;
+      };
+    };
+    /**
+     * Test-Runner Concurrency Bound — host-wide vitest-root cap (the spawn
+     * cap's sibling; docs/specs/test-runner-concurrency-bound.md §2.9).
+     * CAVEAT (§2.6/§2.7 no-lie constraint): this block tunes the ROUTE's
+     * report + server-launched tooling ONLY — NOT the chokepoint. The vitest
+     * globalSetup runs in a bare test process that cannot know which agent's
+     * config to read, so setting `enabled:false` here does NOT disable the
+     * bound: the sole chokepoint kill switch is env
+     * `INSTAR_HOST_TEST_SEMAPHORE=off`, and the host-uniform authority for
+     * caps/posture is the tuning file `~/.instar/host-test-runner-tuning.json`
+     * (env `INSTAR_HOST_TEST_MAX` etc. are per-process overrides). The
+     * GET /test-runner-limiter route likewise resolves cap/posture through
+     * the chokepoint's resolvers, never from these values.
+     */
+    testRunnerCap?: {
+      enabled?: boolean;
+      /** Suite-lane concurrency (mirrors the code default 1). */
+      maxConcurrent?: number;
+      /** Background-class suite-lane acquire budget in ms (mirrors the code default 120000). */
+      acquireWaitMs?: number;
     };
   };
   /**
@@ -3199,15 +4816,72 @@ export interface InstarConfig {
    * `enabledFrameworks`; this is the persisted, operator-settable
    * source of truth the migrator reads.)
    */
-  enabledFrameworks?: ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli')[];
+  enabledFrameworks?: ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build')[];
   /** Job scheduler config */
   scheduler: JobSchedulerConfig;
+  /**
+   * Test-agent leak guard (docs/specs/test-agent-leak-guard.md). Recorded by
+   * `instar init` when it created this agent in a temporary folder or under a
+   * sandboxed HOME (or with --expires-in). Once expiresAt passes, the server
+   * and lifeline remove this agent's own autostart and exit for good.
+   */
+  throwawayAgent?: {
+    createdAt: string;
+    expiresAt?: string;
+    reasons?: string[];
+  };
+  /**
+   * Install-time autostart posture. `autoInstall: false` (recorded by a
+   * non-interactive `instar init` without --autostart) stops the server and
+   * lifeline startup self-heals from installing or regenerating the autostart
+   * unit on their own. `instar autostart install` is the explicit request and
+   * sets it back to true.
+   */
+  autostart?: {
+    autoInstall?: boolean;
+    reason?: string;
+  };
   /** Registered users */
   users: UserProfile[];
   /** Messaging adapters to enable */
   messaging: MessagingAdapterConfig[];
+  /**
+   * Operator config for the outbound Messaging Tone Gate, read LIVE via the
+   * gate's config getter (no restart needed). TOP-LEVEL by necessity:
+   * `messaging` is an array of adapter configs, so the historically-documented
+   * `messaging.toneGate.*` location was structurally unreachable — no config
+   * could ever set it (the 2026-07-24 candidate-body wiring gap).
+   */
+  toneGate?: {
+    /** Kill-switch for fail-closed-on-provider-exhaustion (default true). */
+    failClosedOnExhaustion?: boolean;
+    /** Fail-direction policy: 'always' (default) | 'tiered' (opt-in) | 'never'. */
+    failClosedMode?: 'always' | 'tiered' | 'never';
+    /** Soak flag for 'tiered' — log would-deliver without delivering. */
+    toneTierDryRun?: boolean;
+    /** Opt-in candidate-body capture for decision-quality benchmarking. */
+    recordCandidateBody?: boolean;
+  };
+  /**
+   * L0 zombie-free delivery invariant arm flag (drive12 UX-first enforcement
+   * spec, Increment 1). When true, outbound recovery queues enforce their
+   * per-class max age at DEQUEUE time (policy: src/data/outbound-queue-expiry.json;
+   * a class's maxAgeHours 0 ⇒ no expiry). DARK by default — the test agent
+   * (Codey) arms first per the maturation ladder.
+   */
+  outboundQueueExpiry?: { enabled?: boolean };
   /** Monitoring config */
   monitoring: MonitoringConfig;
+  /**
+   * Claude Code hook wiring (docs/specs/native-hook-events.md).
+   * `nativeEventReporter.enabled` (default FALSE): replace the
+   * hook-event-reporter.js command entry on the 7 reporting events with native
+   * `type: "http"` hooks (no process per event). Takes effect at the next
+   * server restart (boot reconcile) or update; new sessions only. Kept as
+   * command entries below Claude Code 2.1.310, when the version is unreadable,
+   * or when the server is not listening on loopback.
+   */
+  hooks?: { nativeEventReporter?: { enabled?: boolean } };
   /** Feature-rollout reconciler config (docs/specs/RELEASE-READINESS-VISIBILITY-SPEC.md §4.3
    *  Layer C). Off by default — flips on to scan against canonical `main`
    *  instead of the local working tree (which silently misses freshly-merged
@@ -3234,6 +4908,8 @@ export interface InstarConfig {
   /** Dispatch (intelligence broadcast) config */
   dispatches?: DispatchConfig;
   /** Git backup config (opt-in for standalone agents) */
+  /** docs/specs/recommended-services.md: setup recipes this agent is proving. Only a test agent or the development agent sets it. */
+  recommendedServices?: { provingRecipes?: string[] };
   gitBackup?: {
     /** Whether git backup is enabled. Defaults to true if .git/ exists, false otherwise. */
     enabled: boolean;
@@ -3266,9 +4942,67 @@ export interface InstarConfig {
    * All optional; absence preserves today's single-account behaviour.
    */
   subscriptionPool?: {
+    /** Bounded autonomous repair for corroborated Claude Code and Codex sign-in failures.
+     *  Absent/off stays dark. `unattended` requires exact identity opt-in. */
+    assistedRelogin?: {
+      enabled?: boolean;
+      mode?: 'observe' | 'approval' | 'unattended';
+      dryRun?: boolean;
+      tickMs?: number;
+      maxAttempts?: number;
+      retryBaseMs?: number;
+      allowedScopes?: string[];
+      unattendedPolicy?: {
+        /** Exact subscription emails allowed to repair without a dashboard approval. */
+        identities?: string[];
+        /** Evidence floor per exact account/provider/machine path. Default 10. */
+        minimumSuccessfulRepairs?: number;
+        /** Age of the oldest successful repair required in days. Default 30. */
+        minimumEvidenceDays?: number;
+      };
+      /** Optional attention-routing topic. Omit to use the configured attention hub. */
+      approvalTopicId?: number;
+      /**
+       * Who chooses each sign-in step (spec agent-driven-relogin): `agent` = a model reading the
+       * page's floor-filtered controls; `closed` = the fixed page-class table; `agent-session` = one
+       * short-lived agent session follows /subscription-signin section 3 like a person (spec
+       * skill-driven-signin-repair; macOS only — off macOS it resolves to the existing driver).
+       * Every path honors `mode` the same way: `unattended` skips the tap only for an opted-in,
+       * floor-clearing identity. Omitted ⇒ `agent-session` on a macOS development agent,
+       * otherwise the development-agent gate (agent on a development agent, closed on the fleet).
+       */
+      navigation?: 'agent' | 'closed' | 'agent-session';
+      /**
+       * Slow automatic retry of a FAILED repair while its sign-in incident stays open (spec
+       * relogin-unattended-agent-session-and-slow-retry). Absent ⇒ on: first retry 6 h after the
+       * failure, later ones 24 h apart, at most 3 per incident. Safety refusals and operator
+       * cancels are never retried. `enabled: false` turns it off.
+       */
+      slowRetry?: { enabled?: boolean; delaysMs?: number[]; maxRetries?: number;
+        /** Local hours in which an approval re-offer is never sent (default 23 → 8); `null` disables. */
+        quietHours?: { startHour: number; endHour: number } | null };
+      /**
+       * Last-resort model for the repair's own model calls (spec relogin-last-resort-model): a
+       * lightweight model over an Anthropic API key the operator placed in the vault under
+       * `keyName` (default `relogin_last_resort_anthropic_api_key`). Placing the key is the
+       * consent to spend; `ANTHROPIC_API_KEY` and `intelligenceProvider` are never read. Used only
+       * after the shared provider failed or is absent, and only for the repair. With it available,
+       * an agent-session repair with no other healthy account on the machine drives the server-side
+       * browser path instead of waiting on the operator. Absent ⇒ on when the key exists; off with
+       * `enabled: false`. `model` is a tier (`fast` = haiku, the default; `balanced`; `capable`);
+       * the call runs `claude -p` with the key in the child's environment only, in a dedicated
+       * empty config home under the state dir. Caps default to 60 calls per drive and 300 per day.
+       */
+      lastResort?: { enabled?: boolean; keyName?: string; model?: string; maxCallsPerDrive?: number; maxCallsPerDay?: number };
+    };
     /** Soft binding-window utilization % above which an account is "at pressure"
      *  and excluded from proactive selection (default 90). */
     swapSoftThresholdPct?: number;
+    /** Live codex quota reads via `codex app-server` (zero token/quota spend;
+     *  the same call the codex /status screen makes). ON by default — every
+     *  failure falls back to the rollout-tail reader, so `false` only forces
+     *  the old rollout-only behaviour. */
+    codexLiveQuota?: boolean;
     /** DARK by default: when true, a RateLimitSentinel escalation on a
      *  pool-managed session auto-swaps it to another account. Opt-in (auto-
      *  swapping live sessions is real authority — tier-2). */
@@ -3279,6 +5013,23 @@ export interface InstarConfig {
      *  auto-swap functional (a session must carry which account it's on for the
      *  swap engine to move it). Unset → spawns use the default config (no-op). */
     pinSessionsToPool?: boolean;
+    /**
+     * Usage-wall rescue (docs/specs/usage-wall-rescue.md) — ON by default
+     * (operator-approved 2026-11-04). The one switch for: a session that sits
+     * at its account's usage wall is moved to an account with room and
+     * continues (tagged OR untagged sessions); new claude-code spawns are
+     * tagged with a pool account so no session rides the default login
+     * untagged; a spawn never lands on a default login the pool knows is
+     * walled. EFFECTIVE only while the pool holds 2+ usable accounts of the
+     * session's framework — with 0 or 1 nothing changes. An explicit
+     * `autoSwapOnRateLimit: false` turns the wall swap off; an explicit
+     * `pinSessionsToPool: false` limits spawn tagging to the walled-default
+     * guard. Read live.
+     */
+    wallRescue?: {
+      /** Default true. `false` turns the whole rescue off. */
+      enabled?: boolean;
+    };
     /**
      * DARK by default: the PRE-LIMIT swap. When enabled, the ProactiveSwapMonitor
      * moves a session OFF an account that crosses `thresholdPct` on its binding
@@ -3301,15 +5052,99 @@ export interface InstarConfig {
       watchMarginPct?: number;
       /** Max sessions swapped per evaluation cycle (storm guard). Default 3. */
       maxSwapsPerCycle?: number;
-      /** Per-session cooldown (ms) after a successful swap. Default 600000 (10m). */
+      /** Per-session cooldown (ms) after a successful swap. Default 600000 (10m).
+       *  SUBSUMED by antiThrash.dwellMs when the brakes are live (kept working
+       *  for back-compat while antiThrash is dark/dry-run — spec §9). */
       cooldownMs?: number;
       /** Monitor tick cadence (ms). Default 180000 (3m). */
       tickMs?: number;
+      /** Q3-safe rescue for untagged/default sessions. Instead of mutating the
+       * live session binding, exchange the freshest eligible account into the
+       * default credential slot. DEV-GATED and dry-run-first. */
+      defaultSlotRepoint?: {
+        /** Deliberately omitted by default; resolved through resolveDevAgentGate. */
+        enabled?: boolean;
+        /** Exact would-flip audit/log only. Default true. */
+        dryRun?: boolean;
+      };
+      /**
+       * swap-continuity-antithrash §3/§7 — anti-thrash brakes on the proactive
+       * swap. An ABSENT block resolves `enabled:true, dryRun:true` (dry-run
+       * ledger rows, zero decision change) on any install that opted into
+       * proactiveSwap — the soak is the default, never a silent skip. All
+       * knobs read LIVE per tick (§7.1). All numeric reads use `??` (zero is
+       * a legal disable for several).
+       */
+      antiThrash?: {
+        /** Brakes bind decisions when true AND dryRun false. Default true. */
+        enabled?: boolean;
+        /** Log would-refuse/would-defer rows, change nothing. Default true. */
+        dryRun?: boolean;
+        /** Target ceiling = thresholdPct − this (default 15 → ceiling 65%). */
+        targetHeadroomPct?: number;
+        /** source − target must be ≥ this many points (default 15). */
+        minImprovementPct?: number;
+        /** Per-session dwell after ANY account swap (default 2700000 = 45m). */
+        dwellMs?: number;
+        /** Reversal-detection window (default 1800000 = 30m). */
+        reversalWindowMs?: number;
+        /** T1: inversion-class increments within reversalWindowMs (default 2). */
+        thrashBreakerThreshold?: number;
+        /** Breaker suppression backoff (default 3600000 = 1h). */
+        thrashBreakerBackoffMs?: number;
+        /** T2 rotation detector: N proactive executions of one session… (default 3) */
+        swapFrequencyThreshold?: number;
+        /** …within this window (default 10800000 = 3h) opens the breaker. */
+        swapFrequencyWindowMs?: number;
+        /** all-hot / breaker heartbeat-row cadence (default 1800000 = 30m). */
+        allHotHeartbeatMs?: number;
+        /** Reactive hops per session per reversalWindowMs → ONE alert (default 2). */
+        reactiveHopAlertThreshold?: number;
+        /** §3.3 bound 0: a reading older than this is not a measurement
+         *  (default 1800000 = 30m — 2× the quota poller's 15-min cadence). */
+        quotaFreshnessMs?: number;
+      };
+      /**
+       * Login-loss extension: a live, refreshable session whose source account
+       * is explicitly `owner-relogin-required` may use the same anti-thrash and
+       * SessionRefresh funnel even when quota is not high. `enabled` is omitted
+       * from defaults so the development-agent gate decides; dryRun defaults
+       * true and records only a would-swap.
+       */
+      loginLoss?: {
+        enabled?: boolean;
+        dryRun?: boolean;
+      };
+    };
+    /**
+     * swap-continuity-antithrash §4/§7 — Piece 2 (the in-flight work gate for
+     * every session-killing mutation). The `enabled` KEY IS OMITTED from the
+     * shipped config ON PURPOSE — omission routes it through the dev-agent
+     * gate (live on a development agent, dark on the fleet); an explicit
+     * `enabled: false` would pin it dark EVERYWHERE including dev (the #1001
+     * anti-mechanism). `enabled` is restart-required (§7.1 — the gate wiring
+     * into SessionRefresh is constructor-injected); dryRun + numeric knobs
+     * are read live per evaluation.
+     */
+    swapContinuity?: {
+      enabled?: boolean;
+      /** Log would-defer/would-mitigate, change nothing. Default true. */
+      dryRun?: boolean;
+      /** Proactive deferral ceiling (default 1800000 = 30m) — at the ceiling
+       *  the intent is DROPPED (the wall wins; the reactive floor exists). */
+      deferralCeilingMs?: number;
+      /** Reactive grace bound (default 120000 = 2m) — the swap proceeds at
+       *  the FIRST not-busy observation, and always at the deadline. */
+      reactiveGraceMs?: number;
+      /** Busy re-check cadence inside a grace window (default 10000). */
+      recheckMs?: number;
     };
     /** P2.1 enrollment wizard knobs (all optional). */
     enrollment?: {
       /** Per-framework login command override (defaults: claude-code →
-       *  `claude auth login`, codex-cli → `codex login`). */
+       *  `claude auth login`, codex-cli → `codex login --device-auth`). See
+       *  DEFAULT_ENROLL_LOGIN_COMMANDS in FrameworkLoginDriver.ts for the full map
+       *  and why device-code frameworks must pass `--device-auth`. */
       loginCommands?: Record<string, string>;
       /** Auto-reissue sweep cadence in ms (default 300000 = 5 min). */
       reissueSweepMs?: number;
@@ -3390,6 +5225,125 @@ export interface InstarConfig {
   evolution?: EvolutionManagerConfig;
   /** Multi-machine coordination config */
   multiMachine?: MultiMachineConfig;
+  /**
+   * Owner-dark ladder user-facing bounds (ownership-gated-spawn-and-judgment-
+   * within-floors spec §3.3). Not feature flags — the ladder activates with
+   * `multiMachine.sessionPool.ownershipGatedSpawn`.
+   */
+  ownerDarkLadder?: {
+    /** Silence ceiling: first held/refused message → real answer or rung-3 notice. Default 600000 (10 min). */
+    maxUserSilenceMs?: number;
+    /** Per-machine cap on concurrent rung-1 holds; over-cap → rung 3 immediately. Default 20. */
+    maxConcurrentHolds?: number;
+    /** Per-topic cooldown between rung-3 notices. Default 1800000 (30 min). */
+    noticeCooldownMs?: number;
+  };
+  /**
+   * Judgment-call decision provenance (ownership-gated-spawn §3.5) + the
+   * LLM-Decision Quality Meter's `uniformSeam`/`quality` blocks nested here
+   * (llm-decision-quality-meter §5.7). Retention/sampling/tuning knobs ONLY —
+   * the redaction contract (write-time credential scrub, contextFull
+   * machine-local, redaction-by-field-omission at readRedacted, the §5.2
+   * serve-discipline clamps) is an invariant in code, never config.
+   */
+  provenance?: {
+    /** Day-file retention. Default 14. */
+    retentionDays?: number;
+    /** Deterministic sampling for non-arbiter rows, [0,1]. Default 1.0 (0.1 from Increment 2). */
+    deterministicSampling?: number;
+    /**
+     * The uniform provenance seam at the router settlement point
+     * (llm-decision-quality-meter §5.1/§5.7). Observe-only side write — never
+     * gates/blocks/delays the decision call.
+     */
+    uniformSeam?: {
+      /**
+       * OMIT-REQUIRED (never seeded by ConfigDefaults/migrateConfig): resolves
+       * via `resolveDevAgentGate` — LIVE on a development agent, DARK on the
+       * fleet. An explicit value always wins.
+       */
+      enabled?: boolean;
+      /**
+       * Default TRUE even on a dev agent: metadata-only would-write logs; ALL
+       * durable writes (provenance JSONL + SQLite quality/outcome rows) are
+       * suppressed until a deliberate `dryRun: false` flip (§5.2/§5.7).
+       */
+      dryRun?: boolean;
+    };
+    /** Decision-quality substrate tuning knobs (llm-decision-quality-meter §5.5/§5.7). All unseeded — inline defaults. */
+    quality?: {
+      /** `decision_quality` + `decision_outcomes` retention. Default 90 (outcomes floored at 30d in code). */
+      decisionRetentionDays?: number;
+      /** `decision_quality_rollup` retention. Default 90. */
+      rollupRetentionDays?: number;
+      /** Grading-pass global row ceiling per run. Default 200. */
+      maxDecisionsPerPass?: number;
+      /** Evidence-rule window (hog rules). Default 6. A change mints new ruleId versions (§5.4.5). */
+      evidenceWindowHours?: number;
+      /** Grading slack added to carrier retention (≥ 2× the job cadence). Default 2. */
+      gradingSlackHours?: number;
+      /** wired-but-silent runtime-flag threshold (llm-kind calls in-window). Default 20. */
+      wiredSilentMinCalls?: number;
+      /** Below this graded-decision count an aggregate is served with `insufficient-evidence: true`. Default 20. */
+      minSampleForRates?: number;
+    };
+  };
+  /**
+   * Benchmark-Divergence Detector (docs/specs/benchmark-divergence-detector.md
+   * §Config surface). Observe-only detector comparing real grade-rates to the
+   * mirrored INSTAR-Bench predictions. Ships DARK on the fleet, live-in-dryRun
+   * on a development agent.
+   */
+  benchmarkDivergence?: {
+    /**
+     * OMIT-REQUIRED (never seeded by migrateConfig): resolves via
+     * `resolveDevAgentGate` — LIVE on a development agent, DARK on the fleet.
+     * An explicit value always wins.
+     */
+    enabled?: boolean;
+    /** Default TRUE (FD13): dryRun = ZERO detector-owned durable writes (no
+     *  findings, no watermark, no history; would-analyze summaries logged). */
+    dryRun?: boolean;
+    /** FD3 base divergence threshold. Default 0.15. */
+    divergenceThreshold?: number;
+    /** Graded-sample floor; falls through to provenance.quality.minSampleForRates (20). */
+    minSampleForRates?: number;
+    /** FD2 unsettled-stream bound over decided_total. Default 0.5. */
+    maxUnknownShare?: number;
+    /** FD2 pool-merged orphan-share bound. Default 0.10. */
+    maxOrphanShare?: number;
+    /** A day is matured when day ≤ today − this (FD7). Default 2. */
+    analysisMaturityLagDays?: number;
+    /** Analysis cadence (±10% jitter, FD8). Default 24. */
+    analysisCadenceHours?: number;
+    /** Rolling-window length in matured days (FD7). Default 35. */
+    maxDaysPerAnalysis?: number;
+    /** FD1 mirror location relative to the project root. Default src/data/benchmarkPredictions.json. */
+    mirrorPath?: string;
+    /** Mirror age beyond this ⇒ stale-mirror suppression (FD4). Default 30. */
+    mirrorStalenessMaxDays?: number;
+    /** decision_quality_rollup_by_model retention (its OWN knob — P19). Default 180. */
+    byModelRetentionDays?: number;
+    /** Consecutive non-actionable verdicts before chronic:true (FD8). Default 3. */
+    chronicCycles?: number;
+    /** FD11 per-key history cap (first row retained permanently). Default 50. */
+    maxHistoryPerKey?: number;
+    /** FD9 per-peer aggregate-row ceiling (hard absolute cap 10000). Default 10000. */
+    maxAggregateRowsPerPeer?: number;
+    /** FD9 new-finding-key ceiling per pass (excess → one unmapped-flood finding). Default 200. */
+    maxNewFindingKeysPerPass?: number;
+  };
+  /**
+   * Constitutional ceilings carried by ratified standards (three-standards-
+   * enforcement spec). Read by watchers/lints; a missing/non-numeric value
+   * fails CLOSED (escalate-sooner).
+   */
+  standards?: {
+    selfHealBeforeNotify?: {
+      /** Recoverable-latency ceiling in SECONDS (converged value 300 = "300s"). */
+      recoverableLatencyCeiling?: number;
+    };
+  };
   /** Agent type -- standalone lives at ~/.instar/agents/<name>/, project-bound lives in a project */
   agentType?: AgentType;
   /** User registration policy */
@@ -3411,6 +5365,12 @@ export interface InstarConfig {
     /** Max concurrent autonomous jobs (default 5). New starts beyond this are refused. */
     maxConcurrent?: number;
     /**
+     * Tell the operator, once, in the run's own topic when a registered run is
+     * still 'preparing' a few minutes after it started (it is not running and
+     * nothing revives it). Default on; `enabled: false` silences it.
+     */
+    preparingWatchdog?: { enabled?: boolean };
+    /**
      * Codex autonomous-loop driver (codex/Claude parity). When enabled, the standing
      * codex Stop hook (`autonomous-stop-hook.sh --codex`, installed by installCodexHooks)
      * feeds the task list back so a `codex exec` session sustains a multi-turn autonomous
@@ -3422,6 +5382,19 @@ export interface InstarConfig {
      */
     codexLoopDriver?: {
       enabled?: boolean;
+    };
+    /**
+     * Bounded continuation of ordinary Codex interactive work from an explicit
+     * per-topic task ledger. Separate from autonomous jobs; ships dark.
+     */
+    codexTaskContinuation?: {
+      enabled?: boolean;
+      /** Separate dark gate for truthful pre-admission autonomous continuation. */
+      preparationCarrierEnabled?: boolean;
+      maxDurationSeconds?: number;
+      maxContinuations?: number;
+      auditRetentionDays?: number;
+      auditMaxRows?: number;
     };
     /**
      * Gemini multi-turn loop-driver (need-gem-002; docs/specs/gemini-multi-turn-
@@ -3473,7 +5446,36 @@ export interface InstarConfig {
       judgeFailCooldownMs?: number;
       /** Per-field clamp (chars) on the <hard-blocker> marker fields (default 500). */
       markerFieldMaxChars?: number;
+      /** Real-check verification (ACT-152 / autonomous-completion-real-checks spec). */
+      realCheck?: {
+        enabled?: boolean;
+        timeoutMs?: number;
+        maxChars?: number;
+        captureBytes?: number;
+        failBreakerThreshold?: number;
+        failWindowMs?: number;
+        failCooldownMs?: number;
+      };
+      /**
+       * Scope-Accretion Completion Discipline (spec: autonomous-scope-accretion-
+       * completion.md). SNAPSHOT SEMANTICS: snapshotted server-side at run
+       * registration — a mid-run edit here changes nothing for the running
+       * session. The operator's LIVE mid-run lever is the PIN-gated
+       * POST /autonomous/:topic/scope-accretion-override route (audited,
+       * principal-verified); this flag governs FUTURE runs.
+       */
+      scopeAccretion?: {
+        /** Default true (monotone-safe, operator-requested). */
+        enabled?: boolean;
+        /** Consecutive unchanged-set holds that trip the loud breaker (default 3, min 2). */
+        breakerK?: number;
+      };
     };
+    /**
+     * Server-side ceiling (ms) on a registered autonomous run's endAt —
+     * POST /autonomous/register clamps endAt to now + maxDurationMs (default 48h).
+     */
+    maxDurationMs?: number;
   };
   /** Notification preferences for autonomy events */
   notifications?: NotificationPreferences;
@@ -3483,6 +5485,18 @@ export interface InstarConfig {
   inputGuard?: InputGuardConfig;
   /** Threadline relay — cloud relay connection for inter-agent communication */
   threadline?: ThreadlineConfig;
+  /**
+   * Agent identity (a2a-single-agent-identity). `adoption.enabled` is the FLEET-LIVE kill
+   * switch for post-pairing adoption (§1.2): off, a joined identity-less machine stays
+   * `identity-not-provisioned` and loud, and still yields the lease to a live sibling that holds
+   * the identity (observing continues under the switch) — strictly better than minting.
+   * The CLI (`instar identity adopt --from`) works regardless. Default true.
+   */
+  agentIdentity?: {
+    adoption?: {
+      enabled?: boolean;
+    };
+  };
   /** Dashboard configuration */
   dashboard?: DashboardConfig;
   /**
@@ -3592,6 +5606,19 @@ export interface PrGateConfig {
   primaryMachineId?: string;
   /** Machine IDs paired for replication / cross-tunnel failover. */
   pairedMachineIds?: string[];
+  /**
+   * Class-Closure Gate (docs/specs/class-closure-gate.md). Ships dark +
+   * report-only: `enabled:false, dryRun:true` means the CI lint logs findings
+   * and always exits 0. `enabled && !dryRun` lets the lint fail on a hard
+   * structural violation (malformed registry / a novel class with no
+   * semantics). `escalatorDrafting` is the dark-staged LLM drafting arm's own
+   * key (increment 3) — the deterministic trigger rides `enabled`.
+   */
+  classClosure?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    escalatorDrafting?: boolean;
+  };
 }
 
 // ── Integrated-Being Ledger (v1) ────────────────────────────────────
@@ -3841,6 +5868,30 @@ export interface DashboardConfig {
   /** Pool Dashboard Streaming (POOL-DASHBOARD-STREAM-SPEC §2.3) — cross-machine
    *  session streaming from one dashboard. */
   poolStream?: PoolStreamConfig;
+  /** Dashboard Live-LLM-Insights (docs/specs/dashboard-live-insights.md) — the
+   *  per-page Insight Strip: a plain-English headline + supporting lines over a
+   *  page's own data, an LLM insight routed through the shared nature-router
+   *  (FAST lane), cached + awareness-only. Dev-gated dark: `enabled` is OMITTED
+   *  so resolveDevAgentGate resolves it (LIVE on a dev agent, DARK on the fleet;
+   *  /insights routes 503 when dark). */
+  liveInsights?: LiveInsightsConfig;
+}
+
+export interface LiveInsightsConfig {
+  /** Dev-agent dark gate. OMITTED from ConfigDefaults so resolveDevAgentGate
+   *  resolves it (live-on-dev, dark-fleet). An explicit `true` fleet-flips it. */
+  enabled?: boolean;
+  /** The spend canary. Default true (dev): the LLM layer is INERT (deterministic
+   *  floor served, "would generate" logged). A deliberate `false` activates the
+   *  actual LLM insight generation. */
+  dryRun?: boolean;
+  /** Insight cache TTL (seconds). Default 300 (5 min). Unchanged page data serves
+   *  the cached insight with no re-spend. */
+  ttlSeconds?: number;
+  /** Max supporting lines per page (default 3, clamped 1..5). */
+  maxLines?: number;
+  /** Per-call LLM timeout (ms). Default 12000. */
+  llmTimeoutMs?: number;
 }
 
 export interface PoolStreamConfig {
@@ -3909,6 +5960,20 @@ export interface ThreadlineListenerConfig {
 export interface ThreadlineConfig {
   /** Whether cloud relay is enabled (default: false, opt-in) */
   relayEnabled: boolean;
+  /**
+   * A sender is never left guessing (docs/specs/a2a-required-acknowledgment.md).
+   * On unless `enabled: false`, which turns off sending, watching and the instruction;
+   * inbound kinded acks are always consumed safely.
+   */
+  requiredAck?: {
+    enabled?: boolean;
+    /** Reminder to an interactive session. Default 5 minutes. */
+    reminderMs?: number;
+    /** Tell the sender `unacknowledged`. Default 15 minutes. */
+    attentionMs?: number;
+    /** Reminders per peer per day. Default 20. */
+    reminderDailyCap?: number;
+  };
   /** Cloud relay URL (default: 'wss://threadline-relay.fly.dev/v1/connect') */
   relayUrl?: string;
   /** Agent visibility on the relay network: 'public' (discoverable), 'unlisted' (direct only), 'private' (no relay) */
@@ -3931,6 +5996,94 @@ export interface ThreadlineConfig {
   warmSessionA2A?: ThreadlineWarmSessionConfig;
   /** Secure A2A Verified Pairing — SAS mutual verification + credential-share gate (§3.10). */
   verifiedPairing?: ThreadlineVerifiedPairingConfig;
+  /** The owner's name stated in pairing invites. Omitted: the registered users, then the verified Telegram operator. */
+  ownerName?: string;
+  /**
+   * A2A inbound message-id ledger (docs/specs/a2a-inbound-id-ledger.md). Read
+   * live. `enabled` omitted ⇒ the developmentAgent gate (live on a dev agent,
+   * dark on the fleet). `retentionDays` default 14, floor 2.
+   */
+  inboundIdLedger?: { enabled?: boolean; retentionDays?: number };
+  /**
+   * A2A backup routes (docs/specs/a2a-backup-routes.md). Read live per send.
+   * `enabled` omitted ⇒ the developmentAgent gate (live on a dev agent, dark on
+   * the fleet). `false` restores today's relay-send behaviour.
+   */
+  backupRoutes?: { enabled?: boolean };
+  /**
+   * A2A cross-machine route (docs/specs/a2a-cross-machine-route.md). Read live
+   * on every machine. `enabled` omitted ⇒ the developmentAgent gate (live on a
+   * dev agent, dark on the fleet). `false` restores today's 503 on a relay
+   * standby and today's topic linkage on the holder.
+   */
+  relayForward?: { enabled?: boolean };
+  /**
+   * Local-route trust (docs/specs/a2a-local-route-trust.md). Read live per
+   * request on `POST /messages/relay-agent`. `enabled` omitted ⇒ the
+   * developmentAgent gate (live on a dev agent, dark on the fleet). `dryRun`
+   * defaults TRUE: would-refuse verdicts are logged and counted, delivery is
+   * unchanged; only an explicit `false` refuses (pre-admission 403).
+   */
+  localRouteTrust?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * A2A local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md):
+   * the same-machine route verifies the sender's Ed25519 signature against the
+   * key held for its name. `enabled` OMITTED ⇒ the developmentAgent gate decides
+   * (live on a dev agent, off on the fleet). `dryRun` defaults TRUE (verify,
+   * count, log; deliver as today); only an explicit `false` refuses.
+   */
+  localRouteSignature?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Honest sender-side reporting of a send that stays queued
+   * (docs/specs/a2a-single-agent-identity.md §3). `enabled` omitted ⇒ the
+   * developmentAgent gate (live on a dev agent, dark on the fleet). `dryRun`
+   * defaults TRUE: would-raise / would-sentence rows go to
+   * logs/a2a-peer-dark.jsonl, no item and no sentence; the raw health fields
+   * (`dark`, `darkSince`, `queuedCount`, `connectedNow`) are live regardless.
+   * `queuedDarkAfterMs` default 2 h (floor 5 min); `cooldownMs` default 12 h.
+   * `perPeer` sets the threshold for ONE peer by its full fingerprint, e.g.
+   * `{ "<fp>": { queuedDarkAfterMs: 1800000 } }` for a pair that answers in minutes.
+   */
+  peerDarkNotice?: {
+    enabled?: boolean; dryRun?: boolean; queuedDarkAfterMs?: number; cooldownMs?: number;
+    perPeer?: Record<string, { queuedDarkAfterMs?: number }>;
+  };
+  /**
+   * Relay unknown-sender trust (docs/specs/a2a-relay-unknown-sender-trust.md).
+   * Read live per unknown-sender relay message. `enabled` omitted ⇒ the
+   * developmentAgent gate (live on a dev agent, dark on the fleet). `dryRun`
+   * defaults TRUE: would-refuse verdicts are logged and counted, delivery is
+   * unchanged; only an explicit `false` refuses, emits the held trust level,
+   * and creates new fingerprint profiles at `untrusted`.
+   */
+  relayUnknownSenderTrust?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Threadline MCP over local HTTP (docs/specs/threadline-mcp-local-http.md D6).
+   * `enabled` (default false; an explicit operator flag, read live per spawn)
+   * selects the transport NEW sessions get: the in-server `POST /mcp/threadline`
+   * route instead of one stdio helper process per session. The route itself is
+   * mounted whenever Threadline runs, so turning this off never cuts off a
+   * session already wired to it.
+   */
+  mcpHttp?: { enabled?: boolean };
+  /**
+   * Encrypt-to-pinned (docs/specs/threadline-standalone-pairing.md D9, rollout step 5).
+   * Read live per send. `enabled` omitted ⇒ the developmentAgent gate (live on a dev
+   * agent, dark on the fleet). `dryRun` defaults TRUE (watch): sends are unchanged and each
+   * one that would have gone encrypted to an invite-paired peer's PINNED key is counted;
+   * only an explicit `false` (enforce) encrypts every ordinary message to such a peer with
+   * the pinned key, never falling back to plaintext, and labels plaintext arriving under
+   * its fingerprint as unverified.
+   */
+  encryptToPinned?: { enabled?: boolean; dryRun?: boolean };
+  /**
+   * Refuse-downgrade (docs/specs/threadline-standalone-pairing.md D6/D11, rollout step 6). Read
+   * live per inbound message. `enabled` omitted ⇒ the developmentAgent gate. `dryRun` defaults
+   * TRUE (watch): the encryptedSeen mark is recorded when an invite-paired peer sends encrypted
+   * chat, and plaintext later arriving under its fingerprint is counted and delivered as today;
+   * only an explicit `false` (enforce) refuses that plaintext. Off records and refuses nothing.
+   */
+  refuseDowngrade?: { enabled?: boolean; dryRun?: boolean };
 }
 
 /**
@@ -3990,6 +6143,10 @@ export interface ThreadlineSpawnConfig {
   cooldownMs?: number;
   /** Max drains per tick. Default: 8. */
   maxDrainsPerTick?: number;
+  /** Max denied drain attempts per agent before give-up. Default: maxRetries or 3. */
+  drainRefusalGiveUpThreshold?: number;
+  /** Quiet-clear interval before a drain give-up latch can re-arm. Default: 480000 (8m). */
+  drainGiveUpRearmCooldownMs?: number;
   /** Max envelope context size in UTF-8 bytes. Default: 262144 (256 KiB). */
   maxEnvelopeBytes?: number;
   /** Max queued messages across ALL agents. Default: 1000. */
@@ -4045,7 +6202,7 @@ export interface ResponseReviewConfig {
    * (held). Set false to revert THAT behavior to the prior fail-open without a
    * deploy (read live via the gate's optional liveConfig getter; a promise
    * REJECTION keeps its pre-existing unconditional fail-closed). Mirrors
-   * messaging.toneGate.failClosedOnExhaustion.
+   * toneGate.failClosedOnExhaustion (top-level).
    */
   failClosedOnCriticalAbstain?: boolean;
   /** Threshold for escalating warn-mode violations */
@@ -4061,6 +6218,46 @@ export interface ResponseReviewConfig {
   promptCaching?: boolean;
   /** Disable the test endpoint */
   testEndpointDisabled?: boolean;
+  /**
+   * Context-aware reviewers (context-aware-outbound-review spec §D10): feed a
+   * bounded, untrusted-data-enveloped slice of recent conversation to the
+   * OPTED-IN reviewers so the "user explicitly asked for this" carve-out has
+   * an input to judge. `enabled` is deliberately OMITTED from config defaults
+   * so the developmentAgent dark gate resolves it (LIVE on a dev agent, DARK
+   * on the fleet; explicit false force-darks, explicit true is the fleet
+   * flip). Resolution happens at the WIRING layer (server.ts liveConfig
+   * getter) — the gate receives a pre-resolved block and reads it LIVE per
+   * evaluate (kill-switch without restart).
+   */
+  conversationalContext?: ConversationalContextConfig;
+}
+
+/**
+ * Config block for the context-aware reviewer feature
+ * (`responseReview.conversationalContext`). All tunables have in-code
+ * defaults; no migrateConfig entry exists on purpose (the dev-gate convention
+ * REQUIRES `enabled` to be absent — a migration writing `enabled: false`
+ * would recreate the PR #1001 bug the devAgentGate funnel exists to prevent).
+ */
+export interface ConversationalContextConfig {
+  /** OMITTED by default ⇒ resolveDevAgentGate decides (dev LIVE / fleet DARK). */
+  enabled?: boolean;
+  /** Max conversation messages rendered per review (default 6). */
+  maxMessages?: number;
+  /** Per-message char clamp (default 500). */
+  maxCharsPerMessage?: number;
+  /** Total char hard clamp, oldest dropped first (default 4000). */
+  maxTotalChars?: number;
+  /**
+   * Built-in reviewers that receive the context section (default
+   * ['conversational-tone'] — spec §D3, round-1 M1: `information-leakage` is
+   * EXCLUDED by design; widening requires its own principal analysis and a
+   * spec revision, never a config-only addition). Named `injectReviewers`
+   * (not `reviewers`) because the sibling `responseReview.reviewers` key is
+   * an object map — a same-named array one nesting level down invites
+   * mis-merge (spec r2, round-1 m3).
+   */
+  injectReviewers?: string[];
 }
 
 export interface ReviewerConfig {
@@ -4114,6 +6311,7 @@ export interface ResolvedAutonomyState {
 }
 
 export interface NotificationPreferences {
+  selectivity?: import('../messaging/NotificationSelectivityGate.js').SelectivityConfig;
   /** How evolution notifications are batched */
   evolutionDigest?: 'immediate' | 'hourly' | 'daily';
   /** Whether to surface trust elevation suggestions */
@@ -4231,10 +6429,45 @@ export interface MessagingAdapterConfig {
 export interface MonitoringConfig {
   /** Enable quota tracking */
   quotaTracking: boolean;
+  /**
+   * HelperWatchdog (subagent stall / failure). `injectAlerts` (default FALSE,
+   * docs/specs/native-hook-events.md D2): when off the stall / helper-failed
+   * alerts are logged and counted, nothing is typed into the parent session.
+   */
+  helperWatchdog?: { injectAlerts?: boolean };
   /** Enable memory pressure monitoring */
   memoryMonitoring: boolean;
   /** Health check interval in ms */
   healthCheckIntervalMs: number;
+  /**
+   * Authoritative autonomous-window liveness state. Omitted resolves through
+   * the development-agent gate (live on dev, dark on fleet); dryRun defaults
+   * true so the first rollout records at-risk/recovery verdicts without
+   * restarting an executor or notifying the operator.
+   */
+  windowRunLiveness?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    heartbeatMaxAgeMs?: number;
+    workEvidenceMaxAgeMs?: number;
+    /** Hard-clamped by the authority to no more than 15 minutes. */
+    recoveryCeilingMs?: number;
+    /** Admit an ordinary topic run (no window-ritual ledger) by its own open, unexpired server registration. Read live; default false. */
+    ordinaryRunLifecycle?: boolean;
+    /** Durable W32 receipt/report executor. Explicitly enabled; dry-run first. */
+    cadenceExecutor?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+      receiptIntervalMs?: number;
+      reportIntervalMs?: number;
+      checkpointLeadMs?: number;
+      receiptGraceMs?: number;
+      checkpointRetryMaxAttempts?: number;
+      checkpointRetryBackoffMs?: number;
+      reportRetryMaxAttempts?: number;
+      reportRetryBackoffMs?: number;
+    };
+  };
   /**
    * Boot health beacon — a minimal /health responder bound from the very start
    * of the server boot so the supervisor sees liveness during the heavy
@@ -4248,6 +6481,14 @@ export interface MonitoringConfig {
     enabled?: boolean;
   };
   /**
+   * Raw blocker lifecycle timing ledger. Observe-only and dev-gated: omission
+   * enables it on a development agent while keeping fleet agents dark.
+   */
+  blockerLifecycleLedger?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+  };
+  /**
    * DARK-FLAGGED (DEV_GATED_FEATURES idleThrottleSettleGate; CMT-1785 follow-up):
    * settle-gate the SessionManager idle-monitor's `rateLimitedAtIdle` hand-off so it
    * requires the throttle to be present AND the pane byte-identical across polls
@@ -4256,6 +6497,24 @@ export interface MonitoringConfig {
    */
   idleThrottleSettleGate?: {
     enabled?: boolean;
+  };
+  /**
+   * Session-respawn-thrash Fix A (docs/specs/session-respawn-thrash-elimination.md):
+   * the veto-backoff ledger for the SessionManager bound-idle zombie killer. When a
+   * session is idle-at-prompt past its bound-idle threshold but the ReapGuard
+   * permanently vetoes the kill (open-commitment / recent-user-message), the killer
+   * used to re-fire terminateSession every 5s forever (the 132MB reap-log hot-spin).
+   * This ledger backs off re-attempts to one per `cooldownMs`, logs once per veto
+   * episode, and raises ONE attention item after `escalateAfterEpisodes` (P19
+   * breaker). `enabled` resolves via the developmentAgent dark-feature gate
+   * (live-on-dev, dark-fleet); `cooldownMs: 0` is enabled-but-no-cooldown (NOT a
+   * disable — the disable path is `enabled: false`, which never constructs the
+   * ledger). Machine-local by design (never replicated).
+   */
+  idleKillVetoBackoff?: {
+    enabled?: boolean;
+    cooldownMs?: number;
+    escalateAfterEpisodes?: number;
   };
   /**
    * honest-session-state-surfaces Finding (b): lift the Tier-3 honest
@@ -4269,6 +6528,22 @@ export interface MonitoringConfig {
    */
   standbyHonestyTiers?: {
     enabled?: boolean;
+  };
+  /**
+   * Durable-Output Hygiene Standard §2 (Layer B — "What Persists Must Be Clean").
+   * The config-gated DurableOutputScrubber that redacts credential SPANS from LLM
+   * output at durable-output persistence chokepoints BEFORE the write. `enabled` is
+   * OMITTED from ConfigDefaults → resolved via the developmentAgent dark-feature
+   * gate (LIVE on a dev agent, DARK on the fleet). `dryRun` (default true, the
+   * canary) COMPUTES + records would-redact metrics but stores the ORIGINAL text —
+   * a real (dryRun:false) redaction flip is the OPERATOR'S endpoint decision
+   * (Frontloaded Decision #4). `perStore` is the per-store opt-out map. When
+   * absent/disabled, durable writes are byte-identical to today.
+   */
+  durableOutputScrub?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    perStore?: Record<string, { enabled?: boolean }>;
   };
   /**
    * CollaborationRedriveEngine — proactively re-engage a counterpart that
@@ -4339,6 +6614,12 @@ export interface MonitoringConfig {
     enabled: boolean;
     /** Cadence between overlap scans, in minutes (default 15). */
     cadenceMinutes?: number;
+    /**
+     * Delay before the FIRST tick after construction, in seconds (default 30). Without
+     * it the guard-posture row reads on-stale for a whole cadence after every boot
+     * (CMT-810). 0 disables the early tick (first tick waits a full cadence).
+     */
+    initialTickDelaySeconds?: number;
   };
   /**
    * tmux Event-Loop Resilience, Increment 1 (docs/specs/tmux-event-loop-resilience-spec.md).
@@ -4430,33 +6711,119 @@ export interface MonitoringConfig {
     notifyUser?: boolean;
   };
   /**
-   * AutonomousProgressHeartbeat — a hedged, change-gated, sparse liveness
-   * BACKSTOP that posts ONE purely-observational line when an autonomous run
-   * has gone silent on the user for a long stretch while its terminal output is
-   * STILL changing. NOT the suppressed PromiseBeacon §B1 filler — it fires only
-   * on a LONG user-silence gate AND a corroborated recent output change (read
-   * from ActiveWorkSilenceSentinel's already-computed snapshot), with a
-   * per-topic cooldown + a widening per-run backoff + hard cap + the shared
-   * one-voice lease. Signal-only; never gates.
+   * U4.5 — Rope-Health Alerts (docs/specs/u4-5-rope-health-alerts.md). The
+   * in-server RopeHealthMonitor: its own bounded 30s evaluation loop over the
+   * U4.3 PeerEndpointResolver.snapshot() seam, deterministic sleep-aware
+   * classification (ok / degraded / peer-offline / urgent), episode-deduped
+   * HIGH partition alerts, Tailscale key-expiry warnings, and the
+   * GET /mesh/rope-health read surface the rope-health-digest job consumes.
    *
    * `enabled` is DELIBERATELY OPTIONAL (dev-gate convention): omitted from
-   * ConfigDefaults so resolveDevAgentGate decides — LIVE on a development agent,
-   * DARK on the fleet (GET /autonomous-heartbeat 503s). `dryRun` defaults true.
-   * Spec: docs/specs/autonomous-progress-heartbeat.md.
+   * ConfigDefaults so resolveDevAgentGate decides — LIVE on a development
+   * agent day one, DARK on the fleet (the route 503s, no timer exists).
    */
-  autonomousHeartbeat?: {
+  ropeHealth?: {
     /** Dev-gate convention: omit to let resolveDevAgentGate decide. */
     enabled?: boolean;
-    /** Log the intended heartbeat instead of sending (default: true). */
+    /** Urgent (HIGH-alert) tier master — rides the same dev gate (default: true). */
+    urgentEnabled?: boolean;
+    /** Time-pinned flap filter on the all-down condition (default: 60000). */
+    urgentDebounceMs?: number;
+    /** Continuous health required before an episode ends (default: 600000). */
+    clearSustainMs?: number;
+    /** Tailscale key expiry warning horizon in days (default: 14). */
+    keyExpiryWarnDays?: number;
+    /**
+     * Telegram topic id the rope-health-digest job delivers to (mirrors the
+     * burnDetection.alertTopicId precedent — R-r2-8). Default UNSET: the digest
+     * job LOGS only; the operator sets their hub topic id to get delivery.
+     */
+    digestTopicId?: number;
+    /**
+     * HARD CAP on self-wake urgent suppression (default: 300000). Bounded per
+     * docs/audits/multi-machine-seamless-ux-audit-2026-07.md finding P1-A7:
+     * SleepWakeDetector can emit FALSE wake events (event-loop stalls misread
+     * as sleeps), so a "recently slept" signal is a short grace, never a veto.
+     */
+    wakeGraceMaxMs?: number;
+  };
+  /** Autonomous-run reporting on every machine. Legacy switches are kept in
+   * the type for config compatibility; server.ts ignores enabled, dryRun,
+   * silenceThresholdMinutes and maxHeartbeatsPerRun so old fleet-dark config
+   * cannot silence the reporting invariant. */
+  autonomousHeartbeat?: {
+    /** Legacy switch; ignored for autonomous-run reporting. */
+    enabled?: boolean;
+    /** Legacy switch; ignored for autonomous-run reporting. */
     dryRun?: boolean;
     /** User-silence gate, minutes (default 25; floor-clamped to ~5). */
     silenceThresholdMinutes?: number;
     /** Check cadence, ms (default 60_000; floor-clamped to ~30_000). */
     tickIntervalMs?: number;
-    /** Hard per-run heartbeat cap (default 6). */
+    /** Legacy cap; ignored for autonomous-run reporting. */
     maxHeartbeatsPerRun?: number;
     /** How recently the shared snapshot's lastOutputAt must have advanced (default 300_000). */
     recentOutputChangeWindowMs?: number;
+  };
+  /**
+   * Periodic Goal Re-Alignment Phase 1 ("see it"). Dev-gated and dry-run
+   * only: verified operator intake, durable priority ledger, and cached
+   * alignment verdicts. No injection or operator notification exists in Phase 1.
+   */
+  goalRealignment?: {
+    enabled?: boolean;
+    /** Must remain true in Phase 1; false is ignored by the runtime. */
+    dryRun?: boolean;
+    /** Eligibility wake-up, not an unconditional LLM call. Default 60. */
+    cadenceMinutes?: number;
+    /** Window for discovering NEW priorities only. Never expires ledger rows. */
+    recencyDays?: number;
+    /** Prompt projection bound; ledger rows are never trimmed. */
+    maxPriorities?: number;
+  };
+  throughputFloor?: {
+    enabled?: boolean;
+    flatlineMs?: number;
+    tickMs?: number;
+  };
+  /**
+   * Duplicate-session STAND-DOWN (docs/specs/duplicate-session-standdown.md).
+   * Cooperative quiescence for the losing copy when one conversation has live
+   * sessions on two machines: the copy stops STARTING tool calls and stops
+   * EMITTING user-visible output, finishes the step it holds, and is then closed
+   * by the bounded drained-close rule. It NEVER kills and NEVER blocks a read.
+   *
+   * `enabled` is OMITTED from the defaults (NOT hardcoded false) so
+   * resolveDevAgentGate resolves it LIVE on a development agent and DARK on the
+   * fleet; an explicit `false` still wins, including on a dev agent — the hook
+   * honors it so a deliberately-disabled feature costs nothing per tool call.
+   *
+   * `dryRun` ships TRUE even on a dev agent: producers register entries and both
+   * enforcement halves LOG their would-block/would-refuse verdicts while blocking
+   * nothing, so the flip to enforcement rests on measured false-positive evidence
+   * rather than hope. The flip is the operator's.
+   */
+  standDown?: {
+    /** Dev-gate convention: omit to let resolveDevAgentGate decide. */
+    enabled?: boolean;
+    /** Log would-block/would-refuse verdicts and block nothing (default: true). */
+    dryRun?: boolean;
+    /** TTL for a drain-provable framework, minutes (default 60). */
+    standDownTtlMinutes?: number;
+    /** TTL where drain cannot be resolved (non-claude frameworks), minutes (default 15). */
+    unprovableFrameworkTtlMinutes?: number;
+    /** Corroborated drain observations required before `drained` (default 2). */
+    drainConfirmTicks?: number;
+    /** Consecutive failed re-verify legs before release (default 2). */
+    releaseHysteresisTicks?: number;
+    /** Ticks a mutual muzzle must persist before the tiebreak fires (default 2). */
+    mutualMuzzleGraceTicks?: number;
+    /** Latch-blocked re-registration attempts before the attention item (default 5). */
+    latchBlockedAttentionThreshold?: number;
+    /** Closed episodes per topic per 24h before the churn item fires (default 3). */
+    closedEpisodeChurnThreshold?: number;
+    /** Distinct expired episodes in 7d before the health item fires (default 2). */
+    expiredEpisodeHealthThreshold?: number;
   };
   /**
    * Blocker Ledger — the durable resolution-workflow + memory layer that
@@ -4593,6 +6960,57 @@ export interface MonitoringConfig {
     idleSampleIntervalMs?: number;
     /** Retain CPU/mem samples for this many days; older rows pruned (default: 7). */
     retentionDays?: number;
+  };
+  /**
+   * Overload admission (trustworthy-machine-load Part C): close this machine to new
+   * automatic work while it is saturated/impaired, keep one host-wide recovery slot
+   * for an operator session, and advertise the state so placement skips it.
+   * `enabled` undefined resolves via the developmentAgent gate; `dryRun` defaults
+   * true (log would-refuse, refuse nothing). Status: GET /work-admission.
+   */
+  workAdmission?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Consecutive ok/elevated samples (15 s each) before admission reopens (default 5). */
+    reopenAfterGoodSamples?: number;
+    /** Consecutive saturated/impaired samples before the self-help notice (default 3). */
+    selfHelpAfterSaturatedSamples?: number;
+  };
+  /**
+   * Overload shed (trustworthy-machine-load Part D): move existing conversations off
+   * this machine once its admission has stayed closed for 3 minutes, one at a time,
+   * through the ownership reconciler. `enabled` undefined resolves via the
+   * developmentAgent gate; `dryRun` defaults true (log would-move, move nothing).
+   * Status: GET /overload-shed.
+   */
+  overloadShed?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Admission must stay closed this long before this machine sheds (default 180000). */
+    sourceAfterMs?: number;
+    /** Breaker: moves proposed per hour from this machine (default 2). */
+    maxMovesPerHour?: number;
+    /** Same-topic cooldown, and how long a machine seen refusing work is not a target (default 1800000). */
+    recentShedMs?: number;
+    /** A topic that arrived or moved is left alone this long; follows the topic across machines (default 6 h). */
+    topicCooldownMs?: number;
+  };
+  /**
+   * ProcessFootprintMonitor — observe-only per-machine process-count measurement
+   * (the climb signal missing before the 2026-06-26 resource-exhaustion panic).
+   * `enabled` undefined resolves via the developmentAgent gate (live on echo, dark
+   * on the fleet); `false` → null + `/resources/footprint` 503s. Never gates.
+   */
+  processFootprintMonitor?: {
+    enabled?: boolean;
+    /** Sampling cadence (ms) (default: 5min). */
+    sampleIntervalMs?: number;
+    /** Rolling-window size for the trend (default: 288 = 24h at 5-min cadence). */
+    windowSamples?: number;
+    /** Process count at/over which the (opt-in) heads-up fires (default: 220; 0 disables). */
+    alertThreshold?: number;
+    /** Opt-in heads-up — measure first (default: false). */
+    alertEnabled?: boolean;
   };
   /**
    * ActiveWorkSilenceSentinel — topic-independent watchdog: a session that was
@@ -4772,8 +7190,19 @@ export interface MonitoringConfig {
      *  (overall tier = worst of memory and CPU). Default 1.0. */
     cpuModerateLoadPerCore?: number;
     /** CPU pressure: load-per-core at/above which pressure is `critical`.
-     *  Default 1.5. */
+     *  Default 1.5. Decides cpuTier ONLY under `cpuSignal: 'load'`. */
     cpuCriticalLoadPerCore?: number;
+    /**
+     * Which CPU signal decides cpuTier (spec reaper-pressure-signals). `'busy'` (default):
+     * sampled real CPU busy % from os.cpus() tick deltas. `'load'`: the legacy 1-min load ÷
+     * cores — the rollback lever. The load average read 9.4/core on 2026-10-25 while the
+     * CPU was 36-44% idle (macOS counts I/O-blocked threads), so it is no longer the default.
+     */
+    cpuSignal?: 'busy' | 'load';
+    /** Busy-% at/above which cpuTier is `moderate` (cpuSignal 'busy'). Default 75. */
+    cpuModerateBusyPct?: number;
+    /** Busy-% at/above which cpuTier is `critical` (cpuSignal 'busy'). Default 90. */
+    cpuCriticalBusyPct?: number;
     /** Under CPU pressure, require positive descendant-CPU progress before the
      *  `active-process` existence-veto keeps a session — so a wedged/idle child
      *  (live PID, ~0 CPU) no longer holds an otherwise-reapable idle session
@@ -4875,6 +7304,14 @@ export interface MonitoringConfig {
      */
     autoResumeStalePause?: boolean;
     /**
+     * G2 (agent-always-reachable): how long a pressure-held revival may wait
+     * (calm-ticks gate) before the drainer surfaces ONE plain-English notice via
+     * the deterministic raiseAggregated funnel — never silent (closes topic-28744).
+     * Default ~20min (≈2 reaper ticks). CODE-defaulted in the drainer (absent from
+     * ConfigDefaults). 0 disables the notice (the notice never gates a revival).
+     */
+    pressureHeldNoticeMs?: number;
+    /**
      * FD5 (autonomous-run-outlives-session): auto-heal a stale FOREIGN-host
      * resume-queue lock when it is provably a single-host RENAME (local FS + dead
      * pid + stale heartbeat), instead of disabling the queue. Fleet default FALSE
@@ -4915,7 +7352,62 @@ export interface MonitoringConfig {
     enabled?: boolean;
     dryRun?: boolean;
     reapIntervalMs?: number;
+    /** Delay before the one-time initial pass after boot (default 15 min).
+     *  Servers restart far more often than the 24h interval, so without an
+     *  initial pass the reaper never runs. <= 0 disables the initial pass. */
+    initialPassDelayMs?: number;
     maxReapsPerPass?: number;
+    /** Catch multi-commit squash-merges via GitHub merged-PR state (default true;
+     *  fail-safe to git-cherry-only). Set false to disable the network call. */
+    githubMergeCheck?: boolean;
+  };
+  /**
+   * CrashLoopPauser — auto-pause a job that keeps crashing (B3.1).
+   *
+   * The class was written and unit-tested in 2026, constructed EIGHT times in its
+   * own test file and ZERO times in production source, while a job failed 492
+   * consecutive times with nothing pausing it. Eight green tests measured "this
+   * class behaves correctly when constructed"; they were read as "this guard
+   * works." Wiring it at boot is what makes the tests mean what they were read to
+   * mean — the remedy was one construction, not an implementation.
+   *
+   * Ships DRY-RUN (it disables jobs, which is real authority): it evaluates and
+   * logs what it WOULD pause until a deliberate `dryRun: false`.
+   */
+  crashLoopPauser?: {
+    /** Master switch. Default: true — the class's own dryRun is the safety. */
+    enabled?: boolean;
+    /** Log intended pauses without rewriting the jobs file. Default: TRUE. */
+    dryRun?: boolean;
+    /** Cadence between evaluation passes. Default: 1h. */
+    intervalMs?: number;
+    /** Delay before the one-time pass after boot. Default: 10 min; <=0 disables. */
+    initialPassDelayMs?: number;
+    /** Lookback window for failures (hours). Default: 24. */
+    windowHours?: number;
+    /** Non-timeout failures that trigger a pause. Default: 3. */
+    failureThreshold?: number;
+    /** Short (<60s) failing runs that trigger a pause. Default: 5. */
+    shortRunThreshold?: number;
+    /** Job slugs never auto-paused, ADDED to the built-in deny-list. */
+    neverPause?: string[];
+  };
+  /**
+   * SingleInstanceLock — the server-boot fork-bomb guard (docs/specs/
+   * forkbomb-prevention-simple.md). This block tunes the 2026-07-08 hostname-flap
+   * auto-heal: when this host's `os.hostname()` FLAPS (e.g. mac.lan ↔
+   * Justins-MacBook-Pro-99), a dead-holder lock stamped with the old name looks
+   * FOREIGN and wedges every boot. `autoHealStaleHostRename` reclaims such a lock
+   * IFF it is provably a single-host rename (dead pid + `df -P` host-local + a
+   * heartbeat older than `staleHostRenameMs`) — fail-closed on any doubt. Fleet
+   * default FALSE (touches the boot single-instance invariant); resolves TRUE on a
+   * development agent via the dev-agent gate. CODE-defaulted (absent from
+   * ConfigDefaults — preserves the fleet flip). Mirrors resumeQueue.autoHealStaleHostLock.
+   */
+  singleInstanceLock?: {
+    autoHealStaleHostRename?: boolean;
+    /** Heartbeat-staleness floor (ms) for the rename auto-heal. Default 300000. */
+    staleHostRenameMs?: number;
   };
   /**
    * OrphanedWorkSentinel — the silent-uncommitted-death backstop (2026-06-12,
@@ -4933,6 +7425,100 @@ export interface MonitoringConfig {
     settleMs?: number;
     preserveWork?: boolean;
     maxFlagsPerPass?: number;
+  };
+  /**
+   * ExternalHogSentinel (CMT-1901, docs/specs/external-hog-zombie-autokill-sentinel.md)
+   * — surfaces any sustained EXTERNAL CPU hog (broad observability) and AUTO-KILLS one
+   * narrow class: orphaned Electron editor extension-host WRAPPERS (the 2026-07-03
+   * MongoDB-exthost incident). The intelligence (zombie-classify) decides kill/leave/
+   * alert WITHIN a mechanical veto-only safety floor; a kill executes iff
+   * `floor_pass && classifier === 'kill'`. `enabled` is OMITTED so the runtime resolves
+   * it through the developmentAgent dark-feature gate (resolveDevAgentGate): LIVE on a
+   * dev agent, DARK on the fleet. `dryRun: true` is the canary — live-on-dev scans,
+   * classifies, and LOGS would-kills but kills NOTHING until a deliberate PIN-gated arm.
+   * The numeric kill-gate knobs are read-time CLAMPED to code-defined minimums.
+   * Registered in DEV_GATED_FEATURES; GET /external-hog. Machine-local by design
+   * (hardware-bound-resource — a host OS process is bound to one kernel).
+   */
+  /**
+   * SingleMachineFailoverGapDetector (increment 2) — a pure SIGNAL-only guard that
+   * surfaces the "no failover target for active autonomous work" gap BEFORE it bites
+   * (the 2026-07-22 Codey overnight loss): single-machine (no online mesh peer) WHILE
+   * active autonomous runs → ONE deduped HIGH attention item. Never blocks, provisions,
+   * or kills. `enabled` is OMITTED so the runtime resolves it through the
+   * developmentAgent dark-feature gate (resolveDevAgentGate): LIVE on a dev agent, DARK
+   * on the fleet. `dryRun: true` is the graduated-rollout first rung — it computes +
+   * counts would-raise but raises NOTHING until a deliberate dryRun:false flip.
+   * Registered in DEV_GATED_FEATURES; GET /pool/failover-gap.
+   */
+  singleMachineFailoverGap?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+  };
+  /**
+   * MissingLoginSessionDetector (increment 2) — a pure SIGNAL-only guard that
+   * surfaces the "a live session is running on an account whose local login has
+   * gone missing" gap BEFORE the session walls silently (the 2026-07-22 justin-gmail
+   * silent auth-death): a running session bound to an account the subscription pool
+   * flagged `identityDrift.repairState === 'owner-relogin-required'` /
+   * `actualAccountId === 'missing-local-login'` → ONE deduped HIGH attention item.
+   * Never swaps, re-logins, or touches a session. `enabled` is OMITTED so the
+   * runtime resolves it through the developmentAgent dark-feature gate
+   * (resolveDevAgentGate): LIVE on a dev agent, DARK on the fleet. `dryRun: true`
+   * is the graduated-rollout first rung — it computes + counts would-raise but
+   * raises NOTHING until a deliberate dryRun:false flip. Registered in
+   * DEV_GATED_FEATURES; GET /pool/missing-login.
+   */
+  missingLoginSession?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+  };
+  externalHogSentinel?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    /** Read-only scan cadence (default 60s). */
+    scanIntervalMs?: number;
+    /** Sustained-hog threshold in core-equivalents (default 1.5). Read-time clamped. */
+    cpuCoreThreshold?: number;
+    /** N delta windows a candidate must exceed the threshold across (default 3). Clamped. */
+    sustainedSampleCount?: number;
+    /** Length of each rolling delta window (default 30s). Clamped. */
+    sampleWindowMs?: number;
+    /** Poll single-flight budget, sized to the cheap stage-1 scan (default 20s). */
+    singleFlightBudgetMs?: number;
+    /** Kill-time CPU re-confirm micro-window (default 2500ms). */
+    killTimeCpuRecheckWindowMs?: number;
+    /** SIGTERM→SIGKILL grace, widened for mid-write language servers (default 12s). */
+    sigtermGraceMs?: number;
+    /** In-flight-kill-set eviction ceiling (default 3×sigtermGraceMs ≈ 36s). */
+    inFlightKillTtlMs?: number;
+    /** Narrow-fd-skip defer cap before proceeding to SIGKILL (default 3). */
+    maxKillDeferrals?: number;
+    /** P19 kills of the same signature per rolling hour before the breaker (default 3). */
+    killLedgerMaxPerSignaturePerHour?: number;
+    /** Max classifier calls per scan, worst-CPU-first (default 4; < hostSpawnCap). */
+    maxClassificationsPerScan?: number;
+    /** Classifier verdict cache TTL keyed on the full identity tuple (default 300s). */
+    classifierCacheTtlMs?: number;
+    /** Classifier verdict cache max entries (default 256). */
+    classifierCacheMaxEntries?: number;
+    /** In-flight-kill set size cap (default 64). */
+    inFlightKillSetMax?: number;
+    /** P17 coalesced-notice budget per window (default 4). */
+    noticeBudgetPerWindow?: number;
+    /** P17 coalescing window (default 600s). */
+    noticeWindowMs?: number;
+  };
+  /**
+   * Turn-End Self-Deferral Guard (Phase A / shadow; docs/specs/turn-end-self-
+   * deferral-guard.md §3.4, FD8). The UnjustifiedStopGate authority offers an
+   * allow-class U_SELF_DEFERRAL classification and RECORDS it as shadow
+   * telemetry — Phase A blocks NOTHING. `enabled` is OMITTED from ConfigDefaults
+   * so the developmentAgent dark-feature gate decides (LIVE on dev, DARK on the
+   * fleet). Registered in DEV_GATED_FEATURES.
+   */
+  selfDeferralGuard?: {
+    enabled?: boolean;
   };
   /**
    * StrandedTopicSentinel (stranded-inbound-self-heal) — a pure-signal detector
@@ -5010,6 +7596,37 @@ export interface MonitoringConfig {
     maxAncestorHops?: number;
   };
   /**
+   * CodexArmSessionSweeper (spec docs/specs/codex-arm-session-leak-and-sweeper.md).
+   * Closes the detached `instar-codex-arm-*` tmux sessions codexHookArm leaks when
+   * the process that created them is killed before its `finally` runs — which is
+   * PostUpdateMigrator on every update, during which the server restarts (~8
+   * orphans/day measured on one laptop; 41 retired by hand across two sweeps).
+   * Reads the MACHINE (`tmux ls`), never instar's own session registry, because an
+   * arm session is never registered there — the exact reason the leak was invisible
+   * (`GET /sessions` said 11 while the machine held 112). Ships enabled in DRY-RUN:
+   * the source fix stops new orphans, so the sweeper reports the backlog and kills
+   * nothing until `dryRun: false`. GET /codex-arm-sweeper.
+   */
+  codexArmSessionSweeper?: {
+    enabled?: boolean;
+    /** Default true: report would-kills (`wouldKillDistinct`), kill nothing. */
+    dryRun?: boolean;
+    /** Default 900_000; clamped to a 300_000 floor (~2x the ~150 s modeled arming budget). */
+    maxAgeMs?: number;
+    sweepIntervalMs?: number;
+    initialPassDelayMs?: number;
+    /** Kill ATTEMPTS per pass (dry-run and failures count). Default 50. */
+    maxKillsPerPass?: number;
+    /** Wall-clock budget per pass for the synchronous kill path. Default 3000. */
+    maxPassMs?: number;
+    /** Consecutive unreadable passes before the breaker opens. Default 5. */
+    maxConsecutiveListFailures?: number;
+    /** While open, one probe is let through every this many passes. Default 6. */
+    breakerProbeEveryPasses?: number;
+    /** Failed kills of one name before it is never retried. Default 3. */
+    maxKillFailuresPerSession?: number;
+  };
+  /**
    * Agent hard-sleep — SleepController decision foundation (RESPONSIBLE-RESOURCE-
    * USAGE, Stage B; docs/specs/agent-hard-sleep-controller.md). Decides whether a
    * deeply-idle agent may drop its server to near-zero footprint, with safety
@@ -5079,6 +7696,12 @@ export interface MonitoringConfig {
       ciMaxRunsPerTick?: number;
     };
   };
+  /** Serious user-called-out failures retain scrubbed context and receive
+   * bounded investigation by default. Independent of preference promotion. */
+  failureCallouts?: {
+    /** Default true. False disables failure-context retention and investigation. */
+    enabled?: boolean;
+  };
   /**
    * Correction & Preference Learning Sentinel
    * (docs/specs/CORRECTION-PREFERENCE-LEARNING-SENTINEL-SPEC.md). Ships OFF.
@@ -5089,7 +7712,7 @@ export interface MonitoringConfig {
    * distill → ledger → recurrence-gate loop that writes via `recordPreference()`.
    */
   correctionLearning?: {
-    /** Master kill switch (default: false). Gates the loop AND the read route. */
+    /** Preference-learning switch (default false). Failure callouts use their own switch. */
     enabled: boolean;
     /**
      * Self-Violation Signal extension (default: false). Ships DARK behind BOTH
@@ -5107,8 +7730,28 @@ export interface MonitoringConfig {
     minDistinctDaysInfraGap?: number;
     /** Distinct calendar days required for an explicit-preference learning (Slice 1b). */
     minDistinctDaysPreference?: number;
-    /** Distinct topics required for the preference path's second prong (Slice 1b). */
-    minDistinctTopicsPreference?: number;
+    /** Distinct context-reset sessions required for the preference path's second prong. */
+    minDistinctSessionsPreference?: number;
+    /**
+     * Group reworded records of the same preference by meaning (Jev pair
+     * question, Luna referee for unsure pairs) before the recurrence gate.
+     * `enabled` omitted ⇒ live on a development agent, dark on the fleet; read
+     * live per analyzer run. Spec: docs/specs/correction-meaning-grouping.md.
+     */
+    meaningGrouping?: {
+      enabled?: boolean;
+      /** Same-kind pairs below this word overlap are never asked (default 0.05). */
+      candidateFloor?: number;
+      maxJevCallsPerRun?: number;
+      maxRefereeCallsPerRun?: number;
+      /** Wall-clock budget for one run's model calls (default 240000). */
+      runBudgetMs?: number;
+      timeoutMs?: number;
+      model?: string;
+      /** Unsure band for P(same) (default 0.3–0.7). */
+      band?: { lo: number; hi: number };
+      referee?: { enabled?: boolean };
+    };
     /** Auto-submit infra-gap learnings to /feedback (Slice 1b/3). Default false. */
     autoFeedback?: boolean;
     /** Post a periodic Telegram digest of learned preferences (Slice 2). Default false. */
@@ -5166,6 +7809,59 @@ export interface MonitoringConfig {
      *  infra-gap batch serializes under the route's 10/min IP limit (Slice 2
      *  NEW-2). Default 7000. */
     feedbackPostDelayMs?: number;
+  };
+  /** Un-gated correction durable-outcome drain; enabled on dev agents via DEV_GATED_FEATURES. */
+  correctionClassReview?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    maxReviewsPerTick?: number;
+    maxAttempts?: number;
+    maxOpenArtifacts?: number;
+    agingDays?: number;
+  };
+  /** Verify-Before-Done observe-only completion signal; never blocks in v1. */
+  completionClaimVerification?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    generalObservation?: boolean;
+    maxAuditBytes?: number;
+    maxCorpusBytes?: number;
+    maxQueued?: number;
+    maxQueuedPerTopic?: number;
+    maxConcurrent?: number;
+    maxConcurrentPerTopic?: number;
+    queueTtlMs?: number;
+    redactIdentifiers?: boolean;
+  };
+  /**
+   * Bias-to-Action — standing-authorization signal for B17_FALSE_BLOCKER
+   * (spec: docs/specs/BIAS-TO-ACTION-SPEC.md). Feeds the MessagingToneGate a
+   * VERIFIED-operator, non-forwarded, in-window standing-authorization grant so
+   * that "re-asking for authority you already hold" is recognized as the B17
+   * false blocker it is. Dev-gated DARK: `enabled` is OMITTED from ConfigDefaults
+   * (the development-agent gate resolves it) and the routes 503 when off.
+   * SIGNAL-ONLY and OBSERVE-ONLY first (`observeOnly` default true): a would-fire
+   * is recorded to `logs/bias-to-action.jsonl` (source enum + matched-phrase token
+   * + uid HASH, never a raw quote) and the message is NEVER altered until a
+   * separate operator decision graduates it (observeOnly:false). It can never
+   * flip a B1–B7/B15 leak HOLD.
+   */
+  biasToAction?: {
+    /** Master kill switch (default via dev-agent gate; OMITTED from ConfigDefaults). */
+    enabled?: boolean;
+    /**
+     * Observe-only mode (default true). When true the resolver's grant is NOT
+     * attached to the gate context (no verdict can change) — the would-fire is
+     * only recorded to the telemetry log. Graduate to live B17 firing with false.
+     */
+    observeOnly?: boolean;
+    /** Look-back window for the verified-operator grant scan (spec D9). */
+    lookback?: {
+      /** Max operator-authored inbound rows scanned. Default 40. */
+      maxRows?: number;
+      /** Max grant age that still counts (ms). Default 24h. */
+      windowMs?: number;
+    };
   };
   /**
    * PrincipalGuard — observe-only outbound coherence check for the "Know Your
@@ -5253,6 +7949,17 @@ export interface MonitoringConfig {
     canonicalRemote?: string;
     /** Override the instar repo path to analyze (default: the agent home). */
     repoPath?: string;
+    /**
+     * When true, evaluator-self-failures (fetch / analyzer / top-level tick
+     * stages of the watchdog itself) post a LOW-priority Attention item — and
+     * therefore a Telegram topic — in addition to the audit-log entry. Default
+     * false: per the sentinel-trio standard ("Sentinel Notifications" in the
+     * agent CLAUDE.md, post-2026-05-22 topic-spam fix), internal-plumbing
+     * failures are housekeeping and stay in logs/sentinel-events.jsonl +
+     * server.log. The user-actionable "release blocked — unreleased work
+     * piling up" signal always posts regardless of this flag. Flip on only if
+     * you also want catastrophic-failure surfacing in chat. */
+    escalateEvalFailures?: boolean;
   };
   /**
    * green-pr-automerge-enforcement R7: the background watcher that merges a
@@ -5272,6 +7979,8 @@ export interface MonitoringConfig {
     breakerCooldownMin?: number;
     mergeTimeoutMs?: number;
     mergeKillGraceMs?: number;
+    /** Branch prefix owned by this watcher (for example "agent"). Defaults to projectName for compatibility. */
+    agentNamespace?: string;
     /** The agent's verified gh login (R4 identity contract). Unset → inert. */
     expectedGhLogin?: string;
     identityRecheckTicks?: number;
@@ -5295,6 +8004,14 @@ export interface MonitoringConfig {
     armTimeoutMs?: number;
     /** K-consecutive-unconfirmed-arms-on-same-head threshold before the attention line (default 3). */
     unconfirmedArmCeiling?: number;
+    /**
+     * red-pr-watchdog. Signal-only backstop: raise ONE deduped, age-escalating
+     * attention line when a self-authored open PR has a required check stuck RED
+     * past `redThresholdMs` (default 2h). Default on — a red PR sitting silent is
+     * the incident this closes. Only runs while the parent watcher runs (repo +
+     * lease gated); NEVER blocks/merges/closes.
+     */
+    redPrWatchdog?: { enabled?: boolean; redThresholdMs?: number };
   };
   /**
    * Master gate for Telegram delivery of silently-stopped-sentinel escalations
@@ -5395,6 +8112,17 @@ export interface MonitoringConfig {
   /** Opt-in anonymous telemetry — sends usage heartbeats to help improve Instar */
   telemetry?: TelemetryConfig;
   /** Prompt Gate — detect and handle interactive prompts in sessions */
+  /**
+   * Permission-Prompt Auto-Resolver — the always-on safety floor that
+   * auto-answers a framework approval prompt Instar cannot otherwise clear.
+   * There is intentionally NO `enabled` flag (a stale persisted `false` could
+   * re-disable the very safety it provides). The only opt-out is the explicit
+   * emergency kill-switch below, which is absent by default (absence ⇒ on).
+   */
+  permissionPromptAutoResolver?: {
+    /** Emergency off-switch. Absent/false ⇒ floor ON. Set true to disable. */
+    emergencyDisable?: boolean;
+  };
   promptGate?: {
     /** Enable prompt detection (default: false) */
     enabled?: boolean;
@@ -5421,6 +8149,11 @@ export interface MonitoringConfig {
     ownerId?: number;
     /** Relay timeout in seconds (default: 300) */
     relayTimeoutSeconds?: number;
+    /**
+     * Wait this long after detecting a prompt, then relay it only if it is
+     * still on screen (default 45000; 0 relays immediately, as before).
+     */
+    relaySettleMs?: number;
   };
   /**
    * Episodic memory sentinel — periodic mid-session activity digestion.
@@ -5468,6 +8201,23 @@ export interface MonitoringConfig {
      *  opt in for a steady heartbeat). Decoupled from `digestEvenWhenCalm`, which
      *  only governs whether the digest OBJECT/API renders a calm summary. */
     digestSendOnCalmWeeks?: boolean;
+    /**
+     * Standard A/B of maturation-followthrough-fix: read the real dark-flag
+     * inventory from the `/guards` posture surface instead of only the specs
+     * that registered a rollout stage, and give every dark flag a durable
+     * owner + deadline + proof-of-life record.
+     *
+     * Ships DARK (`enabled: false`) and dry-run-first. With `enabled: false`
+     * the analyst reverts to exactly the InitiativeTracker-only behavior and
+     * R3 keeps its old place in the headline, so rollback is a single flag.
+     * With `dryRun: true` the durable registry IS written (the soak accrues
+     * real evidence from day one, which an in-memory counter can never do)
+     * but no R7 finding reaches the digest.
+     */
+    darkFlagInventory?: {
+      enabled?: boolean;
+      dryRun?: boolean;
+    };
     /** Incubation windows in DAYS per risk tier (defaults 3 / 7 / 7). */
     incubationWindows?: {
       lowRisk?: number;
@@ -5493,6 +8243,16 @@ export interface MonitoringConfig {
     /** Render the "all healthy" line even when calm so the operator knows the
      *  analyst ran — the deliberate reversal of over-silence (default true). */
     digestEvenWhenCalm?: boolean;
+    /** C1 (maturation-followthrough-fix Standard C): un-droppable digest delivery.
+     *  When ON, a RETRYABLE blocked send (tone-gate / provider-down / send-error)
+     *  no longer consumes its weekly window — it re-queues under a bounded retry
+     *  contract and raises ONE deduped attention item, instead of silently dropping
+     *  the window (the 2026-06-29 failure). Dev-gated dark: `enabled` OMITTED ⇒
+     *  resolveDevAgentGate (live-on-dev / dark-fleet); OFF restores the legacy
+     *  consume-and-drop behavior (an explicit, tripwire-caught rollback lever). */
+    blockedDigestEscalation?: {
+      enabled?: boolean;
+    };
   };
   /** Periodic mesh config-vs-live-state coherence check (signal-only log warnings).
    *  Dev-gated dark: `enabled` OMITTED ⇒ resolveDevAgentGate (live-on-dev / dark-fleet).
@@ -5704,7 +8464,7 @@ export interface BackupSnapshot {
   /** When this snapshot was created */
   createdAt: string;
   /** What triggered this snapshot */
-  trigger: 'auto-session' | 'manual' | 'pre-update';
+  trigger: 'auto-session' | 'manual' | 'pre-update' | 'feedback-hourly' | 'feedback-promotion' | 'feedback-failover';
   /** Files included in this snapshot */
   files: string[];
   /** Total size in bytes */
@@ -6049,9 +8809,9 @@ export interface DecayReport {
   entitiesProcessed: number;
   entitiesDecayed: number;
   entitiesExpired: number;
-  minConfidence: number;
-  maxConfidence: number;
-  avgConfidence: number;
+  minConfidence: number | null;
+  maxConfidence: number | null;
+  avgConfidence: number | null;
 }
 
 /**
@@ -6071,7 +8831,7 @@ export interface SemanticMemoryStats {
   totalEntities: number;
   totalEdges: number;
   entityCountsByType: Record<EntityType, number>;
-  avgConfidence: number;
+  avgConfidence: number | null;
   staleCount: number;
   dbSizeBytes: number;
   /** Whether vector search (sqlite-vec) is active */

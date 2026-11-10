@@ -381,7 +381,7 @@ export async function intentDrift(options: IntentDriftOptions): Promise<void> {
   console.log(pc.bold('  Current Period:'));
   console.log(`    Decisions:      ${pc.cyan(String(analysis.current.decisionCount))}`);
   console.log(`    Conflict Rate:  ${formatPercent(analysis.current.conflictRate)}`);
-  console.log(`    Avg Confidence: ${analysis.current.avgConfidence > 0 ? analysis.current.avgConfidence.toFixed(2) : pc.dim('n/a')}`);
+  console.log(`    Avg Confidence: ${analysis.current.avgConfidence !== null ? analysis.current.avgConfidence.toFixed(2) : pc.dim('n/a')}`);
   if (analysis.current.topPrinciples.length > 0) {
     const top = analysis.current.topPrinciples[0];
     console.log(`    Top Principle:  ${top.principle} (${top.count}x)`);
@@ -393,7 +393,7 @@ export async function intentDrift(options: IntentDriftOptions): Promise<void> {
     console.log(pc.bold('  Previous Period:'));
     console.log(`    Decisions:      ${pc.cyan(String(analysis.previous.decisionCount))}`);
     console.log(`    Conflict Rate:  ${formatPercent(analysis.previous.conflictRate)}`);
-    console.log(`    Avg Confidence: ${analysis.previous.avgConfidence > 0 ? analysis.previous.avgConfidence.toFixed(2) : pc.dim('n/a')}`);
+    console.log(`    Avg Confidence: ${analysis.previous.avgConfidence !== null ? analysis.previous.avgConfidence.toFixed(2) : pc.dim('n/a')}`);
     if (analysis.previous.topPrinciples.length > 0) {
       const top = analysis.previous.topPrinciples[0];
       console.log(`    Top Principle:  ${top.principle} (${top.count}x)`);
@@ -429,6 +429,19 @@ export async function intentDrift(options: IntentDriftOptions): Promise<void> {
 
   // Alignment score
   const alignment = detector.alignmentScore();
+
+  if (!alignment.assessable) {
+    // Nothing was measured, so print the reason instead of a fabricated grade.
+    // This branch exists because the previous code rendered the empty case as a
+    // red "0/100 (F)" and dropped `summary` — which read as "assessed, and
+    // catastrophic" rather than "no data". The journal was empty for its entire
+    // life, so that red F was the only thing this surface had ever shown.
+    console.log(`  Alignment Score: ${pc.dim('not assessed')}`);
+    console.log(`    ${pc.dim(alignment.summary)}`);
+    console.log();
+    return;
+  }
+
   const gradeColor = alignment.grade === 'A' ? pc.green
     : alignment.grade === 'B' ? pc.cyan
       : alignment.grade === 'C' ? pc.yellow
@@ -439,10 +452,21 @@ export async function intentDrift(options: IntentDriftOptions): Promise<void> {
   console.log(`    Confidence Level:       ${alignment.components.confidenceLevel}/100`);
   console.log(`    Principle Consistency:  ${alignment.components.principleConsistency}/100`);
   console.log(`    Journal Health:         ${alignment.components.journalHealth}/100`);
+  console.log(
+    `    Measured Cohort:        ${alignment.sampleSize}/${alignment.populationSize} ` +
+    `(${(alignment.sampleCoverage * 100).toFixed(1)}%; ${alignment.excludedSampleSize} excluded)`,
+  );
+  if (alignment.excludedSampleSize > 0) {
+    console.log(
+      `      Missing confidence: ${alignment.exclusions.missingConfidence}; ` +
+      `invalid confidence: ${alignment.exclusions.invalidConfidence}`,
+    );
+  }
   console.log();
 }
 
-function formatPercent(rate: number): string {
+function formatPercent(rate: number | null): string {
+  if (rate == null) return pc.dim('n/a');
   const pct = (rate * 100).toFixed(1) + '%';
   if (rate > 0.1) return pc.red(pct);
   if (rate > 0) return pc.yellow(pct);

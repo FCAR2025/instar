@@ -55,12 +55,35 @@ import { sign, verify } from '../core/MachineIdentity.js';
 import { signRequest } from '../server/machineAuth.js';
 import type { NonceStore } from '../core/NonceStore.js';
 import type { SecurityLog } from '../core/SecurityLog.js';
+import { localRouteSignatureCounters, logSafe, type LocalEnvelopeSigner } from '../threadline/localEnvelopeSignature.js';
 
 export interface MessageRouterConfig {
   localAgent: string;
   localMachine: string;
   serverUrl: string;
+  /**
+   * A2A local-route signed envelope (docs/specs/a2a-local-route-signed-envelope.md §7):
+   * signs a same-machine envelope with this agent's identity key. Returns null
+   * when it cannot (no identity, or `from.agent` is not this agent).
+   */
+  envelopeSigner?: LocalEnvelopeSigner;
+  /**
+   * Same-agent delivery guard: true when `tmuxSession` is a RUNNING session this
+   * agent owns. A same-agent message to any other name is marked 'failed' and
+   * never typed — so a wrong name cannot land in another agent's (or the
+   * operator's own) tmux session on this host. Absent ⇒ no ownership check
+   * (tests and embedders without a SessionManager).
+   */
+  isOwnSession?: (tmuxSession: string) => boolean;
 }
+
+/** What the target's server said to a same-machine relay POST. */
+export type LocalRelayOutcome =
+  | { kind: 'accepted' }
+  /** The receiver answered with an explicit `refused: true` body — terminal, never dropped. */
+  | { kind: 'refused'; status: number; error: string; reason: string | null; retryable: boolean }
+  /** Everything else, exactly as before: no token, a network error, any other answered error. */
+  | { kind: 'unreachable' };
 
 /** Optional cross-machine crypto dependencies. Only needed when multi-machine is enabled. */
 export interface CrossMachineDeps {
@@ -68,6 +91,16 @@ export interface CrossMachineDeps {
   signingKeyPem: string;
   nonceStore: NonceStore;
   securityLog: SecurityLog;
+}
+
+/**
+ * The ONE relay-chain-loop predicate (inbound-id ledger §1): `relay()` uses it,
+ * and `/messages/relay-agent` calls it BEFORE the ledger commit so a loop
+ * envelope writes no row.
+ */
+export function isRelayChainLoop(envelope: Pick<MessageEnvelope, 'transport'>, localMachine: string): boolean {
+  const chain = (envelope?.transport as { relayChain?: unknown } | undefined)?.relayChain;
+  return Array.isArray(chain) && chain.includes(localMachine);
 }
 
 export class MessageRouter implements IMessageRouter {
@@ -190,9 +223,16 @@ export class MessageRouter implements IMessageRouter {
     } else if (!isLocalMachine) {
       // Cross-machine → relay via HTTP with Ed25519 or queue to outbound
       await this.routeCrossMachine(envelope);
+    } else if (to.session !== '*' && to.session !== 'best') {
+      // Same agent, same machine, a NAMED session: type it into that session
+      // now. Before this branch the envelope sat at 'sent' forever — nothing
+      // reads a same-agent 'sent' row, and DeliveryRetryManager only retries
+      // 'queued'/'undelivered' — so sessions had no working private channel to
+      // each other and fell back to posting in the user's Telegram topic
+      // (bug 2026-11-03, Echo Bugs topic 10000001474).
+      await this.deliverSameAgentLocal(envelope);
     }
-    // If isLocalMachine && isLocalAgent → already saved locally, delivery is handled
-    // by the local agent's session delivery mechanism
+    // Broadcast ('*') and an unresolved 'best' stay saved locally as before.
 
     return {
       messageId,
@@ -223,9 +263,14 @@ export class MessageRouter implements IMessageRouter {
     await this.store.updateDelivery(messageId, delivery);
   }
 
+  /** This machine's id as the relay chain records it (for isRelayChainLoop). */
+  get localMachine(): string {
+    return this.config.localMachine;
+  }
+
   async relay(envelope: MessageEnvelope, source: 'agent' | 'machine'): Promise<boolean> {
     // Loop prevention: check if our machine is already in the relay chain
-    if (envelope.transport.relayChain.includes(this.config.localMachine)) {
+    if (isRelayChainLoop(envelope, this.config.localMachine)) {
       return false;
     }
 
@@ -444,8 +489,69 @@ export class MessageRouter implements IMessageRouter {
    *    with Bearer token from ~/.instar/agent-tokens/{agentName}.token
    * 4. If agent server is down → write to drop directory with HMAC
    */
+  /**
+   * Deliver a same-agent message into its named local session. A target that
+   * is not a running session of this agent (config.isOwnSession) → 'failed',
+   * never typed. Otherwise success → 'delivered'; any delivery failure
+   * (unsafe foreground process, send-keys error, or a throw) → 'queued', which
+   * DeliveryRetryManager's Layer-2 loop retries every 30s for ~5 minutes and
+   * then dead-letters. Never throws: the message is already saved.
+   */
+  private async deliverSameAgentLocal(envelope: MessageEnvelope): Promise<void> {
+    const target = envelope.message.to.session;
+    let success = false;
+    let reason = '';
+    let owned = true;
+    try {
+      owned = this.config.isOwnSession ? this.config.isOwnSession(target) : true;
+    } catch (err) {
+      owned = false;
+      reason = `ownership check failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (!owned) {
+      // Terminal: never typed, never retried (the retry loop skips 'failed').
+      reason = reason || `"${target}" is not a running session of this agent`;
+    } else {
+      try {
+        const result = await this.delivery.deliverToSession(target, envelope);
+        success = result.success;
+        reason = result.failureReason ?? '';
+      } catch (err) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+    }
+    const now = new Date().toISOString();
+    const to = success ? 'delivered' : owned ? 'queued' : 'failed';
+    envelope.delivery = {
+      ...envelope.delivery,
+      phase: to,
+      transitions: [
+        ...envelope.delivery.transitions,
+        { from: envelope.delivery.phase, to, at: now, reason: success ? `injected into session ${target}` : `same-agent delivery deferred: ${reason}` },
+      ],
+      attempts: envelope.delivery.attempts + 1,
+      ...(success ? {} : { failureReason: reason }),
+    };
+    try {
+      await this.store.updateDelivery(envelope.message.id, envelope.delivery);
+    } catch (err) {
+      // @silent-fallback-ok: the envelope is already saved; a failed phase write
+      // leaves it at 'sent' (today's behaviour) and is logged, never thrown.
+      console.warn(`[message-router] same-agent delivery phase write failed for ${envelope.message.id}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
   private async routeCrossAgentLocal(envelope: MessageEnvelope): Promise<void> {
     const targetAgent = envelope.message.to.agent;
+
+    // Sign ONCE, before the POST-or-drop branch: the envelope carries its
+    // signature whether it is relayed now or parked in the drop directory
+    // (dropMessage only touches `delivery` and `transport.hmac/hmacBy`, all
+    // outside the signed set).
+    if (this.config.envelopeSigner) {
+      const signature = this.config.envelopeSigner(envelope);
+      if (signature) envelope.signature = signature;
+    }
 
     // Look up target agent in registry
     const agents = listAgents({ status: 'running' });
@@ -458,8 +564,28 @@ export class MessageRouter implements IMessageRouter {
     }
 
     // Try HTTP relay first
-    const relaySuccess = await this.relayToAgent(envelope, targetEntry);
-    if (relaySuccess) {
+    const outcome = await this.relayToAgent(envelope, targetEntry);
+    if (outcome.kind === 'refused') {
+      // A Refusal Stays a Refusal: the receiver answered and said no. Parking
+      // the envelope would launder that into a delivery at its next boot.
+      localRouteSignatureCounters.localRefused++;
+      const why = outcome.reason ? `${outcome.error}/${outcome.reason}` : outcome.error;
+      console.log(`[message-router] ${targetAgent} refused ${envelope.message.id}: ${why} (HTTP ${outcome.status}, retryable=${outcome.retryable}) — not dropped`);
+      const now = new Date().toISOString();
+      envelope.delivery = {
+        ...envelope.delivery,
+        phase: 'failed',
+        transitions: [
+          ...envelope.delivery.transitions,
+          { from: 'sent', to: 'failed', at: now, reason: `refused by ${targetAgent}: ${why}${outcome.retryable ? ' (retryable)' : ''}` },
+        ],
+        attempts: envelope.delivery.attempts + 1,
+        failureReason: `refused by ${targetAgent}: ${why}`,
+      };
+      await this.store.updateDelivery(envelope.message.id, envelope.delivery);
+      return;
+    }
+    if (outcome.kind === 'accepted') {
       // Update delivery phase to 'received' (both store and in-memory envelope)
       const now = new Date().toISOString();
       envelope.delivery = {
@@ -480,14 +606,13 @@ export class MessageRouter implements IMessageRouter {
   }
 
   /**
-   * Relay an envelope to another agent's server via HTTP.
-   * Returns true if the target accepted the message.
+   * Relay an envelope to another agent's server via HTTP and classify the answer.
    */
-  private async relayToAgent(envelope: MessageEnvelope, target: AgentRegistryEntry): Promise<boolean> {
+  private async relayToAgent(envelope: MessageEnvelope, target: AgentRegistryEntry): Promise<LocalRelayOutcome> {
     // Read target agent's token for Bearer auth
     const targetToken = getAgentToken(target.name);
     if (!targetToken) {
-      return false; // No token — can't authenticate
+      return { kind: 'unreachable' }; // No token — can't authenticate
     }
 
     try {
@@ -502,10 +627,25 @@ export class MessageRouter implements IMessageRouter {
         signal: AbortSignal.timeout(5000),
       });
 
-      return response.ok;
+      if (response.ok) return { kind: 'accepted' };
+      // An explicit refusal is a JSON body saying `refused: true`, at any status.
+      try {
+        const body = await response.json() as { refused?: unknown; error?: unknown; reason?: unknown; retryable?: unknown } | null;
+        if (body && body.refused === true) {
+          return {
+            kind: 'refused',
+            status: response.status,
+            // The receiver's words go into our log and store: printable ASCII, bounded.
+            error: typeof body.error === 'string' && body.error ? logSafe(body.error) : 'refused',
+            reason: typeof body.reason === 'string' && body.reason ? logSafe(body.reason) : null,
+            retryable: body.retryable === true,
+          };
+        }
+      } catch { /* @silent-fallback-ok — not JSON: an answered error without the flag, handled as before */ }
+      return { kind: 'unreachable' };
     } catch {
       // @silent-fallback-ok — network failure, will fall back to drop directory
-      return false;
+      return { kind: 'unreachable' };
     }
   }
 

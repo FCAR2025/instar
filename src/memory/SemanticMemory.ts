@@ -102,14 +102,96 @@ export interface SemanticMemoryCapabilityLeafKeyVault {
 /**
  * Strip FTS5 special syntax characters from a query.
  * Prevents query manipulation via AND, OR, NOT, NEAR, *, column filters.
+ *
+ * The apostrophe is in this set for a reason worth stating: FTS5 treats `'` as a
+ * STRING DELIMITER, so an ordinary English possessive or contraction — "bot's",
+ * "doesn't", "what's" — reaches the parser as an unterminated string and the whole
+ * query THROWS `fts5: syntax error near "'"`. Measured live against the running
+ * agent on 2026-07-27: `why can a telegram bot not see another bot's messages`
+ * errored on BOTH /semantic/search and /semantic/search/hybrid, while the identical
+ * query without the apostrophe returned the correct entity at rank 1.
+ *
+ * That throw is not confined to keyword search. `searchHybrid()` runs FTS5 alongside
+ * vector KNN, so the exception takes the whole hybrid call down with it — and
+ * PromptBuildRecall is fed the user's RAW message, where contractions are ordinary.
+ * So the character that breaks retrieval is one of the most common in the input.
+ *
+ * Stripping (rather than escaping) matches how every other special character here is
+ * handled, and costs nothing for retrieval: FTS5's unicode61 tokenizer already splits
+ * on the apostrophe, so `bot's` and `bots` produce the same tokens either way.
  */
 function sanitizeFts5Query(query: string): string {
   return query
     .replace(/\b(AND|OR|NOT|NEAR)\b/gi, '')
-    .replace(/[*:"^{}().$@#!~`?\\[\]]/g, '')
+    .replace(/['*:"^{}().$@#!~`?\\[\]]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
+
+/**
+ * English function words that carry no retrieval signal but are FATAL to an
+ * FTS5 implicit-AND query.
+ *
+ * FTS5 requires EVERY bare token to match. No stored entity contains the word
+ * "why", so any question beginning "why ..." matches nothing regardless of the
+ * content words beside it. Recall is fed the user's raw message — always a
+ * natural-language sentence — so in practice it returned empty almost always.
+ * Measured on a live 2,852-entity store: "can I reach Codey" → 0 results,
+ * "is Codey responding to my messages" → 0, "why is Codey not replying" → 0,
+ * while "reach Codey" → 7, "Codey messages" → 17, "Codey" → 20.
+ */
+const FTS_STOPWORDS = new Set([
+  'a', 'about', 'am', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'been', 'but',
+  'by', 'can', 'could', 'did', 'do', 'does', 'for', 'from', 'get', 'got', 'had',
+  'has', 'have', 'how', 'i', 'if', 'in', 'is', 'it', 'its', 'me', 'my', 'no',
+  'of', 'on', 'or', 'our', 'should', 'so', 'that', 'the', 'their', 'them',
+  'then', 'there', 'these', 'they', 'this', 'to', 'was', 'we', 'were', 'what',
+  'when', 'where', 'which', 'who', 'why', 'will', 'with', 'would', 'you', 'your',
+]);
+
+/**
+ * Build the two FTS5 match expressions a recall query needs.
+ *
+ * `strict` drops stopwords and keeps FTS5's implicit AND, so a genuine
+ * multi-keyword query stays precise. `loose` ORs the same content words and is
+ * used ONLY as a fallback when strict returns nothing — five loosely-relevant
+ * memories beat the empty set that made stored lessons unreachable.
+ *
+ * Stopword removal never empties the query: if a message is ALL stopwords the
+ * original tokens are kept, so behaviour degrades to the previous semantics
+ * rather than silently matching everything.
+ *
+ * Exported for tests — the failure this fixes is invisible at the route level
+ * (a zero-result search looks identical to "nothing was ever stored").
+ */
+export function buildFtsQueryVariants(
+  query: string,
+): { strict: string; loose: string } | null {
+  const sanitized = sanitizeFts5Query(query);
+  if (!sanitized) return null;
+
+  const tokens = sanitized.split(' ').filter((t) => t.length > 0);
+  if (tokens.length === 0) return null;
+
+  const content = tokens.filter((t) => !FTS_STOPWORDS.has(t.toLowerCase()));
+  const effective = content.length > 0 ? content : tokens;
+
+  return {
+    strict: effective.join(' '),
+    loose: effective.length > 1 ? effective.join(' OR ') : effective.join(' '),
+  };
+}
+
+/**
+ * Which retrieval strategy actually served a search.
+ *
+ * `vector-hybrid` means embeddings were used; the `fts-*` values mean lexical
+ * matching served it, either because the query was lexically satisfiable or
+ * because the vector path was unavailable. Exposed so a caller can tell a
+ * semantic answer from a keyword one — silently serving the cheap strategy is
+ * the degradation this reporting exists to make visible.
+ */
+export type SearchStrategy = 'vector-hybrid' | 'fts-strict' | 'fts-loose-fallback' | 'none';
 
 export class SemanticMemory {
   /**
@@ -462,6 +544,24 @@ export class SemanticMemory {
   private embeddingProvider: EmbeddingProvider | null = null;
   private vectorSearch: VectorSearch | null = null;
   private _vectorAvailable = false;
+
+  /**
+   * Which retrieval strategy actually served the most recent `search()` call.
+   *
+   * `fts-strict` is the precise implicit-AND query; `fts-loose-fallback` means the
+   * strict query found NOTHING and the weaker OR query was used instead. Exposed
+   * because "No Silent Degradation to Brittle Fallback" requires a drop to a weaker
+   * strategy to be an observable event rather than a detail — a retrieval path that
+   * silently serves from the cheap strategy reports healthy while being fake-healthy.
+   * That is not hypothetical here: recall ran on keyword-only search for its entire
+   * life while a fully-populated vector index went uncalled, and nothing said so.
+   */
+  private _lastSearchStrategy: SearchStrategy = 'none';
+
+  /** Which strategy served the last search — see `_lastSearchStrategy`. */
+  get lastSearchStrategy(): SearchStrategy {
+    return this._lastSearchStrategy;
+  }
   private jsonlPath: string;
   /** Set after corruption auto-recovery — caller should reimport from JSONL */
   private _needsRebuild = false;
@@ -781,7 +881,7 @@ export class SemanticMemory {
    * This is the source of truth for disaster recovery — if semantic.db
    * is lost, the JSONL can reconstruct the full knowledge graph.
    *
-   * Actions: remember, connect, forget, verify, supersede, update, import
+   * Actions: remember, connect, disconnect, forget, verify, supersede, update, import
    */
   private appendToJournal(action: string, data: Record<string, unknown>): void {
     try {
@@ -1430,6 +1530,23 @@ export class SemanticMemory {
     return id;
   }
 
+  /**
+   * Delete every edge touching `entityId` (as source or target) whose context
+   * starts with `contextPrefix` (exact prefix match, no LIKE wildcards). Edges
+   * with other contexts, including null, are untouched. Journaled as
+   * `disconnect` only when something was deleted. Returns the number removed.
+   */
+  removeEdgesTouching(entityId: string, contextPrefix: string): number {
+    const db = this.ensureOpen();
+    const result = db.prepare(
+      'DELETE FROM edges WHERE (from_id = ? OR to_id = ?) AND context IS NOT NULL AND substr(context, 1, length(?)) = ?',
+    ).run(entityId, entityId, contextPrefix, contextPrefix);
+    if (result.changes > 0) {
+      this.appendToJournal('disconnect', { entityId, contextPrefix });
+    }
+    return result.changes;
+  }
+
   // ─── Lookup ─────────────────────────────────────────────────────
 
   /**
@@ -1483,8 +1600,14 @@ export class SemanticMemory {
   search(query: string, options?: SemanticSearchOptions): ScoredEntity[] {
     const db = this.ensureOpen();
 
-    const sanitized = sanitizeFts5Query(query);
-    if (!sanitized) return [];
+    const variants = buildFtsQueryVariants(query);
+    if (!variants) {
+      // Reset rather than leaving the previous call's strategy readable — a stale
+      // "served by strict" on a query that never ran is exactly the kind of
+      // falsely-healthy signal this field exists to prevent.
+      this._lastSearchStrategy = 'none';
+      return [];
+    }
 
     const limit = options?.limit ?? 20;
 
@@ -1496,7 +1619,7 @@ export class SemanticMemory {
       WHERE entities_fts MATCH ?
     `;
 
-    const params: (string | number)[] = [sanitized];
+    const params: (string | number)[] = [variants.strict];
 
     if (options?.types && options.types.length > 0) {
       const placeholders = options.types.map(() => '?').join(',');
@@ -1527,7 +1650,27 @@ export class SemanticMemory {
     sql += ` ORDER BY entities_fts.rank LIMIT ?`;
     params.push(limit * 3); // Fetch extra for re-ranking
 
-    const rows = db.prepare(sql).all(...params) as (EntityRow & { fts_rank: number })[];
+    const statement = db.prepare(sql);
+    let rows = statement.all(...params) as (EntityRow & { fts_rank: number })[];
+    this._lastSearchStrategy = 'fts-strict';
+
+    // Strict (implicit-AND over content words) is the precise query and stays
+    // authoritative whenever it finds anything. Only when it finds NOTHING do we
+    // widen to OR — an empty result is what made stored lessons unreachable, and
+    // a loosely-relevant hit is strictly better than silence. Every other filter
+    // (type, domain, confidence, privacy) is unchanged and still applies.
+    //
+    // The widening is RECORDED, not silent. Per the "No Silent Degradation to
+    // Brittle Fallback" standard, falling back to a weaker strategy is an event:
+    // a retrieval path that quietly serves from the cheap strategy looks healthy
+    // while being fake-healthy, which is the exact defect this whole change exists
+    // to fix. Reading `lastSearchStrategy` tells a caller what actually served.
+    if (rows.length === 0 && variants.loose !== variants.strict) {
+      const looseParams = [...params];
+      looseParams[0] = variants.loose;
+      rows = statement.all(...looseParams) as (EntityRow & { fts_rank: number })[];
+      this._lastSearchStrategy = 'fts-loose-fallback';
+    }
 
     // ─── Vector results (if available) ────────────────────────
     // vectorScores is populated asynchronously via searchHybrid() for callers
@@ -1614,7 +1757,10 @@ export class SemanticMemory {
    */
   async searchHybrid(query: string, options?: SemanticSearchOptions): Promise<ScoredEntity[]> {
     if (!this._vectorAvailable || !this.embeddingProvider || !this.vectorSearch) {
-      // Graceful degradation: fall back to FTS5-only
+      // Graceful degradation: fall back to FTS5-only. `search()` records the
+      // strategy it used, so the caller can still tell that the vector path did
+      // not run — a degradation that reports itself rather than one that looks
+      // identical to success.
       return this.search(query, options);
     }
 
@@ -1635,6 +1781,12 @@ export class SemanticMemory {
 
     // Run the combined search (which now picks up vector scores)
     const results = this.search(query, options);
+
+    // The inner search() just recorded a lexical strategy, which is true of the
+    // candidate selection but misleading as the answer to "did the semantic path
+    // run?" — embeddings genuinely participated in ranking here. Overwrite AFTER
+    // the call so the reported strategy matches what actually served.
+    this._lastSearchStrategy = 'vector-hybrid';
 
     // Clear cached scores
     this._lastVectorScores = null;
@@ -1760,9 +1912,9 @@ export class SemanticMemory {
       entitiesProcessed: rows.length,
       entitiesDecayed: decayed,
       entitiesExpired: expired,
-      minConfidence: activeCount > 0 ? minConf : 0,
-      maxConfidence: activeCount > 0 ? maxConf : 0,
-      avgConfidence: activeCount > 0 ? sumConf / activeCount : 0,
+      minConfidence: activeCount > 0 ? minConf : null,
+      maxConfidence: activeCount > 0 ? maxConf : null,
+      avgConfidence: activeCount > 0 ? sumConf / activeCount : null,
     };
   }
 
@@ -1785,6 +1937,42 @@ export class SemanticMemory {
 
     // Dual-write to JSONL
     this.appendToJournal('verify', { entityId: id, confidence: newConfidence ?? null });
+  }
+
+  /**
+   * Replace an entity's content in place (name, type, tags, confidence and
+   * createdAt are untouched). Used by recurring jobs that keep one keyed entity
+   * and refresh it each run. Journaled so a JSONL rebuild replays it.
+   * Returns false when no entity has that id.
+   */
+  updateContent(
+    id: string,
+    patch: { content: string; lastVerified: string; sourceSession?: string },
+  ): boolean {
+    const db = this.ensureOpen();
+    const result = db.prepare(
+      'UPDATE entities SET content = ?, last_verified = ?, source_session = COALESCE(?, source_session) WHERE id = ?',
+    ).run(patch.content, patch.lastVerified, patch.sourceSession ?? null, id);
+    if (result.changes === 0) return false;
+
+    this.appendToJournal('update', {
+      entityId: id,
+      content: patch.content,
+      lastVerified: patch.lastVerified,
+      sourceSession: patch.sourceSession ?? null,
+    });
+
+    if (this._vectorAvailable && this.embeddingProvider && this.vectorSearch) {
+      const row = db.prepare('SELECT name FROM entities WHERE id = ?').get(id) as { name: string } | undefined;
+      const embeddingText = `${row?.name ?? ''} ${patch.content}`;
+      this.embeddingProvider.embed(embeddingText).then(embedding => {
+        if (this.db && this.vectorSearch) {
+          this.vectorSearch.upsert(this.db, id, embedding);
+        }
+      }).catch(() => { // @silent-fallback-ok: embedding failure is non-fatal, FTS5 search still works
+      });
+    }
+    return true;
   }
 
   // ─── Supersede ──────────────────────────────────────────────────
@@ -2049,6 +2237,8 @@ export class SemanticMemory {
     const deleteEdges = db.prepare('DELETE FROM edges WHERE from_id = ? OR to_id = ?');
 
     const updateVerify = db.prepare('UPDATE entities SET last_verified = ?, confidence = COALESCE(?, confidence) WHERE id = ?');
+    const deleteEdgesByPrefix = db.prepare('DELETE FROM edges WHERE (from_id = ? OR to_id = ?) AND context IS NOT NULL AND substr(context, 1, length(?)) = ?');
+    const updateContentStmt = db.prepare('UPDATE entities SET content = ?, last_verified = ?, source_session = COALESCE(?, source_session) WHERE id = ?');
 
     const runReplay = db.transaction(() => {
       for (const line of lines) {
@@ -2094,6 +2284,19 @@ export class SemanticMemory {
               const id = entry.entityId;
               if (!id) break;
               updateVerify.run(entry.timestamp, entry.confidence ?? null, id);
+              break;
+            }
+
+            case 'disconnect': {
+              if (!entry.entityId || typeof entry.contextPrefix !== 'string') break;
+              deleteEdgesByPrefix.run(entry.entityId, entry.entityId, entry.contextPrefix, entry.contextPrefix);
+              break;
+            }
+
+            case 'update': {
+              const id = entry.entityId;
+              if (!id || typeof entry.content !== 'string') break;
+              updateContentStmt.run(entry.content, entry.lastVerified ?? entry.timestamp, entry.sourceSession ?? null, id);
               break;
             }
 
@@ -2184,7 +2387,7 @@ export class SemanticMemory {
 
     // Avg confidence
     const avgRow = db.prepare('SELECT AVG(confidence) as avg FROM entities').get() as { avg: number | null };
-    const avgConfidence = avgRow.avg ?? 0;
+    const avgConfidence = avgRow.avg;
 
     // Stale count
     const staleCount = (db.prepare('SELECT COUNT(*) as cnt FROM entities WHERE confidence < ?').get(this.config.staleThreshold) as { cnt: number }).cnt;
@@ -2210,7 +2413,7 @@ export class SemanticMemory {
       totalEntities: entityCount,
       totalEdges: edgeCount,
       entityCountsByType: entityCountsByType as Record<EntityType, number>,
-      avgConfidence: Math.round(avgConfidence * 100) / 100, // Round to 2 decimal places
+      avgConfidence: avgConfidence == null ? null : Math.round(avgConfidence * 100) / 100, // Round to 2 decimal places
       staleCount,
       dbSizeBytes,
       vectorSearchAvailable: this._vectorAvailable,

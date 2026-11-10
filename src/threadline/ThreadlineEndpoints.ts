@@ -15,18 +15,24 @@
  * Part of Threadline Protocol Phase 3.
  */
 
+import { parseKindedAck } from './requiredAck.js';
 import { Router } from 'express';
 import crypto from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
+import { bearerMatches } from '../server/middleware.js';
 import type { HandshakeManager, HelloPayload, ConfirmPayload } from './HandshakeManager.js';
 import type { ThreadlineRouter } from './ThreadlineRouter.js';
 import { verify } from './ThreadlineCrypto.js';
 import { IdentityManager } from './client/IdentityManager.js';
 import { recordInboundAck, type InboundAckDeps } from './recordInboundAck.js';
+import { isAutoAckBody, autoAckBodyRecognition } from './autoAck.js';
+import { wireTypeOf } from './PeerUserMeantJudge.js';
 import { computeFingerprint } from './client/MessageEncryptor.js';
 import { recordThreadMessage } from './recordThreadMessage.js';
 import { honorPeerThreadSync, serveBackfill, type SymmetryDeps } from './threadSymmetry.js';
 import { type ThreadSync } from './threadDigest.js';
+import { buildResentNotice, type InboundIdLedger } from './InboundIdLedger.js';
+import { recordDuplicateAck } from './inboundIdLedgerWiring.js';
 
 /**
  * Robustness Phase 2 (D-B/D-D) dependencies for the canonical-history surfaces on
@@ -55,8 +61,20 @@ export interface ThreadlineError {
 }
 
 export interface ThreadlineEndpointsConfig {
+  /** Agent-wide operational view. Local-only health probes omit it to avoid recursive peer reads. */
+  agentRelayStatus?: () => Promise<import('./agentRelayStatus.js').AgentRelayStatus>;
+  agentRelayAuthToken?: string;
   /** Name of this agent */
   localAgent: string;
+  /**
+   * peer-conversation-homebase-topic §2.6: posts a verified peer's user-meant message on an
+   * unbound conversation into that peer's own topic. Optional; absent ⇒ no post (as before).
+   */
+  peerHomebaseRelay?: {
+    relayInbound(input: { threadId: string; peers: Array<string | undefined | null>; senderName: string; text: string; messageType?: string | null }): Promise<{ posted: boolean }>;
+  };
+  /** Is this conversation already bound to a topic (then TopicLinkageHandler owns its posts)? */
+  conversationBound?: (threadId: string) => boolean;
   /** Threadline protocol version */
   version: string;
   /** Agent state directory — used to resolve the canonical routing identity for /threadline/health */
@@ -69,6 +87,162 @@ export interface ThreadlineEndpointsConfig {
    * the relay-server router itself has no trust-manager access.
    */
   mutualVerifiedCount?: () => number;
+  /**
+   * A2A local-route signed envelope §8: the receiver's live mode, advertised
+   * on /threadline/health as `localEnvelopeSignature: { version, mode }`. A
+   * same-machine sender reads the field's presence as "this receiver
+   * understands X-Instar-Require-Signature". Absent ⇒ the field is omitted.
+   */
+  localEnvelopeSignatureMode?: () => 'off' | 'dry-run' | 'enforcing';
+  /**
+   * Live relay connection state for `/threadline/health`.
+   *
+   * Returns null when NO relay client exists in this process — relay disabled, or
+   * the standalone listener daemon owns the connection. Null therefore means "not
+   * applicable here", NOT "down", and must never be reported as a fault.
+   *
+   * Two inputs are needed and neither is sufficient alone. `connectionState` gives
+   * the live up/down but cannot distinguish a drop that WILL retry from a
+   * `displaced` one whose reconnect is disarmed for the life of the process —
+   * and that distinction is the whole point, because the terminal case never
+   * self-heals. `lastEvent.terminal` supplies it. Optional: when absent the
+   * handler reports `not-configured` and the legacy response shape is preserved.
+   */
+  relayStatus?: () => {
+    connectionState: string;
+    lastEvent: { event: string; ts: string; terminal: boolean } | null;
+    /**
+     * True while this machine is deliberately off the relay because another of
+     * its machines holds the serving lease (ACT-1306 a). Not a fault: nothing
+     * retries, and the awake machine holds the connection.
+     */
+    standby?: boolean;
+  } | null;
+  /**
+   * The live inbound-id ledger (docs/specs/a2a-inbound-id-ledger.md), late-bound.
+   * Null/absent ⇒ dark: no dedup, no capability advertised.
+   */
+  inboundIdLedger?: () => InboundIdLedger | null;
+  /** True while the listener daemon owns inbound relay handling (no capability then). */
+  inboundIdLedgerDaemonDeferred?: () => boolean;
+  /**
+   * a2a-single-agent-identity §1.1: true while this machine boots in the
+   * `identity-not-provisioned` posture (a joined machine with no agent identity — the relay
+   * connection is not attempted; `fingerprint` is absent). Reported as relay state
+   * `not-provisioned` so a reader never mistakes it for a dropped connection.
+   */
+  identityNotProvisioned?: () => boolean;
+  /**
+   * a2a-single-agent-identity §2.2: the continuous cross-machine identity check's health —
+   * `{state, connectedAs, siblingsPublish, cannotTellRounds, lastCheckedAt}`. Absent → omitted.
+   */
+  identityCoherence?: () => Record<string, unknown> | null;
+}
+
+/**
+ * §3: advertise `inbound-id-ledger` (and protocolVersion 2) only while the
+ * lookup is operational — table open, no DB-error cooldown or breaker — and the
+ * relay is not daemon-deferred. Evaluated per probe.
+ */
+export function inboundIdLedgerAdvertised(config: Pick<ThreadlineEndpointsConfig, 'inboundIdLedger' | 'inboundIdLedgerDaemonDeferred'>): boolean {
+  try {
+    if (config.inboundIdLedgerDaemonDeferred?.()) return false;
+    const ledger = config.inboundIdLedger?.() ?? null;
+    return !!ledger && ledger.isOperational();
+  } catch {
+    return false;
+  }
+}
+
+/** What `/threadline/health` reports about the relay. Code-defined, never peer text. */
+export type RelayHealthState =
+  | 'connected'
+  | 'disconnected'
+  | 'standby'
+  | 'displaced'
+  | 'never-connected'
+  | 'not-configured'
+  /** a2a-single-agent-identity §1.1: no agent identity on this joined machine; adoption is running. */
+  | 'not-provisioned';
+
+/**
+ * Map live relay state onto the health response. Extracted as a pure function so
+ * the decision boundary is testable without standing up an HTTP server.
+ *
+ * `recoverable` is the field a reader actually acts on: a `disconnected` relay
+ * self-heals via the client's backoff, whereas a `displaced` one has reconnect
+ * disarmed for the life of the process and needs a restart. Reporting both as
+ * merely "down" would understate a permanent outage as a transient blip.
+ *
+ * NOTE what is deliberately NOT reported: the relay's raw `reason` string.
+ * `/threadline/health` is UNAUTHENTICATED, and that string is peer-influenced
+ * text. Only a code-defined state, a boolean, and an ISO timestamp cross this
+ * boundary. The full reason stays in the durable log and the server console,
+ * which are already the place the operator reads for detail.
+ */
+export function resolveRelayHealth(
+  relayStatus: ThreadlineEndpointsConfig['relayStatus'],
+  identityNotProvisioned?: ThreadlineEndpointsConfig['identityNotProvisioned'],
+): {
+  status: 'ok' | 'degraded' | 'error';
+  report: { state: RelayHealthState; recoverable: boolean; since?: string };
+} {
+  // §1.1: an unprovisioned machine never attempted the connection. That is a NAMED posture
+  // (adoption is running, the item names the lever), not a drop — reported before the live
+  // state so a stale client object can never make it read as `never-connected`.
+  try {
+    if (identityNotProvisioned?.()) return { status: 'degraded', report: { state: 'not-provisioned', recoverable: true } };
+  } catch {
+    /* a throwing posture probe falls through to the live relay state */
+  }
+  let live: ReturnType<NonNullable<ThreadlineEndpointsConfig['relayStatus']>> = null;
+  try {
+    live = relayStatus?.() ?? null;
+  } catch {
+    // A throwing status probe must not take down the health route. Fall through
+    // to not-configured rather than 500 — the endpoint peers use for discovery
+    // has to keep answering.
+    live = null;
+  }
+
+  // No relay client in this process: relay disabled, or the listener daemon owns
+  // it. Not a fault, and the legacy 'ok' is correct here.
+  if (!live) return { status: 'ok', report: { state: 'not-configured', recoverable: true } };
+
+  // Connected is checked FIRST so a live connection can never be reported as down
+  // by a stale loss event — the safe direction is refusing to cry wolf.
+  if (live.connectionState === 'connected') {
+    return { status: 'ok', report: { state: 'connected', recoverable: true } };
+  }
+
+  // Deliberately off the relay while another of this agent's machines holds the
+  // serving lease. Reported before the loss states: a release disconnects
+  // without a loss event, which would otherwise read as "disconnected,
+  // retrying" when nothing retries (Echo's review of ACT-1306 a).
+  if (live.standby === true) {
+    return { status: 'ok', report: { state: 'standby', recoverable: true } };
+  }
+
+  const last = live.lastEvent;
+  if (last?.terminal === true) {
+    // Terminal: another connection claimed this identity. Reconnect is disarmed
+    // permanently; only a process restart recovers it.
+    return {
+      status: 'error',
+      report: { state: 'displaced', recoverable: false, since: last.ts },
+    };
+  }
+
+  if (!last) {
+    // Never connected and never dropped: still coming up, or the first connect
+    // failed. Distinct from a drop, because "not yet" is not "broken".
+    return { status: 'degraded', report: { state: 'never-connected', recoverable: true } };
+  }
+
+  return {
+    status: 'degraded',
+    report: { state: 'disconnected', recoverable: true, since: last.ts },
+  };
 }
 
 // ── Error Codes ──────────────────────────────────────────────────────
@@ -137,30 +311,74 @@ export function createThreadlineRoutes(
 
   // ── Health ─────────────────────────────────────────────────────
 
-  router.get('/threadline/health', (_req: Request, res: Response) => {
+  router.get('/threadline/health', async (req: Request, res: Response) => {
     // Report the canonical routing identity (the address the relay answers to),
     // resolved via the SAME read-only API the relay client uses. When it
     // resolves, identityPub + fingerprint correspond
     // (fingerprint === computeFingerprint(identityPub)) so a peer discovering us
     // via health obtains a routable address. When no routing identity resolves
-    // (none on disk, or canonical identity.json is locked-encrypted), fall back
-    // to the handshake-layer key and omit the fingerprint — never fabricate one.
+    // (none on disk, canonical identity.json is locked-encrypted, or the file
+    // is unusable), OMIT both fields — never fabricate one. Reading health must
+    // never create an identity: it is polled by every other local agent's
+    // discovery, and an identity minted here is how ACT-062 began. Consumers
+    // treat an absent identityPub/fingerprint as "not verifiable / no local
+    // route" (AgentDiscovery.verifyAgent, backupRoutes.checkFingerprintHealth).
     const routingIdentity = new IdentityManager(config.stateDir).get();
+    // Relay state. Until 2026-07-30 `status` was the LITERAL 'ok' and this handler
+    // never consulted the relay at all, so it reported healthy for 6h45m while the
+    // relay was displaced and the agent could neither send nor receive — 131
+    // messages queued behind a route that said everything was fine. Every input
+    // needed was already in-process; nothing asked for it.
+    const relay = resolveRelayHealth(config.relayStatus, config.identityNotProvisioned);
+    let identityCoherence: Record<string, unknown> | null = null;
+    try {
+      identityCoherence = config.identityCoherence?.() ?? null;
+    } catch {
+      identityCoherence = null; // a throwing probe must not take the health route down
+    }
+    let agentRelay: import('./agentRelayStatus.js').AgentRelayStatus | null = null;
+    const authenticated = Boolean(config.agentRelayAuthToken) && bearerMatches(req, config.agentRelayAuthToken);
+    if (req.query.scope !== 'local' && config.agentRelayStatus && authenticated) {
+      try { agentRelay = await config.agentRelayStatus(); } catch { /* report unknown rather than a false local answer */ }
+    }
     res.json({
-      status: 'ok',
+      ...(req.query.scope !== 'local' && config.agentRelayStatus ? { agentRelay: agentRelay ?? {
+        state: relay.report.state === 'connected' ? 'reachable' : 'unknown', throughMachine: null, throughMachineId: null,
+        reason: authenticated ? 'The agent-wide relay status could not be checked.' : 'Authenticate to check the holder; this public view does not probe sibling machines.',
+        ifMachineAway: 'Reachability cannot be confirmed until a holder is verified.',
+        peersChecked: 0, peersUnknown: 0,
+      } } : {}),
+      // `status` now reflects the relay. Deliberately still HTTP 200 with
+      // protocol/identityPub/fingerprint unchanged: AgentDiscovery.verifyAgent
+      // gates on response.ok + identityPub + protocol and NEVER on this field, so
+      // a degraded relay must not make a peer drop us from its registry. Verified
+      // against every in-repo consumer — none branches on health.status.
+      status: relay.status,
+      relay: relay.report,
       protocol: 'threadline',
       version: config.version,
       agent: config.localAgent,
-      identityPub: routingIdentity
-        ? routingIdentity.publicKey.toString('hex')
-        : handshakeManager.getIdentityPublicKey(),
-      fingerprint: routingIdentity?.fingerprint,
+      ...(routingIdentity
+        ? {
+            identityPub: routingIdentity.publicKey.toString('hex'),
+            fingerprint: routingIdentity.fingerprint,
+          }
+        : {}),
       pairedAgents: handshakeManager.listPairedAgents().length,
       // Secure A2A Verified Pairing (§3.6): count of mutual-verified pairings.
       // Omitted when no count callback is wired (legacy behavior).
       ...(config.mutualVerifiedCount
         ? { mutualVerifiedCount: config.mutualVerifiedCount() }
         : {}),
+      ...(config.localEnvelopeSignatureMode
+        ? { localEnvelopeSignature: { version: 'v1', mode: config.localEnvelopeSignatureMode() } }
+        : {}),
+      // Inbound-id ledger §3: a HINT for senders; the per-message answer is the truth.
+      ...(inboundIdLedgerAdvertised(config)
+        ? { capabilities: ['inbound-id-ledger'], protocolVersion: 2 }
+        : {}),
+      // a2a-single-agent-identity §2.2: are my machines the same me on the agent network?
+      ...(identityCoherence ? { identityCoherence } : {}),
       timestamp: new Date().toISOString(),
     });
   });
@@ -418,6 +636,11 @@ export function createThreadlineRoutes(
   // ── Messages: Receive (AUTHENTICATED) ──────────────────────────
 
   router.post('/threadline/messages/receive', threadlineAuth, async (req: Request, res: Response) => {
+    // Inbound-id ledger: the attempt-owned ticket. Cleared by the route's
+    // `finally` until the background chain starts, then by the chain's own.
+    let ticket: import('./InboundIdLedger.js').AdmissionTicket | null = null;
+    let chainStarted = false;
+    let resentNotice: string | null = null;
     try {
       const body = req.body;
 
@@ -438,6 +661,48 @@ export function createThreadlineRoutes(
           5,
         ));
         return;
+      }
+
+      // Inbound-id ledger (docs/specs/a2a-inbound-id-ledger.md §1): the commit
+      // point — after the signature check (threadlineAuth), before res.json and
+      // every side effect (implicit ack, thread record, dispatch). Keyed on the
+      // SIGNATURE-DERIVED fingerprint, never the x-threadline-agent header.
+      {
+        const ledger = config.inboundIdLedger?.() ?? null;
+        const verifiedFp = (req as VerifiedRequest).threadlineVerifiedFingerprint;
+        if (body.message?.resend === true) resentNotice = buildResentNotice(false);
+        if (ledger && verifiedFp) {
+          const r = ledger.admit({
+            senderKey: verifiedFp,
+            messageId: typeof body.message?.id === 'string' ? body.message.id : null,
+            ingress: 'threadline-http',
+            threadId: body.message?.threadId,
+          });
+          if (r.kind === 'error') {
+            res.status(503).json({ error: 'ledger-unavailable', retryable: true });
+            return;
+          }
+          if (r.kind === 'duplicate') {
+            ledger.bump('dedupById');
+            recordDuplicateAck(inboundAckDeps?.a2aDeliveryTracker, r.row);
+            res.json({
+              accepted: false,
+              deduped: true,
+              dedupBy: 'id',
+              disposition: r.row.disposition,
+              path: r.row.path,
+              firstSeenAt: r.row.admitted_at,
+              retryable: false,
+            });
+            return;
+          }
+          if (r.kind === 'in-flight') {
+            res.status(409).json({ deduped: true, disposition: 'admitted', retryable: true });
+            return;
+          }
+          ticket = r.ticket;
+          if (r.kind === 'admitted' && (r.ticket.readmissions > 0 || r.crossNamespace)) resentNotice = buildResentNotice(false);
+        }
       }
 
       // Route the message through the ThreadlineRouter
@@ -470,7 +735,21 @@ export function createThreadlineRoutes(
       // background failure is logged (it cannot 500 a response that already
       // returned). The former 422-retryable path was already unreachable — the
       // sender aborts at ~10s, long before the 9-30s spawn produced it.
-      res.json({ accepted: true, async: true, threadId: body.message?.threadId });
+      res.json({
+        accepted: true,
+        delivered: false,
+        async: true,
+        threadId: body.message?.threadId,
+      });
+
+      // a2a-required-acknowledgment D1: a kinded ack branches BEFORE any delivery
+      // record, on every route. Same-machine routes send none, so one arriving here
+      // is consumed with no effect: it never flips a row by thread, never routes.
+      if (parseKindedAck(body.message?.body)) {
+        ticket?.recordNoReply();
+        console.log(`[ThreadlineEndpoints] kinded ack (thread: ${body.message?.threadId ?? 'none'}) consumed on the HTTP route — no effect`);
+        return;
+      }
 
       // Robustness Phase 1 (D-E / closes F4): record the implicit delivery ack on
       // the VERIFIED E2E relay inbound path — the path that previously lacked it,
@@ -486,6 +765,16 @@ export function createThreadlineRoutes(
           senderName: verifiedSender ?? null,
         });
       } catch { /* @silent-fallback-ok: recording-only — never block inbound routing */ }
+
+      // Ack stage (docs/specs/a2a-ack-never-acked.md). INVARIANT: an ack is never
+      // acked, never reaches the router, and never spawns a session — it only
+      // records delivery (done just above). The route's `finally` finishes the
+      // ticket, which now carries the terminal `no-reply` disposition.
+      if (isAutoAckBody(body.message?.body)) {
+        ticket?.recordNoReply();
+        console.log(`[ThreadlineEndpoints] delivery ack (thread: ${body.message?.threadId ?? 'none'}, by ${autoAckBodyRecognition(body.message?.body)}) recorded — not routed`);
+        return;
+      }
 
       // Robustness Phase 2 (D-B): append THIS inbound leg to the canonical log via
       // the single funnel (the 4th and final message-persisting site — the F4 path).
@@ -514,8 +803,31 @@ export function createThreadlineRoutes(
         }
       } catch { /* @silent-fallback-ok: recording-only — never block inbound routing */ }
 
-      void threadlineRouter.handleInboundMessage(envelope)
+      // §2.6: a verified peer's user-meant message on an unbound conversation is posted by the
+      // server into the peer's own topic. Keyed on the DERIVED fingerprint, never the name.
+      // Fire-and-forget: it never delays or blocks routing to a session.
+      try {
+        const hbFp = (req as VerifiedRequest).threadlineVerifiedFingerprint;
+        const hbThread = body.message?.threadId;
+        if (config.peerHomebaseRelay && hbFp && hbThread && !config.conversationBound?.(hbThread)) {
+          const hbText = typeof body.message?.body === 'string'
+            ? body.message.body
+            : String((body.message?.body as Record<string, unknown> | undefined)?.content ?? (body.message?.body as Record<string, unknown> | undefined)?.text ?? '');
+          void config.peerHomebaseRelay.relayInbound({
+            threadId: hbThread,
+            peers: [hbFp],
+            senderName: typeof body.message?.from?.agent === 'string' ? body.message.from.agent : hbFp,
+            text: hbText,
+            messageType: wireTypeOf(body.message?.body),
+          }).catch(() => { /* @silent-fallback-ok — the relay logs; delivery to the session is unaffected */ });
+        }
+      } catch { /* @silent-fallback-ok: a homebase post never blocks inbound routing */ }
+
+      const chainTicket = ticket;
+      chainStarted = true;
+      void threadlineRouter.handleInboundMessage(envelope, undefined, { resentNotice })
         .then((result) => {
+          chainTicket?.recordRouterResult(result);
           if (result?.error) {
             console.warn(
               `[ThreadlineEndpoints] Background handleInboundMessage reported: ${result.error}`,
@@ -523,8 +835,10 @@ export function createThreadlineRoutes(
           }
         })
         .catch((err) => {
+          chainTicket?.recordHandoffFailed();
           console.error('[ThreadlineEndpoints] Background handleInboundMessage failed:', err);
-        });
+        })
+        .finally(() => chainTicket?.finish());
       return;
     } catch (err) {
       console.error('[ThreadlineEndpoints] Message receive error:', err);
@@ -534,6 +848,10 @@ export function createThreadlineRoutes(
         true,
         5,
       ));
+    } finally {
+      // A synchronous exit before the background chain started can never leave
+      // a key in flight: finish() records handoff-failed when no outcome was set.
+      if (!chainStarted) ticket?.finish();
     }
   });
 

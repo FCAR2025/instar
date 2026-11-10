@@ -15,9 +15,10 @@ import {
   GUARD_MANIFEST,
   type GuardManifestEntry,
 } from './guardManifest.js';
+import type { AcceptedFallbackRecord, ScopedAcceptedFallbacks } from './guardAcceptedFallbacks.js';
 import { getConfigByPath } from '../core/devGatedFeatures.js';
 import {
-  extractGuardPosture,
+  buildCompleteGuardPosture,
   type GuardPostureBootSnapshot,
   type ResolvedGuardConfigSnapshot,
 } from './guardPosture.js';
@@ -27,6 +28,7 @@ export type GuardEffectiveState =
   | 'on-confirmed'
   | 'on-unverified'
   | 'on-stale'
+  | 'on-blind'
   | 'on-dry-run'
   | 'off'
   | 'diverged-pending-restart'
@@ -41,6 +43,12 @@ export type GuardDivergence = 'none' | 'diverged' | 'not-applicable' | 'snapshot
 /** Staleness multiplier over a guard's self-declared cadence (spec §2.2, N=5). */
 export const STALE_TICK_MULTIPLIER = 5;
 
+/** Per-heartbeat wire bound for load-bearing keys whose protection cannot
+ * currently be proved. The full count travels separately, so truncation can
+ * never turn into an all-clear. Sixteen covers today's 13 load-bearing guards
+ * while placing a fixed ceiling on this 30-second payload. */
+export const HEARTBEAT_LOAD_BEARING_UNINSPECTABLE_KEY_CAP = 16;
+
 /** The CLOSED projection — every field a /guards row may carry. Anything not
  *  named here never leaves the server (Tier-1 allowlist test). */
 export interface GuardRuntimeProjection {
@@ -51,6 +59,8 @@ export interface GuardRuntimeProjection {
   stale?: boolean;
   jobCount?: number;
   pausedJobCount?: number;
+  verdictUnknown?: boolean;
+  verdictUnknownReason?: string;
 }
 
 export interface GuardRow {
@@ -65,12 +75,26 @@ export interface GuardRow {
   /** Normalized getter-error message (errored state only). */
   error?: string;
   process: 'server' | 'lifeline';
+  // ── G3: dark-but-load-bearing FLAGS (orthogonal to the nine-state contract) ──
+  /** Mirrored from the manifest — a critical path depends on this guard. */
+  loadBearing?: true;
+  /** Present for ANY posture of a load-bearing guard (travels on every anomaly). */
+  criticalPath?: string;
+  /** LOUD: silently unguarded (off:dark-default or on-dry-run), past soak, not accepted. */
+  loadBearingGap?: true;
+  /** GRADUATE arm: on-dry-run within the soak window (no attention item). */
+  loadBearingSoaking?: true;
+  /** Owned operator acceptance recorded on THIS machine (full Gap suppression). */
+  loadBearingAccepted?: true;
+  /** The operator's recorded reason — the VISIBLE accepted-risk row. */
+  acceptedFallbackReason?: string;
 }
 
 export interface GuardsSummary {
   onConfirmed: number;
   onUnverified: number;
   onStale: number;
+  onBlind: number;
   onDryRun: number;
   off: number;
   offDeviant: number;
@@ -80,6 +104,14 @@ export interface GuardsSummary {
   missing: number;
   offRuntimeDivergent: number;
   runtimeEnriched: string; // "n/total"
+  // ── G3: load-bearing key-lists (gap, inspectability, and rollout posture) ──
+  loadBearingGapKeys: string[];
+  /** Load-bearing guards whose posture cannot currently prove protection.
+   *  These retain their existing anomaly class; this list is read-surface
+   *  completeness, not a second probe alarm. */
+  loadBearingUninspectableKeys: string[];
+  loadBearingSoakingKeys: string[];
+  loadBearingAcceptedKeys: string[];
 }
 
 export interface GuardInventoryResult {
@@ -90,9 +122,22 @@ export interface GuardInventoryResult {
 const ROW_FIELD_ALLOWLIST: ReadonlySet<string> = new Set([
   'key', 'configEnabled', 'defaultEnabled', 'effective', 'offClass',
   'divergence', 'runtime', 'runtimeReason', 'error', 'process',
+  // G3 (§2.2): ALL SIX load-bearing fields named — the projection is closed, so
+  // an unnamed field never leaves the server (omitting acceptedFallbackReason
+  // would hollow the accepted-risk row).
+  'loadBearing', 'criticalPath', 'loadBearingGap', 'loadBearingSoaking',
+  'loadBearingAccepted', 'acceptedFallbackReason',
 ]);
 const RUNTIME_FIELD_ALLOWLIST: ReadonlySet<string> = new Set([
   'enabled', 'dryRun', 'lastTickAt', 'tickAgeMs', 'stale', 'jobCount', 'pausedJobCount',
+  'verdictUnknown', 'verdictUnknownReason',
+]);
+const LOAD_BEARING_UNINSPECTABLE_STATES: ReadonlySet<GuardEffectiveState> = new Set([
+  'missing',
+  'errored',
+  'on-stale',
+  'on-blind',
+  'off-runtime-divergent',
 ]);
 export { ROW_FIELD_ALLOWLIST, RUNTIME_FIELD_ALLOWLIST };
 
@@ -110,13 +155,34 @@ interface DeriveInput {
   bootSnapshotAvailable: boolean;
   runtime: GuardRuntimeRead;
   now: number;
+  /** G3 (§2.6): the operator-accept record for THIS guard on THIS machine,
+   *  read/scoped by the CALLER and threaded in — deriveGuardRow stays PURE. */
+  acceptedFallback?: AcceptedFallbackRecord;
+}
+
+/**
+ * G3 soak-window evaluation (§2.1 lint fallback). Returns true iff an on-dry-run
+ * load-bearing guard is still WITHIN its bounded soak window. Any absent/malformed
+ * input returns FALSE (→ the loud Gap: the SAFE, loud direction — never silently
+ * non-soaking from a typo). Monotonic on `now`: once past the window it never
+ * reverts (windowEnd is a fixed manifest constant).
+ */
+function isWithinSoakWindow(manifest: GuardManifestEntry | undefined, now: number): boolean {
+  const days = manifest?.soakWindowDays;
+  if (typeof days !== 'number' || days <= 0) return false; // 0/absent ⇒ no grace
+  const declared = manifest?.declaredLoadBearingAt;
+  if (!declared || !declared.trim()) return false;         // REQUIRED — absent ⇒ Gap
+  const declaredAt = Date.parse(declared);
+  if (Number.isNaN(declaredAt)) return false;              // malformed ⇒ Gap
+  const windowEndMs = declaredAt + days * 86_400_000;
+  return now <= windowEndMs;
 }
 
 /**
  * The normative precedence table (spec §2.2) — ONE state per guard, first
  * match wins:
  *   errored → missing → off-runtime-divergent → diverged-pending-restart →
- *   off → on-dry-run → on-stale → on-confirmed → on-unverified
+ *   off → on-dry-run → on-stale → on-blind → on-confirmed → on-unverified
  */
 export function deriveGuardRow(input: DeriveInput): GuardRow {
   const { key, manifest, runtime, now } = input;
@@ -161,6 +227,12 @@ export function deriveGuardRow(input: DeriveInput): GuardRow {
     }
     if (typeof s.jobCount === 'number') runtimeProjection.jobCount = s.jobCount;
     if (typeof s.pausedJobCount === 'number') runtimeProjection.pausedJobCount = s.pausedJobCount;
+    if (s.verdictUnknown === true) {
+      runtimeProjection.verdictUnknown = true;
+      if (typeof s.verdictUnknownReason === 'string') {
+        runtimeProjection.verdictUnknownReason = s.verdictUnknownReason;
+      }
+    }
   } else if (runtime.kind === 'error') {
     runtimeReason = 'status-error';
     error = runtime.message;
@@ -231,6 +303,8 @@ export function deriveGuardRow(input: DeriveInput): GuardRow {
     effective = 'on-dry-run'; // watching but toothless; stale stays visible in the runtime block
   } else if (stale) {
     effective = 'on-stale';
+  } else if (runtime.kind === 'ok' && runtime.status.verdictUnknown === true) {
+    effective = 'on-blind';
   } else if (runtime.kind === 'ok' && runtime.status.enabled) {
     effective = 'on-confirmed';
   } else {
@@ -252,6 +326,31 @@ export function deriveGuardRow(input: DeriveInput): GuardRow {
   };
   if (runtimeReason) row.runtimeReason = runtimeReason;
   if (error) row.error = error;
+
+  // ── G3: dark-but-load-bearing classification (§2.2) — orthogonal FLAGS ──
+  if (manifest?.loadBearing) {
+    row.loadBearing = true;
+    if (manifest.criticalPath) row.criticalPath = manifest.criticalPath; // travels on every posture
+    // A SILENT-unguarded posture is off:dark-default or on-dry-run. The loud
+    // classes (off-runtime-divergent, diverged-from-default off, missing,
+    // errored, on-stale) already alarm under their own class — G3 attaches
+    // criticalPath (above) but sets NO loadBearingGap there (no double-alarm).
+    const silentlyUnguarded =
+      (effective === 'off' && offClass === 'dark-default') || effective === 'on-dry-run';
+    if (silentlyUnguarded) {
+      if (input.acceptedFallback) {
+        // 1. Owned operator acceptance → full Gap suppression + VISIBLE accepted row.
+        row.loadBearingAccepted = true;
+        row.acceptedFallbackReason = input.acceptedFallback.reason;
+      } else if (effective === 'on-dry-run' && isWithinSoakWindow(manifest, now)) {
+        // 2. Graduate arm: dry-run within the bounded soak window (no attention item).
+        row.loadBearingSoaking = true;
+      } else {
+        // 3. Loud: silently unguarded, past soak (or never soakable), not accepted.
+        row.loadBearingGap = true;
+      }
+    }
+  }
   return row;
 }
 
@@ -264,32 +363,28 @@ export function buildGuardInventory(opts: {
   bootSnapshot: GuardPostureBootSnapshot | null;
   registry: GuardRegistry;
   now?: number;
+  /** G3 (§2.6): THIS machine's operator-accept records, keyed by guardKey. The
+   *  CALLER reads state/guard-accepted-fallbacks.json ONCE + scopes to self, then
+   *  threads it here — buildGuardInventory stays PURE (no fs). */
+  acceptedFallbacks?: ScopedAcceptedFallbacks;
 }): GuardInventoryResult {
   const now = opts.now ?? Date.now();
-  const extractedCurrent = extractGuardPosture(opts.snapshot.resolved);
-  const extractedDefaults = extractGuardPosture(opts.snapshot.defaults);
+  // The endpoint and boot tripwire consume this exact same union builder.
+  // Keeping key/value assembly in one funnel prevents the 36-of-90 split where
+  // /guards knew the manifest but the transition detector did not.
+  const currentPosture = buildCompleteGuardPosture(opts.snapshot.resolved).posture;
+  const defaultPosture = buildCompleteGuardPosture(opts.snapshot.defaults).posture;
   const manifestMap = new Map<string, GuardManifestEntry>();
   for (const entry of GUARD_MANIFEST) manifestMap.set(entry.key, entry);
 
-  const keys = [...new Set([...Object.keys(extractedCurrent), ...manifestMap.keys()])].sort();
+  const keys = Object.keys(currentPosture).sort();
 
   const guards: GuardRow[] = [];
   for (const key of keys) {
     const manifest = manifestMap.get(key);
 
-    let configEnabled = asBool(extractedCurrent[key]);
-    let defaultEnabled = asBool(extractedDefaults[key]);
-    if (configEnabled === undefined && manifest?.configPath) {
-      configEnabled = asBool(getConfigByPath(opts.snapshot.resolved, manifest.configPath));
-    }
-    if (defaultEnabled === undefined && manifest?.configPath) {
-      defaultEnabled = asBool(getConfigByPath(opts.snapshot.defaults, manifest.configPath));
-    }
-    if (defaultEnabled === undefined && manifest) defaultEnabled = manifest.defaultEnabled;
-    // The resolved snapshot normally contains every default key (defaults are
-    // merged in), but a degraded/partial snapshot must still yield the
-    // default-resolved state — a guard can never drop out of the inventory.
-    if (configEnabled === undefined) configEnabled = defaultEnabled;
+    const configEnabled = asBool(currentPosture[key]);
+    const defaultEnabled = asBool(defaultPosture[key]);
 
     const configDryRun = manifest?.dryRunConfigPath
       ? asBool(getConfigByPath(opts.snapshot.resolved, manifest.dryRunConfigPath))
@@ -307,23 +402,33 @@ export function buildGuardInventory(opts: {
         bootSnapshotAvailable: !!bootPosture,
         runtime: opts.registry.read(key),
         now,
+        acceptedFallback: opts.acceptedFallbacks?.[key],
       }),
     );
   }
 
   const summary: GuardsSummary = {
-    onConfirmed: 0, onUnverified: 0, onStale: 0, onDryRun: 0,
+    onConfirmed: 0, onUnverified: 0, onStale: 0, onBlind: 0, onDryRun: 0,
     off: 0, offDeviant: 0, offDarkDefault: 0,
     divergedPendingRestart: 0, errored: 0, missing: 0, offRuntimeDivergent: 0,
     runtimeEnriched: '',
+    loadBearingGapKeys: [], loadBearingUninspectableKeys: [],
+    loadBearingSoakingKeys: [], loadBearingAcceptedKeys: [],
   };
   let enriched = 0;
   for (const g of guards) {
     if (g.runtime) enriched++;
+    if (g.loadBearingGap) summary.loadBearingGapKeys.push(g.key);
+    if (g.loadBearing && LOAD_BEARING_UNINSPECTABLE_STATES.has(g.effective)) {
+      summary.loadBearingUninspectableKeys.push(g.key);
+    }
+    if (g.loadBearingSoaking) summary.loadBearingSoakingKeys.push(g.key);
+    if (g.loadBearingAccepted) summary.loadBearingAcceptedKeys.push(g.key);
     switch (g.effective) {
       case 'on-confirmed': summary.onConfirmed++; break;
       case 'on-unverified': summary.onUnverified++; break;
       case 'on-stale': summary.onStale++; break;
+      case 'on-blind': summary.onBlind++; break;
       case 'on-dry-run': summary.onDryRun++; break;
       case 'off':
         summary.off++;
@@ -362,6 +467,7 @@ export function buildHeartbeatPostureBlock(
     onConfirmed: s.onConfirmed,
     onUnverified: s.onUnverified,
     onStale: s.onStale,
+    onBlind: s.onBlind,
     onDryRun: s.onDryRun,
     offDeviant: s.offDeviant,
     offDeviantKeys,
@@ -370,6 +476,17 @@ export function buildHeartbeatPostureBlock(
     divergedPendingRestart: s.divergedPendingRestart,
     errored: s.errored,
     missing: s.missing,
+    // G3 (§2.6): the load-bearing key-lists ride the heartbeat so peer posture is
+    // visible fleet-wide. The heartbeat compute (server.ts site 3) threads
+    // the local accept map + `now`, so these are already correctly derived here —
+    // this block just filters (an accepted guard never ships as a loadBearingGap).
+    loadBearingGapKeys: [...s.loadBearingGapKeys],
+    loadBearingUninspectable: s.loadBearingUninspectableKeys.length,
+    loadBearingUninspectableKeys: [...s.loadBearingUninspectableKeys]
+      .sort((a, b) => a.localeCompare(b))
+      .slice(0, HEARTBEAT_LOAD_BEARING_UNINSPECTABLE_KEY_CAP),
+    loadBearingSoakingKeys: [...s.loadBearingSoakingKeys],
+    loadBearingAcceptedKeys: [...s.loadBearingAcceptedKeys],
     generatedAt,
   };
 }

@@ -12,7 +12,11 @@
 import { Router, type Request, type Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import { IDENTITY_AUTO_ACCEPT_PROTECTED_PATHS, isRemoteIdentityAuthorityPath } from '../core/IdentityStore.js';
+import { KEY_MATERIAL_DYNAMIC_DIRS, KEY_MATERIAL_FILES, KEY_MATERIAL_NEVER_SERVED_PREFIXES, KEY_MATERIAL_ROOT_NAME_PREFIXES } from '../core/keyMaterialPaths.js';
 import type { InstarConfig, FileViewerConfig } from '../core/types.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
+import { refuseUnsupportedFields } from './refuseUnsupportedFields.js';
 
 // ── Defaults ─────────────────────────────────────────────────────────
 
@@ -78,6 +82,98 @@ function isBinaryFile(filePath: string, buffer?: Buffer): boolean {
   return false;
 }
 
+// ── Never-served paths (security invariant — read + edit deny) ───────
+
+/**
+ * Paths that are NEVER served over HTTP regardless of config — list, read,
+ * download, link, edit, and any proxy that lands on this machine's file routes
+ * (ownership-gated-spawn-and-judgment-within-floors spec §3.5).
+ *
+ * Distinct from NEVER_EDITABLE_PREFIXES (edit-only) and from
+ * `blockedFilenames` (config-mutable via PATCH /api/files/config): this list
+ * is HARDCODED and config-immune, and it is enforced inside validatePath
+ * against the FULLY-RESOLVED (realpath) project-relative path, so a symlink
+ * inside an allowed path cannot evade it. A never-served path is also
+ * never-editable by construction (isNeverEditable consults this list too —
+ * a confused session must not be able to poison provenance rows that the
+ * graded-review job replays into bench batteries).
+ */
+export const NEVER_SERVED_PREFIXES = [
+  // machine-self-assertion FD9: this manifest is the single mechanical list of
+  // identity/evidence inputs whose bearer readability or writability would
+  // collapse the auto-accept boundary. isNeverEditable delegates to this list.
+  ...IDENTITY_AUTO_ACCEPT_PROTECTED_PATHS,
+  // Registry may converge only through the purpose-built registry merge path;
+  // generic bearer file reads/writes remain forbidden.
+  '.instar/machines/registry.json',
+  // Judgment-call provenance rows: full decision context, machine-local only
+  // (0700/0600, gitignored, backup-excluded). The HTTP read surface for this
+  // data is GET /judgment-provenance (redacted rows only) — never the files.
+  // DUAL-ROOT (llm-decision-quality-meter spec §5.3, SEC r4): this list matches
+  // PROJECTDIR-relative paths while the log lives under <projectDir>/.instar/
+  // state/ (stateDir), so the bare 'state/' literal never matches a production
+  // path — it stays only as a legacy-layout regression pin.
+  'state/judgment-provenance/',
+  '.instar/state/judgment-provenance/',
+  // Chrome profiles and the Linux driver's cookie, bindings and page reads (normal-chrome-linux).
+  // The trailing slash keeps state/playwright-profiles.json served.
+  'state/playwright-profiles/',
+  '.instar/state/playwright-profiles/',
+  'state/xdrive/',
+  '.instar/state/xdrive/',
+  // Codex device-limit judge provenance (codex-device-limit-tripwire §1): the prepared refusal
+  // text, machine-local only; the HTTP surface is the content-free log + GET /subscription-pool.
+  'state/codex-device-limit-provenance/',
+  '.instar/state/codex-device-limit-provenance/',
+  // External-hog decision store: grading GROUND TRUTH (llm-decision-quality-
+  // meter spec §5.3) — the dashboard file editor must not read or rewrite it
+  // (serve-deny implies edit-deny via isNeverEditable).
+  '.instar/state/external-hog-decisions.json',
+  // Hook telemetry (docs/specs/native-hook-events.md D1): per-session event
+  // records (paths, redacted message tails) and subagent records. Machine-local
+  // observability, read through /hooks/events/* — never served as files.
+  '.instar/hook-events/',
+  '.instar/subagent-tracking/',
+  // Machine-bound subscription authority: active directory, witness,
+  // candidates, rollbacks, and atomic temp siblings. Dual-root is required:
+  // production paths include `.instar/`, legacy/test paths may not.
+  'state/subscription-pool',
+  '.instar/state/subscription-pool',
+  'state/subscription-login-ledger',
+  '.instar/state/subscription-login-ledger',
+  'state/subscription-relogin',
+  '.instar/state/subscription-relogin',
+  'state/claim-verification/',
+  '.instar/state/claim-verification/',
+  // The agent's own config: round-13 fenced it as never-EDITABLE because it
+  // selects which executable a session spawns. Round-17 (security) found the
+  // read half open — the same Bearer token that cannot write this file could
+  // GET it and read `dashboardPin` and `authToken` verbatim. Every PIN-gated
+  // lever deliberately reserved for an operator act on the machine was then
+  // one HTTP GET away, which makes the write fence worth nothing. Serve-deny
+  // implies edit-deny via isNeverEditable, so this one entry closes read,
+  // download, link, list AND edit. A redacted read surface, if ever wanted,
+  // belongs behind a route that strips the credentials — not the raw file.
+  '.instar/config.json',
+  // Key material (a2a-single-agent-identity §5.1): the agent identity (and its
+  // superseded/invalid/temp siblings), the legacy routing mirror, the
+  // threadline HMAC/invitation/token files, the dedicated SSH keys, the
+  // headless key vault, origin-session credentials and the bind-token secret.
+  // ONE list (src/core/keyMaterialPaths.ts) also feeds backup, gitignore and
+  // the sync classifier, so the four surfaces cannot drift apart.
+  ...KEY_MATERIAL_NEVER_SERVED_PREFIXES,
+];
+
+export function isNeverServed(relativePath: string): boolean {
+  // Case-folded for the same reason as isNeverEditable (round-14 security): on
+  // a case-insensitive filesystem a capitalised request reaches the same file.
+  const normalized = path.normalize(relativePath).toLowerCase();
+  return isRemoteIdentityAuthorityPath(normalized) || NEVER_SERVED_PREFIXES.some(prefix => {
+    const p = prefix.toLowerCase();
+    return normalized.startsWith(p) || normalized === p.replace(/\/$/, '');
+  });
+}
+
 // ── Path validation (6-layer defense) ────────────────────────────────
 
 interface PathValidationResult {
@@ -85,24 +181,60 @@ interface PathValidationResult {
   error?: string;
   status?: number;
   resolvedPath?: string; // absolute path after validation
+  /**
+   * Project-relative path AFTER symlink resolution (round-14 security). The
+   * edit chokepoints must deny on THIS, not on the requested path: a symlink
+   * inside an allowed directory pointing at `.instar/config.json` (or into
+   * `.claude/hooks/`) was accepted, because `isNeverEditable` saw only the
+   * alias while the write went to the resolved target. Verified end-to-end
+   * against the real route before the fix: 200, and the real file rewritten.
+   * `isNeverServed` already had this post-realpath re-check and says in its own
+   * comment that it exists so "a symlink cannot evade it" — the edit list
+   * simply never got the same treatment.
+   */
+  relativeAfterResolve?: string;
+  /**
+   * `stat` of the resolved path taken AT validation time (§5.2). `read` and
+   * `download` open the file, `fstat` the descriptor, and refuse unless its
+   * device+inode equals THIS — the file that was checked is the file that is
+   * served, even if the symlink was swapped between the check and the open.
+   */
+  resolvedStat?: fs.Stats;
 }
 
-async function validatePath(
+/**
+ * Layers 1–4 of the path defense, as one shared pure pre-check: normalize,
+ * reject absolute, reject traversal, never-served deny, allowedPaths match
+ * (with the '.'/'./' project-root convention and segment-boundary matching).
+ *
+ * Exported as the SINGLE source of truth for "is this relative path within
+ * the allowed directories". The /api/files/link route used to carry its own
+ * inline duplicate of this policy, which drifted: it never learned the
+ * project-root convention (so the DEFAULT config `allowedPaths: ['./']`
+ * 403'd every link), matched prefixes without a segment boundary, and
+ * skipped the absolute/traversal rejections. One helper, no drift.
+ */
+export function checkRelativePathAllowed(
   requestedPath: string,
-  projectDir: string,
   config: FileViewerConfig,
-): Promise<PathValidationResult> {
+): { ok: true; normalized: string } | { ok: false; error: string; status: number } {
   // Layer 1: Normalize
   const normalized = path.normalize(requestedPath);
 
   // Layer 2: Reject absolute paths
   if (path.isAbsolute(normalized)) {
-    return { valid: false, error: 'Absolute paths are not allowed', status: 403 };
+    return { ok: false, error: 'Absolute paths are not allowed', status: 403 };
   }
 
   // Layer 3: Reject path traversal
   if (normalized.includes('..')) {
-    return { valid: false, error: 'Path traversal not allowed', status: 403 };
+    return { ok: false, error: 'Path traversal not allowed', status: 403 };
+  }
+
+  // Layer 3b: Never-served deny (fast path — validatePath's load-bearing
+  // check re-runs post-realpath at Layer 5e so a symlink cannot evade it).
+  if (isNeverServed(normalized)) {
+    return { ok: false, error: 'Access to this path is not permitted', status: 403 };
   }
 
   // Layer 4: Check against allowedPaths
@@ -118,8 +250,22 @@ async function validatePath(
            normalizedClean.startsWith(normalizedAllowed + '/');
   });
   if (!allowed) {
-    return { valid: false, error: 'Path not in allowed directories', status: 403 };
+    return { ok: false, error: 'Path not in allowed directories', status: 403 };
   }
+  return { ok: true, normalized };
+}
+
+async function validatePath(
+  requestedPath: string,
+  projectDir: string,
+  config: FileViewerConfig,
+): Promise<PathValidationResult> {
+  // Layers 1–4 via the shared pre-check (single source of truth).
+  const pre = checkRelativePathAllowed(requestedPath, config);
+  if (!pre.ok) {
+    return { valid: false, error: pre.error, status: pre.status };
+  }
+  const normalized = pre.normalized;
 
   // Layer 5: Symlink resolution
   const absolutePath = path.resolve(projectDir, normalized);
@@ -147,12 +293,134 @@ async function validatePath(
     if (!allowedAfterResolve) {
       return { valid: false, error: 'Resolved path not in allowed directories', status: 403 };
     }
-    return { valid: true, resolvedPath: realPath };
+    // Layer 5e: Never-served deny against the FULLY-RESOLVED project-relative
+    // path — a symlink inside an allowed path that dereferences into a
+    // never-served prefix is refused here (config-immune, spec §3.5).
+    if (isNeverServed(relativAfterResolve)) {
+      return { valid: false, error: 'Access to this path is not permitted', status: 403 };
+    }
+    // Layer 5f: `blockedFilenames` on the RESOLVED name too (§5.2) — the
+    // requested-name check in each route sees only the alias; a symlink named
+    // `notes.md` pointing at `.env` was served before this.
+    const resolvedStat = await fs.promises.stat(realPath);
+    return { valid: true, resolvedPath: realPath, relativeAfterResolve: relativAfterResolve, resolvedStat };
   } catch (err: unknown) {
     if (err && typeof err === 'object' && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT') {
       return { valid: false, error: 'Path not found', status: 404 };
     }
-    return { valid: false, error: 'Path validation failed', status: 500 };
+    // A `realpath` that fails for any other reason (ELOOP, EACCES, a dangling
+    // link that lstat saw) REFUSES (§5.2) — never a 500 that invites a retry
+    // and never a fall-through to the requested path.
+    return { valid: false, error: 'Path could not be resolved', status: 403 };
+  }
+}
+
+/**
+ * Open the checked file and prove the descriptor IS the checked file (§5.2).
+ *
+ * `validatePath` resolves and denies on a PATH. Between that check and a
+ * by-path re-open, a symlink can be swapped at a key file (check-then-serve
+ * race). So the routes open FIRST, `fstat` the descriptor, and serve from that
+ * descriptor only when its device+inode equals the `stat` taken at validation.
+ *
+ * A hard link is the other way an inode escapes a prefix check: a link OUTSIDE
+ * `.instar/` carries a key's inode under an innocent name, and no path-based
+ * list can see it. When the descriptor reports `nlink > 1` its device+inode is
+ * compared against every listed key file (a dozen `stat` calls, per request —
+ * only on the rare multi-link file) and refused on a match.
+ *
+ * Returns the open handle (the caller closes it) or `null` with the refusal
+ * reason. Exported for the unit test that swaps the target between the check
+ * and the open — the only way to exercise the race deterministically.
+ */
+export async function openCheckedDescriptor(
+  realPath: string,
+  checkedStat: fs.Stats,
+  projectDir: string,
+): Promise<{ handle: fs.promises.FileHandle; stat: fs.Stats } | { handle: null; reason: string }> {
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fs.promises.open(realPath, 'r');
+  } catch {
+    return { handle: null, reason: 'Path could not be opened' };
+  }
+  try {
+    const opened = await handle.stat();
+    if (opened.dev !== checkedStat.dev || opened.ino !== checkedStat.ino) {
+      await handle.close();
+      return { handle: null, reason: 'File changed between check and open' };
+    }
+    if (opened.nlink > 1) {
+      const stateDir = path.join(projectDir, '.instar');
+      for (const abs of await keyInodeCandidates(stateDir)) {
+        let keyStat: fs.Stats;
+        try {
+          keyStat = await fs.promises.stat(abs);
+        } catch {
+          continue; // that key file does not exist on this agent
+        }
+        if (keyStat.dev === opened.dev && keyStat.ino === opened.ino) {
+          await handle.close();
+          return { handle: null, reason: 'Access to this path is not permitted' };
+        }
+      }
+    }
+    return { handle, stat: opened };
+  } catch {
+    await handle.close().catch(() => { /* already failing */ });
+    return { handle: null, reason: 'Path could not be opened' };
+  }
+}
+
+/**
+ * The key files whose inode a hard link could carry (§5.2): the static list
+ * plus the generation-named keys under `machine-ssh/` and the
+ * `origin-sessions-<digest>` files at the stateDir root, which a static list
+ * cannot name. Two `readdir`s, only on the rare multi-link path.
+ */
+async function keyInodeCandidates(stateDir: string): Promise<string[]> {
+  const out = KEY_MATERIAL_FILES.map((rel) => path.join(stateDir, rel));
+  for (const dir of KEY_MATERIAL_DYNAMIC_DIRS) {
+    try {
+      for (const name of await fs.promises.readdir(path.join(stateDir, dir))) out.push(path.join(stateDir, dir, name));
+    } catch { /* directory absent on this agent — nothing to enumerate */ }
+  }
+  try {
+    for (const name of await fs.promises.readdir(stateDir)) {
+      if (KEY_MATERIAL_ROOT_NAME_PREFIXES.some((p) => name.startsWith(p))) out.push(path.join(stateDir, name));
+    }
+  } catch { /* stateDir absent — nothing to enumerate */ }
+  return out;
+}
+
+/**
+ * Per-entry admission for `list` (§5.2): an entry is OMITTED — never listed,
+ * never 403'd by name — when it is never-served by its requested path, when
+ * its `realpath` fails (a dangling symlink), when it resolves outside the
+ * project root, when its RESOLVED path is never-served, or when either the
+ * requested or the resolved basename matches `blockedFilenames`. A symlink
+ * with an innocent name pointing at a key file is therefore hidden, matching
+ * the route's existing skip-on-stat-failure shape.
+ */
+async function resolveListEntry(
+  dirAbs: string,
+  entryName: string,
+  entryRelPath: string,
+  realProjectDir: string,
+  config: FileViewerConfig,
+): Promise<{ realPath: string; stat: fs.Stats } | null> {
+  if (isNeverServed(entryRelPath)) return null;
+  if (isBlockedFilename(entryName, config.blockedFilenames)) return null;
+  try {
+    const realPath = await fs.promises.realpath(path.join(dirAbs, entryName));
+    if (!realPath.startsWith(realProjectDir + path.sep) && realPath !== realProjectDir) return null;
+    const resolvedRel = path.relative(realProjectDir, realPath);
+    if (isNeverServed(resolvedRel)) return null;
+    if (isBlockedFilename(path.basename(realPath), config.blockedFilenames)) return null;
+    const stat = await fs.promises.stat(realPath);
+    return { realPath, stat };
+  } catch {
+    return null;
   }
 }
 
@@ -195,13 +463,43 @@ const NEVER_EDITABLE_PREFIXES = [
   // direct edits to instar/ would be overwritten on next update and risk
   // breaking the signed lock-file's body-hash verification.
   '.instar/jobs/instar/',
+  // claude-md-reference-layout spec: generated reference files are rewritten on
+  // every update, so a dashboard edit there would be silently lost.
+  '.instar/reference/',
+  // Round-13 (security, grok-build spec §2.1): `.instar/config.json` selects
+  // WHICH EXECUTABLE a session spawns (`sessions.frameworkBinaryPaths`), which
+  // credentials a lane uses, and which features are enabled. `PATCH /config`
+  // was fenced against the executable key — and that fence was incomplete
+  // while the same Bearer token could write the whole file through the editor,
+  // so the stated boundary ("an operator act on the machine") was not held. It
+  // is a machine-local operator surface, not a document to edit from a phone;
+  // the conversational config path and a raw file edit remain.
+  '.instar/config.json',
 ];
 
-function isNeverEditable(relativePath: string): boolean {
-  const normalized = path.normalize(relativePath);
-  return NEVER_EDITABLE_PREFIXES.some(prefix =>
-    normalized.startsWith(prefix) || normalized === prefix.replace(/\/$/, ''),
-  );
+/**
+ * Exported for the round-14 bypass tests: the case-folding and resolved-path
+ * behaviour must be asserted against THIS predicate, not a sibling that merely
+ * shares the fix — a proxy assertion is the "narrower than what it certifies"
+ * class this branch has been catching all night.
+ */
+export function isNeverEditable(relativePath: string): boolean {
+  // CASE-FOLDED (round-14 security). macOS APFS and Windows are
+  // case-INSENSITIVE, so a case-sensitive comparison here was bypassable by
+  // asking for `.instar/Config.json` — verified end-to-end against the real
+  // route: 403 for the exact case, 200 (and the real file rewritten) for a
+  // capitalised one. The sibling `isBlockedFilename` in this same file already
+  // lower-cases both sides; this list did not, and the entries it guards are
+  // the ones whose invariant is "a PIN compromise must never result in
+  // arbitrary code execution" (`.claude/hooks/`, `.claude/scripts/`).
+  const normalized = path.normalize(relativePath).toLowerCase();
+  // A never-served path is never-editable by construction (spec §3.5): the
+  // serve-deny implies the edit-deny at every chokepoint that consults this.
+  if (isNeverServed(normalized)) return true;
+  return NEVER_EDITABLE_PREFIXES.some(prefix => {
+    const p = prefix.toLowerCase();
+    return normalized.startsWith(p) || normalized === p.replace(/\/$/, '');
+  });
 }
 
 // ── Audit log ────────────────────────────────────────────────────────
@@ -226,15 +524,19 @@ async function appendAuditLog(
 export function createFileRoutes(options: { config: InstarConfig; liveConfig?: { set(path: string, value: unknown): void } }): Router {
   const router = Router();
   const projectDir = options.config.projectDir;
-  const config: FileViewerConfig = {
-    ...DEFAULT_FILE_VIEWER_CONFIG,
-    ...options.config.dashboard?.fileViewer,
-  };
+  const config: FileViewerConfig = mergeDefaults(DEFAULT_FILE_VIEWER_CONFIG, options.config.dashboard?.fileViewer);
 
   const liveConfig = options.liveConfig ?? null;
 
-  // If file viewer is disabled, return empty router
-  if (!config.enabled) return router;
+  // Disabled (at boot, or while running via PATCH /api/files/config {enabled:false}): every
+  // file route but the config route itself answers 404. The routes are mounted either way so
+  // the config route exists to turn the viewer back on — an empty router when off at boot
+  // left the feature switch's own enable target answering 404 forever
+  // (spec feature-transition-applies-action §2.7).
+  router.use('/api/files', (req: Request, res: Response, next) => {
+    if (config.enabled || req.path === '/config') { next(); return; }
+    res.status(404).json({ error: 'file viewer is disabled' });
+  });
 
   // ── GET /api/files/list ────────────────────────────────────────
 
@@ -262,16 +564,16 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
             return a.name.localeCompare(b.name);
           });
           const entries: Array<{ name: string; type: string; size?: number; modified?: string }> = [];
+          const realProjectDir = await fs.promises.realpath(projectDir);
           for (const entry of sorted.slice(0, 500)) {
-            if (isBlockedFilename(entry.name, config.blockedFilenames)) continue;
-            if (entry.isDirectory()) {
+            // §5.2: every entry (directories and symlinks included) is
+            // resolved and admitted by the same rules as a direct request.
+            const resolved = await resolveListEntry(projectDir, entry.name, entry.name, realProjectDir, config);
+            if (!resolved) continue;
+            if (resolved.stat.isDirectory()) {
               entries.push({ name: entry.name, type: 'directory' });
-            } else if (entry.isFile() || entry.isSymbolicLink()) {
-              try {
-                const entryAbsPath = path.join(projectDir, entry.name);
-                const entryStat = await fs.promises.stat(entryAbsPath);
-                entries.push({ name: entry.name, type: 'file', size: entryStat.size, modified: entryStat.mtime.toISOString() });
-              } catch { /* skip */ }
+            } else if (resolved.stat.isFile()) {
+              entries.push({ name: entry.name, type: 'file', size: resolved.stat.size, modified: resolved.stat.mtime.toISOString() });
             }
           }
           res.json({ path: '', entries });
@@ -334,29 +636,25 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       // Limit to 500 entries
       const limited = sorted.slice(0, 500);
 
+      const realProjectDir = await fs.promises.realpath(projectDir);
       for (const entry of limited) {
-        // Skip blocked filenames
-        if (isBlockedFilename(entry.name, config.blockedFilenames)) continue;
-        // Skip hidden files starting with . (except specifically allowed like .claude)
-        // Actually, don't skip — let the user see what's there within allowed dirs
-
         const entryRelPath = path.join(path.normalize(requestedPath), entry.name);
+        // §5.2: resolve EACH entry and omit one whose realpath fails or is
+        // denied (requested OR resolved path never-served; requested OR
+        // resolved basename blocked). A symlink with an innocent name that
+        // points at a key file is hidden, not listed.
+        const resolved = await resolveListEntry(absPath, entry.name, entryRelPath, realProjectDir, config);
+        if (!resolved) continue;
 
-        if (entry.isDirectory()) {
+        if (resolved.stat.isDirectory()) {
           entries.push({ name: entry.name, type: 'directory' });
-        } else if (entry.isFile() || entry.isSymbolicLink()) {
-          try {
-            const entryAbsPath = path.join(absPath, entry.name);
-            const entryStat = await fs.promises.stat(entryAbsPath);
-            entries.push({
-              name: entry.name,
-              type: 'file',
-              size: entryStat.size,
-              modified: entryStat.mtime.toISOString(),
-            });
-          } catch {
-            // Skip entries we can't stat
-          }
+        } else if (resolved.stat.isFile()) {
+          entries.push({
+            name: entry.name,
+            type: 'file',
+            size: resolved.stat.size,
+            modified: resolved.stat.mtime.toISOString(),
+          });
         }
       }
 
@@ -394,8 +692,8 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       return;
     }
 
-    // Check blocked filenames
-    const blocked = checkBlockedFilename(requestedPath, config);
+    // Check blocked filenames — on the requested AND the resolved name (§5.2).
+    const blocked = checkBlockedFilename(requestedPath, config) ?? checkBlockedFilename(validation.resolvedPath!, config);
     if (blocked) {
       res.status(403).json({ error: blocked });
       return;
@@ -404,25 +702,38 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
     const absPath = validation.resolvedPath!;
 
     try {
-      const stat = await fs.promises.stat(absPath);
+      const checkedStat = validation.resolvedStat!;
 
-      if (stat.isDirectory()) {
+      if (checkedStat.isDirectory()) {
         res.status(400).json({ error: 'Path is a directory, use /api/files/list instead' });
         return;
       }
 
       // Size check
-      if (stat.size > config.maxFileSize) {
+      if (checkedStat.size > config.maxFileSize) {
         res.status(413).json({
           error: 'File too large',
-          size: stat.size,
+          size: checkedStat.size,
           maxSize: config.maxFileSize,
         });
         return;
       }
 
-      // Read initial bytes for binary detection
-      const buffer = await fs.promises.readFile(absPath);
+      // §5.2: open FIRST, prove the descriptor is the checked inode, then read
+      // FROM THAT DESCRIPTOR — a by-path re-open would reintroduce the
+      // check-then-serve race.
+      const opened = await openCheckedDescriptor(absPath, checkedStat, projectDir);
+      if (!opened.handle) {
+        res.status(403).json({ error: opened.reason });
+        return;
+      }
+      const stat = opened.stat;
+      let buffer: Buffer;
+      try {
+        buffer = await opened.handle.readFile();
+      } finally {
+        await opened.handle.close();
+      }
 
       if (isBinaryFile(absPath, buffer)) {
         res.json({
@@ -435,7 +746,16 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       }
 
       const content = buffer.toString('utf-8');
-      const editable = isEditable(requestedPath, config);
+      // Round-17 (security): `isEditable` alone answers "is this in an allowed
+      // path", not "may this be written". A never-editable file was advertised
+      // as editable=true, so the dashboard rendered an editor whose every save
+      // then 403'd. Consult BOTH the requested and the post-realpath path, for
+      // the same reason the save route does — a symlink is otherwise editable
+      // in the listing and refused on write.
+      const editable =
+        isEditable(requestedPath, config) &&
+        !isNeverEditable(requestedPath) &&
+        !(validation.relativeAfterResolve && isNeverEditable(validation.relativeAfterResolve));
 
       res.json({
         path: path.normalize(requestedPath),
@@ -498,8 +818,16 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       return;
     }
 
-    // Never-editable enforcement (security invariant)
-    if (isNeverEditable(requestedPath)) {
+    // Never-editable enforcement (security invariant).
+    // Round-14 (security): deny on the RESOLVED path as well as the requested
+    // one. A symlink inside an allowed directory pointing at a never-editable
+    // target was accepted, because this saw only the alias while the write went
+    // to `validation.resolvedPath`. Verified end-to-end before the fix: 200,
+    // and the real file rewritten — including a `.claude/hooks/` body, which
+    // breaks that list's stated invariant that a PIN compromise must never
+    // yield arbitrary code execution.
+    if (isNeverEditable(requestedPath)
+        || (validation.relativeAfterResolve && isNeverEditable(validation.relativeAfterResolve))) {
       res.status(403).json({ error: 'This path is never editable for security reasons' });
       return;
     }
@@ -637,7 +965,12 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       return;
     }
 
-    const { allowedPaths, editablePaths } = req.body || {};
+    if (refuseUnsupportedFields(res, req.body, ['allowedPaths', 'editablePaths', 'enabled'])) return;
+    const { allowedPaths, editablePaths, enabled } = req.body || {};
+    if (enabled !== undefined && typeof enabled !== 'boolean') {
+      res.status(400).json({ error: 'enabled must be a boolean' });
+      return;
+    }
 
     // Validate allowedPaths
     if (allowedPaths !== undefined) {
@@ -685,7 +1018,13 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       liveConfig.set('dashboard.fileViewer.editablePaths', editablePaths);
     }
 
+    if (enabled !== undefined) {
+      config.enabled = enabled;
+      liveConfig.set('dashboard.fileViewer.enabled', enabled);
+    }
+
     res.json({
+      enabled: config.enabled,
       allowedPaths: config.allowedPaths,
       editablePaths: config.editablePaths,
       updated: true,
@@ -707,7 +1046,8 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       return;
     }
 
-    const blocked = checkBlockedFilename(requestedPath, config);
+    // Blocked filenames on the requested AND the resolved name (§5.2).
+    const blocked = checkBlockedFilename(requestedPath, config) ?? checkBlockedFilename(validation.resolvedPath!, config);
     if (blocked) {
       res.status(403).json({ error: blocked });
       return;
@@ -716,23 +1056,32 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
     const absPath = validation.resolvedPath!;
 
     try {
-      const stat = await fs.promises.stat(absPath);
-      if (stat.isDirectory()) {
+      const checkedStat = validation.resolvedStat!;
+      if (checkedStat.isDirectory()) {
         res.status(400).json({ error: 'Cannot download a directory' });
         return;
       }
 
-      if (stat.size > config.maxFileSize) {
-        res.status(413).json({ error: 'File too large', size: stat.size, maxSize: config.maxFileSize });
+      if (checkedStat.size > config.maxFileSize) {
+        res.status(413).json({ error: 'File too large', size: checkedStat.size, maxSize: config.maxFileSize });
         return;
       }
+
+      // §5.2: open first, prove the descriptor is the checked inode, stream
+      // FROM THAT DESCRIPTOR (never a by-path createReadStream).
+      const opened = await openCheckedDescriptor(absPath, checkedStat, projectDir);
+      if (!opened.handle) {
+        res.status(403).json({ error: opened.reason });
+        return;
+      }
+      const stat = opened.stat;
 
       const filename = path.basename(absPath);
       res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '\\"')}"`);
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Length', stat.size);
 
-      const stream = fs.createReadStream(absPath);
+      const stream = opened.handle.createReadStream({ autoClose: true });
       stream.pipe(res);
       stream.on('error', () => {
         if (!res.headersSent) {
@@ -747,7 +1096,7 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
   // ── GET /api/files/link ─────────────────────────────────────────
   // Phase 3: Generate a deep link URL for a file in the dashboard
 
-  router.get('/api/files/link', (req: Request, res: Response) => {
+  router.get('/api/files/link', async (req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store');
 
     const filePath = typeof req.query.path === 'string' ? req.query.path : '';
@@ -756,15 +1105,19 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
       return;
     }
 
-    // Validate path is within allowed directories
+    // §5.2: RESOLVE before minting — the full validatePath (lstat, realpath,
+    // post-dereference root/allowed/never-served checks), not just the
+    // pre-check on the requested spelling. A link to a symlink that
+    // dereferences into key material is refused; a realpath failure refuses.
+    const validation = await validatePath(filePath, projectDir, config);
+    if (!validation.valid) {
+      res.status(validation.status || 403).json({ error: validation.error });
+      return;
+    }
     const normalized = path.normalize(filePath);
-    const inAllowed = config.allowedPaths.some(ap => {
-      const normalizedAllowed = path.normalize(ap);
-      return normalized.startsWith(normalizedAllowed) || normalized === normalizedAllowed.replace(/\/$/, '');
-    });
-
-    if (!inAllowed) {
-      res.status(403).json({ error: 'Path not in allowed directories' });
+    const blocked = checkBlockedFilename(normalized, config) ?? checkBlockedFilename(validation.resolvedPath!, config);
+    if (blocked && !validation.resolvedStat!.isDirectory()) {
+      res.status(403).json({ error: blocked });
       return;
     }
 
@@ -774,7 +1127,12 @@ export function createFileRoutes(options: { config: InstarConfig; liveConfig?: {
     res.json({
       path: normalized,
       relative: relativePath,
-      editable: isEditable(normalized, config),
+      // Round-17 (security): same conjunction as the read route — a link must
+      // not advertise an editor for a path whose save is fenced.
+      editable:
+        isEditable(normalized, config) &&
+        !isNeverEditable(normalized) &&
+        !(validation.relativeAfterResolve && isNeverEditable(validation.relativeAfterResolve)),
     });
   });
 

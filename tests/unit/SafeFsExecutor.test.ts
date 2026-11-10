@@ -1,5 +1,5 @@
 // safe-git-allow: this is the test file for SafeFsExecutor; direct fs usage is for fixture setup only.
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -125,6 +125,32 @@ describe('SafeFsExecutor.safeUnlinkSync', () => {
       SafeFsExecutor.safeUnlinkSync(file, { operation: 'unlink-blocked' }),
     ).toThrow(SourceTreeGuardError);
     expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('unlinks only inside an explicitly scoped local verifier clone', async () => {
+    const verifyRoot = path.join(benign, '.worktrees', '.verify');
+    const clone = path.join(verifyRoot, 'runs', 'one');
+    fs.mkdirSync(clone, { recursive: true });
+    fs.writeFileSync(path.join(clone, '.instar-source-tree'), 'marker');
+    fs.mkdirSync(path.join(clone, '.git'));
+    fs.writeFileSync(path.join(clone, '.git', 'config'), '[core]\n\trepositoryformatversion = 0\n');
+    const syncFile = path.join(clone, 'sync-helper');
+    const asyncFile = path.join(clone, 'async-helper');
+    const outsideFile = path.join(fakeInstar, 'outside-helper');
+    for (const file of [syncFile, asyncFile, outsideFile]) fs.writeFileSync(file, 'x');
+
+    expect(() => SafeFsExecutor.safeUnlinkSync(syncFile, {
+      operation: 'verifier-cleanup-test', localVerifyScopeOk: { verifyRoot },
+    })).not.toThrow();
+    await expect(SafeFsExecutor.safeUnlink(asyncFile, {
+      operation: 'verifier-cleanup-test', localVerifyScopeOk: { verifyRoot },
+    })).resolves.toBeUndefined();
+    expect(fs.existsSync(syncFile)).toBe(false);
+    expect(fs.existsSync(asyncFile)).toBe(false);
+    expect(() => SafeFsExecutor.safeUnlinkSync(outsideFile, {
+      operation: 'verifier-cleanup-test', localVerifyScopeOk: { verifyRoot },
+    })).toThrow(SourceTreeGuardError);
+    expect(fs.existsSync(outsideFile)).toBe(true);
   });
 });
 
@@ -330,5 +356,48 @@ describe('safeRm/safeRmSync — transient-error retry defaults (CI tmpdir-cleanu
     await SafeFsExecutor.safeRm(file, { force: true, operation: 'nonrecursive-test' });
     expect(fs.existsSync(file)).toBe(false);
     fs.rmdirSync(dir);
+  });
+});
+
+/**
+ * The rm retry budget had NO coverage before 2026-07-28, which is how a CI
+ * failure on main (`ENOTEMPTY` tearing down a temp dir holding a live git repo)
+ * reached a state where the retries were in force and simply too small.
+ *
+ * These assert the two BEHAVIOURS, deliberately not the numbers — pinning the
+ * constant would just restate it, and the budget is expected to be tuned.
+ */
+describe('SafeFsExecutor — rm retry budget', () => {
+  let sandbox: string;
+  beforeEach(() => { sandbox = mkSandbox('sfe-retry-'); });
+  afterEach(() => { rmrf(sandbox); });
+
+  it('applies a retry budget when recursive+force and the caller gave none', () => {
+    const target = path.join(sandbox, 'doomed');
+    fs.mkdirSync(target);
+    const spy = vi.spyOn(fs, 'rmSync').mockImplementation(() => undefined);
+    try {
+      SafeFsExecutor.safeRmSync(target, { recursive: true, force: true, operation: 'rm-retry-test' });
+      const opts = spy.mock.calls[0]?.[1] as fs.RmOptions;
+      expect(opts?.maxRetries).toBeGreaterThan(0);
+      expect(opts?.retryDelay).toBeGreaterThan(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('never overrides a maxRetries the caller chose explicitly', () => {
+    const target = path.join(sandbox, 'doomed2');
+    fs.mkdirSync(target);
+    const spy = vi.spyOn(fs, 'rmSync').mockImplementation(() => undefined);
+    try {
+      SafeFsExecutor.safeRmSync(target, {
+        recursive: true, force: true, maxRetries: 1, operation: 'rm-retry-explicit',
+      });
+      const opts = spy.mock.calls[0]?.[1] as fs.RmOptions;
+      expect(opts?.maxRetries).toBe(1);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

@@ -10,12 +10,96 @@
  */
 
 import { execFile } from 'node:child_process';
+import { mkdtempSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { IntelligenceProvider, IntelligenceOptions } from './types.js';
 import { resolveCliFlag } from './models.js';
 import { assertClaudeAllowed } from './claudeForbiddenGuard.js';
+import { guardChildStdin } from './pipeErrorGuard.js';
+import { applyClaudeChildAuth, classifyClaudeAuthFailure, reportClaudeCallOutcome } from './claudeChildAuth.js';
 
 const DEFAULT_MODEL = 'fast';
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+const REVIEWER_SCRATCH_DIR_PREFIX = 'instar-claude-review-scratch-';
+
+let cachedReviewerScratchDir: string | null = null;
+
+/**
+ * Lazily create + return an EMPTY, unguessable-named scratch cwd for a hardened
+ * reviewer call (REVIEWER-DOOR-REWIRING §1.4). Running `claude -p` in the repo
+ * root would let project-doc / cwd discovery see repo context; a neutral scratch
+ * dir (mode 0700, random suffix via mkdtemp — like the codex provider's) is the
+ * clean-notepad. Re-verified each call (a tmp-reaper may delete it).
+ */
+function resolveReviewerScratchDir(): string {
+  if (cachedReviewerScratchDir && existsSync(cachedReviewerScratchDir)) return cachedReviewerScratchDir;
+  cachedReviewerScratchDir = mkdtempSync(join(tmpdir(), REVIEWER_SCRATCH_DIR_PREFIX));
+  return cachedReviewerScratchDir;
+}
+
+/**
+ * The env-key ALLOWLIST for a hardened reviewer child (REVIEWER-DOOR-REWIRING
+ * §1.4). Only what `claude -p` itself needs — NEVER agent secrets like
+ * `INSTAR_AUTH_TOKEN`, `GITHUB_TOKEN`, vault material, etc. Prefix matches
+ * (`LC_`, `ANTHROPIC_`) preserve locale + the operator's OWN configured
+ * `ANTHROPIC_BASE_URL` proxy (§Security — the operator-controlled-endpoint
+ * property), without leaking anything else.
+ */
+const REVIEWER_ENV_ALLOW_EXACT = new Set<string>([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', 'TZ',
+  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+]);
+const REVIEWER_ENV_ALLOW_PREFIXES = ['LC_', 'ANTHROPIC_'] as const;
+
+/**
+ * Build the ALLOWLIST-only child env for a hardened reviewer call. Strips every
+ * key not on the allowlist (agent secrets never cross), and — belt-and-suspenders
+ * — deletes the Claude Code session markers so a nested session can't wedge it.
+ */
+export function buildClaudeReviewerChildEnv(
+  parentEnv: NodeJS.ProcessEnv = process.env,
+  structuredOutput = false,
+): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(parentEnv)) {
+    if (v === undefined) continue;
+    if (REVIEWER_ENV_ALLOW_EXACT.has(k) || REVIEWER_ENV_ALLOW_PREFIXES.some((p) => k.startsWith(p))) {
+      out[k] = v;
+    }
+  }
+  delete out.CLAUDECODE;
+  delete out.CLAUDE_SESSION_ID;
+  // The CLI can retry a schema-invalid answer internally. A single audited
+  // supervision call must represent a single model request.
+  if (structuredOutput) out.MAX_STRUCTURED_OUTPUT_RETRIES = '0';
+  return out;
+}
+
+/**
+ * Build the hardened `claude` argv for a reviewer call (REVIEWER-DOOR-REWIRING
+ * §1.4). The prompt is NOT a positional arg (it travels via stdin), so it never
+ * appears in argv. `--allowedTools ''` is an explicit EMPTY allow-list (a new
+ * tool category cannot escape it, unlike a `--disallowedTools '*'` denylist);
+ * `--strict-mcp-config` refuses user MCP servers. `--setting-sources user`
+ * excludes project/local CLAUDE.md (kept from the base door).
+ */
+export function buildClaudeReviewerArgs(model: string, jsonSchema?: string, noTools = false): string[] {
+  return [
+    '--print',
+    // An empty allow-list still lets a model ATTEMPT a tool; --tools '' offers it none.
+    ...(noTools ? ['--tools', ''] : []),
+    '--allowedTools', '',
+    '--strict-mcp-config',
+    '--model', model,
+    '--max-turns', '1',
+    '--output-format', 'json',
+    '--setting-sources', 'user',
+    ...(jsonSchema ? ['--json-schema', jsonSchema] : []),
+  ];
+}
 
 export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
   private claudePath: string;
@@ -33,34 +117,47 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
   }
 
   async evaluate(prompt: string, options?: IntelligenceOptions): Promise<string> {
-    const model = resolveCliFlag(options?.model ?? DEFAULT_MODEL);
+    // Reviewer inbound-safety hardening (REVIEWER-DOOR-REWIRING §1.4): the CONCRETE
+    // resolved pin travels via reviewerHardening.model (never a tier word), and
+    // the call runs locked down (empty allowed-tools, strict-mcp-config, neutral
+    // scratch cwd, stdin prompt, env allowlist).
+    const hardened = options?.reviewerHardening;
+    const model = resolveCliFlag(hardened?.model ?? options?.model ?? DEFAULT_MODEL);
     // Observable Intelligence: surface the resolved provider/model before the
     // call runs, so the metrics funnel can attribute it even on error/timeout.
     try { options?.onModel?.({ model, framework: 'claude-code' }); } catch { /* @silent-fallback-ok: onModel is pure observability — a throw must never break the LLM path */ }
 
     return new Promise((resolve, reject) => {
-      const args = [
-        '-p', prompt,
-        '--model', model,
-        '--max-turns', '1',
-        // JSON (not text) so the response carries a `usage` block. We extract the
-        // answer from `.result` and surface token counts via options.onUsage —
-        // the only way per-feature token cost reaches /metrics/features (the tap
-        // had no usage to record under text output, so it always logged 0).
-        // Iris-audit item 1, spec iris-audit-session-observability.md.
-        '--output-format', 'json',
-        // Exclude project/local CLAUDE.md to prevent identity context
-        // from contaminating classification and evaluation prompts.
-        '--setting-sources', 'user',
-      ];
+      const args = hardened
+        ? buildClaudeReviewerArgs(model, hardened.jsonSchema, hardened.noTools === true)
+        : [
+            '-p', prompt,
+            '--model', model,
+            '--max-turns', '1',
+            // JSON (not text) so the response carries a `usage` block. We extract the
+            // answer from `.result` and surface token counts via options.onUsage —
+            // the only way per-feature token cost reaches /metrics/features (the tap
+            // had no usage to record under text output, so it always logged 0).
+            // Iris-audit item 1, spec iris-audit-session-observability.md.
+            '--output-format', 'json',
+            // Exclude project/local CLAUDE.md to prevent identity context
+            // from contaminating classification and evaluation prompts.
+            '--setting-sources', 'user',
+          ];
 
-      // Strip Claude Code session markers to prevent "nested session" error.
-      // When instar runs inside (or is started from) a Claude Code session, these
-      // env vars propagate to child processes. The Claude CLI refuses to run if
-      // CLAUDECODE is set. SessionManager already does this for tmux spawning.
-      const childEnv = { ...process.env };
-      delete childEnv.CLAUDECODE;
-      delete childEnv.CLAUDE_SESSION_ID;
+      // Env: hardened calls use the ALLOWLIST-only env (agent secrets never
+      // cross); the default path strips only the Claude Code session markers so a
+      // nested session can't wedge it (unchanged behavior).
+      // The configured sign-in key goes on after the allowlist: it is what `claude -p` itself needs
+      // on an agent with no stored login (spec cloud-key-internal-calls).
+      const childEnv = applyClaudeChildAuth(hardened
+        ? buildClaudeReviewerChildEnv(process.env, Boolean(hardened.jsonSchema))
+        : (() => {
+            const e = { ...process.env };
+            delete e.CLAUDECODE;
+            delete e.CLAUDE_SESSION_ID;
+            return e;
+          })());
 
       const child = execFile(this.claudePath, args, {
         // Honor a caller-supplied per-call budget (IntelligenceOptions.timeoutMs);
@@ -68,8 +165,11 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
         // LLM-backed callers on a synchronous HTTP path (e.g. the standards-
         // conformance gate reviewing a full spec) need more than 30s.
         timeout: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024, // 1MB
+        // Hardened reviewer replies are full spec reviews — allow a larger buffer.
+        maxBuffer: hardened ? 8 * 1024 * 1024 : 1024 * 1024,
         env: childEnv,
+        // Neutral scratch cwd for a hardened call (§1.4) — never the repo root.
+        ...(hardened ? { cwd: resolveReviewerScratchDir() } : {}),
       }, (error, stdout, stderr) => {
         if (error) {
           // Timeout or other error — reject so caller can fall back. Include a
@@ -77,13 +177,23 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
           // classifier (isRateLimitError) can see usage/limit language that
           // often appears past the first 200 chars. (Rate-limit detection reads
           // stderr, so the stdout text→json switch does not affect it.)
-          reject(new Error(`Claude CLI error: ${error.message}${stderr ? ` — ${stderr.slice(0, 600)}` : ''}`));
+          // The auth verdict is only in stdout. It is logged as a category, never as CLI text.
+          const authFailure = classifyClaudeAuthFailure(stdout);
+          if (authFailure) reportClaudeCallOutcome(authFailure);
+          reject(new Error(`Claude CLI error: ${error.message}${stderr ? ` — ${stderr.slice(0, 600)}` : ''}${authFailure ? ` — auth: ${authFailure}` : ''}`));
           return;
         }
 
-        resolve(parseJsonResult(stdout, options?.onUsage));
+        reportClaudeCallOutcome('ok');
+        resolve(parseJsonResult(stdout, options?.onUsage, Boolean(hardened?.jsonSchema), options?.onServedModel));
       });
 
+      guardChildStdin(child.stdin, 'claude-cli');
+      // Hardened calls pass the prompt over STDIN (§1.4) so it never appears in
+      // ps-visible argv; the default path already carries it as the `-p` arg.
+      if (hardened) {
+        child.stdin?.write(prompt);
+      }
       // Write prompt via stdin for very long prompts (belt and suspenders)
       child.stdin?.end();
     });
@@ -112,6 +222,8 @@ export class ClaudeCliIntelligenceProvider implements IntelligenceProvider {
 export function parseJsonResult(
   stdout: string,
   onUsage?: (usage: { inputTokens: number; outputTokens: number; cachedTokens?: number }) => void,
+  preferStructuredOutput = false,
+  onServedModel?: (info: { model: string; framework?: string }) => void,
 ): string {
   const trimmed = stdout.trim();
   let parsed: unknown;
@@ -122,6 +234,14 @@ export function parseJsonResult(
     return trimmed;
   }
   const obj = (parsed && typeof parsed === 'object') ? (parsed as Record<string, unknown>) : null;
+  if (onServedModel && obj?.modelUsage && typeof obj.modelUsage === 'object'
+    && !Array.isArray(obj.modelUsage)) {
+    const models = Object.keys(obj.modelUsage as Record<string, unknown>);
+    if (models.length === 1) {
+      try { onServedModel({ model: models[0], framework: 'claude-code' }); }
+      catch { /* @silent-fallback-ok: model observation must not break the result path. */ }
+    }
+  }
   if (onUsage && obj && obj.usage && typeof obj.usage === 'object') {
     try {
       const u = obj.usage as Record<string, unknown>;
@@ -134,9 +254,15 @@ export function parseJsonResult(
         onUsage({ inputTokens, outputTokens, cachedTokens });
       }
     } catch {
-      /* usage extraction must never break the result path */
+      /* @silent-fallback-ok — usage extraction must never break the result path. */
     }
   }
+  if (preferStructuredOutput && obj?.is_error === true) return '';
+  if (preferStructuredOutput && obj && obj.structured_output && typeof obj.structured_output === 'object'
+    && !Array.isArray(obj.structured_output)) {
+    return JSON.stringify(obj.structured_output);
+  }
+  if (preferStructuredOutput) return '';
   if (obj && typeof obj.result === 'string') {
     return obj.result.trim();
   }

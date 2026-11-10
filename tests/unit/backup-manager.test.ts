@@ -196,6 +196,26 @@ describe('BackupManager', () => {
       expect(warnSpy).toHaveBeenCalled();
     });
 
+    it('never backs up machine-local subscription authority or login evidence', () => {
+      fs.mkdirSync(path.join(stateDir, 'state', 'subscription-pool'), { recursive: true });
+      fs.mkdirSync(path.join(stateDir, 'state', 'subscription-login-ledger'), { recursive: true });
+      fs.mkdirSync(path.join(stateDir, 'state', 'subscription-relogin'), { recursive: true });
+      fs.writeFileSync(path.join(stateDir, 'state', 'subscription-pool', 'accounts.json'), '{}');
+      fs.writeFileSync(path.join(stateDir, 'state', 'subscription-login-ledger', 'ledger.db'), 'sqlite');
+      fs.writeFileSync(path.join(stateDir, 'state', 'subscription-login-ledger-refusals.json'), '{}');
+      fs.writeFileSync(path.join(stateDir, 'state', 'subscription-relogin', 'repairs.db'), 'sqlite');
+      const manager = new BackupManager(stateDir, { includeFiles: [
+        'state/subscription-pool/accounts.json',
+        'state/subscription-login-ledger/ledger.db',
+        'state/subscription-login-ledger-refusals.json',
+        'state/subscription-relogin/repairs.db',
+      ] });
+      const snapshot = manager.createSnapshot('manual');
+      expect(snapshot.files.some((file) => file.includes('subscription-pool'))).toBe(false);
+      expect(snapshot.files.some((file) => file.includes('subscription-login-ledger'))).toBe(false);
+      expect(snapshot.files.some((file) => file.includes('subscription-relogin'))).toBe(false);
+    });
+
     it('DEFAULT_CONFIG.includeFiles contains no entries under .instar/secrets/', () => {
       // Defense in depth: even if a bug adds a secrets-path entry to the
       // defaults, this test catches it before any agent snapshots secrets.
@@ -291,6 +311,27 @@ describe('BackupManager', () => {
 
       // Original content should be back
       expect(fs.readFileSync(path.join(stateDir, 'AGENT.md'), 'utf-8')).toBe('# Agent Identity\nI am a test agent.');
+    });
+
+    it('round-trips class-review state but excludes origin-local claim evidence', () => {
+      fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true });
+      fs.writeFileSync(path.join(stateDir, 'class-reviews.db'), 'sqlite-main');
+      fs.writeFileSync(path.join(stateDir, 'class-reviews.db-wal'), 'sqlite-wal');
+      fs.writeFileSync(path.join(stateDir, 'logs', 'completion-claim-audit.jsonl'), '{"flagged":false}\n');
+      fs.writeFileSync(path.join(stateDir, 'logs', 'completion-claim-stats.json'), '{"candidateTurns":1}\n');
+      const manager = new BackupManager(stateDir);
+      const snapshot = manager.createSnapshot('manual');
+      expect(snapshot.files).toEqual(expect.arrayContaining([
+        'class-reviews.db', 'class-reviews.db-wal',
+      ]));
+      expect(snapshot.files).not.toEqual(expect.arrayContaining([
+        'logs/completion-claim-audit.jsonl', 'logs/completion-claim-stats.json',
+      ]));
+      fs.writeFileSync(path.join(stateDir, 'class-reviews.db'), 'corrupt');
+      fs.writeFileSync(path.join(stateDir, 'logs', 'completion-claim-stats.json'), '{}');
+      manager.restoreSnapshot(snapshot.id);
+      expect(fs.readFileSync(path.join(stateDir, 'class-reviews.db'), 'utf8')).toBe('sqlite-main');
+      expect(fs.readFileSync(path.join(stateDir, 'logs', 'completion-claim-stats.json'), 'utf8')).toBe('{}');
     });
 
     it('creates a pre-restore backup before restoring', () => {

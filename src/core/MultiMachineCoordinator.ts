@@ -15,6 +15,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { classifyCadenceLiveness } from './cadenceLiveness.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { MachineIdentityManager } from './MachineIdentity.js';
@@ -26,9 +27,16 @@ import type { LeaseCoordinator } from './LeaseCoordinator.js';
 import { SEAMLESSNESS_PROTOCOL_VERSION } from './seamlessnessConfig.js';
 import { FailureEpisodeLatch } from './FailureEpisodeLatch.js';
 import { ChurnBreaker } from './churnBreaker.js';
-import { writePollIntent } from './pollIntent.js';
+import { writePollIntent, readPollActive, pidAlive } from './pollIntent.js';
 import { resolveDevAgentGate } from './devAgentGate.js';
+import { poolPollerVerdict } from './pollerCount.js';
+import { decideNobodyPollingClaim, sharedG2NobodyPollingLedger } from './nobodyPollingRecovery.js';
+import { applyNobodyPollingRecovery } from './nobodyPollingActuator.js';
+import { serveProgressFresh } from './serveProgress.js';
+import { decideZombieRelinquish, sharedG1ZombieRelinquishLedger } from './zombieRelinquish.js';
+import { getCurrentBootId } from '../server/boot-id.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
 import type { MachineRole, MachineIdentity, MultiMachineConfig, CoordinationMode } from './types.js';
 
 /** Observability shape for /health.multiMachine.syncStatus (spec §11). */
@@ -38,10 +46,26 @@ export interface MultiMachineSyncStatus {
   leaseHolder: string | null;
   leaseEpoch: number;
   holdsLease: boolean;
-  /** 'clear' | 'contested' (more than one awake machine in the registry) | 'self-suspended'. */
+  /** 'clear' | 'contested' (more than one live-awake machine, or a latched pull-contest) | 'self-suspended'. */
   splitBrainState: 'clear' | 'contested' | 'self-suspended';
   protocolVersion: number;
-  awakeMachineCount: number;
+  /**
+   * machine-coherence-guard §5b — the number of machines currently awake. DERIVED
+   * FROM LIVE STATE, not last-written registry symbols: on a lease+pull mesh it is
+   * the lease-live count (self holds + distinct fresh/live/self-claiming peers);
+   * on a git-only mesh it degrades to the registry-role count; on a read failure
+   * it is `null` (honest, never a silent 0). `awakeMachineCountSource` names which
+   * basis spoke — always read the two together.
+   */
+  awakeMachineCount: number | null;
+  /** Which basis produced `awakeMachineCount` (machine-coherence-guard §5b, D5). */
+  awakeMachineCountSource: 'lease-live' | 'registry-roles' | 'unavailable';
+  /** Once-per-process lease backing-store decision made during server boot. */
+  leaseMedium?: {
+    medium: 'git' | 'local' | 'unchecked';
+    reason: string;
+    store: 'GitLeaseStore' | 'LocalLeaseStore';
+  };
   /**
    * multi-machine-lease-self-heal observability (Agent Awareness). F1 tick-watchdog
    * health — answers "did the watchdog fire?" / "is it disarmed?". `lastTickAgeMs`
@@ -58,6 +82,24 @@ export interface MultiMachineSyncStatus {
    * or no ropes advertised yet.
    */
   meshEndpoints?: string[];
+  /**
+   * U4.3 (u4-3-breaker-recovery-probe §3) — per-(peer, kind) rope health served
+   * from the PeerEndpointResolver.snapshot() seam via the RopeRecoveryProber's
+   * registration handle (`attachRopeHealthProvider`). Present ONLY when the
+   * prober is wired (dev-gate live); `syncStatus` itself is only ever serialized
+   * on the AUTHED /health branch, so mesh topology never leaks unauthenticated.
+   * Kind + counters only — no URLs/IPs (Decision 15 content scrub).
+   */
+  ropeHealth?: Array<{
+    peer: string;
+    kind: string;
+    state: 'healthy' | 'dead' | 'exhausted';
+    consecutiveFailures: number;
+    recoveryStreak: number;
+    lastResultAt: number | null;
+    lastProbeAt: number | null;
+    nextProbeDueAt: number | null;
+  }>;
 }
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -77,6 +119,24 @@ const DEFAULT_LEASE_PULL_INTERVAL_MS = 5_000;
 const RENEW_SAFETY_FACTOR = 0.5;
 const MIN_RENEW_INTERVAL_MS = 5_000;
 const MAX_RENEW_INTERVAL_MS = 60_000;
+/**
+ * ACT-1308 — after an UNCONFIRMED renewal, retry after this fraction of the renew
+ * interval instead of waiting a full interval. renew() keeps the old expiry when a
+ * broadcast goes unconfirmed, so with TTL = 2 × interval the next regular tick
+ * lands exactly on that expiry (plus timer drift) and finds the lease already
+ * lapsed. A retry at interval/4 (7.5s at the default 30s) lands well inside it.
+ */
+const RENEW_RETRY_FRACTION = 0.25;
+const MIN_RENEW_RETRY_MS = 1_000;
+/**
+ * B1 — how often an UNCHANGED lease-derived poll intent is rewritten so its `ts`
+ * stays inside the consumer's staleness bound (TelegramLifeline reads it with
+ * `maxStaleMs: 90_000`; past that the record is treated as "no current opinion").
+ * 30s leaves a 3× margin while keeping the write off every lease tick.
+ */
+const POLL_INTENT_REFRESH_MS = 30_000;
+/** Evidence only: how long after a silent-standby relinquish to look for a new holder. */
+const SILENT_STANDBY_EVIDENCE_CHECK_MS = 5 * 60_000;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -92,6 +152,13 @@ export interface CoordinatorConfig {
    * fleet). Threaded from the server's top-level `config.developmentAgent`.
    */
   developmentAgent?: boolean;
+  /**
+   * U4.4 (lease hand-back) — invoked once per lease PULL tick (~5s), AFTER the
+   * pull folded peer state in. The hand-back reconciler's observation rides
+   * this existing tick (spec: "no new dial loop"); the callback is throw-
+   * guarded so an observer fault can never wedge the pull loop.
+   */
+  onLeasePullTick?: () => void;
 }
 
 export interface CoordinatorEvents {
@@ -141,7 +208,13 @@ export class MultiMachineCoordinator extends EventEmitter {
    */
   private leaseRenewTimer: ReturnType<typeof setInterval> | null = null;
   private leaseRenewing: boolean = false;
+  /** ACT-1308 — one-shot retry armed after an unconfirmed renewal. */
+  private leaseRenewRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** ACT-1308 — logged once per episode when the renew tick skips while we are still the named holder. */
+  private leaseRenewSkipLogged = false;
   private leaseRenewStartLogged: boolean = false;
+  private readonly originLeaseRenewalOwners = new Set<symbol>();
+  private leaseRenewStopped = false;
   /**
    * B2 (multimachine-lease-poll-robustness, Decision 8) — the lease flap
    * circuit-breaker. Lazily built when the churnDetector gate resolves on.
@@ -153,6 +226,13 @@ export class MultiMachineCoordinator extends EventEmitter {
    * from one left by a prior incarnation of this server.
    */
   private readonly bootId = `${process.pid}-${process.hrtime.bigint().toString(36)}`;
+  /**
+   * B1 — throttle state for the per-reconcile poll-intent republish. `key` is the
+   * last SUCCESSFULLY written `shouldPoll|role|leaseEpoch`; the timestamp is when
+   * that write landed. See `publishLeasePollIntent`.
+   */
+  private lastPollIntentKey: string | null = null;
+  private lastPollIntentWriteMs = 0;
   /** Integrated-Being v1 — tracks whether we've already emitted the
    *  per-machine-ledger warning this boot. Spec §Multi-machine. */
   private integratedBeingWarningEmitted: boolean = false;
@@ -199,13 +279,45 @@ export class MultiMachineCoordinator extends EventEmitter {
    * `watchdogReArmTimes` is a rolling window of re-arm timestamps for self-disarm.
    */
   private tickWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+  /** Positive evidence that the main monitor interval was installed. Before
+   * its first callback this is the cadence baseline; a missing first tick can
+   * therefore become provably stale without treating bare zero as failure. */
+  private heartbeatMonitorArmedMonoMs: number = 0;
   private lastTickRunMonoMs: number = 0;
   private leaseTickStartMonoMs: number = 0;
   private leasePullStartMonoMs: number = 0;
   private watchdogReArmTimes: number[] = [];
   private watchdogDisarmed: boolean = false;
+  // F6 (Degradation Is an Event): per-stall-EPISODE dedup so the FIRST re-arm of a
+  // genuine lease-tick stall surfaces to the user ONCE — not every re-arm (flood),
+  // and not only on the runaway self-disarm. Reset when a real tick resumes.
+  private leaseStallSurfaced: boolean = false;
   /** F3 — per-incarnation latch so a silent standby relinquishes its held lease once. */
   private silentStandbyRelinquished: boolean = false;
+  /** Evidence only: when to check whether anyone took the lease a silent standby gave up. */
+  private silentStandbyEvidenceCheckAtMs: number | null = null;
+  /** Evidence only: the last G2 decision recorded, so a repeated decision is not a row per cadence. */
+  private g2EvidenceKey: string | null = null;
+  /** Evidence only: the last poll intent recorded, and an open write-failure episode. */
+  private pollIntentEvidence: boolean | null = null;
+  private pollIntentWriteFailEvidenced = false;
+  /** Evidence only: the open churn-breaker latch episode. */
+  private churnEvidenceLatched = false;
+  private churnEvidenceExhausted = false;
+  /**
+   * U4.3 — the rope-health registration handle (the resolver instance is a
+   * closure-local in server.ts; the prober registers its merged view here so
+   * getSyncStatus can serve `ropeHealth` on the authed /health). Null = prober
+   * not wired (dev-gate dark) → the field is simply absent.
+   */
+  private ropeHealthProvider: (() => NonNullable<MultiMachineSyncStatus['ropeHealth']>) | null = null;
+  private leaseMediumProvider: (() => NonNullable<MultiMachineSyncStatus['leaseMedium']>) | null = null;
+  /**
+   * U4.3 — lease-pull tick listeners (the probe CARRIER: "no new scheduler, no
+   * new loop" — the prober attaches here and rides the existing ~5s pull tick).
+   * Each listener is error-isolated; a throwing listener never breaks the pull.
+   */
+  private leasePullTickListeners: Array<() => void> = [];
 
   constructor(state: StateManager, config: CoordinatorConfig) {
     super();
@@ -308,6 +420,7 @@ export class MultiMachineCoordinator extends EventEmitter {
    * Returns the determined role for this machine.
    */
   start(): MachineRole {
+    this.leaseRenewStopped = false;
     // Check if multi-machine is set up
     if (!this.identityManager.hasIdentity()) {
       this._enabled = false;
@@ -436,6 +549,8 @@ export class MultiMachineCoordinator extends EventEmitter {
   }
 
   stop(): void {
+    this.leaseRenewStopped = true;
+    this.originLeaseRenewalOwners.clear();
     if (this.heartbeatWriteTimer) {
       clearInterval(this.heartbeatWriteTimer);
       this.heartbeatWriteTimer = null;
@@ -457,6 +572,7 @@ export class MultiMachineCoordinator extends EventEmitter {
       clearInterval(this.leaseRenewTimer);
       this.leaseRenewTimer = null;
     }
+    this.clearLeaseRenewRetry();
     this.nonceStore.destroy();
   }
 
@@ -578,6 +694,32 @@ export class MultiMachineCoordinator extends EventEmitter {
     this.leaseCoordinator = lc;
   }
 
+  /** Origin egress requires a current fenced lease throughout its lifetime.
+   * Enroll before initializeLease: the existing holder-only timer supplies that
+   * dependency when its flag is omitted. Explicit false remains authoritative;
+   * this never grants a lease or enables the other B3 rollout mechanisms. */
+  enrollOriginWriterLeaseRenewal(): () => void {
+    return this.enrollLeaseRenewalDependency('telegram-origin-writer');
+  }
+
+  /** Any conversation surface that admits work only while this machine holds the
+   * lease (the Telegram origin writer, native app conversations) enrolls the same
+   * holder-only renewal carrier. Without it a non-development agent's lease lapses
+   * at TTL and is re-acquired only at the next 2-minute heartbeat tick, so the
+   * surface refuses work for the gap and the epoch climbs every tick. Same rules
+   * as the origin writer: explicit false wins; renewal never acquires and stops
+   * the moment a higher epoch is seen. Returns an idempotent release. */
+  enrollLeaseRenewalDependency(name: string): () => void {
+    if (this.leaseRenewStopped) throw new Error('lease-renewal-coordinator-stopped');
+    const owner = Symbol(name);
+    this.originLeaseRenewalOwners.add(owner);
+    if (!this.leaseRenewTimer) this.startLeaseRenewTimer();
+    return () => {
+      if (!this.originLeaseRenewalOwners.delete(owner) || this.leaseRenewStopped) return;
+      if (!this.resilientRenewEnabled()) this.startLeaseRenewTimer();
+    };
+  }
+
   /**
    * B2 — the churn breaker, gated by `leaseSelfHeal.churnDetector` (OMIT `enabled`
    * ⇒ developmentAgent gate). Returns null when off. Uses the monotonic clock so a
@@ -606,36 +748,302 @@ export class MultiMachineCoordinator extends EventEmitter {
     return resolveDevAgentGate(m?.pollFollowsLease?.enabled, this.config);
   }
 
+  // ── G2 nobody-polling RECOVERY (enforce) — MESH-SELF-HEAL-SPEC §3.2 ──────────
+  /** Consecutive confirmed-silence reads (debounce so a handoff gap never trips). */
+  private _g2SilenceStreak = 0;
+  private static readonly G2_CONFIRM_OBSERVATIONS = 3;
+  /** Reentrancy guard: a slow eval must not overlap the next cadence tick (which
+   *  would double-increment the silence streak pre-await and trip the debounce
+   *  early). Mirrors `leaseTicking`. */
+  private _g2Evaluating = false;
+
+  /** Resolve the G2 enforce gate: dark+dryRun-first. OMIT `enabled` ⇒ dev-agent
+   *  gate (live-on-dev / dark-on-fleet); dryRun defaults TRUE (observe-only) so
+   *  enabling alone never actuates — flipping dryRun:false is the deliberate
+   *  enforce promotion. Read live so a config flip applies on the next tick. */
+  private nobodyPollingRecoveryCfg(): { enabled: boolean; dryRun: boolean } {
+    const m = this.config.multiMachine as { nobodyPollingRecovery?: { enabled?: boolean; dryRun?: boolean } } | undefined;
+    return {
+      enabled: resolveDevAgentGate(m?.nobodyPollingRecovery?.enabled, this.config),
+      dryRun: m?.nobodyPollingRecovery?.dryRun ?? true,
+    };
+  }
+
+  // ── G1 zombie self-relinquish (lease↔job binding) — MESH-SELF-HEAL-SPEC §3.1 ──
+  private _g1RelinquishStreak = 0;
+  private _g1Evaluating = false;
+  private static readonly G1_CONFIRM_OBSERVATIONS = 3;
+  private static readonly G1_STALE_THRESHOLD_MS = 90_000;
+
+  /** G1 gate: dark+dryRun-first (dev-gated). Flipping dryRun:false (the deliberate
+   *  enforce promotion) is what lets a confirmed zombie actually relinquish. */
+  private zombieRelinquishCfg(): { enabled: boolean; dryRun: boolean } {
+    const m = this.config.multiMachine as { zombieRelinquish?: { enabled?: boolean; dryRun?: boolean } } | undefined;
+    return {
+      enabled: resolveDevAgentGate(m?.zombieRelinquish?.enabled, this.config),
+      dryRun: m?.zombieRelinquish?.dryRun ?? true,
+    };
+  }
+
+  /**
+   * G1 evaluator — called from tickLease's HOLDER branch each tick. Reads the three
+   * machine-local liveness watermarks (about THIS machine), debounces the relevant
+   * staleness, runs the deterministic zombie-relinquish decision, records evidence,
+   * and — only on a confirmed zombie AND `dryRun:false` — relinquishes the lease
+   * (signed tombstone). DARK + dryRun-first: gate off ⇒ strict no-op; dryRun ⇒
+   * records "would relinquish", touches NOTHING.
+   *
+   * Watermark sourcing (FD10 — lifeline-ACTUAL truth, not server intent):
+   *  - serveProgressedMonoMs ← state/serve-progress.json, read with getCurrentBootId()
+   *    (the SAME boot id the dispatch seam wrote with — NOT this.bootId, which is a
+   *    distinct per-coordinator id) so the boot-epoch fence matches; `performance.now()`
+   *    is the shared same-process clock domain for the freshness subtraction.
+   *  - poll signals ← lifeline-poll-active.json (ts-fresh = attempted; +pollingActive
+   *    = succeeded). These are liveness approximations; richer per-signal monotonic
+   *    stamps + the lastFetched>lastServed `pending` counters + positive-peer
+   *    global-outage evidence are enforce-ENABLE refinements (consulted only at
+   *    dryRun:false). With them unwired: pending defaults false (idle→pollSucceeded
+   *    path) and globalOutage defaults false (the local-failure-SAFE direction).
+   */
+  async evaluateZombieRelinquish(
+    nowMonoMs: number,
+    nowIso: string,
+  ): Promise<{ skipped?: string; decision?: string; relinquished?: boolean }> {
+    const cfg = this.zombieRelinquishCfg();
+    if (!cfg.enabled || !this.leaseCoordinator || !this._identity) {
+      return { skipped: 'disabled-or-single-machine' };
+    }
+    if (!this.leaseCoordinator.holdsLease()) {
+      this._g1RelinquishStreak = 0; // only a holder can be a zombie
+      return { skipped: 'not-holder' };
+    }
+    if (this._g1Evaluating) return { skipped: 'already-evaluating' };
+    this._g1Evaluating = true;
+    try {
+      const threshold = MultiMachineCoordinator.G1_STALE_THRESHOLD_MS;
+      const bootId = getCurrentBootId();
+      // serve-progress freshness needs the dispatch-seam's boot id; if the boot id
+      // isn't initialized yet (server not fully up), don't evaluate (skip — never
+      // relinquish on an un-evaluable serve signal).
+      if (!bootId) return { skipped: 'boot-id-not-ready' };
+      const serveProgressedFresh = serveProgressFresh(this.config.stateDir, bootId, nowMonoMs, threshold);
+      const pa = readPollActive(this.config.stateDir);
+      const pollFresh = !!pa && pidAlive(pa.pid) && (Date.now() - pa.ts) < threshold;
+      const pollAttemptedFresh = pollFresh;
+      const pollSucceededFresh = pollFresh && pa!.pollingActive === true;
+      const pending = false; // refinement: lastFetched>lastServed counters not yet plumbed
+      // Debounce the relevant-stale signal (Adv-F8 — an evaluator-resume blip alone never trips).
+      const relevantStale = pending ? !serveProgressedFresh : !pollSucceededFresh;
+      if (relevantStale) this._g1RelinquishStreak += 1; else this._g1RelinquishStreak = 0;
+      const staleConfirmed = this._g1RelinquishStreak >= MultiMachineCoordinator.G1_CONFIRM_OBSERVATIONS;
+      const decision = decideZombieRelinquish({
+        holdsLease: true,
+        isActiveLeaseRole: this._role === 'awake',
+        pending,
+        pollAttemptedFresh,
+        pollSucceededFresh,
+        serveProgressedFresh,
+        staleConfirmed,
+        peerConfirmsGlobalOutage: false, // refinement → local-failure-safe direction
+      });
+      sharedG1ZombieRelinquishLedger.record(decision, nowIso);
+      const zombieEvidenceContext = {
+        action: decision.action, dryRun: cfg.dryRun, staleStreak: this._g1RelinquishStreak,
+        pollAttemptedFresh, pollSucceededFresh, serveProgressedFresh,
+      };
+      if (!decision.relinquish && decision.action !== 'healthy' && decision.action !== 'not-applicable') {
+        // Runs on the evaluator's cadence, so a held state is one row per hour, not per tick.
+        featureEvidence.recordAtMostEvery('multiMachine.zombieRelinquish', `held|${decision.reason}`, 60 * 60 * 1000, { kind: 'held', reason: decision.reason, context: zombieEvidenceContext });
+      }
+      if (decision.relinquish && !cfg.dryRun) {
+        // Quiesce + relinquish (signed tombstone). Best-effort — a failure retries next tick.
+        try {
+          await this.leaseCoordinator.relinquishAndBroadcast();
+          this._g1RelinquishStreak = 0;
+          console.log(`[MultiMachine] [g1-relinquish] zombie holder relinquished (${decision.reason})`);
+          featureEvidence.record('multiMachine.zombieRelinquish', { kind: 'fired', reason: decision.reason, context: zombieEvidenceContext });
+        } catch (err) {
+          console.error(`[MultiMachine] [g1-relinquish] relinquish failed: ${(err as Error).message}`);
+          featureEvidence.record('multiMachine.zombieRelinquish', { kind: 'error', reason: 'relinquish-failed', context: zombieEvidenceContext });
+        }
+      } else if (decision.relinquish && cfg.dryRun) {
+        console.log(`[MultiMachine] [g1-relinquish] DRY-RUN would relinquish (${decision.reason})`);
+        featureEvidence.recordAtMostEvery('multiMachine.zombieRelinquish', `would|${decision.reason}`, 60 * 60 * 1000, { kind: 'fired', reason: `would-relinquish: ${decision.reason}`, context: zombieEvidenceContext });
+      }
+      return { decision: decision.action, relinquished: decision.relinquish && !cfg.dryRun };
+    } finally {
+      this._g1Evaluating = false;
+    }
+  }
+
+  /**
+   * G2 enforce evaluator — the SERVER calls this on its cadence with the live pool
+   * capacities (which carry each machine's lifeline-actual `pollingActive`). It
+   * computes the B5 verdict, debounces a silence, runs the deterministic
+   * single-claimant decision, records the soak evidence, and — only on a genuine
+   * self-claim AND `dryRun:false` — actuates via the injected lease ports
+   * (acquire fenced CAS → re-verify own poll-freshness → start polling, else
+   * relinquish + self-exclude). DARK + dryRun-first: with the gate off it is a
+   * strict no-op; in dryRun it records "would claim" and touches NOTHING.
+   *
+   * NOTE (enforce-ENABLE prerequisite): the `localPollSucceededFresh` port here is
+   * a liveness approximation (lifeline pid alive + a fresh poll-active record). The
+   * true `pollSucceededMonoMs`/serve-progress watermark (spec §3.1 round-3) is a
+   * separate lifeline-side plumbing increment required BEFORE flipping dryRun:false
+   * on the fleet — but it is consulted ONLY when dryRun:false, so the dark soak
+   * never depends on it.
+   */
+  async evaluateNobodyPolling(
+    capacities: Array<{ machineId: string; online?: boolean; pollingActive?: boolean }>,
+    localSaw409: boolean,
+    nowIso: string,
+  ): Promise<{ skipped?: string; verdict?: string; silenceConfirmed?: boolean; decision?: string; actuation?: string }> {
+    const cfg = this.nobodyPollingRecoveryCfg();
+    if (!cfg.enabled || !this.leaseCoordinator || !this._identity) {
+      return { skipped: 'disabled-or-single-machine' };
+    }
+    // Reentrancy guard: never let a slow eval overlap the next cadence tick.
+    if (this._g2Evaluating) return { skipped: 'already-evaluating' };
+    this._g2Evaluating = true;
+    try {
+    const verdict = poolPollerVerdict(capacities, localSaw409);
+    if (verdict.verdict === 'silence') this._g2SilenceStreak += 1; else this._g2SilenceStreak = 0;
+    const silenceConfirmed = this._g2SilenceStreak >= MultiMachineCoordinator.G2_CONFIRM_OBSERVATIONS;
+    const decision = decideNobodyPollingClaim({
+      selfMachineId: this._identity.machineId,
+      pollerVerdict: verdict.verdict,
+      silenceConfirmed,
+      preferredAwakeMachineId: this.config.multiMachine?.leaseSelfHeal?.preferredAwakeMachineId ?? null,
+      // fit = heartbeat-fresh candidate (in a silence nobody is polling, so fitness
+      // is NOT tied to pollingActive); the post-CAS self-reverify checks real poll
+      // freshness before serving.
+      machines: capacities.map((c) => ({ machineId: c.machineId, fit: !!c.online })),
+      // Peer-evidence-of-global-outage plumbing is an enforce-ENABLE prerequisite;
+      // until then a confirmed silence proceeds to elect (the local-failure-safe
+      // direction — G2 picks a server rather than HOLD on unproven global blindness).
+      globalOutageEvidence: false,
+    });
+    sharedG2NobodyPollingLedger.recordClaim(decision, nowIso);
+    const g2Key = `${decision.action}|${decision.reason}|${cfg.dryRun}`;
+    if (g2Key !== this.g2EvidenceKey) {
+      this.g2EvidenceKey = g2Key;
+      if (decision.action !== 'claim' && decision.action !== 'no-op' && decision.action !== 'await-confirm') {
+        featureEvidence.record('multiMachine.nobodyPollingRecovery', {
+          kind: decision.action === 'fail-closed' ? 'error' : 'held',
+          reason: `${decision.action}: ${decision.reason}`,
+          context: { verdict: verdict.verdict, silenceConfirmed, silenceStreak: this._g2SilenceStreak, machines: capacities.length, online: capacities.filter((c) => c.online).length, claimant: decision.claimant, dryRun: cfg.dryRun },
+        });
+      }
+    }
+    const outcome = await applyNobodyPollingRecovery({
+      decision,
+      dryRun: cfg.dryRun,
+      ledger: sharedG2NobodyPollingLedger,
+      nowIso,
+      log: (m) => console.log(`[MultiMachine] ${m}`),
+      ports: {
+        acquireFencedCas: () => this.leaseCoordinator!.acquireIfEligible(),
+        currentEpoch: () => this.leaseCoordinator!.currentEpoch(),
+        localPollSucceededFresh: () => {
+          const rec = readPollActive(this.config.stateDir);
+          if (!rec) return false;
+          return pidAlive(rec.pid) && (Date.now() - rec.ts) < 90_000;
+        },
+        startPolling: () => this.writeLeasePollIntent(true, 'awake'),
+        relinquishAndSelfExclude: () => { void this.leaseCoordinator!.relinquishAndBroadcast(); },
+      },
+    });
+    return { verdict: verdict.verdict, silenceConfirmed, decision: decision.action, actuation: outcome.result };
+    } finally {
+      this._g2Evaluating = false;
+    }
+  }
+
   /**
    * B1 — write the lease-derived poll intent for the lifeline. No-op when the gate
    * is off. Guarded: a write failure is logged once, never thrown into the
    * caller's hot path (the intent file is advisory; a missed write degrades to the
    * lifeline's "no current opinion" → hold, the safe direction).
+   *
+   * Returns true only when a record was actually written, so the throttling
+   * wrapper never records a skip-window off a failed write. EVERY successful
+   * write updates the throttle state here (not in the wrapper) so a direct
+   * caller — e.g. the boot default in `initializeLease` — can never leave the
+   * cached key describing something other than what is actually on disk.
    */
-  private writeLeasePollIntent(shouldPoll: boolean, role: MachineRole): void {
-    if (!this.pollFollowsLeaseEnabled() || !this.leaseCoordinator) return;
+  private writeLeasePollIntent(shouldPoll: boolean, role: MachineRole): boolean {
+    if (!this.pollFollowsLeaseEnabled() || !this.leaseCoordinator) return false;
+    const normalizedRole: MachineRole = role === 'awake' ? 'awake' : 'standby';
+    const epoch = this.leaseCoordinator.currentEpoch();
     try {
       writePollIntent(this.config.stateDir, {
         shouldPoll,
-        leaseEpoch: this.leaseCoordinator.currentEpoch(),
-        role: role === 'awake' ? 'awake' : 'standby',
+        leaseEpoch: epoch,
+        role: normalizedRole,
         serverPid: process.pid,
         bootId: this.bootId,
         ts: Date.now(),
       });
+      this.lastPollIntentKey = `${shouldPoll}|${normalizedRole}|${epoch}`;
+      this.lastPollIntentWriteMs = Date.now();
+      this.pollIntentWriteFailEvidenced = false;
+      return true;
     } catch (err) {
       console.log(`[MultiMachine] [poll-intent] write failed (non-fatal): ${(err as Error).message}`);
+      if (!this.pollIntentWriteFailEvidenced) {
+        this.pollIntentWriteFailEvidenced = true;
+        featureEvidence.record('multiMachine.pollFollowsLease', {
+          kind: 'error',
+          reason: 'poll intent write failed',
+          context: { shouldPoll, role: normalizedRole, epoch, code: (err as NodeJS.ErrnoException).code ?? null },
+        });
+      }
+      return false;
     }
   }
 
   /**
-   * B3 — resolve the resilientRenew gate. OMITTED `enabled` ⇒ developmentAgent
-   * gate (live-on-dev / dark-on-fleet); an explicit boolean wins. Read live so a
-   * config flip applies on the next renew tick without a restart.
+   * B1 — republish the lease-derived poll intent from `reconcileRoleToLease`,
+   * throttled. Writes when the intent CHANGES (shouldPoll / role / lease epoch) or
+   * when the last successful write is older than `POLL_INTENT_REFRESH_MS`, so a
+   * steady role stays comfortably inside the consumer's staleness bound without a
+   * file write on every lease tick. The throttle state is recorded by
+   * `writeLeasePollIntent` on a write that actually landed — a failed write
+   * retries on the next reconcile rather than being treated as delivered.
+   */
+  private publishLeasePollIntent(shouldPoll: boolean, role: MachineRole): void {
+    if (!this.pollFollowsLeaseEnabled() || !this.leaseCoordinator) return;
+    const key = `${shouldPoll}|${role === 'awake' ? 'awake' : 'standby'}|${this.leaseCoordinator.currentEpoch()}`;
+    const unchanged = key === this.lastPollIntentKey;
+    if (unchanged && Date.now() - this.lastPollIntentWriteMs < POLL_INTENT_REFRESH_MS) return;
+    const wrote = this.writeLeasePollIntent(shouldPoll, role);
+    if (wrote && this.pollIntentEvidence !== shouldPoll) this.recordPollIntentEvidence(shouldPoll, role);
+  }
+
+  /** Evidence only: one row per change of the published poll intent, never one per reconcile. */
+  private recordPollIntentEvidence(shouldPoll: boolean, role: MachineRole): void {
+    const first = this.pollIntentEvidence === null;
+    this.pollIntentEvidence = shouldPoll;
+    try {
+      const holder = this.leaseCoordinator?.currentHolder?.() ?? null;
+      const nobody = !shouldPoll && !first && !holder;
+      featureEvidence.record('multiMachine.pollFollowsLease', {
+        kind: nobody ? 'error' : 'fired',
+        reason: nobody ? 'poll intent stopped with no lease holder visible, so nobody may be polling' : (shouldPoll ? 'poll intent start' : 'poll intent stop'),
+        context: { shouldPoll, role, holder, epoch: this.leaseCoordinator?.currentEpoch?.() ?? null, firstThisBoot: first },
+      });
+    } catch { /* @silent-fallback-ok — evidence only; a partial coordinator must not break the lease tick */ }
+  }
+
+  /**
+   * B3 keeps its standalone dev gate. An enrolled lease-dependent surface (origin
+   * writer, app conversations) requires this existing renewal carrier when the
+   * flag is omitted; explicit booleans win.
+   * Read live so disabling it takes effect on the next renew tick.
    */
   private resilientRenewEnabled(): boolean {
     const explicit = this.config.multiMachine?.leaseSelfHeal?.resilientRenew?.enabled;
-    return resolveDevAgentGate(explicit, this.config);
+    return explicit ?? (this.originLeaseRenewalOwners.size > 0 || resolveDevAgentGate(undefined, this.config));
   }
 
   /** B3 — the renew cadence, clamped so it is always comfortably under the TTL. */
@@ -656,7 +1064,7 @@ export class MultiMachineCoordinator extends EventEmitter {
       clearInterval(this.leaseRenewTimer);
       this.leaseRenewTimer = null;
     }
-    if (!this.leaseCoordinator || !this.resilientRenewEnabled()) return;
+    if (this.leaseRenewStopped || !this.leaseCoordinator || !this.resilientRenewEnabled()) return;
     const interval = this.renewIntervalMs();
     if (!this.leaseRenewStartLogged) {
       console.log(`[MultiMachine] lease renew timer armed (every ${interval}ms; TTL ${this.leaseCoordinator.ttlMs}ms) — B3 resilient renew`);
@@ -673,7 +1081,7 @@ export class MultiMachineCoordinator extends EventEmitter {
    * can't wedge the timer.
    */
   private async leaseRenewTick(): Promise<void> {
-    if (this.leaseRenewing || !this.leaseCoordinator) return;
+    if (this.leaseRenewStopped || !this.resilientRenewEnabled() || this.leaseRenewing || !this.leaseCoordinator) return;
     // A muted/observe-only machine NEVER renews — same rule tickLease's
     // observe-only branch enforces. Without this, a machine that booted
     // observe-only while still NAMED in a persisted prior lease (the F3
@@ -681,7 +1089,18 @@ export class MultiMachineCoordinator extends EventEmitter {
     // up to ~TTL, fighting the silent-standby-relinquish self-heal. (2nd-pass.)
     if (this.isLeaseObserveOnly) return;
     // Only a current holder renews. A lapsed/non-holder is acquireIfEligible's job.
-    if (!this.leaseCoordinator.holdsLease()) return;
+    if (!this.leaseCoordinator.holdsLease()) {
+      // ACT-1308 — this skip used to be silent. When the lease still names us,
+      // skipping means our own lease lapsed between renewals: say so once.
+      const lease = this.leaseCoordinator.currentLease();
+      if (!this.leaseRenewSkipLogged && lease && !lease.released && lease.holder === this._identity?.machineId) {
+        this.leaseRenewSkipLogged = true;
+        console.log(`[MultiMachine] lease renew skipped: still the named holder at epoch ${lease.epoch}, but the lease lapsed (last confirmed renewal ${this.leaseCoordinator.msSinceConfirmedRenewal()}ms ago, TTL ${this.leaseCoordinator.ttlMs}ms)`);
+      }
+      return;
+    }
+    this.leaseRenewSkipLogged = false;
+    this.clearLeaseRenewRetry();
     this.leaseRenewing = true;
     try {
       await this.withTickTimeout('lease-renew', () => this.leaseCoordinator!.renew());
@@ -689,6 +1108,35 @@ export class MultiMachineCoordinator extends EventEmitter {
       console.log(`[MultiMachine] lease renew tick error (non-fatal): ${(err as Error).message}`);
     } finally {
       this.leaseRenewing = false;
+    }
+    this.armLeaseRenewRetryIfUnconfirmed();
+  }
+
+  /**
+   * ACT-1308 — renew() returns true inside the grace window even when the
+   * broadcast went unconfirmed, keeping the OLD expiry. If this attempt was not
+   * confirmed and we still hold the lease, try again shortly rather than at the
+   * next regular tick, which would land on that expiry and find it lapsed.
+   */
+  private armLeaseRenewRetryIfUnconfirmed(): void {
+    if (this.leaseRenewStopped || !this.leaseCoordinator || this.leaseRenewRetryTimer) return;
+    if (!this.leaseCoordinator.holdsLease()) return;
+    const interval = this.renewIntervalMs();
+    // A confirmation from this attempt is newer than any part of the interval.
+    if (this.leaseCoordinator.msSinceConfirmedRenewal() < interval / 2) return;
+    const delay = Math.max(MIN_RENEW_RETRY_MS, Math.round(interval * RENEW_RETRY_FRACTION));
+    console.log(`[MultiMachine] lease renewal unconfirmed; retrying in ${delay}ms (last confirmed ${this.leaseCoordinator.msSinceConfirmedRenewal()}ms ago, TTL ${this.leaseCoordinator.ttlMs}ms)`);
+    this.leaseRenewRetryTimer = setTimeout(() => {
+      this.leaseRenewRetryTimer = null;
+      void this.leaseRenewTick();
+    }, delay);
+    if (this.leaseRenewRetryTimer.unref) this.leaseRenewRetryTimer.unref();
+  }
+
+  private clearLeaseRenewRetry(): void {
+    if (this.leaseRenewRetryTimer) {
+      clearTimeout(this.leaseRenewRetryTimer);
+      this.leaseRenewRetryTimer = null;
     }
   }
 
@@ -721,25 +1169,70 @@ export class MultiMachineCoordinator extends EventEmitter {
   }
 
   /**
+   * machine-coherence-guard §5b — the freshness bound for a peer lease observation
+   * to count toward `awakeMachineCount`: 3× the lease-pull interval, floored at
+   * 30s. A pull happens every `leasePullIntervalMs`, so 3 missed pulls (or a peer
+   * that has gone genuinely quiet) ages its last observation out of the count —
+   * the post-failover stale-claim overcount cannot linger past this window.
+   */
+  private leaseObservationStaleMs(): number {
+    const pull = this.config.multiMachine?.leasePullIntervalMs ?? DEFAULT_LEASE_PULL_INTERVAL_MS;
+    return Math.max(30_000, 3 * pull);
+  }
+
+  /**
    * Observability snapshot for /health.multiMachine.syncStatus (spec §11).
-   * Always returns valid fields (never null/throws) — this is the Phase-1
-   * "feature is alive" surface. On a single-machine install it reports the
-   * trivially-held lease.
+   * NEVER throws. Most fields are always valid; `awakeMachineCount` is `number |
+   * null` (source-tagged via `awakeMachineCountSource`) per machine-coherence-guard
+   * §5b — a read failure yields `null`+`'unavailable'`, never a silent 0. On a
+   * single-machine install it reports the trivially-held lease.
    */
   getSyncStatus(): MultiMachineSyncStatus {
-    let awakeMachineCount = 0;
-    try {
-      const reg = this.identityManager.loadRegistry();
-      for (const e of Object.values(reg.machines ?? {})) {
-        if (e.role === 'awake') awakeMachineCount++;
+    // machine-coherence-guard §5b — awakeMachineCount derives from LIVE state.
+    // Preferred basis (lease-live): the fenced lease is the authority for "awake",
+    // so when the lease+pull mesh is active we count self's hold + each distinct
+    // peer whose most-recent lease observation is fresh, live, and a self-claim.
+    // This is the fix for "awakeMachineCount:0 while the Mini holds the lease and
+    // both machines are reachable over Tailscale/LAN" — the old registry-role
+    // count depended on a laggy git-synced symbol that a dead Cloudflare rope or a
+    // slow registry push could leave stale, so it read 0 even though the lease
+    // (leaseHolder) correctly named the holder. The count now tracks the same
+    // authoritative signal leaseHolder does. Legacy git-only mesh (no lease
+    // coordinator, or no pull capability) degrades to the registry-role count,
+    // now HONESTLY tagged rather than silently conflated.
+    let awakeMachineCount: number | null;
+    let awakeMachineCountSource: MultiMachineSyncStatus['awakeMachineCountSource'];
+    if (this.leaseCoordinator && this.leaseCoordinator.canPullPeers()) {
+      try {
+        awakeMachineCount = this.leaseCoordinator.deriveLiveAwakeCount(this.leaseObservationStaleMs());
+        awakeMachineCountSource = 'lease-live';
+      } catch {
+        // @silent-fallback-ok — a read-only /health field: an unreadable lease
+        // view yields null+unavailable (honest), never a fabricated count.
+        awakeMachineCount = null;
+        awakeMachineCountSource = 'unavailable';
       }
-    } catch { /* @silent-fallback-ok — registry unreadable → count 0 */ }
+    } else {
+      try {
+        let n = 0;
+        const reg = this.identityManager.loadRegistry();
+        for (const e of Object.values(reg.machines ?? {})) {
+          if (e.role === 'awake') n++;
+        }
+        awakeMachineCount = n;
+        awakeMachineCountSource = 'registry-roles';
+      } catch {
+        // @silent-fallback-ok — registry unreadable → honest null, never a silent 0.
+        awakeMachineCount = null;
+        awakeMachineCountSource = 'unavailable';
+      }
+    }
 
     const holds = this.holdsLease();
     const selfSuspended = this.leaseCoordinator?.isSuspended ?? false;
     const splitBrainState: MultiMachineSyncStatus['splitBrainState'] = selfSuspended
       ? 'self-suspended'
-      : (awakeMachineCount > 1 || this.leasePullContested)
+      : ((awakeMachineCount != null && awakeMachineCount > 1) || this.leasePullContested)
         ? 'contested'
         : 'clear';
 
@@ -752,6 +1245,8 @@ export class MultiMachineCoordinator extends EventEmitter {
       splitBrainState,
       protocolVersion: SEAMLESSNESS_PROTOCOL_VERSION,
       awakeMachineCount,
+      awakeMachineCountSource,
+      ...(this.leaseMediumProvider ? { leaseMedium: this.leaseMediumSafe() } : {}),
       leaseTickWatchdog: this.leaseCoordinator
         ? {
             lastTickAgeMs: this.lastTickRunMonoMs > 0 ? this.monoNowMs() - this.lastTickRunMonoMs : -1,
@@ -761,7 +1256,49 @@ export class MultiMachineCoordinator extends EventEmitter {
         : undefined,
       preferredAwakeMachineId: this.config.multiMachine?.leaseSelfHeal?.preferredAwakeMachineId ?? null,
       meshEndpoints: this.selfMeshEndpointKinds(),
+      ...(this.ropeHealthProvider ? { ropeHealth: this.ropeHealthSafe() } : {}),
     };
+  }
+
+  attachLeaseMediumProvider(provider: () => NonNullable<MultiMachineSyncStatus['leaseMedium']>): void {
+    this.leaseMediumProvider = provider;
+  }
+
+  private leaseMediumSafe(): NonNullable<MultiMachineSyncStatus['leaseMedium']> {
+    try {
+      return this.leaseMediumProvider?.() ?? { medium: 'local', reason: 'no-git-sync-manager', store: 'LocalLeaseStore' };
+    } catch {
+      // @silent-fallback-ok — passive health metadata must never break /health.
+      return { medium: 'local', reason: 'no-git-sync-manager', store: 'LocalLeaseStore' };
+    }
+  }
+
+  /**
+   * U4.3 — register the rope-health read seam (the prober's merged
+   * resolver-snapshot + probe-scheduling view). getSyncStatus serves it as
+   * `ropeHealth` on the authed /health branch. Idempotent (last writer wins).
+   */
+  attachRopeHealthProvider(provider: () => NonNullable<MultiMachineSyncStatus['ropeHealth']>): void {
+    this.ropeHealthProvider = provider;
+  }
+
+  private ropeHealthSafe(): NonNullable<MultiMachineSyncStatus['ropeHealth']> {
+    try {
+      return this.ropeHealthProvider?.() ?? [];
+    } catch {
+      // @silent-fallback-ok: a read-only /health observability field — a throwing
+      // provider yields an empty list, never an error on the health path.
+      return [];
+    }
+  }
+
+  /**
+   * U4.3 — attach a listener to the ~5s lease-pull tick (the probe CARRIER; spec
+   * §2 "no new scheduler, no new loop, near-zero marginal cost"). Listeners run
+   * after each pull tick settles, each error-isolated.
+   */
+  attachLeasePullTickListener(listener: () => void): void {
+    this.leasePullTickListeners.push(listener);
   }
 
   /**
@@ -788,6 +1325,21 @@ export class MultiMachineCoordinator extends EventEmitter {
    */
   async initializeLease(): Promise<void> {
     if (!this.leaseCoordinator) return;
+    this.leaseCoordinator.sampleLiveness?.();
+      // Prime from the durable medium FIRST so this boot's failover-eligibility check sees the
+      // holder's CURRENT heartbeat — not a stale seed `lastSeen` that a freshly-joined standby
+      // would misread as "holder dead" and use to grab a live holder's lease (verified live on a
+      // two-machine mesh, 2026-05-28). Read-only, so it runs before EVERY branch below: the
+      // observe-only and defer-preferred decisions read the same lease view and benefit equally.
+      this.leaseCoordinator.primeFromDurable();
+    // B1 — publish the SAFE default (shouldPoll:false / mute) BEFORE any branch
+    // below reconciles, so a stale prior-boot {shouldPoll:true} can't resurrect a
+    // poller in the window before the real role is known. This MUST precede the
+    // reconcile: written afterwards it overwrites the decision it was meant to
+    // stand in for, which is exactly what it used to do — every branch here ends
+    // in `reconcileRoleToLease`, so the tail write clobbered the truth and left a
+    // lease HOLDER published as `standby / do-not-poll`.
+    this.writeLeasePollIntent(false, 'standby');
     if (this.isLeaseObserveOnly) {
       // Silent standby: do NOT acquire — only observe the primary's lease.
       this.reconcileRoleToLease('lease-init-observe-only');
@@ -806,10 +1358,6 @@ export class MultiMachineCoordinator extends EventEmitter {
     // B3 — keep the held lease fresh (renew before it lapses) so the epoch stops
     // climbing. No-op unless resilientRenew resolves on (dev-gate).
     this.startLeaseRenewTimer();
-    // B1 — at boot the role isn't yet reconciled; publish the SAFE default
-    // (shouldPoll:false / mute) so a stale prior-boot {shouldPoll:true} can't
-    // resurrect a poller before the first reconcile decides the real role.
-    this.writeLeasePollIntent(false, 'standby');
   }
 
   /**
@@ -827,6 +1375,31 @@ export class MultiMachineCoordinator extends EventEmitter {
   }
 
   /**
+   * U4.4 — acquire the lease by presenting the holder's signed hand-back
+   * consent token (the `handbackOpts` branch of canAcquire; claim-before-
+   * release). Called by the handback-offer handler on the PREFERRED CAPTAIN.
+   * On success reconciles role → awake; on ANY failure nothing changes (the
+   * holder keeps holding — zero-holder states impossible by construction).
+   */
+  async acquireLeaseOnHandbackConsent(
+    token: import('./FencedLease.js').HandbackConsentToken,
+  ): Promise<{ ok: boolean; reason: string }> {
+    if (!this.leaseCoordinator) return { ok: false, reason: 'no-lease-coordinator' };
+    const res = await this.leaseCoordinator.acquireOnHandbackConsent(token);
+    if (res.ok) this.reconcileRoleToLease('handback-consent');
+    return res;
+  }
+
+  /** U4.4 — is the churn breaker currently latched (breaker wins over hand-back)? */
+  churnBreakerLatched(): boolean {
+    try {
+      return this.getChurnBreaker()?.tick().latched ?? false;
+    } catch {
+      return false; /* @silent-fallback-ok — a breaker read fault reads as not-latched; the hand-back reconciler's other bounds (episode cap, hysteresis) still apply */
+    }
+  }
+
+  /**
    * Drive the lease on each monitor tick: renew if we hold it, else attempt
    * failover acquisition. Reconciles role afterward. Fire-and-forget safe.
    */
@@ -836,8 +1409,17 @@ export class MultiMachineCoordinator extends EventEmitter {
     this.leaseTickStartMonoMs = this.monoNowMs(); // F1b — for the watchdog's ceiling-gated guard reset
     // B2 — advance the churn breaker so a settled system auto-resets the latch
     // after a calm window (no-op when the churnDetector gate is off).
-    this.getChurnBreaker()?.tick();
+    const churnTick = this.getChurnBreaker()?.tick();
+    if (churnTick && this.churnEvidenceLatched && !churnTick.latched) {
+      this.churnEvidenceLatched = false;
+      featureEvidence.record('multiMachine.leaseSelfHeal.churnDetector', {
+        kind: 'held',
+        reason: 'breaker reset after a calm window',
+        context: { flipsInWindow: churnTick.flipsInWindow, latchesInHour: churnTick.latchesInHour },
+      });
+    }
     try {
+      this.leaseCoordinator.sampleLiveness?.();
       if (this.isLeaseObserveOnly) {
         // F3 (silentStandbyRelinquish, DARK) — LEVEL-TRIGGERED: a silent standby
         // that is STILL the named holder (the 2026-06-19 zombie: muted while
@@ -852,7 +1434,33 @@ export class MultiMachineCoordinator extends EventEmitter {
           this.leaseCoordinator.currentHolder() === this._identity.machineId
         ) {
           this.silentStandbyRelinquished = true;
-          await this.withTickTimeout('relinquishAndBroadcast', () => this.leaseCoordinator!.relinquishAndBroadcast());
+          const relinquishEpoch = this.leaseCoordinator.currentEpoch?.() ?? null;
+          try {
+            await this.withTickTimeout('relinquishAndBroadcast', () => this.leaseCoordinator!.relinquishAndBroadcast());
+          } catch (err) {
+            featureEvidence.record('multiMachine.leaseSelfHeal.silentStandbyRelinquish', {
+              kind: 'error',
+              reason: 'relinquish failed or timed out',
+              context: { epoch: relinquishEpoch, error: err instanceof Error ? err.message.slice(0, 80) : 'unknown' },
+            });
+            throw err;
+          }
+          this.silentStandbyEvidenceCheckAtMs = Date.now() + SILENT_STANDBY_EVIDENCE_CHECK_MS;
+          featureEvidence.record('multiMachine.leaseSelfHeal.silentStandbyRelinquish', {
+            kind: 'fired',
+            reason: 'silent standby gave up the lease it still held',
+            context: { epoch: relinquishEpoch, holderAfter: this.leaseCoordinator.currentHolder() },
+          });
+        }
+        if (this.silentStandbyEvidenceCheckAtMs !== null && Date.now() >= this.silentStandbyEvidenceCheckAtMs) {
+          this.silentStandbyEvidenceCheckAtMs = null;
+          if (!this.leaseCoordinator.currentHolder()) {
+            featureEvidence.record('multiMachine.leaseSelfHeal.silentStandbyRelinquish', {
+              kind: 'error',
+              reason: 'nobody holds the lease after the silent standby gave it up',
+              context: { epoch: this.leaseCoordinator.currentEpoch?.() ?? null, waitedMs: SILENT_STANDBY_EVIDENCE_CHECK_MS },
+            });
+          }
         }
         // Silent standby: never acquire/renew — just reconcile role to the
         // observed holder (effectiveView folds the primary's broadcast lease).
@@ -861,7 +1469,14 @@ export class MultiMachineCoordinator extends EventEmitter {
         // F1a — bounded await: a hung renew can never wedge the tick.
         await this.withTickTimeout('renew', () => this.leaseCoordinator!.renew());
         this.reconcileRoleToLease('lease-tick');
-      } else if (this.shouldDeferToPreferred()) {
+        // G1 (MESH-SELF-HEAL-SPEC §3.1) — a holder that has stopped doing the JOB
+        // (serve/poll watermarks stale) relinquishes the badge so a healthy machine
+        // takes over. DARK + dryRun-gated INSIDE the evaluator (strict no-op when
+        // off; records-only in dryRun). `performance.now()` matches the dispatch
+        // seam's serve-progress clock domain (same process). Best-effort — a slow/
+        // failed eval must never wedge the lease tick.
+        await this.evaluateZombieRelinquish(performance.now(), new Date().toISOString())
+          .catch(() => { /* @silent-fallback-ok — G1 eval is best-effort; retried next tick */ });
         // F4 (preferred-awake, opt-in) — we are NON-preferred and observe the
         // preferred machine holding a HEALTHY lease: defer, do not contend. If the
         // preferred goes down/unhealthy, shouldDeferToPreferred() flips false and we
@@ -885,6 +1500,18 @@ export class MultiMachineCoordinator extends EventEmitter {
     if (!this.leaseCoordinator || !this._identity) return;
     const holds = this.leaseCoordinator.holdsLease();
     const desired: MachineRole = holds ? 'awake' : 'standby';
+    // B1 — publish the lease-derived poll intent on EVERY reconcile, ABOVE the
+    // no-transition early-return. `_role` is restored from the machine registry at
+    // startup, so a machine that was already awake before a restart re-enters
+    // reconcile with `desired === this._role` and returns here. Publishing below
+    // the early-return therefore left `initializeLease()`'s safe boot default
+    // ({shouldPoll:false, role:'standby'}) standing as the PERMANENT published
+    // intent for a machine that actually holds the lease — the lifeline then
+    // either fought for the poll (dry-run: 409 conflict loop) or muted the
+    // rightful holder (live). Publishing here also refreshes `ts` inside the
+    // consumer's staleness bound (TelegramLifeline: maxStaleMs 90_000), so a
+    // steady role reads as a live opinion instead of decaying to "no opinion".
+    this.publishLeasePollIntent(holds, desired);
     if (desired === this._role) return;
     const oldRole = this._role;
     this._role = desired;
@@ -906,11 +1533,6 @@ export class MultiMachineCoordinator extends EventEmitter {
     if (holds) this.emit('promote');
     else this.emit('demote');
     console.log(`[MultiMachine] Lease reconcile → ${desired} (${reason})`);
-    // B1 — publish the lease-derived poll intent for the lifeline (shouldPoll =
-    // awake). No-op unless pollFollowsLease resolves on. Nothing consumes it yet
-    // (the lifeline reconcile loop is the next increment), so this is a safe,
-    // observe-only producer — it cannot change ingress.
-    this.writeLeasePollIntent(holds, desired);
     // B2 — feed the flap circuit-breaker on every REAL role transition (this is
     // past the `desired === this._role` early-return, so it counts only true
     // flips). Observe/dry-run: log the would-latch; applying the deterministic
@@ -927,6 +1549,22 @@ export class MultiMachineCoordinator extends EventEmitter {
           `${v.exhausted ? ' (EXHAUSTED — operator attention)' : ''} — ` +
           `${dryRun ? `would hold role '${wouldRole}' (dry-run)` : `holding role '${wouldRole}'`}`,
         );
+        if (!this.churnEvidenceLatched) {
+          this.churnEvidenceLatched = true;
+          featureEvidence.record('multiMachine.leaseSelfHeal.churnDetector', {
+            kind: 'fired',
+            reason: dryRun ? 'would latch the flap breaker' : 'latched the flap breaker',
+            context: { flipsInWindow: v.flipsInWindow, latchesInHour: v.latchesInHour, wouldRole, dryRun, transitionReason: reason },
+          });
+        }
+        if (v.exhausted && !this.churnEvidenceExhausted) {
+          this.churnEvidenceExhausted = true;
+          featureEvidence.record('multiMachine.leaseSelfHeal.churnDetector', {
+            kind: 'error',
+            reason: 'breaker exhausted its latch budget: stays latched until the operator clears it',
+            context: { flipsInWindow: v.flipsInWindow, latchesInHour: v.latchesInHour, wouldRole, dryRun },
+          });
+        }
       }
     }
   }
@@ -965,9 +1603,13 @@ export class MultiMachineCoordinator extends EventEmitter {
   /**
    * One pull tick: fan-out pull every peer, fold the freshest lease into our
    * view, reconcile role (a pulled HIGHER-epoch peer fences us → auto-demote),
-   * then surface a SAME-epoch contested split-brain Near-Silently. Pull is for
-   * LEARNING (anti-blinding); the heartbeat tickLease remains the only path that
-   * ACTS (acquire/renew). Re-arms via `arm` even on failure.
+   * then surface a SAME-epoch contested split-brain Near-Silently. A successful
+   * peer observation also nudges the normal fenced lease tick: this closes the
+   * phase gap where stale-holder eligibility becomes true just after the slow
+   * 2-minute heartbeat tick and takeover otherwise waits almost another full
+   * heartbeat period. The nudge does not add authority — tickLease still owns
+   * every acquire/renew decision and all its observe-only/preferred/fencing
+   * gates. Re-arms via `arm` even on failure.
    */
   private async tickLeasePull(arm: () => void): Promise<void> {
     if (this.leasePulling) { arm(); return; }
@@ -976,6 +1618,11 @@ export class MultiMachineCoordinator extends EventEmitter {
     try {
       // F1a — bounded await: a hung peer pull can never wedge the pull loop.
       await this.withTickTimeout('pullFromPeers', () => this.leaseCoordinator!.pullFromPeers());
+      // U4.4 — hand-back observation rides this existing pull tick (no new dial
+      // loop). Throw-guarded: an observer fault never wedges the pull loop.
+      try {
+        this.config.onLeasePullTick?.();
+      } catch { /* @silent-fallback-ok — observation is signal-only; the next tick retries */ }
       // Only reconcile role / surface split-brain when a peer lease was actually
       // OBSERVED. A solo machine (no peers, or no peer lease seen this boot) must
       // NEVER be demoted by the pull loop on a transient self-lease lapse — that
@@ -1004,12 +1651,35 @@ export class MultiMachineCoordinator extends EventEmitter {
         // §Problem A — ACT on a same-epoch contested tie (not just surface it):
         // deterministic tie-break → loser relinquishes / winner advances once.
         await this.resolveContestedSplitBrain();
+        // CMT-984/CMT-992 — automatic serving takeover must follow the existing
+        // 5s anti-blinding pull cadence, not the unrelated 2-minute heartbeat
+        // phase. Once F2's monotonic non-renewal window opens (or the observed
+        // lease expires), immediately re-run the ONE authoritative lease actor.
+        // tickLease's reentrancy guard makes this safe against a concurrent
+        // heartbeat tick; observe-only machines still refuse to acquire.
+        if (
+          !this.leaseCoordinator!.holdsLease() &&
+          this.leaseCoordinator!.peerTakeoverEligible()
+        ) {
+          await this.tickLease();
+        }
       }
     } catch {
       // @silent-fallback-ok — a pull failure (incl. a bounded-await timeout) is retried next tick
     } finally {
       this.leasePulling = false;
       this.leasePullStartMonoMs = 0;
+      // U4.3 — the probe carrier: run attached tick listeners (error-isolated;
+      // the prober's onTick is synchronous eligibility scanning + fire-and-forget
+      // dials, so the pull cadence is never blocked).
+      for (const listener of this.leasePullTickListeners) {
+        try {
+          listener();
+        } catch {
+          // @silent-fallback-ok — a throwing tick listener (probe scan fault) must
+          // never break the lease pull loop; the next tick retries it.
+        }
+      }
       arm();
     }
   }
@@ -1256,9 +1926,15 @@ export class MultiMachineCoordinator extends EventEmitter {
       // No lease coordinator (solo / non-git mesh) ⇒ nothing to self-heal.
       if (!this.leaseCoordinator) return;
       const now = this.monoNowMs();
-      // lastTickRunMonoMs is stamped at the TOP of checkHeartbeatAndAct; if it
-      // has not advanced within the stale window, the main loop is stalled.
-      if (this.lastTickRunMonoMs > 0 && now - this.lastTickRunMonoMs <= cfg.staleMs) return;
+      // Absence of a first tick sample is UNKNOWN by itself (P20), but the
+      // successful timer-arm event is positive evidence and starts a bounded
+      // first-fire deadline. This catches a main interval lost before callback
+      // #1 without calling ordinary startup a recovered stall.
+      const cadenceBaseline = this.lastTickRunMonoMs > 0
+        ? this.lastTickRunMonoMs
+        : this.heartbeatMonitorArmedMonoMs;
+      const liveness = classifyCadenceLiveness(cadenceBaseline, now, cfg.staleMs);
+      if (liveness.state !== 'stale') return;
 
       // Ceiling-gated guard reset: only clear a guard whose in-flight tick is
       // ALSO older than the ceiling (a stuck guard, not a slow-but-live tick).
@@ -1278,6 +1954,24 @@ export class MultiMachineCoordinator extends EventEmitter {
       this.watchdogReArmTimes = this.watchdogReArmTimes.filter((t) => t >= hourAgo);
       console.log(`[MultiMachine] lease-tick watchdog: stalled >${cfg.staleMs}ms — re-armed (${this.watchdogReArmTimes.length}/${cfg.maxReArmsPerHour} this hour)`);
       this.emit('tickStallRecovered', { reArmCount: this.watchdogReArmTimes.length });
+
+      // F6 (Degradation Is an Event): surface the FIRST re-arm of THIS stall
+      // episode to the user — the exact 2026-06-25 postmortem gap, where a single
+      // >staleMs lease-tick stall was silently re-armed (log-only / pull-only via
+      // /health) and nobody knew the coordination layer was degraded until
+      // messages disappeared. Deduped per episode (reset when a real tick resumes)
+      // so a single stall surfaces ONCE, not on every re-arm; the runaway
+      // self-disarm below is a separate, louder event.
+      if (!this.leaseStallSurfaced) {
+        this.leaseStallSurfaced = true;
+        DegradationReporter.getInstance().report({
+          feature: 'MultiMachine.leaseTick',
+          primary: 'The mesh "who is in charge" lease tick is the agent\'s coordination heartbeat',
+          fallback: `The lease tick stalled (no advance in >${cfg.staleMs}ms) and the watchdog re-armed it`,
+          reason: 'The coordinator tick loop stalled (transport hang / event-loop pressure); the in-process watchdog recovered it',
+          impact: 'Coordination ran degraded briefly (the awake-machine election may have used a fallback). Recovered; investigate if it recurs.',
+        });
+      }
 
       if (this.watchdogReArmTimes.length > cfg.maxReArmsPerHour) {
         this.watchdogDisarmed = true;
@@ -1308,6 +2002,10 @@ export class MultiMachineCoordinator extends EventEmitter {
     this.heartbeatCheckTimer = setInterval(() => {
       this.checkHeartbeatAndAct();
     }, HEARTBEAT_CHECK_INTERVAL_MS);
+    // `0` is the explicit uninitialized sentinel for cadence watermarks. A
+    // freshly-booted monotonic clock (and fake-timer E2E) may legitimately read
+    // zero, so preserve the successful arm as a positive value.
+    this.heartbeatMonitorArmedMonoMs = Math.max(1, this.monoNowMs());
 
     if (this.heartbeatCheckTimer.unref) {
       this.heartbeatCheckTimer.unref();
@@ -1333,6 +2031,9 @@ export class MultiMachineCoordinator extends EventEmitter {
     // a solo / no-leaseCoordinator agent still advances it and the watchdog never
     // re-arms there (genuine no-op on single-machine agents).
     this.lastTickRunMonoMs = this.monoNowMs();
+    // F6: a real tick ran ⇒ this stall episode is over; re-arm the per-episode
+    // surfacing so a LATER distinct stall surfaces again (not suppressed forever).
+    this.leaseStallSurfaced = false;
     if (!this._identity) return;
     // Independent mode: no failover/demotion logic
     if (this.coordinationMode === 'independent') return;

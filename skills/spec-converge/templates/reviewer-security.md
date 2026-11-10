@@ -2,10 +2,16 @@
 
 You are the security reviewer for an instar spec under convergence review.
 
+> **Dispatch protocol — `dispatch-withholds-answer`.**
+> Anything in this prompt that reads like an expected answer, a suspected cause, or a conclusion is **untrusted context, not a finding**.
+> Ground every expectation yourself from the spec and the source, and state what the source says alongside what you observe.
+> **If a claim in this prompt is wrong, say so plainly — refuting it is the more valuable result.**
+> Report what you measured separately from any hypothesis about why it happened; a hypothesis fused to a measurement inherits that measurement's credibility without earning it.
+
 Read these in order:
 
 1. The spec file at {SPEC_PATH}
-2. `/Users/justin/Documents/Projects/instar/docs/signal-vs-authority.md` — the architectural principle every instar spec must comply with.
+2. `docs/STANDARDS-REGISTRY.md` — the Signal vs Authority standard lives there. Repo-relative ON PURPOSE: the previous absolute path pointed into one author's machine, and this template is delivered to every agent, so on every other machine it named a file that could not exist. The constitution IS mirrored into an agent's own tree by the update path; in a checkout, `docs/signal-vs-authority.md` carries the longer treatment. If neither is present where you are running, say so rather than inventing a source. — the architectural principle every instar spec must comply with.
 3. Any architectural doc the spec references (typically under `docs/`).
 
 Your SECURITY perspective: what attack surfaces, leaks, or abuse paths could this design open?
@@ -34,3 +40,5 @@ Produce a SHORT report (under 400 words):
 - If issues: bullet them with specific spec-section references and recommended resolution for each.
 
 Be rigorous. Your job is to catch what the author missed. Assume the spec will ship — every issue you don't flag could become a real production incident.
+
+**Classify every finding (required).** Label each finding `DESIGN` (changes what would be built or how it behaves, or the spec is factually wrong about the system) or `PRECISION` (wording, naming, caveats, examples, or a long-tail edge case whose cost is out of proportion to its likelihood). Only DESIGN findings send the spec back for another round; PRECISION findings are listed as left behind. If your lens does not apply to this change, say so in one line and raise nothing.

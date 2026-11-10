@@ -25,6 +25,23 @@ shared directory skip-set lives in `skipDirs`. Read surfaces:
 - `GET /cartographer/stale` — nodes whose summary has drifted from the code.
 - `GET /cartographer/health` — node count, authored count, staleness + freshness backlog.
 
+### Verified project roots (`CartographerRootAuthority`, `CartographerRootRegistry`)
+
+On a standalone agent, Cartographer no longer assumes the agent's home directory is
+the project a request means. `CartographerRootRegistry` resolves the request's topic
+through the existing project binding, asks `CartographerRootAuthority` to verify the
+checkout's canonical repository identity and exact revision, and opens an isolated
+tree namespace for that root. Every Cartographer response reports that selected
+identity and revision, so the tree being described is the tree that was actually
+read. A request without an unambiguous topic binding is refused instead of falling
+back to a noisy or stale checkout.
+
+Structural population remains free and runs for every eligible bound root at boot.
+If a checkout has no readable Git revision yet, it receives a structural-only tree
+but cannot authorize paid summaries. Inline refreshes and the background sweep
+revalidate the pinned revision before trusted writes; revision drift stops the write
+rather than letting evidence about one checkout authorize another.
+
 ## Spec #2 — The freshness sweep (`CartographerSweepEngine`, `CartographerSweepPoller`)
 
 A fresh tree is all "never-authored," and as code changes summaries rot. The
@@ -62,6 +79,14 @@ ratchet beats a gate beats a lint beats a design doc beats nothing). It surfaces
 standard citing a guard that no longer exists). It is "Structure beats Willpower" made
 measurable.
 
+The parser reads complete article blocks through a closed enforcement-heading list,
+not every bold section indiscriminately. Guard headings such as **Applied through**,
+**Enforced by (structure, not willpower)**, and **Full spec(s)** are included;
+provenance such as **Earned from** and **Traces to the goal** is deliberately excluded,
+as are explicitly enumerated explanatory headings. The report's
+`registry.enforcementScope` names those boundaries and lists any unrecognized article
+headings, so an unread section cannot masquerade as an article with no guard.
+
 The core is fully deterministic — local file reads only, zero token cost, zero egress,
 identical output every run. An optional language-model enrichment pass for fuzzy cases
 is a structural stub, off by default; the deterministic coverage is always the
@@ -70,7 +95,7 @@ authority. Read surfaces (owner-gated):
 - `GET /conformance/coverage` — the full per-standard coverage map (filters by
   `family`, `kind`, `status`).
 - `GET /conformance/coverage/health` — counts by enforcement kind, the enforced ratio,
-  the gap list, and the dangling-ref count.
+  the gap list, the dangling-ref count, and the parser's enforcement-heading scope.
 
 A CI ratchet (`scripts/standards-coverage.mjs`) holds an enforced-ratio floor and a
 hard zero ceiling on dangling references.
@@ -98,15 +123,17 @@ before a downstream sub-agent reads it. Read surface:
 
 | Layer | Core modules | Read surface |
 |-------|-------------|--------------|
-| Doc-tree (spec #1) | `CartographerTree`, `skipDirs` | `/cartographer/tree`, `/cartographer/node`, `/cartographer/stale`, `/cartographer/health` |
+| Doc-tree + verified roots (spec #1 / Item 11B) | `CartographerTree`, `CartographerRootAuthority`, `CartographerRootRegistry`, `skipDirs` | `/cartographer/tree`, `/cartographer/node`, `/cartographer/stale`, `/cartographer/health` |
 | Freshness sweep (spec #2) | `CartographerSweepEngine`, `CartographerSweepPoller`, `HostPressureSampler`, `cartographerSummary` | `/cartographer/node/refresh` |
 | Conformance audit (spec #3) | `StandardsRegistryParser`, `StandardEnforcementExtractor`, `StandardsEnforcementAuditor` | `/conformance/coverage`, `/conformance/coverage/health` |
 | Subtree navigation (spec #5) | `CartographerNavigator` | `/cartographer/navigate` |
 
-`CartographerTree` is the substrate every layer reads; `CartographerSweepEngine`
-authors against it; `StandardsEnforcementAuditor` audits the constitution's
-enforcement, never the code itself; `CartographerNavigator` scopes a sub-agent to the
-relevant subtree. All are observe-only — they inform, they never block.
+`CartographerTree` is the substrate every layer reads; `CartographerRootRegistry`
+selects its verified project namespace; `CartographerSweepEngine` authors against
+it; `StandardsEnforcementAuditor` audits the constitution's enforcement, never the
+code itself; `CartographerNavigator` scopes a sub-agent to the relevant subtree.
+The root authority can refuse an ambiguous or drifted trusted operation; the
+conformance and navigation layers remain observe-only.
 
 ## Enabling
 

@@ -15,6 +15,8 @@ import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import os from 'node:os';
 import type { InstarConfig, SessionManagerConfig, JobSchedulerConfig, FeedbackConfig, AgentType } from './types.js';
 import { CANONICAL_FEEDBACK_URL } from './canonicalFeedback.js';
+import { resolveFrameworkAlias } from './frameworkFacts.js';
+import { agentRegistryPath } from './AgentRegistryPaths.js';
 
 const DEFAULT_PORT = 4040;
 const DEFAULT_MAX_SESSIONS = 10;
@@ -113,11 +115,114 @@ export function detectTmuxPath(): string | null {
  * baking any single absolute path into the codebase. Add a framework
  * here and detection works automatically.
  */
+/**
+ * Merge operator-configured framework binary paths over detected ones,
+ * dropping any configured path that is PROVABLY absent.
+ *
+ * Background: until round-11 this map was built purely from detection, so
+ * `sessions.frameworkBinaryPaths` in config.json was read by nothing and an
+ * operator pointing at a relocated install was silently ignored. Round-11
+ * gave the operator's value precedence, which is right — a lever with no load
+ * path is not a lever.
+ *
+ * ROUND-21 found the cost of that fix landing unguarded. Because the values
+ * had been inert, an agent could be carrying a stale or hand-written entry
+ * that had never mattered; the moment operator values started winning, that
+ * entry began deciding which binary gets SPAWNED, with no existence check —
+ * for every framework, on every agent, including agents with no interest in
+ * grok. A fix for a silently-ignored value should not become a silently-broken
+ * spawn.
+ *
+ * The guard is deliberately asymmetric. Only a path we can POSITIVELY show is
+ * absent is dropped; anything we merely cannot resolve (a bare command name
+ * with an empty PATH, a stat that throws) is honoured, because an unprovable
+ * negative must never override an explicit operator instruction. A dropped
+ * entry is reported rather than silently discarded — the original bug was
+ * silence.
+ */
+/**
+ * `sessions.claudePath` was used verbatim, so a config copied from another
+ * machine kept a path that does not exist here. Every Claude session then
+ * died the instant it spawned, and with it the session's Telegram sending
+ * credential (instar#2122). Same rule as `mergeOperatorBinaryPaths`: a path
+ * we can positively show is absent is ignored in favour of detection, loudly.
+ * A bare command name, or a probe that fails, is kept as configured.
+ */
+export function resolveConfiguredClaudePath(
+  configured: string | undefined,
+  detect: () => string | null,
+  deps: { exists?: (p: string) => boolean; warn?: (msg: string) => void } = {},
+): string | null {
+  if (typeof configured !== 'string' || configured.trim() === '') return detect();
+  const exists = deps.exists ?? ((p: string) => fs.existsSync(p));
+  const warn = deps.warn ?? ((msg: string) => console.warn(msg));
+  let provablyAbsent = false;
+  if (configured.includes('/')) {
+    try {
+      provablyAbsent = !exists(configured);
+    } catch {
+      // @silent-fallback-ok — a failed probe is not evidence of absence.
+      provablyAbsent = false;
+    }
+  }
+  if (!provablyAbsent) return configured;
+  const detected = detect();
+  if (!detected) {
+    // Nothing to replace it with: keep the configured value (unchanged
+    // behaviour, and the hermetic-test convention of a placeholder path on a
+    // host without claude still satisfies the prerequisite check).
+    warn(`[config] sessions.claudePath points at ${configured}, which does not exist on this machine, and no claude binary was detected. Fix or remove sessions.claudePath.`);
+    return configured;
+  }
+  warn(
+    `[config] sessions.claudePath points at ${configured}, which does not exist on this machine — `
+      + `using the detected ${detected} instead. Fix or remove sessions.claudePath to silence this.`,
+  );
+  return detected;
+}
+
+export function mergeOperatorBinaryPaths(
+  detected: Record<string, string>,
+  configured: Record<string, string> | undefined,
+  deps: { exists?: (p: string) => boolean; warn?: (msg: string) => void } = {},
+): Record<string, string> {
+  const exists = deps.exists ?? ((p: string) => fs.existsSync(p));
+  const warn = deps.warn ?? ((msg: string) => console.warn(msg));
+  const merged: Record<string, string> = { ...detected };
+  for (const [framework, configuredPath] of Object.entries(configured ?? {})) {
+    if (typeof configuredPath !== 'string' || configuredPath.trim() === '') continue;
+    // Only an absolute/relative PATH can be checked for existence. A bare
+    // command name resolves through PATH at spawn time, which we do not
+    // second-guess here.
+    const checkable = configuredPath.includes('/');
+    let provablyAbsent = false;
+    if (checkable) {
+      try {
+        provablyAbsent = !exists(configuredPath);
+      } catch {
+        // @silent-fallback-ok — a failed probe is not evidence of absence.
+        provablyAbsent = false;
+      }
+    }
+    if (provablyAbsent) {
+      warn(
+        `[config] sessions.frameworkBinaryPaths['${framework}'] points at ${configuredPath}, `
+          + 'which does not exist — ignoring it and using detection instead. '
+          + 'Fix or remove the entry to silence this.',
+      );
+      continue;
+    }
+    merged[framework] = configuredPath;
+  }
+  return merged;
+}
+
 export type FrameworkBinary =
   | 'claude'      // Claude Code CLI
   | 'codex'       // OpenAI Codex CLI
   | 'gemini'      // Gemini CLI
   | 'pi'          // pi coding agent (@earendil-works/pi-coding-agent)
+  | 'grok'        // xAI Grok Build CLI (xai-org/grok-build)
   | 'aider'       // Aider
   | 'goose'       // Block Goose
   | 'cursor-cli'  // Cursor CLI
@@ -130,7 +235,8 @@ export type FrameworkBinary =
  *   2. Standard system paths (`/usr/local/bin`, `/opt/homebrew/bin`)
  *   3. npm global bin (where `npm install -g` lands)
  *   4. nvm-managed bin directories
- *   5. asdf shims (`$ASDF_DATA_DIR/shims` or `~/.asdf/shims`) + `asdf which`
+ *   5. asdf shims (`$ASDF_DATA_DIR/shims` or `~/.asdf/shims`) + `asdf which`, and mise shims
+ *      (`$MISE_DATA_DIR/shims` or `~/.local/share/mise/shims`)
  *   6. System PATH (via `which`)
  *
  * Returns the absolute path or null if not found.
@@ -148,6 +254,7 @@ const _frameworkBinaryCache = new Map<FrameworkBinary, string | null>();
 /** Test-only: clear the detection memo. */
 export function _resetFrameworkBinaryCache(): void {
   _frameworkBinaryCache.clear();
+  _npmPrefixMemo = undefined;
 }
 
 export function detectFrameworkBinary(name: FrameworkBinary): string | null {
@@ -156,6 +263,34 @@ export function detectFrameworkBinary(name: FrameworkBinary): string | null {
   const result = detectFrameworkBinaryUncached(name);
   _frameworkBinaryCache.set(name, result);
   return result;
+}
+
+/** For the installer: looks again right after installing a binary, which the memo would hide. */
+export function redetectFrameworkBinary(name: FrameworkBinary): string | null {
+  _frameworkBinaryCache.delete(name);
+  _npmPrefixMemo = undefined;
+  return detectFrameworkBinary(name);
+}
+
+/** Memoized `npm config get prefix` — one subprocess per process, not per framework. */
+let _npmPrefixMemo: string | null | undefined;
+function npmGlobalPrefix(): string | null {
+  if (_npmPrefixMemo !== undefined) return _npmPrefixMemo;
+  try {
+    // lint-allow-sync-spawn: config LOAD-time binary detection, the same
+    // pre-runtime phase the sibling detection spawns in this file already
+    // occupy (`which`, `asdf which`) — loadConfig runs before the server's
+    // event loop exists, and this memo REDUCES the count from one-per-framework
+    // to one-per-process (round-11 scalability).
+    _npmPrefixMemo = execFileSync('npm', ['config', 'get', 'prefix'], {
+      encoding: 'utf-8',
+      stdio: 'pipe',
+    }).trim() || null;
+  } catch {
+    // @silent-fallback-ok — no npm on PATH; the other candidate roots still apply.
+    _npmPrefixMemo = null;
+  }
+  return _npmPrefixMemo;
 }
 
 function detectFrameworkBinaryUncached(name: FrameworkBinary): string | null {
@@ -173,6 +308,23 @@ function detectFrameworkBinaryUncached(name: FrameworkBinary): string | null {
     case 'gemini':
       candidates.push(path.join(home, '.gemini', 'bin', 'gemini'));
       break;
+    case 'grok':
+      // The installer links BOTH `grok` and `agent` into ~/.grok/bin. We
+      // detect ONLY `grok` — `agent` collides with Cursor's CLI binary of the
+      // same name (grok-build spec §2.1) and must never be the invoked name.
+      //
+      // GROK_HOME FIRST (round-9 adversarial, spec §2.1 normative order): this
+      // arm was GROK_HOME-blind, so under an isolated GROK_HOME with a stale
+      // `~/.grok` install still on disk, detection returned a binary from one
+      // root while auth and config.toml resolved from
+      // another — breaking the adapter's own "every path resolves from ONE
+      // root" invariant and pointing the version-drift canary at the wrong
+      // binary.
+      if (process.env['GROK_HOME']) {
+        candidates.push(path.join(process.env['GROK_HOME'], 'bin', 'grok'));
+      }
+      candidates.push(path.join(home, '.grok', 'bin', 'grok'));
+      break;
     default:
       // No framework-specific path; falls through to system + PATH.
       break;
@@ -183,12 +335,16 @@ function detectFrameworkBinaryUncached(name: FrameworkBinary): string | null {
   candidates.push(`/usr/local/bin/${name}`);    // macOS Intel / Linux
   candidates.push(`/usr/bin/${name}`);           // Linux system
 
+
   // npm global bin (where `npm install -g <pkg>` lands).
+  // MEMOIZED across every framework name (round-11 scalability): this
+  // subprocess ran once PER framework probed, BEFORE the existsSync candidate
+  // loop — so adding grok detection to loadConfig cost every agent another
+  // ~0.14s of synchronous subprocess at boot and on every CLI invocation, opted
+  // in or not, which is a dark-ship break arriving through COST instead of a
+  // write. The prefix cannot change within a process, so one probe is correct.
   try {
-    const npmPrefix = execFileSync('npm', ['config', 'get', 'prefix'], {
-      encoding: 'utf-8',
-      stdio: 'pipe',
-    }).trim();
+    const npmPrefix = npmGlobalPrefix();
     if (npmPrefix) candidates.push(path.join(npmPrefix, 'bin', name));
   } catch {
     // @silent-fallback-ok — npm prefix detection
@@ -227,6 +383,20 @@ function detectFrameworkBinaryUncached(name: FrameworkBinary): string | null {
   // Honors ASDF_DATA_DIR, else the default ~/.asdf.
   const asdfDataDir = process.env.ASDF_DATA_DIR || path.join(home, '.asdf');
   candidates.push(path.join(asdfDataDir, 'shims', name));
+
+  // The per-user bin, after the rest, so an agent that already finds a copy anywhere else keeps using it (a Mac can hold both, with only the system one on PATH). Claude Code's own native
+  // installer puts `claude` here, and `instar install` puts an npm CLI here when the global npm
+  // folder isn't writable; a login shell adds it to PATH only if it existed at login, so a binary
+  // installed during this session would otherwise read as missing (fresh Ubuntu, 2026-11-03).
+  if (home) candidates.push(path.join(home, '.local', 'bin', name));
+
+  // mise shims, which a service PATH also misses. Omarchy 4.0 keeps node there and launchers for claude and
+  // codex in ~/.local/bin (searched just above); its 4.5 release candidates move those to mise shims
+  // that route each launch to the person's active subscription, so the shim, not the resolved
+  // install, is what their terminal runs.
+  const miseDataDir = process.env.MISE_DATA_DIR
+    || path.join(process.env.XDG_DATA_HOME || path.join(home, '.local', 'share'), 'mise');
+  candidates.push(path.join(miseDataDir, 'shims', name));
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate;
@@ -307,6 +477,17 @@ export function detectPiPath(): string | null {
   return detectFrameworkBinary('pi');
 }
 
+/**
+ * Detect the Grok Build CLI binary (grok-build framework integration spec
+ * §2.1). Resolves ONLY the `grok` name — never the sibling `agent` symlink,
+ * which collides with Cursor's CLI. GROK_HOME-aware installs are handled by
+ * the adapter config (GROK_BUILD_PATH override); this covers the standard
+ * `~/.grok/bin/grok` install plus system locations.
+ */
+export function detectGrokPath(): string | null {
+  return detectFrameworkBinary('grok');
+}
+
 // ── Framework Prerequisite Check ───────────────────────────────────────
 
 /**
@@ -316,7 +497,7 @@ export function detectPiPath(): string | null {
  */
 export interface FrameworkPrerequisiteInput {
   /** Framework selected by config or env. */
-  configuredFramework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
+  configuredFramework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
   /** Path to claude binary if detected, else null. */
   claudePathDetected: string | null;
   /** Path to codex binary if detected, else null. */
@@ -325,6 +506,8 @@ export interface FrameworkPrerequisiteInput {
   geminiPathDetected?: string | null;
   /** Path to pi binary if detected, else null. */
   piPathDetected?: string | null;
+  /** Path to grok binary if detected, else null. */
+  grokPathDetected?: string | null;
 }
 
 export interface FrameworkPrerequisiteResult {
@@ -390,6 +573,16 @@ export function checkFrameworkPrerequisite(
         };
       }
       return { satisfied: true };
+    case 'grok-build':
+      if (!input.grokPathDetected) {
+        return {
+          satisfied: false,
+          error:
+            'Grok Build CLI not found. The configured framework is grok-build. '
+            + 'Install with: curl -fsSL https://x.ai/cli/install.sh | bash',
+        };
+      }
+      return { satisfied: true };
     default: {
       const _exhaustive: never = input.configuredFramework;
       void _exhaustive;
@@ -404,10 +597,10 @@ export function checkFrameworkPrerequisite(
  * unit-test the resolution independently.
  */
 export function resolveConfiguredFramework(
-  configValue: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | undefined,
+  configValue: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build' | undefined,
   envValue: string | undefined,
-  enabledFrameworks?: ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli')[],
-): 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' {
+  enabledFrameworks?: ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build')[],
+): 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build' {
   // Precedence:
   //   1. sessions.framework (explicit per-install runtime override)
   //   2. INSTAR_FRAMEWORK env (explicit runtime override for this boot)
@@ -417,16 +610,29 @@ export function resolveConfiguredFramework(
   //      the runtime honors the wizard's framework choice even when
   //      sessions.framework and the env are both unset)
   //   4. 'claude-code' (historical default)
-  if (configValue === 'claude-code' || configValue === 'codex-cli' || configValue === 'gemini-cli' || configValue === 'pi-cli') {
+  // Round-11 (adversarial): all three arms omitted 'grok-build' while the
+  // signature named it — the predicate-outruns-its-runtime-test shape again,
+  // and this instance is the one that matters most for the actual deliverable:
+  // a Grok-PRIMARY agent whose config says `enabledFrameworks: ['grok-build']`
+  // resolved to claude-code, so the agent built to run on grok would silently
+  // have run on Claude. It also made Config's grok binary arm and the grok
+  // prerequisite check unreachable.
+  if (
+    configValue === 'claude-code' || configValue === 'codex-cli'
+    || configValue === 'gemini-cli' || configValue === 'pi-cli'
+    || configValue === 'grok-build'
+  ) {
     return configValue;
   }
-  const env = envValue?.trim().toLowerCase();
-  if (env === 'codex-cli' || env === 'codex') return 'codex-cli';
-  if (env === 'gemini-cli' || env === 'gemini') return 'gemini-cli';
-  if (env === 'pi-cli' || env === 'pi') return 'pi-cli';
-  if (env === 'claude-code' || env === 'claude') return 'claude-code';
+  // Round-21: shares one alias table with the provider factory's resolver,
+  // which had drifted to a three-framework subset of this chain.
+  const fromEnv = resolveFrameworkAlias(envValue);
+  if (fromEnv !== null) return fromEnv;
   const first = enabledFrameworks?.[0];
-  if (first === 'claude-code' || first === 'codex-cli' || first === 'gemini-cli' || first === 'pi-cli') return first;
+  if (
+    first === 'claude-code' || first === 'codex-cli' || first === 'gemini-cli'
+    || first === 'pi-cli' || first === 'grok-build'
+  ) return first;
   return 'claude-code';
 }
 
@@ -471,6 +677,47 @@ function buildCredentialsMap(
   }
 
   return Object.keys(credentials).length > 0 ? credentials : undefined;
+}
+
+/**
+ * Launch-time Anthropic credential fields for SessionManagerConfig (fb-7cb86d4b-1fd).
+ *
+ * Every claude-code spawn path builds its env from `anthropicApiKey`/`anthropicBaseUrl`. Feeding
+ * those from the SAME precedence as {@link buildCredentialsMap} (explicit
+ * `sessions.credentials.anthropic` wins, legacy `sessions.anthropicApiKey`/`anthropicBaseUrl`
+ * fill in) keeps one source of truth without touching each spawn site. A non-string value (for
+ * example an unmigrated `{ secret: true }` placeholder) is ignored rather than stringified.
+ */
+export function resolveAnthropicLaunchFields(
+  sessionsConfig: Record<string, unknown> | undefined,
+): { anthropicApiKey: string | undefined; anthropicBaseUrl: string | undefined } {
+  const legacyKey = typeof sessionsConfig?.['anthropicApiKey'] === 'string' ? (sessionsConfig['anthropicApiKey'] as string) : undefined;
+  const legacyBase = typeof sessionsConfig?.['anthropicBaseUrl'] === 'string' ? (sessionsConfig['anthropicBaseUrl'] as string) : undefined;
+  const map = sessionsConfig?.['credentials'] as Record<string, unknown> | undefined;
+  const cred = map && typeof map === 'object' ? (map['anthropic'] as Record<string, unknown> | undefined) : undefined;
+  const credValue = cred && typeof cred['value'] === 'string' && (cred['value'] as string).length > 0 ? (cred['value'] as string) : undefined;
+  const credBase = cred && typeof cred['baseUrl'] === 'string' && (cred['baseUrl'] as string).length > 0 ? (cred['baseUrl'] as string) : undefined;
+  return { anthropicApiKey: credValue ?? legacyKey, anthropicBaseUrl: credBase ?? legacyBase };
+}
+
+/**
+ * The launch key as it stands in config.json right now, for a process whose loaded config may be
+ * stale. Null when none is set. Undefined when the file can't be read or parsed: a writer may be
+ * mid-write, so the caller keeps what it last had.
+ */
+export function readConfiguredAnthropicKey(stateDir: string): string | null | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(stateDir, 'config.json'), 'utf-8')) as { sessions?: Record<string, unknown> };
+    return resolveAnthropicLaunchFields(raw.sessions).anthropicApiKey || null;
+  } catch { return undefined; } // @silent-fallback-ok: an unreadable file keeps the last key, by contract above
+}
+
+/** The off switch as it stands in config.json now. An unreadable file reads as on, the default. */
+export function readClaudeChildAuthEnabled(stateDir: string): boolean {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(stateDir, 'config.json'), 'utf-8')) as { sessions?: { claudeChildAuth?: { enabled?: unknown } } };
+    return raw.sessions?.claudeChildAuth?.enabled !== false;
+  } catch { return true; } // @silent-fallback-ok: a writer may be mid-write; the default stands for this one read
 }
 
 /**
@@ -653,9 +900,11 @@ export function resolveAgentDir(nameOrPath?: string): string {
     return agentDir;
   }
 
-  // Check global registry for the name (dynamic import to avoid circular deps)
+  // Resolve before the read fallback: an invalid explicit trial directory
+  // must never silently revert to another registry or a generic not-found.
+  const registryPath = agentRegistryPath();
+  // Check the selected registry for the name.
   try {
-    const registryPath = path.join(os.homedir(), '.instar', 'registry.json');
     if (fs.existsSync(registryPath)) {
       const data = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
       const entries = Array.isArray(data.entries) ? data.entries : [];
@@ -788,22 +1037,50 @@ export function loadConfig(projectDir?: string): InstarConfig {
     // agent (sessions.framework + INSTAR_FRAMEWORK both unset) would
     // resolve to claude-code and spawn Claude sessions on every
     // message — the framework-portability bug.
-    fileConfig.enabledFrameworks as ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli')[] | undefined,
+    fileConfig.enabledFrameworks as ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build')[] | undefined,
   );
-  const claudePathDetected = fileConfig.sessions?.claudePath || detectClaudePath();
+  const claudePathDetected = resolveConfiguredClaudePath(fileConfig.sessions?.claudePath, detectClaudePath);
   const codexPathDetected = detectCodexPath();
   const geminiPathDetected = detectGeminiPath();
   const piPathDetected = detectPiPath();
+  const grokPathDetected = detectGrokPath();
 
   if (!tmuxPath) {
     throw new Error('tmux not found. Install with: brew install tmux (macOS) or apt install tmux (Linux)');
   }
+
+  // ROUND-23 — the operator's binary-path lever did not reach the PREREQUISITE
+  // check, only the spawn map built ~50 lines below. So `claude-code` had an
+  // escape hatch for a relocated install (`sessions.claudePath` seeds its
+  // detection above) and the other FOUR frameworks had none: an operator whose
+  // grok/codex/gemini/pi binary lives somewhere detection does not look could
+  // configure the correct path, watch it be honoured for spawning, and still be
+  // refused at boot. Same "a lever with no load path is not a lever" shape that
+  // round-11 fixed for the spawn map — one layer earlier, and unnoticed because
+  // the two levers look identical from config.json.
+  //
+  // The merge keeps its asymmetric existence guard, which is what makes this
+  // safe: a configured path we can POSITIVELY show is absent is dropped, so a
+  // stale or hand-written entry cannot fake a prerequisite for a binary that
+  // is not there. It can only rescue a path that genuinely exists.
+  const operatorMergedPaths = mergeOperatorBinaryPaths(
+    {
+      ...(claudePathDetected ? { 'claude-code': claudePathDetected } : {}),
+      ...(codexPathDetected ? { 'codex-cli': codexPathDetected } : {}),
+      ...(geminiPathDetected ? { 'gemini-cli': geminiPathDetected } : {}),
+      ...(piPathDetected ? { 'pi-cli': piPathDetected } : {}),
+      ...(grokPathDetected ? { 'grok-build': grokPathDetected } : {}),
+    },
+    fileConfig.sessions?.frameworkBinaryPaths as Record<string, string> | undefined,
+  );
+
   const prereq = checkFrameworkPrerequisite({
     configuredFramework,
-    claudePathDetected,
-    codexPathDetected,
-    geminiPathDetected,
-    piPathDetected,
+    claudePathDetected: operatorMergedPaths['claude-code'] ?? claudePathDetected,
+    codexPathDetected: operatorMergedPaths['codex-cli'] ?? codexPathDetected,
+    geminiPathDetected: operatorMergedPaths['gemini-cli'] ?? geminiPathDetected,
+    piPathDetected: operatorMergedPaths['pi-cli'] ?? piPathDetected,
+    grokPathDetected: operatorMergedPaths['grok-build'] ?? grokPathDetected,
   });
   if (!prereq.satisfied) {
     throw new Error(prereq.error!);
@@ -820,7 +1097,14 @@ export function loadConfig(projectDir?: string): InstarConfig {
         ? (geminiPathDetected ?? claudePathDetected ?? '')
         : configuredFramework === 'pi-cli'
           ? (piPathDetected ?? claudePathDetected ?? '')
-          : (claudePathDetected ?? '');
+          : configuredFramework === 'grok-build'
+            // NO claudePath fallback (adversarial round-8): a grok-configured
+            // agent whose binary vanished must fail loudly, never launch
+            // Claude under a grok label. The prerequisite check already
+            // refuses boot when the binary is missing, so this only guards
+            // transient disappearance.
+            ? (grokPathDetected ?? '')
+            : (claudePathDetected ?? '');
 
   const projectName = fileConfig.projectName || path.basename(resolvedProjectDir);
 
@@ -830,12 +1114,19 @@ export function loadConfig(projectDir?: string): InstarConfig {
     claudePath,
     // Expose every detected framework binary so spawnInteractiveSession
     // can route a session to any framework without re-running detection.
-    frameworkBinaryPaths: {
-      ...(claudePathDetected ? { 'claude-code': claudePathDetected } : {}),
-      ...(codexPathDetected ? { 'codex-cli': codexPathDetected } : {}),
-      ...(geminiPathDetected ? { 'gemini-cli': geminiPathDetected } : {}),
-      ...(piPathDetected ? { 'pi-cli': piPathDetected } : {}),
-    },
+    //
+    // Round-11 (adversarial) — the SEVENTH load-path-gap instance: this map was
+    // built PURELY from detection, so `sessions.frameworkBinaryPaths` in
+    // config.json was never read and an operator pointing at a relocated
+    // install had the value silently discarded. The grok spec's §2.1 named it
+    // as rung 2 of the normative order, i.e. a lever with no load path — the
+    // same defect the spec catalogues elsewhere, in its own carrier. The
+    // operator's explicit values WIN over detection; detection fills the rest.
+    // ROUND-23: reuse the SAME merged value the prerequisite check consumed.
+    // Computing it twice is how the two answers drift — a boot that refuses on
+    // one resolution while spawning on another is the worst of both, and the
+    // divergence would be invisible because each site looks correct alone.
+    frameworkBinaryPaths: operatorMergedPaths,
     // The resolved runtime framework. Both spawn paths read this as
     // the default when no per-call framework override is given, so a
     // codex-cli agent spawns Codex on EVERY path (jobs + messages).
@@ -843,6 +1134,7 @@ export function loadConfig(projectDir?: string): InstarConfig {
     projectDir: resolvedProjectDir,
     maxSessions: fileConfig.sessions?.maxSessions ?? DEFAULT_MAX_SESSIONS,
     protectedSessions: fileConfig.sessions?.protectedSessions || [`${projectName}-server`],
+    standingSessions: normalizeStandingSessions(fileConfig.sessions?.standingSessions),
     completionPatterns: fileConfig.sessions?.completionPatterns || [
       'has been automatically paused',
       'Session ended',
@@ -850,8 +1142,23 @@ export function loadConfig(projectDir?: string): InstarConfig {
     ],
     authToken: fileConfig.authToken as string | undefined,
     port: (fileConfig.port as number | undefined) ?? 4040,
-    anthropicApiKey: fileConfig.sessions?.anthropicApiKey as string | undefined,
-    anthropicBaseUrl: fileConfig.sessions?.anthropicBaseUrl as string | undefined,
+    // fb-7cb86d4b-1fd: session launch reads `anthropicApiKey`/`anthropicBaseUrl`. An install that
+    // configures only the documented `sessions.credentials.anthropic` used to launch every
+    // claude-code session with an EMPTY token ("Not logged in"). Resolve the launch credential
+    // from the same precedence getProviderCredential() uses: explicit credentials.anthropic
+    // first, the legacy fields as the fallback.
+    ...resolveAnthropicLaunchFields(fileConfig.sessions as Record<string, unknown> | undefined),
+    ...(fileConfig.sessions?.claudeChildAuth ? { claudeChildAuth: fileConfig.sessions.claudeChildAuth as { enabled?: boolean } } : {}),
+    ...(fileConfig.sessions?.claudeKeyHealth ? { claudeKeyHealth: fileConfig.sessions.claudeKeyHealth as { enabled?: boolean } } : {}),
+    ...(fileConfig.sessions?.resumeFollowsAccount &&
+    typeof fileConfig.sessions.resumeFollowsAccount === 'object'
+      ? { resumeFollowsAccount: fileConfig.sessions.resumeFollowsAccount as { enabled?: boolean } }
+      : {}),
+    // CMT-798: retained per-version Claude executable (off switch + dir + grace).
+    ...(fileConfig.sessions?.retainedClaudeBinary &&
+    typeof fileConfig.sessions.retainedClaudeBinary === 'object'
+      ? { retainedClaudeBinary: fileConfig.sessions.retainedClaudeBinary as { enabled?: boolean; dir?: string; pruneGraceMs?: number } }
+      : {}),
     credentials: buildCredentialsMap(fileConfig.sessions as Record<string, unknown> | undefined),
     // Per-component framework routing (docs/specs/per-component-framework-routing.md).
     // LOAD-PATH FIX (2026-06-06): this field was documented + consumed
@@ -864,6 +1171,47 @@ export function loadConfig(projectDir?: string): InstarConfig {
     ...(fileConfig.sessions?.componentFrameworks &&
     typeof fileConfig.sessions.componentFrameworks === 'object'
       ? { componentFrameworks: fileConfig.sessions.componentFrameworks }
+      : {}),
+    // Per-framework default model pattern (frameworkDefaultModels['pi-cli'] →
+    // the pi-cli provider's required model). SAME LOAD-PATH GAP as componentFrameworks
+    // above (2026-06-25): server.ts reads config.sessions.frameworkDefaultModels to build
+    // the pi-cli provider, but the loader never copied it from the config FILE here — so
+    // the pattern was always undefined at boot, the factory degraded pi-cli to null
+    // ("binary missing / not built"), and pi-cli was silently UNAVAILABLE on every
+    // deployed agent despite a valid binary + config. Pass it through (the factory still
+    // guards each value; an absent/empty pattern degrades per design).
+    ...(fileConfig.sessions?.frameworkDefaultModels &&
+    typeof fileConfig.sessions.frameworkDefaultModels === 'object'
+      ? { frameworkDefaultModels: fileConfig.sessions.frameworkDefaultModels }
+      : {}),
+    // dynamicMcp (DYNAMIC-MCP-LIFECYCLE-SPEC). THE SAME LOAD-PATH GAP as
+    // componentFrameworks/frameworkDefaultModels above (THIRD instance — live-test
+    // 2026-06-27): #1293 added the feature, the `/mcp/*` routes (which read
+    // `options.config.sessions.dynamicMcp.enabled`), and SessionManager.buildSessionMcpFlags
+    // (which reads `config.sessions.dynamicMcp`) — but the loader never copied the field
+    // from the config FILE here. So the feature was UN-ENABLABLE on every deployed agent:
+    // setting `sessions.dynamicMcp.enabled: true` did nothing (routes 503'd, sessions never
+    // trimmed). The e2e/integration tests build config objects in-memory, bypassing
+    // loadConfig, so the file-load gap never surfaced until a real config-file enable was
+    // driven live. Pass it through (DynamicMcpService.enabled()/buildSessionMcpFlags still
+    // gate on `.enabled === true`, and the service construction is fail-safe).
+    ...(fileConfig.sessions?.dynamicMcp &&
+    typeof fileConfig.sessions.dynamicMcp === 'object'
+      ? { dynamicMcp: fileConfig.sessions.dynamicMcp }
+      : {}),
+    // grok-build interactive dual gate (grok-build spec §4.3/§7). THE SAME
+    // LOAD-PATH GAP as the three lifts above — FOURTH instance, caught in
+    // spec review BEFORE shipping this time (2026-08-14): SessionManager
+    // reads BOTH levers off the sessions slice, so both must be lifted from
+    // the config FILE here or the documented opt-in is a dead switch that
+    // refuses forever. enabledFrameworks is top-level in the file; it is
+    // COPIED into the slice (never moved) because the top-level consumer
+    // (framework resolution) still reads it there.
+    ...(Array.isArray(fileConfig.enabledFrameworks)
+      ? { enabledFrameworks: fileConfig.enabledFrameworks as ('claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build')[] }
+      : {}),
+    ...(fileConfig.sessions?.grokInteractiveSessions === true
+      ? { grokInteractiveSessions: true }
       : {}),
     // pi-cli subscription-guard override (PI-HARNESS-INTEGRATION-SPEC §4.3).
     // Config surface: top-level `piCli.allowAnthropicProviders` — file-config
@@ -896,6 +1244,10 @@ export function loadConfig(projectDir?: string): InstarConfig {
     },
     authToken: fileConfig.authToken as string | undefined,
     projectName,
+    // Test-agent leak guard override (docs/specs/test-agent-leak-guard.md).
+    // Built field-by-field like the rest of this object, so an unlisted key
+    // would be silently dropped and the override could never take effect.
+    ...(fileConfig.scheduler?.allowOnThrowawayAgent === true ? { allowOnThrowawayAgent: true } : {}),
   };
 
   // Auto-generate contextSigningKey if not present (persists to config file)
@@ -991,4 +1343,10 @@ export function ensureStateDir(stateDir: string): void {
   for (const dir of dirs) {
     fs.mkdirSync(dir, { recursive: true });
   }
+}
+
+/** `sessions.standingSessions` — keep only non-empty strings; anything else ⇒ []. */
+export function normalizeStandingSessions(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((e): e is string => typeof e === 'string' && e.trim().length > 0).map(e => e.trim());
 }

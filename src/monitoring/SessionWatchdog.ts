@@ -7,20 +7,23 @@
  *
  * Escalation pipeline:
  *   Level 0: Monitoring (default)
- *   Level 1: Ctrl+C via tmux send-keys
+ *   Level 1: targeted SIGINT to the selected descendant
  *   Level 2: SIGTERM the stuck child PID
  *   Level 3: SIGKILL the stuck child PID
  *   Level 4: Kill tmux session
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { maybeRotateJsonl } from '../utils/jsonl-rotation.js';
+import { withSyncOp } from '../core/InFlightSyncOpMarker.js';
 import {
   evaluateThrottleSettle,
+  evaluateUsageWallSettle,
   RATE_LIMIT_SETTLED_CAPTURE_LINES,
   RATE_LIMIT_DEFAULT_SETTLE_MS,
   type ThrottleSettleState,
@@ -60,6 +63,40 @@ import type { SessionManager } from '../core/SessionManager.js';
 import type { StateManager } from '../core/StateManager.js';
 import type { InstarConfig, IntelligenceProvider } from '../core/types.js';
 import { createRequire } from 'node:module';
+import { buildBoundedContext, buildStructuredSha256Identity } from '../core/JudgmentProvenanceLog.js';
+import { DP_WATCHDOG_STUCK_JUDGE } from '../data/provenanceCoverage.js';
+import { FrameworkProcessProvenanceVerifier } from './FrameworkProcessProvenance.js';
+import {
+  TestRunnerProgressTracker,
+  parseCpuTime,
+  type TestRunnerProgress,
+} from './testRunnerProgress.js';
+
+export const WATCHDOG_STUCK_JUDGE_PROMPT_ID = 'watchdog-stuck-judge-v1';
+
+/** Identity-only envelope for the bounded command and terminal evidence shown to the judge. */
+export function buildWatchdogStuckDecisionContext(input: {
+  promptText: string;
+  commandSlice: string;
+  commandWasTruncated: boolean;
+  outputSample: string;
+  elapsedMinutes: number;
+}): Record<string, unknown> {
+  return buildBoundedContext({
+    promptIdentitySha256: buildStructuredSha256Identity(input.promptText),
+    promptChars: input.promptText.length,
+    promptBytes: Buffer.byteLength(input.promptText, 'utf8'),
+    commandIdentitySha256: buildStructuredSha256Identity(input.commandSlice),
+    commandChars: input.commandSlice.length,
+    commandWasTruncated: input.commandWasTruncated,
+    outputAvailable: input.outputSample.length > 0,
+    outputIdentitySha256: input.outputSample.length > 0
+      ? buildStructuredSha256Identity(input.outputSample)
+      : null,
+    outputChars: input.outputSample.length,
+    elapsedMinutes: input.elapsedMinutes,
+  });
+}
 
 // ESM module: a bare CJS `require` is undefined and throws at runtime. Bind a
 // real require via createRequire so the lazy load below is genuinely ESM-legal
@@ -76,16 +113,26 @@ export enum EscalationLevel {
 
 interface ChildProcessInfo {
   pid: number;
+  parentPid: number;
   command: string;
   elapsedMs: number;
+  /** Cumulative CPU time of this process alone, from the same `ps` snapshot.
+   *  `undefined` when the platform's `ps` gave no readable time column. */
+  cpuMs?: number;
 }
 
 interface EscalationState {
   level: EscalationLevel;
   levelEnteredAt: number;
   stuckChildPid: number;
+  stuckChildParentPid: number;
   stuckCommand: string;
+  sessionId?: string;
+  sessionStartedAt?: string;
   retryCount: number;
+  /** Test-runner class of the stuck command, decided once at detection time
+   *  (where the live descendant snapshot is available). */
+  stuckCommandKind?: 'test-runner' | 'test-runner-ancestor';
 }
 
 export interface InterventionEvent {
@@ -94,11 +141,398 @@ export interface InterventionEvent {
   action: string;
   stuckCommand: string;
   stuckPid: number;
+  stuckParentPid?: number;
+  processRole: 'user-command';
+  effectScope: 'target-process' | 'session-via-reap-authority';
+  sessionId?: string;
+  sessionStartedAt?: string;
   timestamp: number;
+  /** The actor that caused the interruption. Never infer a human principal from Ctrl+C. */
+  principal: 'session-watchdog';
+  /** Stable lifecycle reason for audit/correlation with framework turn-aborted events. */
+  reason: 'stuck-command-judge';
+  /**
+   * Set when the interrupted process was a test runner, or an ancestor of one.
+   * Interrupting a test run destroys its results, so this class of
+   * intervention is announced to the user at EVERY escalation level — see
+   * watchdog-notifications.ts.
+   */
+  stuckCommandKind?: 'test-runner' | 'test-runner-ancestor';
+  /** How long the interrupted process had been running, for an honest notice. */
+  stuckElapsedMs?: number;
+  /** 0 on the first intervention of an episode; >0 on a repeat Ctrl+C. Lets a
+   *  notice fire once per episode instead of once per escalation step. */
+  stuckRetryCount?: number;
+  operatorInitiated: false;
   /** Outcome tracking — filled in after a delay */
-  outcome?: 'recovered' | 'died' | 'unknown';
+  outcome?: 'session-alive' | 'recovered' | 'died' | 'unknown';
   /** Time in ms between intervention and outcome determination */
   outcomeDelayMs?: number;
+}
+
+export interface ProtectedWaitEvidence {
+  protected: boolean;
+  reason?: 'safe-merge-wait' | 'github-run-watch' | 'bounded-wait-output' | 'test-runner' | 'test-runner-ancestor' | 'timed-sleep';
+  /**
+   * True when the wall-clock floor had already expired and protection was held
+   * open only because the subtree's CPU time was still advancing. Surfaced so
+   * the log line says WHY a run past its floor was spared.
+   */
+  extendedByProgress?: boolean;
+}
+
+export interface LongLivedServiceEvidence {
+  protected: boolean;
+  reason?: 'esbuild-service';
+}
+
+/**
+ * Deterministic process-role floor for compiler/test helpers that are expected
+ * to remain quiet for the lifetime of their parent.  Match the complete argv
+ * contract, not a basename alone: a normal one-shot `esbuild` invocation must
+ * remain eligible for ordinary stuck-command assessment.
+ */
+export function classifyLongLivedServiceProcess(command: string): LongLivedServiceEvidence {
+  const argv = command.trim().split(/\s+/);
+  const executable = path.basename(argv[0] ?? '');
+  const isEsbuildService = executable === 'esbuild'
+    && argv.some((arg) => /^--service(?:=|$)/.test(arg))
+    && argv.includes('--ping');
+  return isEsbuildService
+    ? { protected: true, reason: 'esbuild-service' }
+    : { protected: false };
+}
+
+export interface FrameworkInfrastructureEvidence {
+  protected: boolean;
+  /** `ownership-unknown` is intentionally protective: uncertain framework
+   * provenance is never authority to interrupt a process. */
+  reason?: 'codex-code-mode-host' | 'ownership-unknown';
+  confirmed: boolean;
+}
+
+/**
+ * Cheap host-name detector only. A basename is never sufficient evidence of
+ * framework ownership. Until the spawn-time executable snapshot and runtime
+ * vnode/start-time probes agree, the only safe classification is
+ * `ownership-unknown`: preserve and audit, never claim confirmed ownership.
+ */
+export function classifyFrameworkInfrastructureProcess(
+  command: string,
+  framework: string | undefined,
+): FrameworkInfrastructureEvidence {
+  if (framework !== 'codex-cli') return { protected: false, confirmed: false };
+  const executable = command.trim().split(/\s+/, 1)[0] ?? '';
+  const basename = path.basename(executable);
+  return basename === 'codex-code-mode-host'
+    ? { protected: true, confirmed: false, reason: 'ownership-unknown' }
+    : { protected: false, confirmed: false };
+}
+
+/**
+ * Deterministic guard for commands whose purpose is to wait for external state.
+ * These must not be handed to the probabilistic stuck judge: a quiet waiter is
+ * healthy by definition, and Ctrl+C aborts the entire Codex turn.
+ */
+const MAX_PROTECTED_WAIT_MS = 2 * 60 * 60 * 1_000;
+
+/**
+ * Bound for the test-runner floor. A full instar suite takes roughly 5-15 min
+ * on an idle machine and has been seen past 30 min under CPU saturation (the
+ * exact condition in which the LLM judge misread a busy `npm test` as stuck).
+ * One hour covers a saturated full suite with margin, while still handing a
+ * genuinely hung run back to the contextual judge (and its hard ceiling) the
+ * same afternoon. Deliberately shorter than the 2h external-wait floor: a test
+ * run is local CPU work, not a wait on someone else's system.
+ */
+export const MAX_TEST_RUNNER_PROTECTION_MS = 60 * 60 * 1_000;
+
+/**
+ * Absolute bound on the test-runner floor, including any progress-based
+ * extension. A suite still burning CPU after three hours is not a suite this
+ * guard should keep defending: either the machine is in a state no watchdog
+ * can fix, or the run is in a loop that consumes CPU without finishing. Past
+ * this the contextual judge and the hard ceiling decide, exactly as before.
+ *
+ * The extension exists because the floor's expiry was wall-clock only, which
+ * killed a healthy full suite at 3610s on 2026-10-20 — past the floor the
+ * hard ceiling (default 1800s) is already exceeded, so every fail-closed path
+ * votes to interrupt. Progress has to be able to hold the door open, and the
+ * door still has to close.
+ */
+export const MAX_TEST_RUNNER_ABSOLUTE_MS = 3 * 60 * 60 * 1_000;
+
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn']);
+const VITEST_EXECUTABLES = new Set(['vitest', 'vitest.mjs', 'vitest.js']);
+
+/**
+ * Xcode test runs (fb-412e8332-ee1). An iOS unit + UI suite under
+ * `xcodebuild test` takes 17-22 min and prints nothing while a UI test drives
+ * the simulator, so past the stuck threshold the judge once SIGINTed a healthy
+ * run with 21 of 69 tests still to go. It gets the same bounded floor as
+ * vitest — but only on identity, never a basename: the executable must be
+ * exactly `<developer dir>/usr/bin/<tool>` for the ACTIVE Xcode developer dir
+ * (or the SIP-protected `/usr/bin/xcodebuild` shim), and the argv must carry a
+ * test action as an action word, not as an option's value.
+ */
+const XCODEBUILD_TEST_ACTIONS = new Set(['test', 'test-without-building']);
+/** xcodebuild options that take no value; every other `-option` consumes the next token. */
+const XCODEBUILD_VALUELESS_OPTIONS = new Set([
+  '-quiet', '-verbose', '-json', '-hideShellScriptEnvironment', '-allowProvisioningUpdates',
+  '-allowProvisioningDeviceRegistration', '-skipUnavailableActions', '-skipPackagePluginValidation',
+  '-skipMacroValidation', '-disableAutomaticPackageResolution', '-onlyUsePackageVersionsFromResolvedFile',
+  '-skipPackageUpdates', '-disablePackageRepositoryCache', '-parallelizeTargets',
+  '-showBuildSettings', '-showdestinations', '-showTestPlans', '-list', '-dry-run', '-n',
+  '-retry-tests-on-failure', '-run-tests-until-failure', '-showBuildTimingSummary', '-showsdks',
+  '-alltargets', '-version', '-usage', '-help', '-enableCodeCoverage', '-enableAddressSanitizer',
+  '-enableThreadSanitizer', '-enableUndefinedBehaviorSanitizer', '-collect-test-diagnostics',
+]);
+
+let cachedActiveDeveloperDir: { dir: string | null; at: number } | undefined;
+/** A missing Xcode is re-checked after this long, so one failed probe or a later `xcode-select -s` is not permanent. */
+const XCODE_DIR_NULL_RETRY_MS = 10 * 60 * 1_000;
+/**
+ * The active Xcode developer dir: `DEVELOPER_DIR` if set, else `xcode-select -p`
+ * (macOS only), cached. A bare `.../Xcode.app` (which xcrun accepts) is
+ * normalised to `.../Xcode.app/Contents/Developer`, and symlinks are resolved
+ * because `ps` shows the resolved path. `null` when there is no Xcode — then
+ * only the `/usr/bin/xcodebuild` shim matches.
+ */
+export function activeXcodeDeveloperDir(now: number = Date.now()): string | null {
+  const cached = cachedActiveDeveloperDir;
+  if (cached && (cached.dir !== null || now - cached.at < XCODE_DIR_NULL_RETRY_MS)) return cached.dir;
+  let dir: string | null = null;
+  const fromEnv = process.env.DEVELOPER_DIR?.trim();
+  if (fromEnv) dir = fromEnv;
+  else if (process.platform === 'darwin') {
+    try {
+      dir = withSyncOp(() => execFileSync('/usr/bin/xcode-select', ['-p'], { encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'] })).trim() || null;
+    } catch { dir = null; /* @silent-fallback-ok — no Xcode tools is a normal state: only the /usr/bin/xcodebuild shim matches, the run is judged normally (no new protection), and null is re-probed after XCODE_DIR_NULL_RETRY_MS */ }
+  }
+  if (dir) {
+    dir = path.resolve(dir);
+    if (dir.endsWith('.app')) dir = path.join(dir, 'Contents', 'Developer');
+    try { dir = fs.realpathSync(dir); } catch { /* @silent-fallback-ok — keep the unresolved path: a mismatch with ps output only withholds the floor, so the run is judged normally */ }
+  }
+  cachedActiveDeveloperDir = { dir, at: now };
+  return dir;
+}
+
+/** True when xcodebuild's arguments (executable excluded) name a test action. */
+function hasXcodebuildTestAction(argv: readonly string[]): boolean {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith('-')) {
+      // `-only-testing:Target/Case` and `-opt=value` carry their value inline.
+      if (!XCODEBUILD_VALUELESS_OPTIONS.has(arg) && !arg.includes(':') && !arg.includes('=')) i++; // skip the option's value
+      continue;
+    }
+    if (arg.includes('=')) continue; // a build setting, KEY=VALUE
+    if (XCODEBUILD_TEST_ACTIONS.has(arg)) return true;
+  }
+  return false;
+}
+
+function classifyXcodeTestCommand(command: string, developerDir: string | null): 'test-runner' | null {
+  // Match the executable as a prefix of the ps command column, not argv[0]:
+  // a developer dir may contain spaces (`/Applications/Xcode 26.app/...`).
+  const devBin = developerDir ? path.join(developerDir, 'usr', 'bin') : null;
+  const restAfter = (exe: string): string[] | null =>
+    command === exe ? [] : command.startsWith(exe + ' ') ? command.slice(exe.length + 1).trim().split(/\s+/) : null;
+  const xcodebuildArgs = restAfter('/usr/bin/xcodebuild') ?? (devBin ? restAfter(path.join(devBin, 'xcodebuild')) : null);
+  if (xcodebuildArgs) return hasXcodebuildTestAction(xcodebuildArgs) ? 'test-runner' : null;
+  // `xcrun xctest <bundle>.xctest` runs the developer dir's xctest.
+  const xctestArgs = devBin ? restAfter(path.join(devBin, 'xctest')) : null;
+  if (xctestArgs) return xctestArgs.some((a) => !a.startsWith('-') && /\.xctest\/?$/.test(a)) ? 'test-runner' : null;
+  return null;
+}
+
+/** First argument after `start` that is not a flag or the `--` separator. */
+function firstPositional(argv: string[], start: number): string | undefined {
+  for (let i = start; i < argv.length; i++) {
+    if (argv[i] === '--' || argv[i].startsWith('-')) continue;
+    return argv[i];
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic argv-contract match for a known test runner. The executable
+ * position decides, never a substring: `echo npm test`, `grep vitest file` and
+ * `node worker.mjs --label "npm test"` do not match.
+ */
+export function classifyTestRunnerCommand(
+  command: string,
+  xcodeDeveloperDir: string | null = activeXcodeDeveloperDir(),
+): 'test-runner' | null {
+  const trimmed = command.trim();
+  if (classifyXcodeTestCommand(trimmed, xcodeDeveloperDir)) return 'test-runner';
+  // Vitest rewrites its own process title: main process `node (vitest)`,
+  // pool workers `node (vitest 1)`, `node (vitest 2)`, ...
+  if (/^node \(vitest(?: \d+)?\)$/.test(trimmed)) return 'test-runner';
+  const argv = trimmed.split(/\s+/);
+  const base = (index: number) => path.basename(argv[index] ?? '');
+  const i = /^node(?:\.exe)?$/.test(base(0)) ? 1 : 0;
+  const exe = base(i);
+  const sub = argv[i + 1];
+  if (PACKAGE_MANAGERS.has(exe)) {
+    if (sub === 'test' || sub === 't') return 'test-runner';
+    if ((sub === 'run' || sub === 'run-script') && /^test(?::[\w.-]+)?$/.test(argv[i + 2] ?? '')) return 'test-runner';
+    // pnpm/yarn run package scripts without `run`: `pnpm test:push`.
+    if (exe !== 'npm' && /^test(?::[\w.-]+)?$/.test(sub ?? '')) return 'test-runner';
+    if ((sub === 'exec' || sub === 'x') && VITEST_EXECUTABLES.has(path.basename(firstPositional(argv, i + 2) ?? ''))) return 'test-runner';
+    return null;
+  }
+  if (exe === 'npx' || exe === 'pnpx') {
+    return VITEST_EXECUTABLES.has(path.basename(firstPositional(argv, i + 1) ?? '')) ? 'test-runner' : null;
+  }
+  if (VITEST_EXECUTABLES.has(exe)) return 'test-runner';
+  return null;
+}
+
+/** Commands of every process below `rootPid` in an already-captured snapshot. */
+function descendantCommands(rows: readonly ChildProcessInfo[], rootPid: number): string[] {
+  const below = new Set([rootPid]);
+  const out: string[] = [];
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const row of rows) {
+      if (row.parentPid !== undefined && below.has(row.parentPid) && !below.has(row.pid)) {
+        below.add(row.pid); out.push(row.command); changed = true;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Cumulative CPU time of `rootPid` plus every process below it in an
+ * already-captured snapshot.
+ *
+ * The subtree, not the process: `npm test` spends its life waiting on the
+ * vitest pool, so the parent's own CPU time barely moves while the run is at
+ * full tilt. Summing the subtree is what makes "still working" measurable.
+ *
+ * Returns `undefined` when the root itself had no readable CPU column — a
+ * missing measurement must never be reported as zero work done.
+ */
+function subtreeCpuMs(rows: readonly ChildProcessInfo[], rootPid: number): number | undefined {
+  const root = rows.find((r) => r.pid === rootPid);
+  const rootCpu = root?.cpuMs;
+  if (rootCpu === undefined) return undefined;
+  const below = new Set([rootPid]);
+  let total = rootCpu;
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const row of rows) {
+      if (row.parentPid !== undefined && below.has(row.parentPid) && !below.has(row.pid)) {
+        below.add(row.pid);
+        total += row.cpuMs ?? 0;
+        changed = true;
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * A process with a matched test runner running below it (a shell wrapper such
+ * as `zsh -lc 'cd repo && npm test'`, or `git push` running a pre-push test
+ * tier) is protected like the runner itself. The decision rests on the live
+ * descendant in the snapshot, not on the ancestor's own argv.
+ */
+function hasTestRunnerDescendant(descendantCommands: readonly string[]): boolean {
+  return descendantCommands.some((c) => classifyTestRunnerCommand(c) !== null);
+}
+
+/**
+ * The test-runner floor on its own. Returns null when the process is neither a
+ * runner nor above one. `command` is the `ps` command column (argv joined by
+ * spaces, or a process title the program set itself); `elapsedMs` is THIS
+ * process's age, so an ancestor's bound is measured from the ancestor's own
+ * start. Past the bound the contextual judge (and, if the judge cannot run,
+ * the hard ceiling) regains authority.
+ */
+export function classifyTestRunnerProtection(
+  command: string,
+  elapsedMs: number,
+  descendantCommands: readonly string[] = [],
+  progress: TestRunnerProgress = 'unknown',
+): ProtectedWaitEvidence | null {
+  const testRunner = classifyTestRunnerCommand(command)
+    ?? (hasTestRunnerDescendant(descendantCommands) ? 'test-runner-ancestor' : null);
+  if (!testRunner) return null;
+  if (elapsedMs <= MAX_TEST_RUNNER_PROTECTION_MS) return { protected: true, reason: testRunner };
+  // Past the wall-clock floor, measured work can hold protection open — but
+  // only up to the absolute bound, and only on evidence. 'unknown' (no CPU
+  // column on this platform, an unreadable reading) does NOT extend: an
+  // unmeasurable run is handed back to the judge exactly as it was before this
+  // extension existed.
+  //
+  // 'baseline' — a reading taken with nothing yet to compare it against — buys
+  // exactly one poll. Without that, a watchdog meeting an already-old run on
+  // its first poll (after a server restart, say) would interrupt it before it
+  // could measure anything, which is the very failure this guards.
+  if (elapsedMs > MAX_TEST_RUNNER_ABSOLUTE_MS) return { protected: false };
+  return progress === 'progressed' || progress === 'baseline'
+    ? { protected: true, reason: testRunner, extendedByProgress: true }
+    : { protected: false };
+}
+
+/**
+ * `sleep N` is a wait that states its own length. While it has run no longer
+ * than it said it would (plus a minute of slack) it is doing exactly what it
+ * was asked to do and is not stuck. Poll loops and Monitor watch scripts sleep
+ * between checks; interrupting the sleep ends the loop, and the 2026-10-19
+ * coordinator twice reported a watch as armed after this watchdog had killed
+ * it. Parses `sleep 300`, `sleep 5m`, `sleep 1h 30m`, `sleep 0.5`; anything
+ * else (`sleep infinity`, extra flags) is not a timed sleep.
+ */
+export function timedSleepDurationMs(command: string): number | null {
+  const argv = command.trim().split(/\s+/);
+  if (path.basename(argv[0] ?? '') !== 'sleep' || argv.length < 2) return null;
+  const unit: Record<string, number> = { '': 1_000, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+  let total = 0;
+  for (const arg of argv.slice(1)) {
+    const m = /^(\d+(?:\.\d+)?)([smhd]?)$/.exec(arg);
+    if (!m) return null;
+    total += Number(m[1]) * unit[m[2]];
+  }
+  return Number.isFinite(total) && total > 0 ? total : null;
+}
+
+const TIMED_SLEEP_SLACK_MS = 60_000;
+
+export function classifyProtectedWait(
+  command: string,
+  recentOutput = '',
+  elapsedMs = 0,
+  descendantCommands: readonly string[] = [],
+  progress: TestRunnerProgress = 'unknown',
+): ProtectedWaitEvidence {
+  const testRunner = classifyTestRunnerProtection(command, elapsedMs, descendantCommands, progress);
+  if (testRunner) return testRunner;
+  // Protection is a bounded floor, not permanent immunity. Past two hours the
+  // normal contextual judge gets authority even if the original argv matches.
+  if (elapsedMs > MAX_PROTECTED_WAIT_MS) return { protected: false };
+  const sleepMs = timedSleepDurationMs(command);
+  if (sleepMs !== null && elapsedMs <= sleepMs + TIMED_SLEEP_SLACK_MS) return { protected: true, reason: 'timed-sleep' };
+  const normalized = command.toLowerCase();
+  const argv = normalized.trim().split(/\s+/);
+  const executableIndex = /(?:^|\/)node(?:\.exe)?$/.test(argv[0] ?? '') ? 1 : 0;
+  if (/(?:^|\/)safe-merge(?:\.mjs|\.js)?$/.test(argv[executableIndex] ?? '')) {
+    return { protected: true, reason: 'safe-merge-wait' };
+  }
+  const ghExecutable = /(?:^|\/)gh(?:\.exe)?$/.test(argv[0] ?? '');
+  const ghRunWatch = argv[1] === 'run' && argv[2] === 'watch';
+  const ghPrChecksWatch = argv[1] === 'pr' && argv[2] === 'checks' && argv.includes('--watch');
+  if (ghExecutable && (ghRunWatch || ghPrChecksWatch)) {
+    return { protected: true, reason: 'github-run-watch' };
+  }
+  if (/\bwaiting\b[\s\S]{0,160}\b(?:deadline|timeout|poll|checks?)\b/i.test(recentOutput)) {
+    return { protected: true, reason: 'bounded-wait-output' };
+  }
+  return { protected: false };
 }
 
 /** Aggregated watchdog stats for telemetry */
@@ -202,6 +636,11 @@ export class SessionWatchdog extends EventEmitter {
   private enabled = true;
   /** Liveness of the poll loop (GUARD-POSTURE-ENDPOINT-SPEC §2.2): 0 = never polled. */
   private lastPollAt = 0;
+  private readonly lastStallDecisionAt = new Map<string, string>();
+  private pollRevision = 0;
+  private inspectionAuthorityKey!: Buffer;
+  private inspectionAuthorityEpoch!: string;
+  private inspectionAuthorityPath!: string;
   private running = false;
 
   private stuckThresholdMs: number;
@@ -211,12 +650,24 @@ export class SessionWatchdog extends EventEmitter {
    *  interrupt) rather than fail-open. 0 disables the ceiling (pure fail-closed). */
   private hardCeilingMs: number;
   private logPath: string;
+  private readonly frameworkProvenance: FrameworkProcessProvenanceVerifier;
+  private readonly observedIncarnations = new Set<string>();
+  private provenanceCanaryInterval: ReturnType<typeof setInterval> | null = null;
+  private readonly onProvenanceCanaryAlert?: (message: string) => void;
+  /** Optional live reader for `monitoring.watchdog` so threshold edits apply
+   *  without a restart. Boot values remain the fallback. */
+  private readonly readLiveWatchdogConfig?: () => { stuckCommandSec?: unknown; hardCeilingSec?: unknown } | undefined;
 
   /** Intelligence provider — gates escalation entry with LLM command analysis */
   intelligence: IntelligenceProvider | null = null;
 
   /** Temporarily exempted commands (LLM confirmed as legitimate long-running) */
   private temporaryExclusions = new Set<number>(); // PIDs
+  /**
+   * CPU-time samples for test-runner subtrees. Only consulted once a run is
+   * past its wall-clock floor, so an ordinary suite never touches it.
+   */
+  private readonly testRunnerProgress = new TestRunnerProgressTracker();
 
   /** Counter for LLM gate overrides (said "legitimate") — for telemetry */
   private llmGateOverrides = 0;
@@ -242,11 +693,31 @@ export class SessionWatchdog extends EventEmitter {
   /** How long a throttled pane must be byte-identical before recovery (configurable for tests/tuning). */
   private readonly rateLimitSettleMs: number;
 
-  constructor(config: InstarConfig, sessionManager: SessionManager, state: StateManager) {
+  /**
+   * Settle tracking for the USAGE WALL (the account's own quota, not a server
+   * throttle). Kept apart from throttleSettle because the two need different
+   * remedies: a throttle is retried in place, a wall is solved by moving the
+   * session to an account with room (usage-wall-rescue).
+   */
+  private usageWallSettle = new Map<string, ThrottleSettleState>();
+  private usageWallCooldowns = new Map<string, number>();
+  /** A walled pane stays walled for hours; one 'usage-wall' per 5 min is plenty
+   *  (the rescue dedupes and backs off on its own as well). */
+  private static readonly USAGE_WALL_COOLDOWN_MS = 300_000;
+
+  constructor(config: InstarConfig, sessionManager: SessionManager, state: StateManager, options: {
+    onProvenanceCanaryAlert?: (message: string) => void;
+    readLiveWatchdogConfig?: () => { stuckCommandSec?: unknown; hardCeilingSec?: unknown } | undefined;
+  } = {}) {
     super();
     this.config = config;
     this.sessionManager = sessionManager;
     this.state = state;
+    this.inspectionAuthorityPath = path.join(config.stateDir, 'window-lifecycle', 'watchdog-inspection-authority.json');
+    try { const persisted = JSON.parse(fs.readFileSync(this.inspectionAuthorityPath, 'utf8')) as { key: string; epoch: string; pollRevision: number; decisions?: Record<string, string> }; this.inspectionAuthorityKey = Buffer.from(persisted.key, 'base64'); this.inspectionAuthorityEpoch = persisted.epoch; this.pollRevision = persisted.pollRevision; for (const [name, at] of Object.entries(persisted.decisions ?? {})) this.lastStallDecisionAt.set(name, at); if (this.inspectionAuthorityKey.length !== 32 || !this.inspectionAuthorityEpoch || !Number.isSafeInteger(this.pollRevision)) throw new Error('invalid-watchdog-authority'); }
+    catch { /* @silent-fallback-ok — first boot creates durable inspection authority */ this.inspectionAuthorityKey = crypto.randomBytes(32); this.inspectionAuthorityEpoch = crypto.randomUUID(); this.persistInspectionAuthority(); }
+    this.onProvenanceCanaryAlert = options.onProvenanceCanaryAlert;
+    this.readLiveWatchdogConfig = options.readLiveWatchdogConfig;
 
     const wdConfig = config.monitoring.watchdog;
     this.stuckThresholdMs = (wdConfig?.stuckCommandSec ?? 180) * 1000;
@@ -257,19 +728,39 @@ export class SessionWatchdog extends EventEmitter {
 
     // Persistent log path
     this.logPath = path.join(config.stateDir, 'watchdog-interventions.jsonl');
+    this.frameworkProvenance = new FrameworkProcessProvenanceVerifier(config.stateDir, {
+      launcherPath: config.sessions?.frameworkBinaryPaths?.['codex-cli'],
+    });
   }
+
+  private persistInspectionAuthority(): void { fs.mkdirSync(path.dirname(this.inspectionAuthorityPath), { recursive: true, mode: 0o700 }); const decisions = Object.fromEntries(this.lastStallDecisionAt); fs.writeFileSync(this.inspectionAuthorityPath, `${JSON.stringify({ key: this.inspectionAuthorityKey.toString('base64'), epoch: this.inspectionAuthorityEpoch, pollRevision: this.pollRevision, decisions })}\n`, { mode: 0o600 }); }
 
   start(): void {
     if (this.interval) return;
     console.log(`[Watchdog] Starting (poll: ${this.pollIntervalMs / 1000}s, threshold: ${this.stuckThresholdMs / 1000}s)`);
     this.interval = setInterval(() => this.poll(), this.pollIntervalMs);
     setTimeout(() => this.poll(), 5000);
+    const runProvenanceCanary = () => {
+      const canary = this.frameworkProvenance.runCanary();
+      if (canary.alert) {
+        const message = 'Codex executable provenance canary failed three consecutive times; framework candidates remain protected as ownership-unknown.';
+        console.error(`[Watchdog] HIGH: ${message}`);
+        this.onProvenanceCanaryAlert?.(message);
+      }
+    };
+    runProvenanceCanary();
+    this.provenanceCanaryInterval = setInterval(runProvenanceCanary, 24 * 60 * 60 * 1000);
+    this.provenanceCanaryInterval.unref?.();
   }
 
   stop(): void {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
+    }
+    if (this.provenanceCanaryInterval) {
+      clearInterval(this.provenanceCanaryInterval);
+      this.provenanceCanaryInterval = null;
     }
   }
 
@@ -307,6 +798,28 @@ export class SessionWatchdog extends EventEmitter {
     };
   }
 
+  /** Window-lifecycle authority: perform a fresh, bounded observation of every
+   * currently running session rather than treating the status registry as an
+   * inspection. The caller persists this exact per-session result. */
+  inspectSessionsForStall(observedAt = new Date().toISOString()): { observedAt: string; authorityEpoch: string; pollRevision: number; authorityProof: string; sessions: Array<{ name: string; outputObserved: boolean; escalationActive: boolean; decisionEvaluated: boolean; decisionEvaluatedAt?: string }> } {
+    const sessions = this.sessionManager.listRunningSessions().map(session => ({
+      name: session.tmuxSession,
+      outputObserved: this.sessionManager.captureOutput(session.tmuxSession, 30) !== null,
+      escalationActive: this.isManaging(session.tmuxSession),
+      decisionEvaluated: this.lastStallDecisionAt.has(session.tmuxSession),
+      decisionEvaluatedAt: this.lastStallDecisionAt.get(session.tmuxSession),
+    }));
+    const payload = JSON.stringify({ observedAt, authorityEpoch: this.inspectionAuthorityEpoch, pollRevision: this.pollRevision, sessions });
+    return { observedAt, authorityEpoch: this.inspectionAuthorityEpoch, pollRevision: this.pollRevision, authorityProof: crypto.createHmac('sha256', this.inspectionAuthorityKey).update(payload).digest('hex'), sessions };
+  }
+
+  verifyStallInspection(observation: { observedAt: string; authorityEpoch: string; pollRevision: number; authorityProof: string; sessions: unknown[] }): boolean {
+    if (observation.authorityEpoch !== this.inspectionAuthorityEpoch || observation.pollRevision > this.pollRevision) return false;
+    const payload = JSON.stringify({ observedAt: observation.observedAt, authorityEpoch: observation.authorityEpoch, pollRevision: observation.pollRevision, sessions: observation.sessions });
+    const expected = crypto.createHmac('sha256', this.inspectionAuthorityKey).update(payload).digest();
+    try { return crypto.timingSafeEqual(expected, Buffer.from(observation.authorityProof, 'hex')); } catch { /* @silent-fallback-ok — malformed proof fails closed */ return false; }
+  }
+
   // --- Core polling ---
 
   private async poll(): Promise<void> {
@@ -316,9 +829,16 @@ export class SessionWatchdog extends EventEmitter {
 
     try {
       const sessions = this.sessionManager.listRunningSessions();
+      const currentIncarnations = new Set(sessions.map((s) => `${s.tmuxSession}:${s.startedAt}`));
+      for (const incarnation of this.observedIncarnations) {
+        if (!currentIncarnations.has(incarnation)) this.frameworkProvenance.endIncarnation(incarnation);
+      }
+      this.observedIncarnations.clear();
+      for (const incarnation of currentIncarnations) this.observedIncarnations.add(incarnation);
       for (const session of sessions) {
         try {
           await this.checkSession(session.tmuxSession);
+          this.lastStallDecisionAt.set(session.tmuxSession, new Date().toISOString());
         } catch (err) {
           console.error(`[Watchdog] Error checking "${session.tmuxSession}":`, err);
         }
@@ -326,6 +846,8 @@ export class SessionWatchdog extends EventEmitter {
         // can never monopolize the loop and starve /health (which shares it).
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
+      this.pollRevision += 1;
+      this.persistInspectionAuthority();
     } finally {
       this.running = false;
     }
@@ -335,6 +857,14 @@ export class SessionWatchdog extends EventEmitter {
     const existing = this.escalationState.get(tmuxSession);
 
     if (existing && existing.level > EscalationLevel.Monitoring) {
+      const current = this.sessionManager.listRunningSessions?.()
+        .find((session) => session.tmuxSession === tmuxSession);
+      if ((existing.sessionId && current?.id !== existing.sessionId)
+        || (existing.sessionStartedAt && current?.startedAt !== existing.sessionStartedAt)) {
+        console.warn(`[Watchdog] "${tmuxSession}": session incarnation changed — discarding stale escalation`);
+        this.escalationState.delete(tmuxSession);
+        return;
+      }
       await this.handleEscalation(tmuxSession, existing);
       return;
     }
@@ -349,19 +879,70 @@ export class SessionWatchdog extends EventEmitter {
       return;
     }
 
+    // Some embedders and older test doubles expose only the watchdog's narrow
+    // SessionManager surface. Attribution is additive, so absence must degrade
+    // to the conservative (unclassified) path instead of breaking triage.
+    const sessionRecord = this.sessionManager.listRunningSessions?.()
+      .find((session) => session.tmuxSession === tmuxSession);
+    const framework = sessionRecord?.framework;
     const children = await this.getChildProcesses(claudePid);
-    const stuckChild = children.find(c => {
-      if (this.isExcluded(c.command)) return false;
-      if (this.temporaryExclusions.has(c.pid)) return false;
+    let stuckChild: ChildProcessInfo | undefined;
+    const stuckThresholdMs = this.currentStuckThresholdMs();
+    // Subtrees of a protected test runner. They are skipped and the search goes
+    // on. An ancestor of a runner (a shell wrapper, `git push`) is itself left
+    // alone but NOT pruned, so its other children are still checked: a test run
+    // cannot hide an unrelated stuck command, even under a shared parent.
+    const protectedSubtrees = new Set<number>();
+    for (const c of children) {
+      if (protectedSubtrees.has(c.parentPid)) { protectedSubtrees.add(c.pid); continue; }
+      const infrastructure = classifyFrameworkInfrastructureProcess(c.command, framework);
+      if (infrastructure.protected) {
+        const verdict = await this.frameworkProvenance.classify({
+          pid: c.pid,
+          parentPid: c.parentPid,
+          frameworkRootPid: claudePid,
+          sessionIncarnation: `${tmuxSession}:${sessionRecord?.startedAt ?? 'legacy'}`,
+          sessionStartedAt: Date.parse(sessionRecord?.startedAt ?? '') || 0,
+        });
+        if (!verdict.confirmed) {
+          this.persistAudit({
+            type: 'framework-process-provenance', sessionName: tmuxSession, pid: c.pid,
+            outcome: 'ownership-unknown', detail: verdict.detail ?? 'unconfirmed', timestamp: Date.now(),
+          });
+        }
+        continue;
+      }
+      const service = classifyLongLivedServiceProcess(c.command);
+      if (service.protected) {
+        this.persistAudit({
+          type: 'long-lived-service-process', sessionName: tmuxSession, pid: c.pid,
+          parentPid: c.parentPid, processRole: service.reason,
+          effectScope: 'none', outcome: 'protected', detail: service.reason, timestamp: Date.now(),
+        });
+        continue;
+      }
+      if (this.isExcluded(c.command)) continue;
+      if (this.temporaryExclusions.has(c.pid)) continue;
       // Stdin consumers (tail, grep, sort...) get a much longer grace
       // period. They're typically part of a pipeline where the producer
       // is the real work, and the 3-minute default threshold is too
       // aggressive for long-running builds, tests, or measurements.
       const threshold = this.isStdinConsumerCommand(c.command)
-        ? Math.max(this.stuckThresholdMs, 600_000) // at least 10 minutes
-        : this.stuckThresholdMs;
-      return c.elapsedMs > threshold;
-    });
+        ? Math.max(stuckThresholdMs, 600_000) // at least 10 minutes
+        : stuckThresholdMs;
+      if (c.elapsedMs > threshold) {
+        const testRun = classifyTestRunnerProtection(
+          c.command, c.elapsedMs, descendantCommands(children, c.pid), this.observeTestRunnerProgress(children, c),
+        );
+        if (testRun?.protected) {
+          const why = testRun.extendedByProgress ? `${testRun.reason}, still working` : testRun.reason;
+          console.log(`[Watchdog] "${tmuxSession}": protected wait (${why}) — refusing to interrupt`);
+          if (testRun.reason === 'test-runner') protectedSubtrees.add(c.pid);
+          continue;
+        }
+        stuckChild = c; break;
+      }
+    }
 
     if (stuckChild) {
       // Pipeline guard: if the stuck child is a pure stdin consumer (tail,
@@ -382,6 +963,21 @@ export class SessionWatchdog extends EventEmitter {
       // Pass recent tmux output so the LLM can see what the session is actually doing,
       // not just the (often truncated) child command name.
       const recentOutput = this.sessionManager.captureOutput(tmuxSession, 30) ?? '';
+      const protectedWait = classifyProtectedWait(
+        stuckChild.command, recentOutput, stuckChild.elapsedMs, descendantCommands(children, stuckChild.pid),
+        this.observeTestRunnerProgress(children, stuckChild),
+      );
+      if (protectedWait.protected) {
+        const why = protectedWait.extendedByProgress
+          ? `${protectedWait.reason}, still working`
+          : protectedWait.reason;
+        console.log(
+          `[Watchdog] "${tmuxSession}": protected wait (${why}) — refusing to interrupt`,
+        );
+        // Re-evaluate on every poll. A waiter must not gain permanent PID
+        // immunity from one historical match if its evidence later changes.
+        return;
+      }
       const isStuck = await this.isCommandStuck(stuckChild.command, stuckChild.elapsedMs, recentOutput);
       if (!isStuck) {
         // LLM says legitimate — temporarily exclude this PID from future checks
@@ -404,22 +1000,39 @@ export class SessionWatchdog extends EventEmitter {
         return;
       }
 
+      // Decided here, where the live descendant snapshot is still in hand: an
+      // ancestor of a test runner (a shell wrapper, a `git push` running a
+      // pre-push tier) cannot be recognised from its own argv later on.
+      const stuckCommandKind = classifyTestRunnerProtection(
+        stuckChild.command, 0, descendantCommands(children, stuckChild.pid),
+      )?.reason;
       const state: EscalationState = {
         level: EscalationLevel.CtrlC,
         levelEnteredAt: Date.now(),
         stuckChildPid: stuckChild.pid,
+        stuckChildParentPid: stuckChild.parentPid,
         stuckCommand: stuckChild.command,
+        sessionId: sessionRecord?.id,
+        sessionStartedAt: sessionRecord?.startedAt,
         retryCount: existing?.retryCount ?? 0,
+        ...(stuckCommandKind === 'test-runner' || stuckCommandKind === 'test-runner-ancestor'
+          ? { stuckCommandKind }
+          : {}),
       };
       this.escalationState.set(tmuxSession, state);
 
       console.log(
         `[Watchdog] "${tmuxSession}": stuck command (${Math.round(stuckChild.elapsedMs / 1000)}s): ` +
-        `${stuckChild.command.slice(0, 80)} — sending Ctrl+C`
+        `${stuckChild.command.slice(0, 80)} — sending targeted SIGINT`
       );
 
-      this.sessionManager.sendKey(tmuxSession, 'C-c');
-      this.recordIntervention(tmuxSession, EscalationLevel.CtrlC, 'Sent Ctrl+C', stuckChild);
+      const interrupted = await this.signalIfIdentityMatches(stuckChild, 'SIGINT');
+      if (!interrupted) {
+        console.warn(`[Watchdog] "${tmuxSession}": target identity changed — refusing interruption`);
+        this.escalationState.delete(tmuxSession);
+        return;
+      }
+      this.recordIntervention(tmuxSession, EscalationLevel.CtrlC, `SIGINT ${stuckChild.pid} (targeted)`, stuckChild, state);
     } else if (existing) {
       this.escalationState.delete(tmuxSession);
     }
@@ -467,6 +1080,9 @@ export class SessionWatchdog extends EventEmitter {
   checkRateLimited(tmuxSession: string): void {
     const output = this.sessionManager.captureOutput(tmuxSession, RATE_LIMIT_SETTLED_CAPTURE_LINES);
     const now = Date.now();
+    // The usage wall is its own signal (evaluateThrottleSettle reports a wall
+    // as 'no-throttle' on purpose — a wall is not something to retry in place).
+    this.checkUsageWall(tmuxSession, output, now);
     const { decision, next } = evaluateThrottleSettle(
       output,
       this.throttleSettle.get(tmuxSession),
@@ -503,6 +1119,42 @@ export class SessionWatchdog extends EventEmitter {
     );
     this.rateLimitedCooldowns.set(tmuxSession, now);
     this.emit('rate-limited', tmuxSession);
+  }
+
+  /**
+   * Detects a session sitting at its account's USAGE WALL ("Usage limit
+   * reached · limit resets 8am", "You've hit your weekly limit") and emits
+   * 'usage-wall'. Signal-only: the consumer (UsageWallRescue) decides whether
+   * another account has room and moves the session; this method never acts.
+   *
+   * Same settled-output discipline as the throttle: the banner must be the
+   * current pane state (only Claude Code chrome below it) AND the pane must be
+   * byte-identical across polls for the settle window.
+   */
+  checkUsageWall(tmuxSession: string, output: string | null | undefined, now: number = Date.now()): void {
+    const { decision, next } = evaluateUsageWallSettle(
+      output,
+      this.usageWallSettle.get(tmuxSession),
+      now,
+      { settleMs: this.rateLimitSettleMs },
+    );
+    if (decision === 'no-throttle') {
+      // A wall this session had settled on (it emitted) is now gone: say so,
+      // so the episode's last outcome stops speaking for a later wall.
+      if (this.usageWallCooldowns.has(tmuxSession)) {
+        this.usageWallCooldowns.delete(tmuxSession);
+        this.emit('usage-wall-cleared', tmuxSession);
+      }
+      this.usageWallSettle.delete(tmuxSession);
+      return;
+    }
+    if (next) this.usageWallSettle.set(tmuxSession, next);
+    if (decision === 'waiting') return;
+    const lastEmitted = this.usageWallCooldowns.get(tmuxSession);
+    if (lastEmitted && (now - lastEmitted) < SessionWatchdog.USAGE_WALL_COOLDOWN_MS) return;
+    this.usageWallCooldowns.set(tmuxSession, now);
+    console.log(`[Watchdog] "${tmuxSession}": usage wall detected — pane settled at the account's usage limit`);
+    this.emit('usage-wall', tmuxSession);
   }
 
   /**
@@ -584,10 +1236,20 @@ export class SessionWatchdog extends EventEmitter {
       state.level = EscalationLevel.CtrlC;
       state.levelEnteredAt = now;
       state.retryCount++;
-      this.sessionManager.sendKey(tmuxSession, 'C-c');
-      this.recordIntervention(tmuxSession, EscalationLevel.CtrlC, `Retry ${state.retryCount}: Sent Ctrl+C`, {
-        pid: state.stuckChildPid, command: state.stuckCommand, elapsedMs: 0,
-      });
+      const interrupted = await this.signalIfIdentityMatches({
+        pid: state.stuckChildPid,
+        parentPid: state.stuckChildParentPid,
+        command: state.stuckCommand,
+        elapsedMs: 0,
+      }, 'SIGINT');
+      if (interrupted) {
+          this.recordIntervention(tmuxSession, EscalationLevel.CtrlC, `Retry ${state.retryCount}: SIGINT ${state.stuckChildPid} (targeted)`, {
+          pid: state.stuckChildPid, parentPid: state.stuckChildParentPid, command: state.stuckCommand, elapsedMs: 0,
+        }, state);
+      } else {
+        console.warn(`[Watchdog] "${tmuxSession}": retry target identity changed — standing down`);
+        this.escalationState.delete(tmuxSession);
+      }
       return;
     }
 
@@ -597,19 +1259,25 @@ export class SessionWatchdog extends EventEmitter {
     state.level = nextLevel as EscalationLevel;
     state.levelEnteredAt = now;
 
-    const child = { pid: state.stuckChildPid, command: state.stuckCommand, elapsedMs: 0 };
+    const child = { pid: state.stuckChildPid, parentPid: state.stuckChildParentPid, command: state.stuckCommand, elapsedMs: 0 };
 
     switch (state.level) {
       case EscalationLevel.SigTerm:
         console.log(`[Watchdog] "${tmuxSession}": sending SIGTERM to ${state.stuckChildPid}`);
-        this.sendSignal(state.stuckChildPid, 'SIGTERM');
-        this.recordIntervention(tmuxSession, EscalationLevel.SigTerm, `SIGTERM ${state.stuckChildPid}`, child);
+        if (await this.signalIfIdentityMatches(child, 'SIGTERM')) {
+          this.recordIntervention(tmuxSession, EscalationLevel.SigTerm, `SIGTERM ${state.stuckChildPid}`, child, state);
+        } else {
+          this.escalationState.delete(tmuxSession);
+        }
         break;
 
       case EscalationLevel.SigKill:
         console.log(`[Watchdog] "${tmuxSession}": sending SIGKILL to ${state.stuckChildPid}`);
-        this.sendSignal(state.stuckChildPid, 'SIGKILL');
-        this.recordIntervention(tmuxSession, EscalationLevel.SigKill, `SIGKILL ${state.stuckChildPid}`, child);
+        if (await this.signalIfIdentityMatches(child, 'SIGKILL')) {
+          this.recordIntervention(tmuxSession, EscalationLevel.SigKill, `SIGKILL ${state.stuckChildPid}`, child, state);
+        } else {
+          this.escalationState.delete(tmuxSession);
+        }
         break;
 
       case EscalationLevel.KillSession: {
@@ -620,13 +1288,24 @@ export class SessionWatchdog extends EventEmitter {
         // autonomous kill — so a session the guards would have kept survives a
         // buggy watchdog, gains exactly-once sessionComplete/sessionReaped
         // emission, and lands in the reap-log with its reason.
+        if (!await this.processIdentityMatches(child)) {
+          console.warn(`[Watchdog] "${tmuxSession}": target identity changed before session-level escalation — standing down`);
+          this.escalationState.delete(tmuxSession);
+          break;
+        }
         console.log(`[Watchdog] "${tmuxSession}": requesting session kill via ReapAuthority`);
         const sess = this.sessionManager
           .listRunningSessions()
           .find((s) => s.tmuxSession === tmuxSession);
         if (!sess) {
           // Session already gone — nothing to kill.
-          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, 'session already gone', child);
+          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, 'session already gone', child, state);
+          this.escalationState.delete(tmuxSession);
+          break;
+        }
+        if ((state.sessionId && sess.id !== state.sessionId)
+          || (state.sessionStartedAt && sess.startedAt !== state.sessionStartedAt)) {
+          console.warn(`[Watchdog] "${tmuxSession}": session incarnation changed before termination — standing down`);
           this.escalationState.delete(tmuxSession);
           break;
         }
@@ -635,14 +1314,14 @@ export class SessionWatchdog extends EventEmitter {
           finalStatus: 'killed',
         });
         if (result.terminated) {
-          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, 'terminated via ReapAuthority', child);
+          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, 'terminated via ReapAuthority', child, state);
         } else {
           // The authority refused (protected / lease / a KEEP). Stand down — the
           // guards own this decision; the §P5 backstop will surface a
           // persistently-stale session for an operator decision rather than the
           // watchdog re-escalating against a guarded session every tick.
           console.log(`[Watchdog] "${tmuxSession}": kill refused — ${result.skipped} (standing down)`);
-          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, `kept (${result.skipped})`, child);
+          this.recordIntervention(tmuxSession, EscalationLevel.KillSession, `kept (${result.skipped})`, child, state);
         }
         this.escalationState.delete(tmuxSession);
         break;
@@ -676,10 +1355,11 @@ export class SessionWatchdog extends EventEmitter {
     const elapsedMin = Math.round(elapsedMs / 60000);
     // Keep the output sample small — enough for context, not enough to blow the token budget.
     const outputSample = recentOutput ? recentOutput.slice(-1500) : '';
+    const commandSlice = command.slice(0, 200);
     const promptLines = [
       'You are evaluating whether a running process is stuck or legitimately long-running.',
       '',
-      `Command: ${command.slice(0, 200)}`,
+      `Command: ${commandSlice}`,
       `Running for: ${elapsedMin} minutes`,
     ];
     if (outputSample) {
@@ -719,6 +1399,18 @@ export class SessionWatchdog extends EventEmitter {
         maxTokens: 5,
         temperature: 0,
         attribution: { component: 'SessionWatchdog' }, // attribution for /metrics/features
+        provenance: {
+          decisionPoint: DP_WATCHDOG_STUCK_JUDGE,
+          context: buildWatchdogStuckDecisionContext({
+            promptText: prompt,
+            commandSlice,
+            commandWasTruncated: command.length > commandSlice.length,
+            outputSample,
+            elapsedMinutes: elapsedMin,
+          }),
+          optionsPresented: ['stuck', 'legitimate'],
+          promptId: WATCHDOG_STUCK_JUDGE_PROMPT_ID,
+        },
       });
       const answer = response.trim().toLowerCase();
       if (answer === 'legitimate') {
@@ -748,7 +1440,24 @@ export class SessionWatchdog extends EventEmitter {
    * never interrupt without a positive LLM "stuck" verdict).
    */
   private hardCeilingExceeded(elapsedMs: number): boolean {
-    return this.hardCeilingMs > 0 && elapsedMs > this.hardCeilingMs;
+    const ceilingMs = this.liveSeconds('hardCeilingSec', this.hardCeilingMs);
+    return ceilingMs > 0 && elapsedMs > ceilingMs;
+  }
+
+  private currentStuckThresholdMs(): number {
+    return this.liveSeconds('stuckCommandSec', this.stuckThresholdMs);
+  }
+
+  /** Live `monitoring.watchdog.<key>` in ms; any missing, invalid or unreadable
+   *  value falls back to the boot-time value (never to an implicit 0). */
+  private liveSeconds(key: 'stuckCommandSec' | 'hardCeilingSec', bootMs: number): number {
+    try {
+      const value = this.readLiveWatchdogConfig?.()?.[key];
+      return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value * 1000 : bootMs;
+    } catch {
+      // @silent-fallback-ok — live config unreadable; boot value is the documented fallback
+      return bootMs;
+    }
   }
 
   // --- Process utilities (self-contained, no shared module) ---
@@ -814,28 +1523,63 @@ export class SessionWatchdog extends EventEmitter {
     }
   }
 
+  /**
+   * Sample a candidate's subtree CPU time and report whether it advanced.
+   *
+   * Called on every poll for any process already past the stuck threshold, so
+   * a baseline exists well before the one-hour floor expires — a verdict that
+   * first becomes available AFTER the floor would arrive too late to spare
+   * anything (the first post-floor poll would read 'unknown' and interrupt).
+   */
+  private observeTestRunnerProgress(
+    children: readonly ChildProcessInfo[],
+    candidate: ChildProcessInfo,
+  ): TestRunnerProgress {
+    return this.testRunnerProgress.observe(candidate.pid, subtreeCpuMs(children, candidate.pid));
+  }
+
   private async getChildProcesses(pid: number): Promise<ChildProcessInfo[]> {
     try {
-      const childPidsStr = (await shellExecAsync(`pgrep -P ${pid} 2>/dev/null`)).trim();
-      if (!childPidsStr) return [];
-
-      const childPids = childPidsStr.split('\n').filter(Boolean).join(',');
-      if (!childPids) return [];
-
-      const output = (await shellExecAsync(`ps -o pid=,etime=,command= -p ${childPids} 2>/dev/null`)).trim();
+      // One process-table snapshot, then bounded in-memory traversal. Direct-
+      // child-only enumeration let a protected framework host hide real user
+      // commands below it; recursive pgrep would add an unbounded subprocess
+      // hot path. This keeps both correctness and poll cost bounded.
+      const output = (await shellExecAsync('ps -axo pid=,ppid=,etime=,time=,command= 2>/dev/null')).trim();
       if (!output) return [];
-
-      const results: ChildProcessInfo[] = [];
+      const rows = new Map<number, { parentPid: number; info: ChildProcessInfo }>();
       for (const line of output.split('\n')) {
-        const match = line.trim().match(/^(\d+)\s+([\d:.-]+)\s+(.+)$/);
+        // Columns: pid ppid etime time command. `etime` is wall clock since
+        // start, `time` is cumulative CPU — both match the same character
+        // class, so they are read positionally, never by shape.
+        const match = line.trim().match(/^(\d+)\s+(\d+)\s+([\d:.-]+)\s+([\d:.-]+)\s+(.+)$/);
         if (!match) continue;
         const childPid = parseInt(match[1], 10);
-        if (isNaN(childPid)) continue;
-        results.push({
-          pid: childPid,
-          command: match[3],
-          elapsedMs: this.parseElapsed(match[2]),
+        const parentPid = parseInt(match[2], 10);
+        if (isNaN(childPid) || isNaN(parentPid)) continue;
+        const cpuMs = parseCpuTime(match[4]);
+        rows.set(childPid, {
+          parentPid,
+          info: {
+            pid: childPid,
+            parentPid,
+            command: match[5],
+            elapsedMs: this.parseElapsed(match[3]),
+            ...(cpuMs !== undefined ? { cpuMs } : {}),
+          },
         });
+      }
+
+      const results: ChildProcessInfo[] = [];
+      const queue = [pid];
+      const visited = new Set<number>([pid]);
+      while (queue.length > 0 && results.length < 256) {
+        const parent = queue.shift()!;
+        for (const [childPid, row] of rows) {
+          if (row.parentPid !== parent || visited.has(childPid)) continue;
+          visited.add(childPid);
+          results.push(row.info);
+          queue.push(childPid);
+        }
       }
       return results;
     } catch {
@@ -989,6 +1733,29 @@ export class SessionWatchdog extends EventEmitter {
     }
   }
 
+  /** Action-time PID reuse/parent-edge/argv fence for every descendant signal. */
+  private async processIdentityMatches(child: ChildProcessInfo): Promise<boolean> {
+    const output = (await shellExecAsync(
+      `ps -p ${child.pid} -o ppid=,command= 2>/dev/null`,
+    )).trim();
+    const match = output.match(/^(\d+)\s+(.+)$/);
+    if (!match) return false;
+    const parentPid = Number(match[1]);
+    const command = match[2];
+    return parentPid === child.parentPid && command === child.command;
+  }
+
+  /** Action-time PID reuse/parent-edge/argv fence for every descendant signal. */
+  private async signalIfIdentityMatches(child: ChildProcessInfo, signal: NodeJS.Signals): Promise<boolean> {
+    if (!await this.processIdentityMatches(child)) return false;
+    try {
+      process.kill(child.pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private isProcessAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
@@ -1004,15 +1771,30 @@ export class SessionWatchdog extends EventEmitter {
     sessionName: string,
     level: EscalationLevel,
     action: string,
-    child: { pid: number; command: string; elapsedMs: number },
-  ): void {
+    child: { pid: number; parentPid?: number; command: string; elapsedMs: number },
+    state?: Pick<EscalationState, 'sessionId' | 'sessionStartedAt' | 'stuckCommandKind' | 'retryCount'>,
+  ): InterventionEvent {
     const event: InterventionEvent = {
       sessionName,
       level,
       action,
       stuckCommand: child.command.slice(0, 200),
       stuckPid: child.pid,
+      stuckParentPid: child.parentPid,
+      processRole: 'user-command',
+      effectScope: level === EscalationLevel.KillSession ? 'session-via-reap-authority' : 'target-process',
+      sessionId: state?.sessionId,
+      sessionStartedAt: state?.sessionStartedAt,
       timestamp: Date.now(),
+      principal: 'session-watchdog',
+      reason: 'stuck-command-judge',
+      // A test run interrupted mid-flight loses everything it had done, and
+      // the harness that launched it can report a clean exit — so this class
+      // is never silent, at any level (watchdog-notifications.ts).
+      ...(state?.stuckCommandKind ? { stuckCommandKind: state.stuckCommandKind } : {}),
+      stuckElapsedMs: child.elapsedMs,
+      stuckRetryCount: state?.retryCount ?? 0,
+      operatorInitiated: false,
     };
     this.interventionHistory.push(event);
     if (this.interventionHistory.length > 50) {
@@ -1029,6 +1811,7 @@ export class SessionWatchdog extends EventEmitter {
 
     // Persist to JSONL
     this.persistEvent(event);
+    return event;
   }
 
   /**
@@ -1043,7 +1826,10 @@ export class SessionWatchdog extends EventEmitter {
     const sessions = this.sessionManager.listRunningSessions();
     const stillRunning = sessions.some(s => s.tmuxSession === sessionName);
 
-    event.outcome = stillRunning ? 'recovered' : 'died';
+    // A living tmux session proves only survival. It does not prove that the
+    // interrupted turn resumed or made progress; claiming recovery here hid
+    // the exact Codex abandonment incident this audit is meant to expose.
+    event.outcome = stillRunning ? 'session-alive' : 'died';
     event.outcomeDelayMs = Date.now() - event.timestamp;
 
     // Persist the outcome update
@@ -1057,6 +1843,10 @@ export class SessionWatchdog extends EventEmitter {
    * 30-day retention, auto-rotated.
    */
   private persistEvent(event: InterventionEvent): void {
+    this.persistAudit({ ...event });
+  }
+
+  private persistAudit(event: Record<string, unknown>): void {
     try {
       const dir = path.dirname(this.logPath);
       if (!fs.existsSync(dir)) {

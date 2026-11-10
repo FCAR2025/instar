@@ -43,9 +43,10 @@ import {
 } from '../../src/threadline/CredentialShareGate.js';
 import {
   generateIdentityKeyPair,
-  deriveSAS,
-  deriveSasBits,
-  deriveSasFingerprint,
+  deriveSASv2,
+  deriveSasBitsV2,
+  deriveSasFingerprintV2,
+  derivePairingIdV2,
 } from '../../src/threadline/ThreadlineCrypto.js';
 import { computeFingerprint } from '../../src/threadline/client/MessageEncryptor.js';
 import type { InstarConfig } from '../../src/core/types.js';
@@ -70,7 +71,9 @@ function makePeer(): Peer {
 }
 
 // Encrypted-path probe stub (the §3.5 "this peer has an encrypted+signed channel" oracle).
-const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known });
+// `isChannelBoundToPairing` stands in for the real X25519-binding check (exercised for real in
+// threadline-pairing-v2-relay-agents.test.ts).
+const encryptedPath = (known: boolean) => ({ hasEncryptedSendPath: () => known, isChannelBoundToPairing: () => known, ...(known ? { sendCredentialToPinned: () => ({ messageId: 'm', threadId: 't' }) } : {}) });
 
 const AUTH = 'test-e2e-verified-pairing';
 const DASHBOARD_PIN = '654321';
@@ -90,10 +93,9 @@ describe('Secure A2A Verified Pairing E2E lifecycle (feature is alive)', () => {
 
   // Shared-secret-derived SAS for the self↔peer handshake (computed inline at
   // handshake completion per FD4 — never persisted).
-  const sharedSecret = crypto.randomBytes(32);
-  const sasWords = deriveSAS(sharedSecret, self.idPub, peer.idPub);
-  const sasFingerprint = deriveSasFingerprint(deriveSasBits(sharedSecret, self.idPub, peer.idPub));
-  const pairingId = crypto.randomBytes(16).toString('hex');
+  const sasWords = deriveSASv2(self.idPub, peer.idPub);
+  const sasFingerprint = deriveSasFingerprintV2(deriveSasBitsV2(self.idPub, peer.idPub));
+  const pairingId = derivePairingIdV2(self.idPub, peer.idPub);
 
   beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verified-pairing-e2e-'));
@@ -145,7 +147,7 @@ describe('Secure A2A Verified Pairing E2E lifecycle (feature is alive)', () => {
     // ── Step 3: the two in-process agents complete a handshake. Both ends derive
     // the SAME SAS from the same shared secret (deterministic, FD2). Record the
     // pending pairing on the REAL trust manager (the post-handshake state).
-    const peerSas = deriveSAS(sharedSecret, peer.idPub, self.idPub);
+    const peerSas = deriveSASv2(peer.idPub, self.idPub);
     // SAS is order-independent (salt = sort(idPubA‖idPubB)) — both sides agree.
     expect(peerSas).toEqual(sasWords);
     trustManager.recordPendingVerification(peer.fp, {
@@ -174,8 +176,14 @@ describe('Secure A2A Verified Pairing E2E lifecycle (feature is alive)', () => {
     const p = res.body.pairings.find((x: { peerFp: string }) => x.peerFp === peer.fp);
     expect(p).toBeDefined();
     expect(p.state).toBe('pending-verification');
-    // SAS words NEVER appear on the list route.
-    expect(JSON.stringify(res.body)).not.toContain(sasWords[0]);
+    // SAS words NEVER appear on the list route. Assert on the FIELD and on the
+    // joined 6-word phrase — never a lone word: SAS words come from a 2048-word
+    // common-English list, and a single word can legitimately collide with other
+    // response content (observed 2026-07-02: sasWords[0] === 'setup' false-
+    // positived against trustSource 'setup-default').
+    expect(p.sasWords).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain(sasWords.join(' '));
+    expect(JSON.stringify(res.body)).not.toContain(JSON.stringify(sasWords).slice(1, -1));
   });
 
   it('GET /threadline/pairing/:peerFp WITH a valid PIN surfaces the SAS while pending (§3.9)', async () => {
@@ -197,7 +205,7 @@ describe('Secure A2A Verified Pairing E2E lifecycle (feature is alive)', () => {
     const res = await request(app)
       .post(`/threadline/pairing/${peer.fp}/verify`)
       .set('Authorization', `Bearer ${AUTH}`)
-      .send({ match: true, pin: DASHBOARD_PIN });
+      .send({ words: sasWords, pin: DASHBOARD_PIN });
     expect(res.status).toBe(200);
     expect(res.body.state).toBe('mutual-verified');
     // The REAL trust manager state mutated through the SOLE writer.

@@ -24,6 +24,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { SafeGitExecutor } from '../../src/core/SafeGitExecutor.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const WRITE_TRACE = path.join(REPO_ROOT, 'skills', 'instar-dev', 'scripts', 'write-trace.mjs');
@@ -66,6 +67,21 @@ describe('write-trace.mjs — tier declaration (Step A)', () => {
     return JSON.parse(fs.readFileSync(path.join(sandbox, traceRel), 'utf8'));
   }
 
+  it('stages the trace in git (the directory is gitignored), so the PR carries its review', () => {
+    // Without staging, a flagged PR could never present the concurring trace the merge floor requires.
+    SafeGitExecutor.execSync(['init', '-q'], { cwd: sandbox, stdio: 'ignore', operation: 'tests/unit/write-trace-tier.test.ts:git-init' });
+    fs.writeFileSync(path.join(sandbox, '.gitignore'), '.instar/instar-dev-traces/\n');
+    const artifact = writeArtifact('upgrades/side-effects/widget.md');
+    const eli16 = 'docs/specs/widget.eli16.md';
+    fs.writeFileSync(path.join(sandbox, eli16), `# ELI16\n\n${'y'.repeat(400)}\n`);
+    // A git sandbox has no commit hooks; the gate's own test-harness override applies.
+    const r = spawnSync('node', [sandboxScript, '--artifact', artifact, '--files', 'src/a.ts', '--tier', '1', '--tier-reasoning', 'Small tweak.', '--eli16-path', eli16, '--side-effects-path', artifact], { cwd: sandbox, encoding: 'utf8', env: { ...process.env, INSTAR_DEV_ALLOW_UNINSTALLED_GATE: '1' } });
+    const res = { status: r.status, stdout: r.stdout || '' };
+    expect(res.status).toBe(0);
+    const staged = String(SafeGitExecutor.readSync(['diff', '--cached', '--name-only'], { cwd: sandbox, encoding: 'utf8', operation: 'tests/unit/write-trace-tier.test.ts:git-diff-cached' })).split('\n');
+    expect(staged).toContain(res.stdout.trim());
+  });
+
   it('round-trips a TIER-1 trace: tier:1 + eli16Path + sideEffectsPath, NO specPath', () => {
     const artifact = writeArtifact('upgrades/side-effects/widget.md');
     const eli16 = 'docs/specs/widget.eli16.md';
@@ -93,6 +109,7 @@ describe('write-trace.mjs — tier declaration (Step A)', () => {
     expect(trace.phase).toBe('complete');
     expect(trace.artifactPath).toBe(artifact);
     expect(trace.coveredFiles).toEqual(['src/a.ts', 'src/b.ts']);
+    expect(trace.slug).toBe('widget');
     expect(typeof trace.artifactSha256).toBe('string');
   });
 

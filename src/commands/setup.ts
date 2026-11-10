@@ -16,7 +16,10 @@
  * No flags needed. No manual config editing. Just answers.
  */
 
+import { isBlankAgentHome, markNewAgent } from '../recommended/offerPrerequisites.js';
 import { execFileSync, execSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { telegramFetch } from '../messaging/telegram-egress.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,17 +31,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Codex model used by setup-wizard and secret-setup micro-sessions when
- * the host framework is codex-cli. Codex CLI's bundled default
- * (gpt-5.2-codex) was retired from ChatGPT-subscription accounts on
- * 2026-04-14 and is API-only since. The wizard targets the subscription
- * path by default, so we pin to a model empirically confirmed-working on
- * ChatGPT auth (see src/providers/adapters/openai-codex/models.ts for
- * the full availability matrix).
- *
- * Exported for the tests-suite canary that asserts this constant is
+ * the host framework is codex-cli. Single source of truth:
+ * setup-wizard/model-constants.ts (env-overridable via
+ * INSTAR_WIZARD_CODEX_MODEL — the wizard runs pre-config, so an env var
+ * is its override surface; LLM-ROUTING-REGISTRY.md risk item #5).
+ * Re-exported for the tests-suite canary that asserts this constant is
  * passed to every codex spawn in setup.ts.
  */
-export const WIZARD_CODEX_MODEL = 'gpt-5.3-codex';
+import { WIZARD_CODEX_MODEL } from './setup-wizard/model-constants.js';
+export { WIZARD_CODEX_MODEL };
 
 import { detectClaudePath, detectCodexPath, detectGeminiPath, detectGhPath, checkFrameworkPrerequisite } from '../core/Config.js';
 import { ensurePrerequisites } from '../core/Prerequisites.js';
@@ -54,6 +55,7 @@ import {
 } from './discovery.js';
 import { SafeGitExecutor } from '../core/SafeGitExecutor.js';
 import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
+import { autoStartRefusalReason, setLastAutoStartRefusal, withTeardownLock } from '../core/ThrowawayAgentGuard.js';
 
 /**
  * Try allocatePort from the registry, fall back to scanning for a free port.
@@ -133,7 +135,7 @@ async function promptForFramework(
   }
 }
 
-export async function runSetup(opts?: { framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' }): Promise<void> {
+export async function runSetup(opts?: { framework?: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build' }): Promise<void> {
   // Check and install prerequisites (tmux + the chosen framework's CLI)
   console.log();
   const prereqs = await ensurePrerequisites();
@@ -152,7 +154,7 @@ export async function runSetup(opts?: { framework?: 'claude-code' | 'codex-cli' 
   //      which runtime to use. (gemini-cli is selectable via the explicit
   //      --framework flag; the interactive prompt covers claude/codex for now.)
   //   3. Default 'claude-code' otherwise (non-interactive / piped / CI).
-  const framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' = opts?.framework
+  const framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build' = opts?.framework
     ?? (process.stdin.isTTY
       ? await promptForFramework(claudePath, codexPath)
       : 'claude-code');
@@ -437,7 +439,7 @@ ${agentSummary}
  */
 async function ensureSecretBackend(
   binaryPath: string,
-  framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli',
+  framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build',
   instarRoot: string,
 ): Promise<string> {
   const backendFile = path.join(os.homedir(), '.instar', 'secrets', 'backend.json');
@@ -777,17 +779,62 @@ export function launchctlLoadAllowed(): boolean {
   return !process.env.VITEST && !process.env.INSTAR_SKIP_LAUNCHCTL_LOAD;
 }
 
-export function installAutoStart(projectName: string, projectDir: string, hasTelegram: boolean): boolean {
+export function macOSAutoStartLoadCommands(
+  label: string,
+  plistPath: string,
+  uid: number,
+): Array<[string, string[]]> {
+  const domain = `gui/${uid}`;
+  return [
+    ['launchctl', ['bootout', domain, plistPath]],
+    ['launchctl', ['enable', `${domain}/${label}`]],
+    ['launchctl', ['bootstrap', domain, plistPath]],
+  ];
+}
+
+/**
+ * True when a LaunchAgent plist should be regenerated to run the lifeline
+ * supervisor: Telegram is configured but the plist starts the bare server
+ * (how `instar join` installs a standby that had no Telegram config yet).
+ */
+export function autoStartNeedsLifeline(plistContent: string, hasTelegramConfigured: boolean): boolean {
+  return hasTelegramConfigured && !plistContent.includes('<string>lifeline</string>');
+}
+
+export function installAutoStart(
+  projectName: string,
+  projectDir: string,
+  hasTelegram: boolean,
+  opts: { force?: boolean; noStart?: boolean } = {},
+): boolean {
   const platform = process.platform;
 
-  if (platform === 'darwin') {
-    return installMacOSLaunchAgent(projectName, projectDir, hasTelegram);
-  } else if (platform === 'linux') {
-    return installLinuxSystemdService(projectName, projectDir, hasTelegram);
-  } else {
+  // Test-agent leak guard (docs/specs/test-agent-leak-guard.md). EVERY writer of
+  // the autostart unit funnels through here — the CLI, the server and lifeline
+  // startup self-heals, and the PostUpdateMigrator regenerations — so this one
+  // check covers them all. A throwaway agent (temp-folder project, sandboxed
+  // HOME, or a recorded throwaway marker) must never load a keep-alive job into
+  // the REAL user launchd/systemd: the domain belongs to the account, not to
+  // $HOME, and launchd then runs the job with the account's real HOME and login.
+  // The check-and-write runs under the same per-agent lock as the expiry
+  // teardown, so an install can never cross a teardown in progress.
+  const locked = withTeardownLock(projectDir, () => {
+    const refusal = autoStartRefusalReason(projectDir, { force: opts.force });
+    setLastAutoStartRefusal(refusal);
+    if (refusal) return false;
+    if (platform === 'darwin') {
+      return installMacOSLaunchAgent(projectName, projectDir, hasTelegram);
+    } else if (platform === 'linux') {
+      return installLinuxSystemdService(projectName, projectDir, hasTelegram, opts.noStart === true);
+    }
     // Windows or other — no auto-start support yet
     return false;
+  });
+  if (!locked.ran) {
+    setLastAutoStartRefusal('a throwaway-agent teardown is in progress for this agent');
+    return false;
   }
+  return locked.value;
 }
 
 /**
@@ -861,6 +908,17 @@ function resolveNodeCandidates(): string[] {
     if (current && fs.existsSync(current)) candidates.add(current);
   } catch { /* not found */ }
 
+  // 1b. Every PATH entry, not only the first `which node` result. The first
+  // result can be this agent's own .instar/bin/node symlink. If that symlink is
+  // being repaired, selecting it as its own target creates a self-loop and
+  // makes the agent unbootable. A later PATH entry commonly contains the real
+  // NVM/asdf/Homebrew binary we need.
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, 'node');
+    if (fs.existsSync(candidate)) candidates.add(candidate);
+  }
+
   // 2. process.execPath — the node that's running THIS process right now
   if (fs.existsSync(process.execPath)) candidates.add(process.execPath);
 
@@ -886,6 +944,12 @@ function resolveNodeCandidates(): string[] {
   } catch { /* brew not installed or node not installed via brew */ }
 
   return [...candidates];
+}
+
+/** Remove the managed symlink itself from the target candidate set. */
+export function excludeManagedNodeSymlink(candidates: string[], symlinkPath: string): string[] {
+  const managed = path.resolve(symlinkPath);
+  return candidates.filter((candidate) => path.resolve(candidate) !== managed);
 }
 
 /**
@@ -999,8 +1063,13 @@ export function ensureStableNodeSymlink(projectDir: string): string {
   const nativeModuleExists = fs.existsSync(nativeModulePath);
 
   // Resolve all available node paths and pick the most durable ABI-compatible one
-  const candidates = resolveNodeCandidates();
-  const durablePath = pickDurableNodePath(candidates, nativeModulePath) ?? findNodePath();
+  const candidates = excludeManagedNodeSymlink(resolveNodeCandidates(), symlinkPath);
+  const fallback = findNodePath();
+  const durablePath = pickDurableNodePath(candidates, nativeModulePath)
+    ?? (path.resolve(fallback) !== path.resolve(symlinkPath) ? fallback : undefined);
+  if (!durablePath) {
+    throw new Error(`No real Node binary found outside managed symlink ${symlinkPath}`);
+  }
 
   // Check if symlink exists and already points to a valid target.
   try {
@@ -1037,52 +1106,6 @@ export function ensureStableNodeSymlink(projectDir: string): string {
   );
 
   return symlinkPath;
-}
-
-function findInstarCli(): string {
-  // Find the actual instar CLI entry point
-  // CRITICAL: Never resolve to an npx cache path. When users run `npx instar setup`,
-  // import.meta.url points to the npx cache. If we bake that path into the launchd
-  // plist, `npm install -g` updates won't reach the running binary (the npx cache
-  // is a separate copy). This caused an infinite update→notify→restart loop (v0.12.12).
-  try {
-    const globalPath = execFileSync('which', ['instar'], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-    if (globalPath && !globalPath.includes('.npm/_npx')) {
-      return globalPath;
-    }
-  } catch { /* not global */ }
-
-  // Try resolving from npm's global prefix (works even when `which` fails)
-  try {
-    const prefix = execFileSync('npm', ['prefix', '-g'], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).trim();
-    const globalCli = path.join(prefix, 'lib', 'node_modules', 'instar', 'dist', 'cli.js');
-    if (fs.existsSync(globalCli)) {
-      return globalCli;
-    }
-  } catch { /* npm prefix failed */ }
-
-  // Fallback: use the dist/cli.js from the npm package — but ONLY if not in npx cache
-  const cliPath = path.resolve(__dirname, '../cli.js');
-  if (fs.existsSync(cliPath) && !cliPath.includes('.npm/_npx')) {
-    return cliPath;
-  }
-
-  // Last resort: if everything points to npx cache, warn and use bare command name.
-  // The plist will need PATH to resolve it, but at least it won't be pinned to a stale cache.
-  if (cliPath.includes('.npm/_npx')) {
-    console.warn(
-      '[setup] WARNING: Running from npx cache. The launchd plist will use bare "instar" command.\n' +
-      '  Auto-updates are handled via shadow installs — no global install needed.'
-    );
-  }
-
-  return 'instar';
 }
 
 function escapeXml(str: string): string {
@@ -1148,6 +1171,11 @@ SHADOW="${shadowCli}"
 SHADOW_DIR="${shadowDir}"
 CRASH_FILE="${crashFile}"
 
+if [ ! -d "$SHADOW_DIR" ] && [ -f "$SHADOW_DIR.previous/node_modules/instar/dist/cli.js" ]; then
+  mv "$SHADOW_DIR.previous" "$SHADOW_DIR" || exit 1
+  echo "[instar-boot] Restored previous install after interrupted update" >&2
+fi
+
 if [ ! -f "$SHADOW" ]; then
   # Attempt one-shot reinstall before giving up. Debounced via marker file so
   # launchd KeepAlive throttling doesn't trigger 30+ reinstalls per minute.
@@ -1163,8 +1191,9 @@ if [ ! -f "$SHADOW" ]; then
     echo "[instar-boot] Shadow install missing — attempting one-shot reinstall" >&2
 
     # Resolve absolute node + npm (PATH may be empty under launchd).
-    NODE_BIN=""
-    for cand in /opt/homebrew/bin/node /usr/local/bin/node; do
+    NODE_BIN="$(command -v node 2>/dev/null || true)"
+    [ -n "$NODE_BIN" ] && [ ! -x "$NODE_BIN" ] && NODE_BIN=""
+    [ -z "$NODE_BIN" ] && for cand in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
       [ -x "$cand" ] && NODE_BIN="$cand" && break
     done
     NPM_BIN=""
@@ -1223,8 +1252,21 @@ fi
 # Crash loop protection: if node fails rapidly, back off before exiting.
 # Prevents launchd KeepAlive from spinning at max speed on persistent errors.
 mkdir -p "$(dirname "$CRASH_FILE")" 2>/dev/null
-node "$SHADOW" "$@"
+# Run node as a child and pass stop signals on. Under systemd this bash is the
+# unit's main process, and with KillMode=process a stop or restart signals it
+# alone: without the trap, bash exits and node keeps the port and the agent's
+# single-instance lock, so "restart" leaves the old server serving.
+node "$SHADOW" "$@" &
+CHILD=$!
+trap 'kill -TERM "$CHILD" 2>/dev/null' TERM INT HUP
+wait "$CHILD"
 EXIT_CODE=$?
+# A trapped signal interrupts wait early; wait again for node's own exit.
+while kill -0 "$CHILD" 2>/dev/null; do
+  wait "$CHILD"
+  EXIT_CODE=$?
+done
+trap - TERM INT HUP
 
 if [ $EXIT_CODE -ne 0 ]; then
   echo "$(date -u +%s)" >> "$CRASH_FILE"
@@ -1398,6 +1440,11 @@ function selfHealNodeSymlink() {
   }
 }
 
+if (!fs.existsSync(SHADOW_DIR) && fs.existsSync(SHADOW_DIR + '.previous')) {
+  fs.renameSync(SHADOW_DIR + '.previous', SHADOW_DIR);
+  process.stderr.write('[instar-boot] Restored previous install after interrupted update\\n');
+}
+
 selfHealNodeSymlink();
 
 // Verify shadow install exists — attempt one-shot reinstall before giving up.
@@ -1543,8 +1590,14 @@ child.on('error', (err) => {
 `;
 
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(shPath, bashWrapper, { mode: 0o755 });
-  fs.writeFileSync(jsPath, jsWrapper, { mode: 0o755 });
+  // A promotion can request this regeneration immediately before switching
+  // installs. Never leave a half-written launchd wrapper after interruption.
+  const shTemp = `${shPath}.tmp-${randomUUID()}`;
+  const jsTemp = `${jsPath}.tmp-${randomUUID()}`;
+  fs.writeFileSync(shTemp, bashWrapper, { mode: 0o755 });
+  fs.writeFileSync(jsTemp, jsWrapper, { mode: 0o755 });
+  fs.renameSync(shTemp, shPath);
+  fs.renameSync(jsTemp, jsPath);
   return { sh: shPath, js: jsPath };
 }
 
@@ -1738,20 +1791,37 @@ ${argsXml}
     <integer>10</integer>
     <!-- Fork-bomb prevention belt (forkbomb-prevention-simple §D-CAP): an
          OS-level NumberOfProcesses ceiling under the host-wide spawn-cap
-         semaphore (the PRIMARY control). Generous + conservative (512) — it
-         bounds a non-compliant runaway that bypasses the funnel without
-         affecting normal operation (normal instar runs far fewer subprocesses).
-         This is the host-GLOBAL belt the funnel's per-process honesty can't
-         provide; it never substitutes for the spawn cap, it backstops it. -->
+         semaphore (the PRIMARY control). This is the host-GLOBAL belt the
+         funnel's per-process honesty can't provide; it never substitutes for
+         the spawn cap, it backstops it.
+
+         The ceiling MUST clear the machine's idle process floor, and by a wide
+         margin. NumberOfProcesses maps to RLIMIT_NPROC, which the kernel counts
+         PER REAL UID — every process the logged-in user owns, not just the ones
+         instar spawned. The original value (512) was chosen as "generous"
+         against instar's own subprocess count, which was the wrong denominator:
+         a normal logged-in macOS desktop already runs ~500-550 user daemons
+         before instar starts. The belt therefore sat BELOW the idle floor, and
+         the failure was not a bounded runaway — it was every fork() from an
+         instar-supervised shell returning EAGAIN on an otherwise idle machine
+         (observed on a Mac Studio, 2026-08-19: 531 uid processes against the
+         512 ceiling, with agent shell commands failing intermittently for
+         hours). A backstop that fires at rest is not a backstop.
+
+         2048 leaves ~1500 headroom over that floor — far above anything the
+         spawn cap admits (default 8 concurrent LLM subprocesses and their
+         children), far below kern.maxprocperuid (10666 on macOS 15), and still
+         well under the 2026-06-20 runaway (~230-289 concurrent spawns on top of
+         the floor). Raise this only against a measured floor, never a guess. -->
     <key>HardResourceLimits</key>
     <dict>
         <key>NumberOfProcesses</key>
-        <integer>512</integer>
+        <integer>2048</integer>
     </dict>
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfProcesses</key>
-        <integer>512</integer>
+        <integer>2048</integer>
     </dict>
 </dict>
 </plist>`;
@@ -1759,7 +1829,12 @@ ${argsXml}
   try {
     fs.mkdirSync(launchAgentsDir, { recursive: true });
     fs.mkdirSync(logDir, { recursive: true });
-    fs.writeFileSync(plistPath, plist);
+    // RAISE-ONLY on the setup path too (docs/specs/launchd-process-ceiling-floor.md §1,
+    // "The operator's escape path, as a contract"). The migration is raise-only, but setup
+    // REGENERATES this file — so without this, a re-run would silently clobber an operator
+    // who deliberately raised their ceiling for a heavy host, and the contract that their
+    // change "sticks" would be false. Found in spec review before it shipped, not after.
+    fs.writeFileSync(plistPath, preserveHigherProcessCeiling(plist, readExistingPlist(plistPath)));
 
     // Validate the plist is well-formed XML before loading.
     // A corrupted plist means launchd can't restart the agent after crashes,
@@ -1777,12 +1852,17 @@ ${argsXml}
 
     // Load the agent (skipped under test — see launchctlLoadAllowed).
     if (launchctlLoadAllowed()) {
+      const commands = macOSAutoStartLoadCommands(label, plistPath, process.getuid?.() ?? 501);
       try {
         // Unload first if already loaded
-        execFileSync('launchctl', ['bootout', `gui/${process.getuid?.() ?? 501}`, plistPath], { stdio: 'ignore' });
+        execFileSync(commands[0][0], commands[0][1], { stdio: 'ignore' });
       } catch { /* not loaded yet — fine */ }
 
-      execFileSync('launchctl', ['bootstrap', `gui/${process.getuid?.() ?? 501}`, plistPath], { stdio: 'ignore' });
+      // A previously disabled label makes bootstrap fail with the opaque
+      // launchctl "Input/output error" even when the plist is valid. Installing
+      // auto-start is an explicit request to re-enable this exact service.
+      execFileSync(commands[1][0], commands[1][1], { stdio: 'ignore' });
+      execFileSync(commands[2][0], commands[2][1], { stdio: 'ignore' });
     }
 
     // Ensure the user-machine fleet watchdog is installed alongside this agent.
@@ -1796,36 +1876,224 @@ ${argsXml}
   }
 }
 
-function installLinuxSystemdService(projectName: string, projectDir: string, hasTelegram: boolean): boolean {
-  const serviceName = `instar-${projectName}.service`;
-  const serviceDir = path.join(os.homedir(), '.config', 'systemd', 'user');
-  const servicePath = path.join(serviceDir, serviceName);
-  const nodePath = findNodePath();
-  const instarCli = findInstarCli();
+/**
+ * Whether the systemd user manager for `user` survives logout — i.e. whether an
+ * enabled user service actually starts at BOOT rather than only at login.
+ *
+ * Returns `null` when the question cannot be answered (no loginctl, command
+ * failed) — the caller must report that honestly rather than assuming either
+ * answer.
+ */
+export function readLingerState(
+  user: string,
+  run: (cmd: string, args: string[]) => string = (cmd, args) =>
+    // stderr is piped, not inherited: loginctl writes "Failed to look up user
+    // <x>" for an unknown account, and a setup step must not leak a raw system
+    // error into the operator's terminal on a path it handles cleanly.
+    execFileSync(cmd, args, { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }),
+): boolean | null {
+  try {
+    // lint-allow-sync-spawn: a bounded one-shot install-time query, never on a hot path.
+    const out = run('loginctl', ['show-user', user, '-p', 'Linger']);
+    const m = out.match(/Linger=(yes|no)/);
+    return m ? m[1] === 'yes' : null;
+  } catch {
+    // @silent-fallback-ok: no loginctl / unknown user → unanswerable, not "no".
+    return null;
+  }
+}
 
-  const command = hasTelegram ? 'lifeline' : 'server';
-  const args = hasTelegram
-    ? `${instarCli} lifeline start --dir ${projectDir}`
-    : `${instarCli} server start --foreground --dir ${projectDir}`;
+/**
+ * Result of trying to make a Linux auto-start service survive logout.
+ *
+ * WHY THIS EXISTS (2026-08-25, first headless Linux host). `instar autostart
+ * install` wrote a correct systemd USER service, enabled it, started it, and
+ * printed "your agent will start automatically when you log in." On Linux a
+ * per-user service only runs while that user holds a login session, and does
+ * NOT start at boot unless LINGERING is enabled for the account. It was not.
+ *
+ * On a desktop Mac the distinction never bites, because someone is logged in.
+ * On a headless box it is the whole problem: the agent comes up when you SSH
+ * in and dies when you disconnect. The message was not false — it was true in a
+ * way that means NEVER on a machine nobody logs into.
+ *
+ * `enabled-already` / `enabled-now` — starts at boot.
+ * `needs-privilege`  — loginctl refused; the operator must run the named
+ *                      command. The service still works at login.
+ * `unavailable`      — no loginctl (a container, a non-systemd distro). The
+ *                      service still works at login.
+ *
+ * Note the deliberate absence of a sudo attempt: a setup step must not silently
+ * escalate privilege. It reports the exact command instead.
+ */
+export type LingerOutcome = 'enabled-already' | 'enabled-now' | 'needs-privilege' | 'unavailable';
 
-  const isNodeScript = instarCli.endsWith('.js') || instarCli.endsWith('.mjs');
-  const execStart = isNodeScript ? `${nodePath} ${args}` : args;
+/**
+ * The lingering outcome from the most recent Linux auto-start install, so the
+ * CLI can report the truth without changing `installAutoStart`'s boolean
+ * contract (four callers depend on it). Null on macOS and before any install.
+ */
+let lastLingerOutcome: LingerOutcome | null = null;
 
-  const service = `[Unit]
-Description=Instar Agent - ${projectName}
+/** Read (and clear) the lingering outcome of the last Linux auto-start install. */
+export function takeLastLingerOutcome(): LingerOutcome | null {
+  const out = lastLingerOutcome;
+  lastLingerOutcome = null;
+  return out;
+}
+
+/** Test seam: set the carrier directly. */
+export function _setLastLingerOutcomeForTest(o: LingerOutcome | null): void {
+  lastLingerOutcome = o;
+}
+
+export function ensureLinuxLingering(
+  user: string,
+  deps: {
+    read?: (user: string) => boolean | null;
+    enable?: (user: string) => void;
+  } = {},
+): LingerOutcome {
+  const read = deps.read ?? ((u: string) => readLingerState(u));
+  const before = read(user);
+  if (before === true) return 'enabled-already';
+  if (before === null) return 'unavailable';
+  try {
+    const enable =
+      deps.enable ??
+      ((u: string) => {
+        // lint-allow-sync-spawn: bounded one-shot at install time.
+        execFileSync('loginctl', ['enable-linger', u], { stdio: 'ignore', timeout: 5000 });
+      });
+    enable(user);
+  } catch {
+    // @silent-fallback-ok: polkit refused (common when not root) — reported to
+    // the operator by the caller as a named command, never silently swallowed.
+    return 'needs-privilege';
+  }
+  // Verify rather than trust the exit code — the whole defect being fixed here
+  // is a step that reported success without producing its effect.
+  return read(user) === true ? 'enabled-now' : 'needs-privilege';
+}
+
+/** The system user whose systemd user-manager owns the installed service. */
+export function currentSystemdUser(): string {
+  return process.env.USER || process.env.LOGNAME || os.userInfo().username;
+}
+
+/**
+ * Human-readable truth about when the installed Linux service actually starts.
+ * The CLI prints this INSTEAD of an unconditional "starts when you log in".
+ */
+export function describeLingerOutcome(outcome: LingerOutcome, user: string): string {
+  switch (outcome) {
+    case 'enabled-already':
+    case 'enabled-now':
+      return 'Your agent will start automatically when this machine boots, with nobody logged in.';
+    case 'needs-privilege':
+      return [
+        'Your agent will start when you log in — but NOT at boot.',
+        `On a machine nobody logs into, that means never. To fix it: sudo loginctl enable-linger ${user}`,
+      ].join('\n');
+    case 'unavailable':
+      return [
+        'Your agent will start when you log in.',
+        'Whether it also starts at boot could not be determined on this system.',
+      ].join('\n');
+  }
+}
+
+/**
+ * Stop only the main process when the service stops or restarts.
+ *
+ * systemd's default (KillMode=control-group) kills EVERY process the service ever
+ * started, and the tmux server that holds all agent sessions is one of them: it
+ * daemonizes but stays in the service's cgroup. So a routine `systemctl --user
+ * restart` killed every session, live autonomous runs included (Mama PC,
+ * 2026-10-22). launchd on macOS only kills the job's process group, which tmux
+ * leaves via setsid, so sessions there already survive a restart; this gives
+ * Linux the same behavior. Existing units get it from PostUpdateMigrator.
+ */
+export const SYSTEMD_KILL_MODE_LINE = 'KillMode=process';
+/**
+ * Tells the lifeline systemd will start it again. The unit runs the bash boot wrapper, so the
+ * lifeline's parent is bash and the parent-name check cannot see systemd; the macOS plist sets
+ * the same variable for the same reason. Without it the watchdog's self-restart never runs.
+ */
+export const SYSTEMD_SUPERVISED_ENV_LINE = 'Environment=INSTAR_SUPERVISED=1';
+
+/**
+ * PATH entries that only make sense while `npx` runs: its cache, which npm may clear at any
+ * time, and the folders `npm exec` adds (`node_modules/.bin` up the tree, `node-gyp-bin`).
+ */
+export function withoutNpxCache(envPath: string): string {
+  return envPath.split(':')
+    .filter((dir) => dir && !/[\\/]_npx[\\/]/.test(dir) && !/(^|[\\/])node_modules[\\/]\.bin$/.test(dir) && !/[\\/]node-gyp-bin$/.test(dir))
+    .join(':');
+}
+
+/**
+ * True when a systemd unit cannot start the agent on its own: its ExecStart is not an absolute
+ * path (systemd refuses a bare name with 203/EXEC), or it or its PATH points into the npx cache.
+ * Found on Cirrus, 2026-11-03: an install through npx wrote `ExecStart=instar server start ...`.
+ */
+export function systemdUnitNeedsStableStart(unit: string): boolean {
+  // systemd allows `-`, `@`, `+`, `!` and `:` before the path; they don't make it relative.
+  const exec = /^\s*ExecStart\s*=\s*[-@+!:]*(\S+)/m.exec(unit)?.[1];
+  if (!exec) return false;
+  if (!exec.startsWith('/')) return true;
+  if (/[\\/]_npx[\\/]/.test(exec)) return true;
+  const envPath = /^\s*Environment\s*=\s*"?PATH=([^"\n]*)/m.exec(unit)?.[1] ?? '';
+  return /[\\/]_npx[\\/]/.test(envPath);
+}
+
+export function buildLinuxSystemdUnit(opts: {
+  projectName: string;
+  projectDir: string;
+  hasTelegram: boolean;
+  /** The agent's boot wrapper, which runs its own copy of instar (.instar/shadow-install). */
+  bootWrapper: string;
+  envPath: string;
+}): string {
+  const args = opts.hasTelegram
+    ? `lifeline start --dir ${opts.projectDir}`
+    : `server start --foreground --dir ${opts.projectDir}`;
+  // The same start as macOS: the boot wrapper runs the agent's own copy of instar, which the
+  // auto-updater keeps current, and reinstalls it if it is missing. Never a bare `instar` or a
+  // path in the npx cache (203/EXEC on every boot, Cirrus 2026-11-03).
+  return `[Unit]
+Description=Instar Agent - ${opts.projectName}
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${execStart}
-WorkingDirectory=${projectDir}
+${SYSTEMD_KILL_MODE_LINE}
+ExecStart=/bin/bash ${opts.bootWrapper} ${args}
+WorkingDirectory=${opts.projectDir}
 Restart=always
 RestartSec=10
-Environment=PATH=${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}
+Environment=PATH=${withoutNpxCache(opts.envPath) || '/usr/local/bin:/usr/bin:/bin'}
+${SYSTEMD_SUPERVISED_ENV_LINE}
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+function installLinuxSystemdService(projectName: string, projectDir: string, hasTelegram: boolean, noStart = false): boolean {
+  const serviceName = `instar-${projectName}.service`;
+  const serviceDir = path.join(os.homedir(), '.config', 'systemd', 'user');
+  const servicePath = path.join(serviceDir, serviceName);
+  const nodeDir = path.dirname(process.execPath);
+  const envPath = process.env.PATH || '/usr/local/bin:/usr/bin:/bin';
+  const service = buildLinuxSystemdUnit({
+    projectName,
+    projectDir,
+    hasTelegram,
+    bootWrapper: installBootWrapper(projectDir).sh,
+    // The node running setup goes first, so the wrapper's `node` is one that exists.
+    envPath: envPath.split(':').includes(nodeDir) ? envPath : `${nodeDir}:${envPath}`,
+  });
 
   try {
     fs.mkdirSync(serviceDir, { recursive: true });
@@ -1833,7 +2101,16 @@ WantedBy=default.target
 
     execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
     execFileSync('systemctl', ['--user', 'enable', serviceName], { stdio: 'ignore' });
-    execFileSync('systemctl', ['--user', 'start', serviceName], { stdio: 'ignore' });
+    // noStart: the caller knows the agent is already running some other way, and a second
+    // start would only lose the single-instance lock and loop (PostUpdateMigrator).
+    if (!noStart) execFileSync('systemctl', ['--user', 'start', serviceName], { stdio: 'ignore' });
+    // Enabling the unit is not enough on Linux: without lingering, the user's
+    // systemd manager exits at logout and an "enabled" service never starts at
+    // boot. Attempted here; the OUTCOME is reported by the caller (see
+    // describeLingerOutcome) rather than folded into this boolean, because a
+    // service that works only at login is still a successful install — it is
+    // just not the thing the old message claimed.
+    lastLingerOutcome = ensureLinuxLingering(currentSystemdUser());
     return true;
   } catch {
     return false;
@@ -1939,7 +2216,7 @@ export async function runNonInteractiveSetup(opts: NonInteractiveOptions): Promi
         // Not a runtime state detector; runs exactly once during the
         // non-interactive setup path and the failure mode is "ask the operator
         // to enter the numeric id directly" — no inferred state, no follow-up.
-        const res = await fetch(`https://api.telegram.org/bot${opts.telegramToken}/getChat`, {
+        const res = await telegramFetch(`https://api.telegram.org/bot${opts.telegramToken}/getChat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId }),
@@ -2019,6 +2296,8 @@ export async function runNonInteractiveSetup(opts: NonInteractiveOptions): Promi
     console.log(key);
   }
 
+  if (isBlankAgentHome(stateDir)) markNewAgent(stateDir);
+
   // Write config
   fs.writeFileSync(path.join(stateDir, 'config.json'), JSON.stringify(config, null, 2));
 
@@ -2071,4 +2350,50 @@ I am ${agentName}, set up via non-interactive mode.
     console.log(pc.green('  ✓ Telegram configured'));
   }
   console.log(pc.dim(`\n  Start with: instar server start --dir ${agentDir}\n`));
+}
+
+/**
+ * Read an existing launchd plist, or `null` when there is none / it cannot be read.
+ * A missing plist is the normal first-install case, not an error.
+ */
+function readExistingPlist(plistPath: string): string | null {
+  try {
+    return fs.readFileSync(plistPath, 'utf-8');
+  } catch {
+    // @silent-fallback-ok: no existing plist (first install) or an unreadable one. Either
+    // way the freshly generated template is written as-is, which is the pre-existing
+    // behaviour — this helper can only ever PRESERVE more, never less.
+    return null;
+  }
+}
+
+/**
+ * Carry an operator's HIGHER `NumberOfProcesses` value from an existing plist into the
+ * freshly generated one, leaving everything else in the new template intact.
+ *
+ * Raise-only by construction: a previous value is carried forward ONLY when it is strictly
+ * greater than the template's. So a stale LOW value (the 512 this change exists to fix) is
+ * correctly replaced by the template, while an operator's deliberate higher value survives
+ * a setup re-run.
+ *
+ * Exported for tests: this is the half of the raise-only contract that lives on the
+ * regenerating path, and it is exactly the half a spec review caught missing.
+ */
+export function preserveHigherProcessCeiling(nextPlist: string, previousPlist: string | null): string {
+  if (!previousPlist) return nextPlist;
+  const RE = /(<key>\s*NumberOfProcesses\s*<\/key>\s*<integer>\s*)(\d+)(\s*<\/integer>)/g;
+  const previous: number[] = [];
+  for (const m of previousPlist.matchAll(RE)) {
+    const v = Number.parseInt(m[2] ?? '', 10);
+    if (Number.isFinite(v)) previous.push(v);
+  }
+  if (previous.length === 0) return nextPlist;
+  const highestPrevious = Math.max(...previous);
+  let i = 0;
+  return nextPlist.replace(RE, (whole, lead: string, digits: string, tail: string) => {
+    i += 1;
+    const templateValue = Number.parseInt(digits, 10);
+    if (!Number.isFinite(templateValue)) return whole;
+    return highestPrevious > templateValue ? `${lead}${highestPrevious}${tail}` : whole;
+  });
 }

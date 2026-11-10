@@ -25,6 +25,10 @@
  * failover threshold.
  */
 
+import { clampCoherenceAdvert } from './machineCoherenceAdvert.js';
+import { classifyPullFailure, type PullFailureShape } from './machineLiveness.js';
+import { clampLoadReport, type MachineLoadReport } from './machineLoadReport.js';
+
 /** A peer to consider polling: its machine id + resolved tunnel URL (null ⇒ unreachable). */
 export interface PeerPresenceMachine {
   machineId: string;
@@ -87,6 +91,55 @@ export interface PeerCapacity {
   seamlessnessFlags?: import('./types.js').MachineCapacity['seamlessnessFlags'];
   /** Platform/workspace reachability (placement-platform-workspace-aware) — replicated like the others. */
   servesChannels?: import('./types.js').MachineCapacity['servesChannels'];
+  /**
+   * Machine-coherence advert (machine-coherence-guard §3.2): the peer's running
+   * instar version, protocol version, manifest hash, guard posture, and
+   * manifest-resolved effective flag values. CLAMP-PASSED by the narrowing step
+   * (M4 — the narrowing applies `clampCoherenceAdvert`, so a value here is
+   * already format-validated; a rejected advert lands in
+   * `coherenceAdvertRejected` instead). Absent = pre-guard peer (`unknown` →
+   * version-class after grace). The #930/A2/WS2.1/seamlessnessFlags narrowing
+   * lesson applies a FIFTH time — this field is in SESSION_STATUS_ADVERT_FIELDS
+   * so the ratchet covers the narrowing, AND it must survive `pullOnce`'s
+   * hand-maintained recordHeartbeat spread (the R2-N1 second enumeration).
+   */
+  coherenceAdvert?: import('./machineCoherenceAdvert.js').CoherenceAdvert;
+  /** Clamp-rejection marker (M4): the peer SENT an advert but it failed the
+   *  receive clamp — recorded so the peer classifies `advert-rejected` (a loud
+   *  named condition), never silently treated as advert-less. */
+  coherenceAdvertRejected?: { atMs: number; reason: string };
+  /**
+   * The peer's own direct contacts with OTHER machines, as ages on the peer's
+   * clock (trustworthy-machine-load A4). Display only — never refreshes our
+   * own evidence, never re-relayed, never feeds placement. Sanitized on
+   * receive (bounded entry count, finite non-negative ages).
+   */
+  peerSightings?: Record<string, { ageMs: number }>;
+  /**
+   * The peer's multi-signal load report (trustworthy-machine-load B1), CLAMPED
+   * on receive. Stored in its own receipt-stamped registry slot so a coarse
+   * beat can never erase it. Absent = older peer = load `unknown`, never `ok`.
+   */
+  loadReport?: MachineLoadReport;
+}
+
+/** Bound on sighting entries accepted from one peer. */
+export const MAX_PEER_SIGHTINGS = 64;
+
+/** Receive clamp for a peer's sightings block. Returns undefined when unusable. */
+export function sanitizePeerSightings(raw: unknown): Record<string, { ageMs: number }> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, { ageMs: number }> = {};
+  let n = 0;
+  for (const [id, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (n >= MAX_PEER_SIGHTINGS) break;
+    if (typeof id !== 'string' || id.length === 0 || id.length > 128) continue;
+    const age = (v as { ageMs?: unknown } | null)?.ageMs;
+    if (typeof age !== 'number' || !Number.isFinite(age) || age < 0) continue;
+    out[id] = { ageMs: age };
+    n++;
+  }
+  return out;
 }
 
 /**
@@ -106,6 +159,9 @@ export const SESSION_STATUS_ADVERT_FIELDS = [
   'guardPosture',
   'seamlessnessFlags',
   'servesChannels',
+  'coherenceAdvert',
+  'peerSightings',
+  'loadReport',
 ] as const;
 
 /**
@@ -133,7 +189,12 @@ export function narrowSessionStatusToPeerCapacity(
     guardPosture?: import('./types.js').GuardPostureSummary;
     seamlessnessFlags?: import('./types.js').MachineCapacity['seamlessnessFlags'];
     servesChannels?: import('./types.js').MachineCapacity['servesChannels'];
+    coherenceAdvert?: unknown;
+    peerSightings?: unknown;
+    loadReport?: unknown;
   };
+  const loadReport = cap.loadReport !== undefined ? clampLoadReport(cap.loadReport) : null;
+  const sightings = cap.peerSightings !== undefined ? sanitizePeerSightings(cap.peerSightings) : undefined;
   return {
     selfReportedLastSeen: cap.selfReportedLastSeen,
     loadAvg: cap.loadAvg,
@@ -146,6 +207,20 @@ export function narrowSessionStatusToPeerCapacity(
     // THE FIX (4th instance of the narrowing-return-forgets-a-field class): the
     // peer's receive advert must cross the wire or replication never starts.
     ...(cap.seamlessnessFlags !== undefined ? { seamlessnessFlags: cap.seamlessnessFlags } : {}),
+    ...(sightings !== undefined ? { peerSightings: sightings } : {}),
+    ...(loadReport ? { loadReport } : {}),
+    // Machine-coherence advert (§3.2): CLAMPED on receive, right here in the
+    // narrowing step (M4 — the spec's designated clamp point). A clean advert
+    // passes rebuilt-byte-identical; a malformed one becomes a rejection marker
+    // (rejected ≠ absent — the peer classifies `advert-rejected`, loudly).
+    ...(cap.coherenceAdvert !== undefined
+      ? (() => {
+          const res = clampCoherenceAdvert(cap.coherenceAdvert);
+          return res.ok
+            ? { coherenceAdvert: res.advert }
+            : { coherenceAdvertRejected: { atMs: Date.now(), reason: res.reason } };
+        })()
+      : {}),
   };
 }
 
@@ -169,9 +244,18 @@ export interface PeerPresencePullerDeps {
    */
   fetchPeerCapacity: (machineId: string, url: string) => Promise<PeerCapacity | null>;
   /** Record an observed peer heartbeat into the pool registry (marks it online for the failover window). */
-  recordHeartbeat: (obs: { machineId: string; selfReportedLastSeen: string; loadAvg?: number; quotaState?: { blocked: boolean; blockedUntil?: string; reason?: string }; guardPosture?: import('./types.js').GuardPostureSummary; seamlessnessFlags?: import('./types.js').MachineCapacity['seamlessnessFlags']; servesChannels?: import('./types.js').MachineCapacity['servesChannels'] }) => void;
+  recordHeartbeat: (obs: { machineId: string; selfReportedLastSeen: string; loadAvg?: number; rttMs?: number; loadReport?: MachineLoadReport; quotaState?: { blocked: boolean; blockedUntil?: string; reason?: string }; guardPosture?: import('./types.js').GuardPostureSummary; seamlessnessFlags?: import('./types.js').MachineCapacity['seamlessnessFlags']; servesChannels?: import('./types.js').MachineCapacity['servesChannels']; coherenceAdvert?: import('./machineCoherenceAdvert.js').CoherenceAdvert; coherenceAdvertRejected?: { atMs: number; reason: string } }) => void;
   /** Wall clock — injectable for tests. Defaults to `Date`. */
   now?: () => Date;
+  /** Monotonic ms clock for round-trip timing — injectable for tests. */
+  monoNow?: () => number;
+  /**
+   * Record a failed direct attempt and its shape (trustworthy-machine-load A1).
+   * Display-only evidence; MUST NOT throw into the puller.
+   */
+  recordPullFailure?: (machineId: string, shape: PullFailureShape) => void;
+  /** Record a peer's sightings of other machines (A4, display only). MUST NOT throw. */
+  recordPeerSightings?: (observerMachineId: string, sightings: Record<string, { ageMs: number }>) => void;
   /** Optional structured log line per pass (e.g. for the boot log). */
   log?: (line: string) => void;
 
@@ -240,18 +324,33 @@ export class PeerPresencePuller {
    * Never rejects.
    */
   async pullOnce(): Promise<{ recorded: string[] }> {
-    const peers = this.d.listPeers().filter((m) => m.machineId !== this.d.selfMachineId && !!m.url);
+    const all = this.d.listPeers().filter((m) => m.machineId !== this.d.selfMachineId);
+    // A peer with no resolvable URL is a failed attempt of shape `no-route`
+    // (display evidence only — it was never recorded online before either).
+    for (const m of all) if (!m.url) this.noteFailure(m.machineId, 'no-route');
+    const peers = all.filter((m) => !!m.url);
+    const mono = this.d.monoNow ?? (() => Number(process.hrtime.bigint() / 1_000_000n));
     const results = await Promise.all(
       peers.map(async (m): Promise<string | null> => {
         let cap: PeerCapacity | null = null;
+        let failure: unknown = null;
+        const startedMs = mono();
         try {
           cap = await this.d.fetchPeerCapacity(m.machineId, m.url as string);
-        } catch {
+        } catch (err) {
           cap = null; // unreachable / rejected → not recorded; ages out of online
+          failure = err ?? new Error('fetch failed');
         }
-        if (!cap) return null;
+        if (!cap) {
+          this.noteFailure(m.machineId, classifyPullFailure(failure));
+          return null;
+        }
+        const rttMs = Math.max(0, mono() - startedMs);
         const seen = cap.selfReportedLastSeen ?? (this.d.now?.() ?? new Date()).toISOString();
-        this.d.recordHeartbeat({ machineId: m.machineId, selfReportedLastSeen: seen, loadAvg: cap.loadAvg, ...(cap.quotaState !== undefined ? { quotaState: cap.quotaState } : {}), ...(cap.guardPosture !== undefined ? { guardPosture: cap.guardPosture } : {}), ...(cap.seamlessnessFlags !== undefined ? { seamlessnessFlags: cap.seamlessnessFlags } : {}), ...(cap.servesChannels !== undefined ? { servesChannels: cap.servesChannels } : {}) });
+        if (cap.peerSightings && this.d.recordPeerSightings) {
+          try { this.d.recordPeerSightings(m.machineId, cap.peerSightings); } catch { /* @silent-fallback-ok: display-only sightings must never break the presence pass (the puller's never-throw contract) */ }
+        }
+        this.d.recordHeartbeat({ machineId: m.machineId, selfReportedLastSeen: seen, loadAvg: cap.loadAvg, rttMs, ...(cap.loadReport !== undefined ? { loadReport: cap.loadReport } : {}), ...(cap.quotaState !== undefined ? { quotaState: cap.quotaState } : {}), ...(cap.guardPosture !== undefined ? { guardPosture: cap.guardPosture } : {}), ...(cap.seamlessnessFlags !== undefined ? { seamlessnessFlags: cap.seamlessnessFlags } : {}), ...(cap.servesChannels !== undefined ? { servesChannels: cap.servesChannels } : {}), ...(cap.coherenceAdvert !== undefined ? { coherenceAdvert: cap.coherenceAdvert } : {}), ...(cap.coherenceAdvertRejected !== undefined ? { coherenceAdvertRejected: cap.coherenceAdvertRejected } : {}) });
         // REPLICATION-GATED journal-delta drive — only when the server wired the
         // delta deps (i.e. replication.enabled === true). Otherwise a complete
         // no-op (engine/transport stay dark). Never throws into the puller.
@@ -278,6 +377,38 @@ export class PeerPresencePuller {
     const recorded = results.filter((r): r is string => r !== null);
     if (recorded.length && this.d.log) this.d.log(`recorded ${recorded.length} peer(s) online over HTTP: ${recorded.join(', ')}`);
     return { recorded };
+  }
+
+  /**
+   * ownership-nudge: pull one kind from one peer now, walking pages to the head the peer
+   * advertises. Records no heartbeat and no presence: this is not a sighting pass. Resolves
+   * true only if this machine has reached that head. Never throws.
+   */
+  async pullKindFrom(machineId: string, url: string, kind: string, maxPages = 3): Promise<boolean> {
+    if (!this.d.requestJournalDelta || !this.d.applyDelta || !this.d.localAdvertFor) return false;
+    let advert: { incarnation: string; lastSeq: number } | undefined;
+    try {
+      advert = (await this.d.fetchPeerCapacity(machineId, url))?.journalAdvert?.[kind];
+    } catch { /* @silent-fallback-ok: an unreachable peer reads as not reached, and the 30 s pull retries */
+      return false;
+    }
+    if (!advert) return false;
+    const reached = (): boolean => {
+      try {
+        const held = this.d.localAdvertFor?.(machineId)?.[kind];
+        return !!held && held.incarnation === advert!.incarnation && held.lastSeq >= advert!.lastSeq;
+      } catch { /* @silent-fallback-ok: an unreadable view reads as not reached */
+        return false;
+      }
+    };
+    for (let page = 0; page < maxPages && !reached(); page++) {
+      await this.driveJournalDelta(machineId, url, { [kind]: advert });
+    }
+    return reached();
+  }
+
+  private noteFailure(machineId: string, shape: PullFailureShape): void {
+    try { this.d.recordPullFailure?.(machineId, shape); } catch { /* @silent-fallback-ok: display-only failure evidence must never break the presence pass (the puller's never-throw contract) */ }
   }
 
   /**

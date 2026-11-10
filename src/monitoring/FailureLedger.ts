@@ -28,6 +28,7 @@
  *    back into the commit / reconciler / route that observed the failure.
  */
 import Database from 'better-sqlite3';
+import { featureEvidence } from './FeatureEvidenceLog.js';
 import { registerSqliteHandle } from '../core/SqliteRegistry.js';
 import type { Database as BetterSqliteDatabase } from 'better-sqlite3';
 import fs from 'node:fs';
@@ -88,6 +89,13 @@ export interface FailureRecord {
   summary: string;
   detail: FailureDetail;
   category: FailureCategory;
+  /**
+   * Judgment Within Floors (ownership-gated-spawn spec §3.6): the failure traces
+   * to a STATIC HEURISTIC at a competing-signals decision point — a candidate
+   * for a judgment point within a deterministic floor. Set by the filer;
+   * clustered by the analyzer into the judgment-candidate recommendation.
+   */
+  judgmentCandidate?: boolean;
   // attribution
   initiativeId?: string;
   projectId?: string;
@@ -168,6 +176,8 @@ export interface OpenFailureInput {
   summary: string;
   detail: FailureDetail;
   category?: FailureCategory;
+  /** See {@link FailureRecord.judgmentCandidate}. */
+  judgmentCandidate?: boolean;
   initiativeId?: string;
   projectId?: string;
   specPath?: string;
@@ -314,6 +324,10 @@ const SCHEMA = [
    )`,
   // Insight pagination index (Process Health tab §3): keyset on discovered_at DESC.
   `CREATE INDEX IF NOT EXISTS idx_insights_discovered ON failure_insights(discovered_at)`,
+  // Judgment Within Floors (§3.6): filer-set flag marking a failure as tracing
+  // to a static heuristic at a competing-signals decision point. ALTER TABLE is
+  // idempotent via the duplicate-column swallow in the constructor's exec loop.
+  `ALTER TABLE failure_records ADD COLUMN judgment_candidate INTEGER NOT NULL DEFAULT 0`,
 ];
 
 // ── FailureLedger ─────────────────────────────────────────────────────
@@ -345,7 +359,17 @@ export class FailureLedger {
     );
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
-    for (const ddl of SCHEMA) this.db.exec(ddl);
+    for (const ddl of SCHEMA) {
+      try {
+        this.db.exec(ddl);
+      } catch (err) {
+        // ALTER TABLE … ADD COLUMN is idempotent at the column level but SQLite
+        // throws if the column already exists. Swallow that one case; rethrow
+        // anything else (the TokenLedger precedent).
+        const msg = (err as Error).message || '';
+        if (!/duplicate column name/i.test(msg)) throw err;
+      }
+    }
     // Close-on-exit registry (SqliteRegistry.ts) — closed once at shutdown.
     registerSqliteHandle(() => { try { this.db?.close(); } catch { /* already closed */ } });
   }
@@ -430,12 +454,12 @@ export class FailureLedger {
           .prepare(
             `INSERT INTO failure_records
                (id, dedupe_key, occurrence_count, detected_at, filed_by, source, severity,
-                summary, detail_redacted, detail_full, category, initiative_id, project_id,
+                summary, detail_redacted, detail_full, category, judgment_candidate, initiative_id, project_id,
                 spec_path, cause_commit_oid, pr_number, toolchain_ref, build_skill, provenance,
                 attribution, attribution_confidence, status, created_at, updated_at, version)
              VALUES
                (@id, @dedupeKey, 1, @detectedAt, @filedBy, @source, @severity,
-                @summary, @detailRedacted, @detailFull, @category, @initiativeId, @projectId,
+                @summary, @detailRedacted, @detailFull, @category, @judgmentCandidate, @initiativeId, @projectId,
                 @specPath, @causeCommitOid, @prNumber, @toolchainRef, @buildSkill, @provenance,
                 @attribution, @attributionConfidence, 'open', @createdAt, @updatedAt, 1)
              ON CONFLICT(dedupe_key) DO UPDATE SET
@@ -455,6 +479,7 @@ export class FailureLedger {
             detailRedacted: input.detail.redacted,
             detailFull: input.detail.full,
             category,
+            judgmentCandidate: input.judgmentCandidate ? 1 : 0,
             initiativeId: input.initiativeId ?? null,
             projectId: input.projectId ?? null,
             specPath: input.specPath ?? null,
@@ -472,9 +497,33 @@ export class FailureLedger {
       });
 
       const id = txn();
-      return this.get(id);
+      const record = this.get(id);
+      // First sighting, then at each doubling: a repeating failure stays visible without a row per repeat.
+      const occurrences = record?.occurrenceCount ?? 0;
+      if (occurrences > 0 && (occurrences & (occurrences - 1)) === 0) {
+        featureEvidence.record('monitoring.failureLearning', {
+          kind: 'fired',
+          reason: `failure-recorded:${input.attribution}`,
+          context: {
+            source: input.source,
+            severity: input.severity,
+            category,
+            attribution: input.attribution,
+            attributionConfidence: input.attributionConfidence ?? 0,
+            provenance: input.provenance ?? 'unknown',
+            hasCauseCommit: Boolean(input.causeCommitOid),
+            occurrences,
+          },
+        });
+      }
+      return record;
     } catch (err) {
       this.onError('open', err);
+      featureEvidence.record('monitoring.failureLearning', {
+        kind: 'error',
+        reason: 'failure-write-failed',
+        context: { source: input.source, errorName: err instanceof Error ? err.name : 'unknown' },
+      });
       return null;
     }
   }
@@ -664,9 +713,21 @@ export class FailureLedger {
           ids: JSON.stringify(input.supportingFailureIds), ds: input.distinctSessions, dc: input.distinctCauseCommits,
           tc: input.targetCategory ?? null, br: input.baselineRate ?? null,
         });
+      featureEvidence.record('monitoring.failureLearning', {
+        kind: 'fired',
+        reason: 'pattern-surfaced',
+        context: {
+          insightId: id,
+          supportingFailures: input.supportingFailureIds.length,
+          distinctSessions: input.distinctSessions,
+          distinctCauseCommits: input.distinctCauseCommits,
+          targetCategory: input.targetCategory ?? null,
+        },
+      });
       return this.getInsight(id);
     } catch (err) {
       this.onError('upsertInsight', err);
+      featureEvidence.record('monitoring.failureLearning', { kind: 'error', reason: 'insight-write-failed', context: { errorName: err instanceof Error ? err.name : 'unknown' } });
       return null;
     }
   }
@@ -786,6 +847,7 @@ export class FailureLedger {
       summary: r.summary as string,
       detail: { redacted: (r.detail_redacted as string) ?? '', full: (r.detail_full as string) ?? '' },
       category: r.category as FailureCategory,
+      judgmentCandidate: (r.judgment_candidate as number) === 1 ? true : undefined,
       initiativeId: (r.initiative_id as string) ?? undefined,
       projectId: (r.project_id as string) ?? undefined,
       specPath: (r.spec_path as string) ?? undefined,

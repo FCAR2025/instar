@@ -42,6 +42,16 @@ export interface LlmQueueOptions {
   now?: () => number;
 }
 
+export interface LlmMeteredRequest {
+  component: string;
+  estimatedInputTokens: number;
+  maxOutputTokens: number;
+  estimatedCostCents: number;
+  hourly: { requests: number; perTopicRequests?: number; topic?: string };
+  daily: { requests: number; inputTokens: number; outputTokens: number; costCents: number };
+  run: (signal: AbortSignal, reportUsage: (usage: { inputTokens: number; outputTokens: number; costCents?: number }) => void) => Promise<string>;
+}
+
 interface InFlight {
   lane: LlmLane;
   controller: AbortController;
@@ -54,6 +64,15 @@ interface Waiter {
   costCents: number;
   resolve: (v: string) => void;
   reject: (e: Error) => void;
+}
+
+/**
+ * A call refused before any provider ran. Typed so a caller can tell "the model
+ * answered badly" from "the model was never asked" without matching error text.
+ */
+export type LlmQueueAdmissionCode = 'daily-spend-cap' | 'lane-reserve' | 'component-budget';
+export class LlmQueueAdmissionError extends Error {
+  constructor(readonly code: LlmQueueAdmissionCode, message: string) { super(message); }
 }
 
 export class LlmQueue {
@@ -75,6 +94,7 @@ export class LlmQueue {
   private dailySpendCents = 0;
   private dailyInteractiveCents = 0;
   private dailyDateKey = '';
+  private readonly metered = new Map<string, Array<{ at: number; topic?: string; inputTokens: number; outputTokens: number; costCents: number }>>();
 
   constructor(opts: LlmQueueOptions = {}) {
     this.maxConcurrent = opts.maxConcurrent ?? 3;
@@ -102,7 +122,7 @@ export class LlmQueue {
 
     // Daily cap check.
     if (this.dailySpendCents + costCents > this.maxDailyCents) {
-      throw new Error('LLM daily spend cap exceeded');
+      throw new LlmQueueAdmissionError('daily-spend-cap', 'LLM daily spend cap exceeded');
     }
     // Per-lane reserve: interactive lane is guaranteed ≥ reservePct; background
     // lane cannot push total into the reserved portion once interactive floor
@@ -111,7 +131,7 @@ export class LlmQueue {
     if (lane === 'background') {
       const remainingAfter = this.maxDailyCents - (this.dailySpendCents + costCents);
       if (remainingAfter < reservedForInteractive - this.dailyInteractiveCents) {
-        throw new Error('LLM background lane would breach interactive reserve');
+        throw new LlmQueueAdmissionError('lane-reserve', 'LLM background lane would breach interactive reserve');
       }
     }
 
@@ -119,6 +139,47 @@ export class LlmQueue {
       this.waiters.push({ lane, fn, costCents, resolve, reject });
       this.drain();
     });
+  }
+
+  /** Atomically reserves a component budget before entering the shared background lane. */
+  async enqueueMetered(request: LlmMeteredRequest): Promise<string> {
+    const now = this.now();
+    const rows = (this.metered.get(request.component) ?? []).filter((row) => now - row.at <= 86_400_000);
+    const hourly = rows.filter((row) => now - row.at <= 3_600_000);
+    if (hourly.length >= request.hourly.requests
+      || (request.hourly.topic && request.hourly.perTopicRequests !== undefined
+        && hourly.filter((row) => row.topic === request.hourly.topic).length >= request.hourly.perTopicRequests)
+      || rows.length >= request.daily.requests
+      || rows.reduce((sum, row) => sum + row.inputTokens, 0) + request.estimatedInputTokens > request.daily.inputTokens
+      || rows.reduce((sum, row) => sum + row.outputTokens, 0) + request.maxOutputTokens > request.daily.outputTokens
+      || rows.reduce((sum, row) => sum + row.costCents, 0) + request.estimatedCostCents > request.daily.costCents) {
+      throw new LlmQueueAdmissionError('component-budget', 'LLM metered component budget exhausted');
+    }
+    const reservation = { at: now, ...(request.hourly.topic ? { topic: request.hourly.topic } : {}),
+      inputTokens: request.estimatedInputTokens, outputTokens: request.maxOutputTokens, costCents: request.estimatedCostCents };
+    rows.push(reservation);
+    this.metered.set(request.component, rows);
+    let actual: { inputTokens: number; outputTokens: number; costCents?: number } | undefined;
+    try {
+      const value = await this.enqueue('background', (signal) => request.run(signal, (usage) => { actual = usage; }), request.estimatedCostCents);
+      if (actual) {
+        reservation.inputTokens = Math.max(0, Math.floor(actual.inputTokens));
+        reservation.outputTokens = Math.max(0, Math.floor(actual.outputTokens));
+        reservation.costCents = Math.max(0, actual.costCents ?? request.estimatedCostCents);
+      }
+      return value;
+    } catch (error) {
+      // Provider uncertainty retains the conservative reservation. Admission
+      // failures before provider execution are also counted to prevent storms.
+      throw error;
+    }
+  }
+
+  getMeteredUsage(component: string): { requests: number; inputTokens: number; outputTokens: number; costCents: number } {
+    const now = this.now();
+    const rows = (this.metered.get(component) ?? []).filter((row) => now - row.at <= 86_400_000);
+    return { requests: rows.length, inputTokens: rows.reduce((sum, row) => sum + row.inputTokens, 0),
+      outputTokens: rows.reduce((sum, row) => sum + row.outputTokens, 0), costCents: rows.reduce((sum, row) => sum + row.costCents, 0) };
   }
 
   /**

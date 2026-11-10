@@ -16,6 +16,7 @@ import { getTelegramInboundDir } from '../../src/messaging/shared/telegramInboun
 describe('SessionManager.injectTelegramMessage', () => {
   let project: TempProject;
   let sendKeyCalls: string[][];
+  const maintenanceTicks = new WeakMap<SessionManager, () => Promise<void>>();
 
   beforeEach(() => {
     project = createTempProject();
@@ -54,7 +55,7 @@ describe('SessionManager.injectTelegramMessage', () => {
     const files = fs.readdirSync(inboundDir).filter(f => f.startsWith('msg-42-'));
     expect(files).toHaveLength(1);
     const content = fs.readFileSync(path.join(inboundDir, files[0]), 'utf-8');
-    expect(content).toContain('[telegram:42]');
+    expect(content).toContain('[telegram:42 (name unresolved)]');
     expect(content).toContain(longText);
   });
 
@@ -62,7 +63,7 @@ describe('SessionManager.injectTelegramMessage', () => {
     // The tagged text is `[telegram:${topicId}] ${text}`
     // For topicId=42, that's "[telegram:42] " = 14 chars prefix
     // So text needs to be 500 - 14 = 486 chars to exceed threshold
-    const prefix = '[telegram:42] ';
+    const prefix = '[telegram:42 (name unresolved)] ';
     const text = 'X'.repeat(500 - prefix.length); // Exactly 500 tagged = below threshold
     const taggedLength = prefix.length + text.length;
     expect(taggedLength).toBe(500); // Should NOT go to file
@@ -75,17 +76,23 @@ describe('SessionManager.injectTelegramMessage', () => {
   // ── Delivery-chokepoint dedup (a single user message must reach a session at
   // most once even if an upstream path over-forwards it 5x). We count the temp
   // files written for a unique topicId to detect whether a delivery happened.
-  const mkSm = () => new SessionManager(
-    {
-      tmuxPath: '/usr/bin/tmux',
-      claudePath: '/usr/bin/claude',
-      projectDir: project.dir,
-      maxSessions: 3,
-      protectedSessions: [],
-      completionPatterns: [],
-    },
-    project.state,
-  );
+  const mkSm = () => {
+    let maintenanceTick!: () => Promise<void>;
+    const sm = new SessionManager(
+      {
+        tmuxPath: '/usr/bin/tmux',
+        claudePath: '/usr/bin/claude',
+        projectDir: project.dir,
+        maxSessions: 3,
+        protectedSessions: [],
+        completionPatterns: [],
+      },
+      project.state,
+      { bindMaintenanceTickForTesting: (tick) => { maintenanceTick = tick; } },
+    );
+    maintenanceTicks.set(sm, maintenanceTick);
+    return sm;
+  };
   const longText = 'Z'.repeat(600); // exceeds the 500-char file threshold
   const countFilesFor = (topicId: number) => {
     const dir = getTelegramInboundDir(project.dir);
@@ -154,7 +161,6 @@ describe('SessionManager.injectTelegramMessage', () => {
       isSessionAliveAsync: (tmuxSession: string) => Promise<boolean>;
       captureOutput: (tmuxSession: string, lines?: number) => string | null;
       recordBuildContext: () => void;
-      monitorTick: () => Promise<void>;
     };
     smAny.pendingInjections.set('gemini-topic-1', {
       topicId: 1,
@@ -180,7 +186,7 @@ describe('SessionManager.injectTelegramMessage', () => {
     const detected: Array<{ topicId: number; sessionName: string; text: string }> = [];
     sm.on('injectionReplyDetected', (info) => detected.push(info as { topicId: number; sessionName: string; text: string }));
 
-    await smAny.monitorTick();
+    await maintenanceTicks.get(sm)!();
 
     expect(detected).toHaveLength(1);
     expect(detected[0]).toMatchObject({

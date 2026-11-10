@@ -1,3 +1,4 @@
+import { mergeDefaults } from '../core/mergeDefaults.js';
 /**
  * OutboundContentDedup — suppress the agent re-sending the SAME conversational
  * reply to the same topic within a window.
@@ -36,6 +37,11 @@ export interface OutboundContentDedupConfig {
   minLength?: number;
   /** Cap on remembered fingerprints per topic (ring). Default 50. */
   maxPerTopic?: number;
+  /** How long an in-flight `tryReserve` claim stays live before it auto-expires,
+   *  so a leaked reservation (a send that neither recorded nor released — e.g. a
+   *  crash mid-send) can never permanently suppress a fingerprint. Must comfortably
+   *  exceed the outbound route's own send budget. Default 3min. */
+  reserveTtlMs?: number;
 }
 
 const DEFAULTS: Required<OutboundContentDedupConfig> = {
@@ -43,6 +49,7 @@ const DEFAULTS: Required<OutboundContentDedupConfig> = {
   windowMs: 15 * 60 * 1000,
   minLength: 40,
   maxPerTopic: 50,
+  reserveTtlMs: 3 * 60 * 1000,
 };
 
 /** Normalize for fingerprinting: trim, collapse internal whitespace runs. Two
@@ -65,7 +72,16 @@ export function fingerprint(text: string): string {
 export class OutboundContentDedup {
   private readonly cfg: Required<OutboundContentDedupConfig>;
   /** topicId -> (fingerprint -> last-sent epoch ms) */
-  private readonly seen = new Map<number, Map<string, number>>();
+  private readonly seen = new Map<number | string, Map<string, number>>();
+  /** topicId -> (fingerprint -> reserved-at epoch ms). An IN-FLIGHT claim taken
+   *  by `tryReserve` BEFORE a send starts and cleared by `record` (success) or
+   *  `releaseReservation` (failure). This closes the check-then-send race that
+   *  `isDuplicate` + record-after-success left open: under a server stall a send
+   *  can be in flight for tens of seconds, and a second identical request that
+   *  arrives in that window used to pass the duplicate check (nothing recorded
+   *  yet) and send a second copy. Reservations auto-expire after `reserveTtlMs`
+   *  so a leaked claim can never permanently suppress a fingerprint. */
+  private readonly reserved = new Map<number | string, Map<string, number>>();
   private readonly now: () => number;
   /** Optional durable backing so a duplicate is caught ACROSS a restart / across
    *  overlapping processes (the in-memory `seen` Map resets on restart — the exact
@@ -79,7 +95,7 @@ export class OutboundContentDedup {
     now: () => number = Date.now,
     store: import('./OutboundDedupStore.js').OutboundDedupStore | null = null,
   ) {
-    this.cfg = { ...DEFAULTS, ...cfg };
+    this.cfg = mergeDefaults(DEFAULTS, cfg);
     this.now = now;
     this.store = store;
   }
@@ -87,7 +103,7 @@ export class OutboundContentDedup {
   /** Is `text` an exact duplicate of a message sent to `topicId` within the
    *  window? Pure read — does NOT record. Returns false when disabled or the
    *  text is below the length floor. */
-  isDuplicate(topicId: number, text: string): boolean {
+  isDuplicate(topicId: number | string, text: string): boolean {
     if (!this.cfg.enabled) return false;
     const norm = normalizeForDedup(text);
     if (norm.length < this.cfg.minLength) return false;
@@ -104,9 +120,53 @@ export class OutboundContentDedup {
     return false;
   }
 
+  /** Atomically decide whether `text` may be sent to `topicId`, AND — if so —
+   *  reserve it in-flight so a concurrent/rapid identical send is caught before
+   *  the first one has recorded. Returns:
+   *    - false  ⇒ suppress: an identical text was sent within the window OR is
+   *               currently in flight (a live reservation). The caller must NOT
+   *               send and must NOT release (it doesn't own the reservation).
+   *    - true   ⇒ proceed: the caller now OWNS a reservation and MUST resolve it
+   *               with `record` (on success) or `releaseReservation` (on failure).
+   *  Below-floor text is never deduped → always returns true with no reservation
+   *  (brief acks legitimately repeat). This supersedes the plain `isDuplicate`
+   *  check at the send callsite to close the check-then-send race. */
+  tryReserve(topicId: number | string, text: string): boolean {
+    if (!this.cfg.enabled) return true;
+    const norm = normalizeForDedup(text);
+    if (norm.length < this.cfg.minLength) return true;
+    const fp = fingerprint(norm);
+    // Already sent within the window (in-memory or durable) → duplicate.
+    if (this.isDuplicate(topicId, text)) return false;
+    // Currently in flight (a live, non-expired reservation) → duplicate.
+    const now = this.now();
+    if (this.store?.hasOriginReservation?.(topicId, fp, now) === true) return false;
+    const resMap = this.reserved.get(topicId);
+    const reservedAt = resMap?.get(fp);
+    if (reservedAt !== undefined && now - reservedAt < this.cfg.reserveTtlMs) return false;
+    // Claim it.
+    let topicRes = this.reserved.get(topicId);
+    if (!topicRes) {
+      topicRes = new Map();
+      this.reserved.set(topicId, topicRes);
+    }
+    topicRes.set(fp, now);
+    this.pruneReserved(topicRes);
+    return true;
+  }
+
+  /** Release an in-flight reservation taken by `tryReserve` — call when the send
+   *  FAILED, so the legitimate retry of the same text isn't wrongly suppressed. */
+  releaseReservation(topicId: number | string, text: string): void {
+    const norm = normalizeForDedup(text);
+    if (norm.length < this.cfg.minLength) return;
+    this.reserved.get(topicId)?.delete(fingerprint(norm));
+  }
+
   /** Record that `text` was sent to `topicId` now. Call AFTER a successful send.
-   *  No-op for below-floor text (it can never be a dedup target anyway). */
-  record(topicId: number, text: string): void {
+   *  No-op for below-floor text (it can never be a dedup target anyway). Also
+   *  clears any in-flight reservation for this fingerprint (the send resolved). */
+  record(topicId: number | string, text: string): void {
     if (!this.cfg.enabled) return;
     const norm = normalizeForDedup(text);
     if (norm.length < this.cfg.minLength) return;
@@ -119,11 +179,48 @@ export class OutboundContentDedup {
     const fp = fingerprint(norm);
     topicMap.set(fp, now);
     this.pruneTopic(topicMap);
+    // The send resolved → drop the in-flight reservation; the `seen` record now
+    // carries the (longer) window suppression.
+    this.reserved.get(topicId)?.delete(fp);
     // Mirror to the durable store so a post-restart process sees it. Fail-open.
     this.store?.record(topicId, fp, now);
   }
 
   /** Drop expired entries, then enforce the per-topic ring cap (oldest-first). */
+  /** `preparedAt` bounds the look-back for a retry: any acceptance of this
+   * text since the operation was prepared supersedes it, even past the window
+   * (a released held operation retried after a fresh send must not duplicate it). */
+  reserveOrigin(topicId: number | string, text: string, operationId: string, ownerToken: string, deadlineAt: number, preparedAt?: number): import('./OutboundDedupStore.js').OriginReservation {
+    const norm = normalizeForDedup(text);
+    if (!this.cfg.enabled || norm.length < this.cfg.minLength) return 'reserved';
+    const now = this.now(), fp = fingerprint(norm), reservedAt = this.reserved.get(topicId)?.get(fp);
+    // A legacy send still in flight is not a delivery.
+    if (reservedAt !== undefined && now - reservedAt < this.cfg.reserveTtlMs) return 'pending';
+    if (!Number.isSafeInteger(deadlineAt) || deadlineAt < now || deadlineAt - now > 24 * 60 * 60_000) return 'unavailable';
+    const windowStart = now - this.cfg.windowMs;
+    const sentSince = preparedAt !== undefined && Number.isSafeInteger(preparedAt) && preparedAt < windowStart ? preparedAt : windowStart;
+    return this.store?.reserveOrigin?.({ topicId, fingerprint: fp, operationId, ownerToken, now,
+      expiresAt: deadlineAt + this.cfg.windowMs, sentSince }) ?? 'unavailable';
+  }
+
+  /** Only a fully accepted operation records its content as sent. A failure
+   * with no platform acceptance releases its reservation (`releaseOrigin`). */
+  completeOrigin(topicId: number | string, text: string, operationId: string): void {
+    const norm = normalizeForDedup(text);
+    if (!this.cfg.enabled || norm.length < this.cfg.minLength) return;
+    const now = this.now();
+    this.store?.completeOrigin?.({ topicId, fingerprint: fingerprint(norm), operationId, now, expiresAt: now + this.cfg.windowMs });
+  }
+
+  /** An execution that ended without platform acceptance releases its own
+   * reservation, so its content is never treated as delivered. Fenced to the
+   * operation and the claim token that reserved it. */
+  releaseOrigin(topicId: number | string, text: string, operationId: string, ownerToken: string): void {
+    const norm = normalizeForDedup(text);
+    if (!this.cfg.enabled || norm.length < this.cfg.minLength) return;
+    this.store?.releaseOrigin?.({ topicId, fingerprint: fingerprint(norm), operationId, ownerToken, now: this.now() });
+  }
+
   private pruneTopic(topicMap: Map<string, number>): void {
     const cutoff = this.now() - this.cfg.windowMs;
     for (const [fp, at] of topicMap) {
@@ -133,6 +230,20 @@ export class OutboundContentDedup {
       const oldest = topicMap.keys().next().value; // insertion-ordered
       if (oldest === undefined) break;
       topicMap.delete(oldest);
+    }
+  }
+
+  /** Drop expired reservations (past `reserveTtlMs`), then cap the ring. Keeps a
+   *  leaked reservation from lingering and bounds memory the same way `seen` is. */
+  private pruneReserved(resMap: Map<string, number>): void {
+    const cutoff = this.now() - this.cfg.reserveTtlMs;
+    for (const [fp, at] of resMap) {
+      if (at < cutoff) resMap.delete(fp);
+    }
+    while (resMap.size > this.cfg.maxPerTopic) {
+      const oldest = resMap.keys().next().value; // insertion-ordered
+      if (oldest === undefined) break;
+      resMap.delete(oldest);
     }
   }
 }

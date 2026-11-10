@@ -66,6 +66,15 @@ export interface GateSignal {
   normalizedValue?: string;
   /** Detector self-confidence, clamped to [0,1] at emit. */
   confidence?: number;
+  /**
+   * Who decided `detected` (jev-signal-live). Absent on the plain detector
+   * path. `jev` = a confident Jev answer decided it; `detector` = the detector
+   * decided (Jev unsure/unavailable, or Jev disputes a detector match — then
+   * `modelProbability` carries Jev's low answer and the detection stands).
+   */
+  source?: 'jev' | 'detector';
+  /** Jev's probability for this kind, when Jev answered (clamped to [0,1]). */
+  modelProbability?: number;
 }
 
 /** Hard caps so an adversarial candidate can't inflate the signal payload. */
@@ -163,13 +172,13 @@ function detectFilePath(text: string): GateSignal | null {
 /** Known TLDs used to exclude hostname-shaped tokens from the config-key detector. */
 const HOSTNAME_TLD = /\.(?:com|org|net|io|dev|ai|co|gov|edu|app|sh|me|info|biz)$/i;
 
-/** B3 — a dotted config key (e.g. messaging.toneGate.failClosedOnExhaustion). */
+/** B3 — a dotted config key (e.g. toneGate.failClosedOnExhaustion). */
 function detectConfigKey(text: string): GateSignal | null {
   // 3+ dotted lowerCamel/snake segments — config paths, not sentences (which
   // have spaces). Anchored so "e.g." or "a.b" prose abbreviations don't match.
   const re = /(?<![\w.])[a-z][a-zA-Z0-9]*(?:\.[a-z][a-zA-Z0-9]*){2,}(?![\w.])/g;
   // Precision: drop hostname-shaped matches. A real config key
-  // (messaging.toneGate.x) has a camelCase segment; a hostname is all-lowercase
+  // (toneGate.failClosedMode) has a camelCase segment; a hostname is all-lowercase
   // labels ending in a known TLD (or a www. prefix) — that's prose, not a key.
   return collect(re, text, 'config-key', (v) => {
     const looksLikeHost = /^www\./i.test(v) || HOSTNAME_TLD.test(v);

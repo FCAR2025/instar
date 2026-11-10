@@ -6,6 +6,26 @@
 
 set -euo pipefail
 
+# ── VAULT_AUTH_RESOLVE — the server bearer token, vault-aware. config.json's
+# authToken becomes a SecretMigrator placeholder ({"secret": true}) once an
+# agent's secrets move to the encrypted vault; the old inline reads then printed
+# the literal placeholder and every server call 403'd — on an admission-enforcing
+# install the run registered nothing and sat "preparing" forever (the 2026-09-19
+# silent no-start). Prefer a real string from config; otherwise read the vault
+# via the hardened secret-get script (value to stdout only, never logged).
+resolve_auth_token() {
+  local t
+  t=$(python3 -c "import json
+try:
+ v=json.load(open('.instar/config.json')).get('authToken','')
+ print(v if isinstance(v,str) else '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [[ -n "$t" ]]; then printf '%s' "$t"; return 0; fi
+  if [[ -f .instar/scripts/secret-get.mjs ]]; then
+    node .instar/scripts/secret-get.mjs authToken 2>/dev/null || true
+  fi
+}
+
 # Parse arguments
 GOAL=""
 DURATION="4h"
@@ -18,6 +38,9 @@ COMPLETION_CONDITION=""   # verifiable end-state; an independent judge decides "
 REPORT_INTERVAL="30m"
 VERIFICATION_COMMAND=""   # opt-in real check (ACT-152): the stop-hook RUNS this on a met:true verdict and gates the exit on exit-0.
 VERIFICATION_CWD=""       # directory the verification command runs in (resolves verification_cwd → work_dir → agent home).
+DECLARED_DELIVERABLES=""  # SCOPE_ACCRETION: comma-separated repo-relative paths the run is EXPECTED to
+                          # produce as drafts (the escape for genuinely draft-only missions — operator-
+                          # confirmed at setup). Recorded server-side at registration; immutable mid-run.
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -59,6 +82,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verification-cwd)
       VERIFICATION_CWD="$2"
+      shift 2
+      ;;
+    --declared-deliverables)
+      DECLARED_DELIVERABLES="$2"
       shift 2
       ;;
     --report-interval)
@@ -130,7 +157,7 @@ HARD_BLOCKER_NONCE=$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom 
 # holds. Starting/restarting THIS topic's own job is always allowed.
 if [[ -n "$REPORT_TOPIC" ]]; then
   PORT=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-  AUTH=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+  AUTH=$(resolve_auth_token)
   CAN_START=$(curl -s -m 3 -H "Authorization: Bearer $AUTH" "http://localhost:${PORT}/autonomous/can-start?priority=medium" 2>/dev/null || echo "")
   ALLOWED=$(printf '%s' "$CAN_START" | python3 -c "import sys,json
 try: print(json.load(sys.stdin).get('allowed'))
@@ -147,7 +174,12 @@ except Exception: print('')" 2>/dev/null || echo "")
   fi
   if [[ "$ALLOWED" == "unknown" ]] && [[ "$ALREADY_RUNNING" != "true" ]]; then
     MAX_CONCURRENT=$(python3 -c "import json;print((json.load(open('.instar/config.json')).get('autonomousSessions') or {}).get('maxConcurrent',5))" 2>/dev/null || echo 5)
-    COUNT=$(ls .instar/autonomous/*.local.md 2>/dev/null | grep -cv "/${REPORT_TOPIC}\.local\.md$")
+    # VAULT_AUTH_RESOLVE: grep -c exits 1 on zero matches, and under
+    # `set -euo pipefail` that killed the WHOLE setup silently (exit 1, no
+    # output) whenever this fallback ran (server unreachable → allowed
+    # "unknown") and no OTHER topic had a state file — a silent no-start.
+    # `|| true` keeps grep's "0" output.
+    COUNT=$(ls .instar/autonomous/*.local.md 2>/dev/null | grep -cv "/${REPORT_TOPIC}\.local\.md$") || true
     COUNT=${COUNT:-0}
     if [[ "$COUNT" =~ ^[0-9]+$ ]] && [[ "$MAX_CONCURRENT" =~ ^[0-9]+$ ]] && [[ $COUNT -ge $MAX_CONCURRENT ]]; then
       echo "❌ Autonomous start refused: concurrency cap reached ($COUNT/$MAX_CONCURRENT) [server unreachable; local check]." >&2
@@ -186,9 +218,87 @@ if [[ -n "$VERIFICATION_CWD" ]]; then
 $VERIFICATION_FIELDS"
 fi
 
+# ── W32_PREPARING_LIVENESS — server-side run registration (spec: autonomous-scope-
+# accretion-completion.md R30). The SERVER mints the runId, snapshots the
+# scopeAccretion config + the sweep base roots with their start-SHAs, and clamps
+# endAt — so mid-run edits to config/state-file change nothing the completion
+# chokepoint reads. The runId is written into the frontmatter so the stop hook
+# can echo it on every evaluate-completion / run-end call. Best-effort: an
+# unreachable server leaves run_id empty (the gate degrades honestly server-side;
+# the run still starts — registration is a discipline layer, not a start gate).
+RUN_ID=""
+# Resolve enforcement from local config before contacting the server.
+# Registration is a response contract, not the source of the rollout decision:
+# an enforcing Echo run stays preparing if the server is temporarily unreachable,
+# while observe-only/dark/legacy installs retain byte-compatible active behavior.
+LIVENESS_INITIAL=$(python3 -c "import json
+try:
+ c=json.load(open('.instar/config.json'))
+ raw=((c.get('monitoring') or {}).get('windowRunLiveness') or {})
+ explicit=raw.get('enabled',None)
+ enabled=explicit if isinstance(explicit,bool) else bool(c.get('developmentAgent',False))
+ enforcing=c.get('projectName')=='echo' and enabled and raw.get('dryRun',True) is False
+ print('preparing' if enforcing else 'active')
+except Exception:
+ print('active')" 2>/dev/null || echo active)
+if [[ "$LIVENESS_INITIAL" == "active" ]]; then
+  RUN_ACTIVE="true"
+  RUN_STATUS="active"
+else
+  RUN_ACTIVE="false"
+  RUN_STATUS="preparing"
+fi
+if [[ -n "$REPORT_TOPIC" ]]; then
+  REG_PORT=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
+  REG_AUTH=$(resolve_auth_token)
+  # Comma-separated → JSON array (empty string → []).
+  REG_DECLARED=$(printf '%s' "$DECLARED_DELIVERABLES" | python3 -c "import sys,json
+print(json.dumps([p.strip() for p in sys.stdin.read().split(',') if p.strip()]))" 2>/dev/null || echo '[]')
+  REG_END_AT="$END_AT"
+  [[ "$REG_END_AT" == "unknown" || "$REG_END_AT" == "unlimited" ]] && REG_END_AT=""
+  REG_RESP=$(jq -nc \
+    --arg t "$REPORT_TOPIC" --arg c "$COMPLETION_CONDITION" --arg w "$WORK_DIR" \
+    --arg s "$STARTED_AT" --arg e "$REG_END_AT" --arg sid "${CLAUDE_CODE_SESSION_ID:-}" \
+    --argjson d "$REG_DECLARED" \
+    '{topicId:$t,condition:$c,workDir:$w,declaredDeliverables:$d,startedAt:$s}
+     + (if $e != "" then {endAt:$e} else {} end)
+     + (if $sid != "" then {sessionId:$sid} else {} end)' 2>/dev/null \
+    | curl -s -m 8 -w '\n%{http_code}' -H "Authorization: Bearer $REG_AUTH" -H 'Content-Type: application/json' \
+      --data-binary @- "http://localhost:${REG_PORT}/autonomous/register" 2>/dev/null || echo "")
+  REG_CODE=$(printf '%s' "$REG_RESP" | tail -n 1)
+  REG_RESP=$(printf '%s' "$REG_RESP" | sed '$d')
+  RUN_ID=$(printf '%s' "$REG_RESP" | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('runId',''))
+except Exception: print('')" 2>/dev/null || echo "")
+  REG_INITIAL_STATUS=$(printf '%s' "$REG_RESP" | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('initialStatus',''))
+except Exception: print('')" 2>/dev/null || echo "")
+  if [[ "$REG_INITIAL_STATUS" == "preparing" ]]; then
+    RUN_ACTIVE="false"
+    RUN_STATUS="preparing"
+  fi
+  if [[ -n "$RUN_ID" ]]; then
+    echo "  Scope-accretion: run registered server-side (runId $RUN_ID)"
+  elif [[ "$REG_CODE" == "401" || "$REG_CODE" == "403" ]]; then
+    echo "  ERROR: run registration REFUSED (HTTP $REG_CODE) — the server rejected the bearer token." >&2
+    echo "  The token lives in the encrypted vault on migrated agents; this script resolves it via resolve_auth_token()." >&2
+    if [[ "$RUN_STATUS" == "preparing" ]]; then
+      echo "  ABORTING SETUP: this install requires server admission before a run can arm; an unregistered run would sit 'preparing' forever (the silent no-start this guard closes)." >&2
+      exit 1
+    fi
+  else
+    echo "  Scope-accretion: server registration unavailable — accretion gate degrades honestly (run still bounded by duration)"
+  fi
+fi
+if [[ -n "$RUN_ID" ]]; then
+  VERIFICATION_FIELDS="run_id: \"$RUN_ID\"
+$VERIFICATION_FIELDS"
+fi
+
 cat > "$STATE_PATH" <<EOF
 ---
-active: true
+active: $RUN_ACTIVE
+status: $RUN_STATUS
 iteration: 1
 session_id: ${CLAUDE_CODE_SESSION_ID:-}
 goal: "$GOAL"
@@ -269,7 +379,7 @@ if [[ -n "$COMPLETION_CONDITION" ]] && [[ -n "$REPORT_TOPIC" ]]; then
   fi
   if [[ "$NATIVE_GOAL_OK" == "true" ]]; then
     NG_PORT=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-    NG_AUTH=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+    NG_AUTH=$(resolve_auth_token)
     jq -nc --arg t "$REPORT_TOPIC" --arg c "$COMPLETION_CONDITION" '{topicId:$t,condition:$c}' \
       | curl -s -m 8 -H "Authorization: Bearer $NG_AUTH" -H 'Content-Type: application/json' \
         --data-binary @- "http://localhost:${NG_PORT}/autonomous/native-goal/set" >/dev/null 2>&1 \

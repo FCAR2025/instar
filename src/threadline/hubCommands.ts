@@ -1,42 +1,33 @@
+import { notificationStamper, withNotificationEnvelope } from '../messaging/notificationStampers.js';
+const stampNotification = notificationStamper('src/threadline/hubCommands.ts');
 /**
- * Threadline hub commands — deterministic "open this" / "tie this to <topic>"
- * (CMT-529). Both the `POST /threadline/hub/bind` route AND the structural
- * intercept in `telegram.onTopicMessage` use `bindHubConversation`, so the
- * behavior is identical regardless of how the message arrived. `parseHubCommand`
- * is a pure, tightly-anchored matcher so ordinary hub chat falls through to the
- * agent.
+ * Threadline hub commands — "open this" / "tie this to <topic>" (CMT-529). Both
+ * the `POST /threadline/hub/bind` route AND the structural intercept in
+ * `telegram.onTopicMessage` use `bindHubConversation`, so the behavior is
+ * identical regardless of how the message arrived.
+ *
+ * The DECISION of "does this hub message mean bind-this-conversation?" is NO
+ * LONGER a keyword/regex matcher. It moved to an LLM-with-context classifier
+ * (`HubIntentClassifier.classifyHubIntent`) per the constitutional standard
+ * "Intelligence Infers, Keywords Only Guard" — Conversion #3 of
+ * docs/specs/keyword-intent-conversions-1-and-3.md. The old anchored regexes
+ * (`/^open(?:\s+this)?…/`, `/^(?:tie|bind)\s+this\s+to\s+(.+?)…/`) SWALLOWED the
+ * message before the agent saw it, and a misread silently EATS a real message.
+ * The classifier fails OPEN on any uncertainty (never swallows) and constrains a
+ * `tie` target to a structured enum of real topics. This module now owns only the
+ * `HubCommand` shape + the authoritative binder; the recognizer lives in
+ * `HubIntentClassifier.ts` and adapts a positive result via `toHubCommand()`.
  */
 
 import type { CollaborationSurfacer } from './CollaborationSurfacer.js';
 import type { ConversationStore } from './ConversationStore.js';
 import type { CommitmentTracker } from '../monitoring/CommitmentTracker.js';
 import { generateConversationBrief, type BriefDeps } from './openConversationBrief.js';
+import { topicNameFor as verifiedTopicName, topicRef } from '../messaging/shared/topicRef.js';
 
 export type HubCommand =
   | { action: 'open' }
   | { action: 'tie'; targetTopicId?: number; targetTopicName?: string };
-
-/**
- * Deterministically classify a hub-topic message. Returns null for anything
- * that isn't *only* a hub command, so "can you open this and explain it?" is
- * left to the conversational agent.
- */
-export function parseHubCommand(text: string): HubCommand | null {
-  const t = (text ?? '').trim();
-  if (!t) return null;
-  // "open this" / "open" / "Open This." — the message must be only the command.
-  if (/^open(?:\s+this)?\s*[.!]?$/i.test(t)) return { action: 'open' };
-  // "tie this to <topic>" / "bind this to <topic>"
-  const tie = t.match(/^(?:tie|bind)\s+this\s+to\s+(.+?)\s*[.!]?$/i);
-  if (tie) {
-    const target = tie[1].trim();
-    // "#1234" or a bare number → topic id; else a topic name (verbatim).
-    const idMatch = target.match(/^#?(\d{1,15})$/);
-    if (idMatch) return { action: 'tie', targetTopicId: Number(idMatch[1]) };
-    return { action: 'tie', targetTopicName: target };
-  }
-  return null;
-}
 
 export interface HubBindDeps {
   collaborationSurfacer: CollaborationSurfacer;
@@ -131,7 +122,7 @@ export async function bindHubConversation(deps: HubBindDeps, args: HubBindArgs):
     if (args.action === 'tie') {
       if (typeof args.targetTopicId === 'number') {
         topicId = args.targetTopicId;
-        topicName = typeof args.targetTopicName === 'string' ? args.targetTopicName : `topic ${topicId}`;
+        topicName = typeof args.targetTopicName === 'string' ? args.targetTopicName : (verifiedTopicName(topicId) ?? topicRef(topicId));
       } else if (typeof args.targetTopicName === 'string' && args.targetTopicName) {
         const t = await telegram.findOrCreateForumTopic(args.targetTopicName, undefined, { origin: 'user' });
         topicId = t.topicId; topicName = t.name;
@@ -159,14 +150,21 @@ export async function bindHubConversation(deps: HubBindDeps, args: HubBindArgs):
     }
 
     // Authoritative bind: conversation + commitment.
-    await conversationStore.mutate(threadId, (c) => { c.boundTopicId = topicId; return c; });
+    // Tagged `operator`: this is the deliberate bind the homebase feature must never
+    // override (peer-conversation-homebase-topic §2.2). An untagged bind would be
+    // indistinguishable from a legacy record, which is preserved but only out of caution.
+    await conversationStore.mutate(threadId, (c) => {
+      c.boundTopicId = topicId;
+      c.boundTopicSource = 'operator';
+      return c;
+    });
     const commitment = commitmentTracker?.findByThreadId(threadId);
     if (commitment && commitmentTracker) {
       try { await commitmentTracker.mutate(commitment.id, (c) => { c.topicId = topicId; return c; }); }
       catch (e) { console.warn(`[hub/bind] commitment topicId update failed: ${e instanceof Error ? e.message : e}`); }
     }
     collaborationSurfacer.markBound(threadId);
-    await telegram.sendToTopic(topicId, firstMessage).catch(() => { });
+    await withNotificationEnvelope(stampNotification(), async () => (telegram)!.sendToTopic(topicId, firstMessage)).catch(() => { });
     await collaborationSurfacer.noteInHub(`Opened "${topicName}" (conversation ${threadId.slice(0, 8)}).`);
     return { ok: true, action: args.action, threadId, topicId, topicName };
   } catch (err) {

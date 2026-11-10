@@ -55,6 +55,7 @@ describe('IntentDriftDetector', () => {
       const result = detector.analyze();
 
       expect(result.current.decisionCount).toBe(0);
+      expect(result.current.conflictRate).toBeNull();
       expect(result.previous).toBeNull();
       expect(result.signals).toEqual([]);
       expect(result.driftScore).toBe(0);
@@ -77,6 +78,25 @@ describe('IntentDriftDetector', () => {
       expect(result.current.topPrinciples[0].principle).toBe('safety');
       expect(result.previous).toBeNull();
       expect(result.signals).toEqual([]);
+    });
+
+    it('does not compare conflicts when the current window has no decisions', () => {
+      writeJournal(stateDir, [
+        {
+          timestamp: daysAgo(20),
+          decision: 'Previous conflict',
+          conflict: true,
+          principle: 'safety',
+          confidence: 0.8,
+        },
+      ]);
+
+      const result = detector.analyze(14);
+      expect(result.current.decisionCount).toBe(0);
+      expect(result.current.conflictRate).toBeNull();
+      expect(result.previous?.decisionCount).toBe(1);
+      expect(result.previous?.conflictRate).toBe(1);
+      expect(result.signals.some(signal => signal.type === 'conflict_spike')).toBe(false);
     });
 
     it('detects conflict spike — warning threshold (>2x)', () => {
@@ -178,6 +198,60 @@ describe('IntentDriftDetector', () => {
       const confSignal = result.signals.find(s => s.type === 'confidence_drop');
       expect(confSignal).toBeTruthy();
       expect(confSignal!.severity).toBe('alert');
+    });
+
+    it('REGRESSION: legacy numeric strings remain measurable and still trigger a drop signal', () => {
+      const previousEntries = Array.from({ length: 5 }, (_, i) => ({
+        timestamp: daysAgo(20 + i),
+        decision: `Prev D${i}`,
+        confidence: '0.90' as never,
+        principle: 'safety',
+      }));
+      const currentEntries = Array.from({ length: 5 }, (_, i) => ({
+        timestamp: daysAgo(1 + i),
+        decision: `Curr D${i}`,
+        confidence: '0.50' as never,
+        principle: 'safety',
+      }));
+
+      writeJournal(stateDir, [...previousEntries, ...currentEntries]);
+
+      const result = detector.analyze(14);
+
+      expect(result.previous?.avgConfidence).toBe(0.9);
+      expect(result.current.avgConfidence).toBe(0.5);
+      expect(Number.isFinite(result.current.avgConfidence)).toBe(true);
+      expect(result.signals.find(s => s.type === 'confidence_drop')).toMatchObject({
+        severity: 'alert',
+        delta: -0.4,
+      });
+    });
+
+    it('REGRESSION: qualitative legacy confidence emits an unmeasurable signal, not stable', () => {
+      writeJournal(stateDir, [
+        {
+          timestamp: daysAgo(20),
+          decision: 'Previous legacy decision',
+          confidence: 'high' as never,
+          principle: 'safety',
+        },
+        {
+          timestamp: daysAgo(1),
+          decision: 'Current decision',
+          confidence: 0.5,
+          principle: 'safety',
+        },
+      ]);
+
+      const result = detector.analyze(14);
+
+      expect(result.previous?.avgConfidence).toBeNull();
+      expect(result.previous?.invalidConfidenceCount).toBe(1);
+      expect(result.signals.find(s => s.type === 'confidence_unmeasurable')).toMatchObject({
+        severity: 'warning',
+        delta: 1,
+      });
+      expect(result.summary).not.toMatch(/^Stable:/);
     });
 
     it('detects principle shift — info when top principle changes', () => {
@@ -361,17 +435,46 @@ describe('IntentDriftDetector', () => {
       expect(score.score).toBeGreaterThanOrEqual(85);
     });
 
-    it('handles empty journal — score 0, grade F', () => {
+    it('handles empty journal — not assessable, grade N/A', () => {
+      // This test previously asserted `grade === 'F'` on an empty journal,
+      // which LOCKED IN the defect: "no data" was indistinguishable from
+      // "assessed and failing", and `instar intent reflect` rendered it as a
+      // red F. The empty case now reports 'N/A' + assessable:false.
+      // See tests/unit/alignment-score-not-assessed.test.ts.
       const score = detector.alignmentScore();
 
       expect(score.score).toBe(0);
-      expect(score.grade).toBe('F');
+      expect(score.grade).toBe('N/A');
+      expect(score.assessable).toBe(false);
       expect(score.sampleSize).toBe(0);
       expect(score.components.conflictFreedom).toBe(0);
       expect(score.components.confidenceLevel).toBe(0);
       expect(score.components.principleConsistency).toBe(0);
       expect(score.components.journalHealth).toBe(0);
       expect(score.summary).toContain('No decisions logged');
+    });
+
+    it('excludes a legacy qualitative confidence and reports an unmeasurable population', () => {
+      writeJournal(stateDir, [{
+        timestamp: daysAgo(1),
+        decision: 'Legacy decision',
+        principle: 'safety',
+        confidence: 'high' as never,
+        conflict: false,
+      }]);
+
+      const score = detector.alignmentScore(30);
+
+      expect(score.sampleSize).toBe(0);
+      expect(score.populationSize).toBe(1);
+      expect(score.excludedSampleSize).toBe(1);
+      expect(score.exclusions.invalidConfidence).toBe(1);
+      expect(score.assessable).toBe(false);
+      expect(score.grade).toBe('N/A');
+      expect(score.score).toBe(0);
+      expect(score.components.confidenceLevel).toBe(0);
+      expect(score.summary).toMatch(/invalid confidence/i);
+      expect(JSON.stringify(score)).not.toContain('null');
     });
 
     it('handles perfect journal — all high, grade A', () => {

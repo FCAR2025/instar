@@ -44,6 +44,21 @@ for _arg in "$@"; do [[ "$_arg" == "--codex" ]] && IS_CODEX=1; done
 # verification_command on a met:true verdict and gates the exit on it; fail/timeout/breaker-open →
 # keep working, the safe direction). This sentinel is the PostUpdateMigrator marker that re-deploys
 # this hook to existing agents that carry COMPLETION_DISCIPLINE but not REALCHECK_VERIFY.
+# hook-capability: SCOPE_ACCRETION — scope-accretion completion discipline (spec:
+# autonomous-scope-accretion-completion.md). Layer B evasion-vocabulary scan (advisory
+# scopeAccretionSuspected signal, fenced/quoted-region excluded), topicId/runId/sessionId echoed
+# to the evaluate-completion chokepoint (the server computes the LOAD-BEARING git-truth sweep +
+# ratification state there), and run_end_call fired on EVERY terminal exit surface (R40/R44) so
+# no exit is silent. This sentinel is the PostUpdateMigrator marker that re-deploys this hook to
+# existing agents that carry REALCHECK_VERIFY but not SCOPE_ACCRETION.
+# hook-capability: TASK_CONTINUATION — ordinary Codex interactive work may use
+# the same trusted Stop boundary when an explicit bounded task ledger is live.
+# hook-capability: DECISION_QUALITY_REALCHECK — run_end_call carries the real-check
+# pass|fail|configured:false observation to the existing decision-quality annotator.
+# hook-capability: STATE_PARSE_LOUD — a selected state file with missing/malformed
+# frontmatter is a visible hook failure, distinct from the clean no-state exit.
+# hook-capability: PREPARATION_CARRIER — a truthful inactive autonomous record in
+# preparing/recovering state falls through to the bounded continuation authority.
 # emit — human-facing approve/status text. In codex mode the Stop hook's STDOUT must be
 # ONLY valid decision-JSON (the `{"decision":"block",...}` case far below) or empty:
 # codex rejects ANY other stdout as "invalid stop hook JSON output" and reports the stop
@@ -84,17 +99,21 @@ fi
 # autonomousSessions.codexLoopDriver.enabled is true. Otherwise approve (exit 0) so a
 # normal codex stop is unaffected — this is the instant-rollback flag (flip it off and
 # the standing hook is a no-op again, no redeploy). Claude (IS_CODEX=0) skips this.
+CODEX_TASK_CONTINUATION_ENABLED=0
 if [[ "$IS_CODEX" == "1" ]]; then
-  CODEX_LOOP_ENABLED=$(python3 -c "
+  CODEX_GATES=$(python3 -c "
 import json
 try:
     c = json.load(open('.instar/config.json'))
     a = (c.get('autonomousSessions') or {}).get('codexLoopDriver') or {}
-    print('1' if a.get('enabled') else '0')
+    t = (c.get('autonomousSessions') or {}).get('codexTaskContinuation') or {}
+    print(('1' if a.get('enabled') else '0') + ':' + ('1' if t.get('enabled') else '0'))
 except Exception:
-    print('0')
-" 2>/dev/null || echo "0")
-  if [[ "$CODEX_LOOP_ENABLED" != "1" ]]; then
+    print('0:0')
+" 2>/dev/null || echo "0:0")
+  CODEX_LOOP_ENABLED="${CODEX_GATES%%:*}"
+  CODEX_TASK_CONTINUATION_ENABLED="${CODEX_GATES##*:}"
+  if [[ "$CODEX_LOOP_ENABLED" != "1" ]] && [[ "$CODEX_TASK_CONTINUATION_ENABLED" != "1" ]]; then
     exit 0
   fi
 fi
@@ -104,6 +123,46 @@ RECOVERY_AUDIT=".instar/autonomous-recovery.jsonl"
 LEGACY_STATE=".instar/autonomous-state.local.md"
 MULTI_DIR=".instar/autonomous"
 LIVENESS_SECS="${INSTAR_AUTONOMOUS_LIVENESS_SECS:-120}"
+
+# ── VAULT_AUTH_RESOLVE — the server bearer token, vault-aware. config.json's
+# authToken becomes a SecretMigrator placeholder ({"secret": true}) once an
+# agent's secrets move to the encrypted vault; the old inline reads then printed
+# the literal placeholder and every server call 403'd — on an admission-enforcing
+# install the run registered nothing and sat "preparing" forever (the 2026-09-19
+# silent no-start). Prefer a real string from config; otherwise read the vault
+# via the hardened secret-get script (value to stdout only, never logged).
+resolve_auth_token() {
+  local t
+  t=$(python3 -c "import json
+try:
+ v=json.load(open('.instar/config.json')).get('authToken','')
+ print(v if isinstance(v,str) else '')
+except Exception: print('')" 2>/dev/null || echo "")
+  if [[ -n "$t" ]]; then printf '%s' "$t"; return 0; fi
+  if [[ -f .instar/scripts/secret-get.mjs ]]; then
+    node .instar/scripts/secret-get.mjs authToken 2>/dev/null || true
+  fi
+}
+
+# The sole shell adapter for bounded task continuation. The TypeScript store and
+# authenticated decision route remain the mutation/decision authority.
+continuation_decision() {
+  [[ "$IS_CODEX" == "1" ]] || return 0
+  [[ "$CODEX_TASK_CONTINUATION_ENABLED" == "1" ]] || return 0
+  [[ -n "$MY_TOPIC" ]] || return 0
+  local port auth agent_id decision reason
+  port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
+  auth=$(resolve_auth_token)
+  agent_id=$(python3 -c "import json;c=json.load(open('.instar/config.json'));print(c.get('projectName') or c.get('agentName') or 'local-stop-hook')" 2>/dev/null | tr -d '\r\n' || echo "local-stop-hook")
+  [[ -n "$agent_id" ]] || agent_id="local-stop-hook"
+  decision=$(jq -nc --arg topicId "$MY_TOPIC" --arg sessionId "$HOOK_SESSION" '{topicId:$topicId,sessionId:$sessionId}' \
+    | curl -sS -m 5 -H "Authorization: Bearer $auth" -H "X-Instar-AgentId: $agent_id" -H 'Content-Type: application/json' \
+      --data-binary @- "http://127.0.0.1:${port}/continuation/decide" 2>/dev/null || echo "")
+  if [[ "$(printf '%s' "$decision" | jq -r '.decision // ""' 2>/dev/null)" == "continue" ]]; then
+    reason=$(printf '%s' "$decision" | jq -r '.reasonText // "Continue the explicit open task list."' 2>/dev/null)
+    jq -nc --arg reason "$reason" '{decision:"block",reason:$reason}'
+  fi
+}
 
 # ── Inputs from the hook ──────────────────────────────────────────────
 HOOK_SESSION=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // ""' 2>/dev/null || echo "")
@@ -181,11 +240,31 @@ elif [[ -f "$LEGACY_STATE" ]]; then
     STATE_FILE="$LEGACY_STATE"
   fi
 else
-  # No autonomous job for this session anywhere — allow exit.
+  # No autonomous job for this session. Ordinary Codex interactive work may
+  # still own an explicit bounded continuation ledger. The server is the sole
+  # mutation/decision authority; empty/invalid state returns allow.
+  continuation_decision
+  # No autonomous job or open continuation ledger — allow exit.
   exit 0
 fi
 
 # ── Read the selected state file ──────────────────────────────────────
+# STATE_FILE was selected only after an existence check. From this point on,
+# "no parseable state" is corruption, NOT the same outcome as "no autonomous
+# job". The API reader accepts plain key lines anywhere in the document, while
+# this hook intentionally consumes fenced frontmatter. A missing/partial fence
+# must therefore fail visibly instead of turning an active run into exit 0.
+state_parse_failure() {
+  printf 'ERROR: Autonomous mode: autonomous state exists but its frontmatter is unparseable: %s (expected a fenced block with active: true|false)\n' "$STATE_FILE" >&2
+  exit 1
+}
+
+FM_DELIMITER_COUNT=$(awk '$0 == "---" { count++ } END { print count + 0 }' "$STATE_FILE" 2>/dev/null)
+FM_DELIMITER_COUNT="${FM_DELIMITER_COUNT:-0}"
+if [[ "$FM_DELIMITER_COUNT" -lt 2 ]]; then
+  state_parse_failure
+fi
+
 FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$STATE_FILE")
 fm_get() {
   local key="$1"
@@ -203,8 +282,36 @@ fm_get_raw() {
   printf '%s' "$val"
 }
 
+# Convert the ISO-8601 timestamps written by the autonomous setup path on both
+# macOS/BSD and GNU date. BSD date's strict format rejects fractional seconds,
+# so normalize only a terminal fractional component before parsing. Invalid
+# input remains fail-safe and returns 0.
+iso8601_epoch() {
+  local raw="${1:-}"
+  local normalized
+  normalized=$(printf '%s' "$raw" | sed 's/\.[0-9][0-9]*Z$/Z/')
+  date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$normalized" +%s 2>/dev/null \
+    || date -d "$normalized" +%s 2>/dev/null \
+    || echo "0"
+}
+
 ACTIVE=$(fm_get active)
+if [[ "$ACTIVE" != "true" ]] && [[ "$ACTIVE" != "false" ]]; then
+  state_parse_failure
+fi
 if [[ "$ACTIVE" != "true" ]]; then
+  # Inactive autonomous records are observational, never continuation
+  # authority. Always fall through to the bounded ledger: no ledger (or a
+  # disabled/error decision) allows the stop, while a truthful preparation
+  # carrier can continue even during the tiny cross-file marker write window.
+  continuation_decision
+  exit 0
+fi
+
+# Only an ACTIVE autonomous record is governed by the autonomous Codex-loop
+# gate. An inactive record is observational and has already fallen through to
+# the independently gated continuation authority above.
+if [[ "$IS_CODEX" == "1" ]] && [[ "$CODEX_LOOP_ENABLED" != "1" ]]; then
   exit 0
 fi
 
@@ -239,6 +346,11 @@ WORK_DIR=$(fm_get_raw work_dir)
 # marker (mirrors the completion_promise exact-match guard). Absent on older
 # state files → the marker branch self-disables for that run (no false exit).
 HARD_BLOCKER_NONCE=$(fm_get hard_blocker_nonce)
+# SCOPE_ACCRETION — the server-minted run id written by setup at registration
+# (POST /autonomous/register). Echoed on evaluate-completion + run-end calls so
+# the server can verify the (topicId, runId) pair against its OWN registration
+# record. Absent on older/unregistered runs → the server degrades honestly.
+RUN_ID=$(fm_get run_id)
 
 # ── COMPLETION_DISCIPLINE — off-switch + judge curl budget (read at the chokepoint) ──
 # Autonomous Completion Discipline (spec: AUTONOMOUS-COMPLETION-DISCIPLINE.md).
@@ -281,7 +393,13 @@ try:
     rcbt = rc.get('failBreakerThreshold', 3)
     rcbw = rc.get('failWindowMs', 600000)
     rcbc = rc.get('failCooldownMs', 600000)
-    print('%s %d %d %d %d %d %d %s %d %d %d %d %d %d' % (
+    # SCOPE_ACCRETION — Layer B advisory scan gate. NOTE: the LOAD-BEARING gate
+    # is snapshotted SERVER-SIDE at registration (this local read only gates the
+    # hook's ADVISORY scopeAccretionSuspected field, keeping the judge prompt
+    # byte-identical when the feature is off).
+    sa = a.get('scopeAccretion') or {}
+    sae = sa.get('enabled', True)
+    print('%s %d %d %d %d %d %d %s %d %d %d %d %d %d %s' % (
         '1' if en else '0', jt,
         int(bt) if str(bt).isdigit() else 3,
         int(bw) if str(bw).isdigit() else 600000,
@@ -294,12 +412,14 @@ try:
         int(rcbt) if str(rcbt).isdigit() else 3,
         int(rcbw) if str(rcbw).isdigit() else 600000,
         int(rcbc) if str(rcbc).isdigit() else 600000,
+        '1' if sae else '0',
     ))
 except Exception:
-    print('1 35000 3 600000 600000 500 1048576 1 120000 2000 65536 3 600000 600000')
-" 2>/dev/null || echo "1 35000 3 600000 600000 500 1048576 1 120000 2000 65536 3 600000 600000")
-read -r CD_ENABLED JUDGE_TIMEOUT_MS CD_BREAKER_THRESHOLD CD_BREAKER_WINDOW_MS CD_BREAKER_COOLDOWN_MS CD_MARKER_MAX_CHARS CD_LOG_ROTATE_BYTES RC_ENABLED RC_TIMEOUT_MS RC_MAX_CHARS RC_CAPTURE_BYTES RC_BREAKER_THRESHOLD RC_BREAKER_WINDOW_MS RC_BREAKER_COOLDOWN_MS <<< "$CD_CFG"
+    print('1 35000 3 600000 600000 500 1048576 1 120000 2000 65536 3 600000 600000 1')
+" 2>/dev/null || echo "1 35000 3 600000 600000 500 1048576 1 120000 2000 65536 3 600000 600000 1")
+read -r CD_ENABLED JUDGE_TIMEOUT_MS CD_BREAKER_THRESHOLD CD_BREAKER_WINDOW_MS CD_BREAKER_COOLDOWN_MS CD_MARKER_MAX_CHARS CD_LOG_ROTATE_BYTES RC_ENABLED RC_TIMEOUT_MS RC_MAX_CHARS RC_CAPTURE_BYTES RC_BREAKER_THRESHOLD RC_BREAKER_WINDOW_MS RC_BREAKER_COOLDOWN_MS SA_ENABLED <<< "$CD_CFG"
 [[ "$CD_ENABLED" =~ ^[01]$ ]] || CD_ENABLED=1
+[[ "${SA_ENABLED:-}" =~ ^[01]$ ]] || SA_ENABLED=1
 [[ "$JUDGE_TIMEOUT_MS" =~ ^[0-9]+$ ]] || JUDGE_TIMEOUT_MS=35000
 # curl -m takes SECONDS; convert ms→s (ceil), floor 5s.
 JUDGE_TIMEOUT_S=$(( (JUDGE_TIMEOUT_MS + 999) / 1000 ))
@@ -341,6 +461,42 @@ notify_terminal_stop() {
   fi
   [[ -z "$script" ]] && return 0
   printf '%s\n' "$msg" | "$script" "$REPORT_TOPIC" >/dev/null 2>&1 || true
+}
+
+# SCOPE_ACCRETION — run-end reporting (R44): EVERY terminal exit surface calls
+# POST /autonomous/:topic/run-end so the server runs the non-blocking advisory
+# sweep and, when unbuilt accreted work remains, enumerates it LOUDLY (R40 —
+# the silent clock-out is structurally closed; the emergency-stop lever buys a
+# faster exit, never a quieter one). Best-effort + `-m`-bounded: a delivery
+# failure NEVER blocks or delays the exit (the R28b daily sweep is the backstop).
+run_end_call() {
+  local reason="$1"
+  local met_override="${2:-}" terminal="${3:-true}"
+  [[ -z "$REPORT_TOPIC" ]] && return 0
+  local re_met="false" re_configured="false" re_outcome="" re_exit=""
+  [[ "$reason" == met* ]] && re_met="true"
+  [[ -n "$met_override" ]] && re_met="$met_override"
+  if [[ "$RC_ENABLED" == "1" ]] && [[ -n "$VERIFICATION_COMMAND" ]]; then
+    re_configured="true"
+    [[ "$RC_OUTCOME" == "pass" ]] && re_outcome="pass" || re_outcome="fail"
+    [[ "${RC_EXIT:-}" =~ ^-?[0-9]+$ ]] && re_exit="$RC_EXIT"
+  fi
+  # Test seam: record the would-be call instead of hitting the server.
+  if [[ -n "${INSTAR_HOOK_RUNEND_RECORD:-}" ]]; then
+    jq -nc --arg topic "$REPORT_TOPIC" --arg r "$reason" --arg id "${RUN_ID:-}" \
+      --argjson met "$re_met" --argjson terminal "$terminal" --argjson configured "$re_configured" --arg outcome "$re_outcome" --arg exit "$re_exit" \
+      '{topic:$topic,reason:$r,runId:$id,met:$met,terminal:$terminal,realcheck:(if $configured then ({configured:true,outcome:$outcome} + (if $exit != "" then {exitCode:($exit|tonumber)} else {} end)) else {configured:false} end)}' \
+      >> "$INSTAR_HOOK_RUNEND_RECORD" 2>/dev/null || true
+    return 0
+  fi
+  local re_port re_auth
+  re_port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
+  re_auth=$(resolve_auth_token)
+  jq -nc --arg r "$reason" --arg id "${RUN_ID:-}" --argjson met "$re_met" --argjson terminal "$terminal" \
+    --argjson configured "$re_configured" --arg outcome "$re_outcome" --arg exit "$re_exit" \
+    '{reason:$r,met:$met,terminal:$terminal,realcheck:(if $configured then ({configured:true,outcome:$outcome} + (if $exit != "" then {exitCode:($exit|tonumber)} else {} end)) else {configured:false} end)} + (if $id != "" then {runId:$id} else {} end)' 2>/dev/null \
+    | curl -s -m 8 -H "Authorization: Bearer $re_auth" -H 'Content-Type: application/json' \
+      --data-binary @- "http://localhost:${re_port}/autonomous/${REPORT_TOPIC}/run-end" >/dev/null 2>&1 || true
 }
 
 # Validate recorded session_id is a real UUID. Claude sometimes writes a custom
@@ -434,20 +590,22 @@ if [[ "$GOAL_MODE" == "native" ]]; then
   native_goal_clear() {
     local port auth
     port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-    auth=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+    auth=$(resolve_auth_token)
     jq -nc --arg t "$REPORT_TOPIC" '{topicId:$t}' \
       | curl -s -m 10 -H "Authorization: Bearer $auth" -H 'Content-Type: application/json' \
         --data-binary @- "http://localhost:${port}/autonomous/native-goal/clear" >/dev/null 2>&1 || true
   }
   if [[ -f ".instar/autonomous-emergency-stop" ]]; then
     notify_terminal_stop "🛑 My autonomous run on \"$(goal_snippet)\" was stopped (emergency stop)."
+    run_end_call "emergency-stop (native-goal)"
     native_goal_clear; rm -f "$STATE_FILE"
     echo "[autonomous] emergency stop — native /goal cleared" >&2; exit 0
   fi
   if [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && [[ $DURATION_SECONDS -gt 0 ]]; then
-    NG_START=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$STARTED_AT" +%s 2>/dev/null || date -d "$STARTED_AT" +%s 2>/dev/null || echo 0)
+    NG_START=$(iso8601_epoch "$STARTED_AT")
     if [[ "$NG_START" =~ ^[0-9]+$ ]] && [[ $NG_START -gt 0 ]] && [[ $(( $(date +%s) - NG_START )) -ge $DURATION_SECONDS ]]; then
       notify_terminal_stop "⏰ My autonomous run on \"$(goal_snippet)\" hit its time limit and stopped. Ask me and I'll pick up where I left off."
+      run_end_call "duration-expiry (native-goal)"
       native_goal_clear; rm -f "$STATE_FILE"
       echo "[autonomous] duration expired — native /goal cleared" >&2; exit 0
     fi
@@ -461,6 +619,7 @@ fi
 # Validate iteration
 if [[ ! "$ITERATION" =~ ^[0-9]+$ ]]; then
   echo "⚠️  Autonomous mode: State file corrupted (bad iteration)" >&2
+  run_end_call "state-corrupt (bad iteration)"
   rm -f "$STATE_FILE"
   exit 0
 fi
@@ -470,7 +629,7 @@ fi
 # premature exit (that is the very failure class this hook exists to prevent).
 REMAINING_MIN=""
 if [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && [[ $DURATION_SECONDS -gt 0 ]]; then
-  START_EPOCH=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$STARTED_AT" +%s 2>/dev/null || date -d "$STARTED_AT" +%s 2>/dev/null || echo "0")
+  START_EPOCH=$(iso8601_epoch "$STARTED_AT")
   if [[ "$START_EPOCH" =~ ^[0-9]+$ ]] && [[ $START_EPOCH -gt 0 ]]; then
     NOW_EPOCH=$(date +%s)
     ELAPSED=$(( NOW_EPOCH - START_EPOCH ))
@@ -478,6 +637,7 @@ if [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] && [[ $DURATION_SECONDS -gt 0 ]]; then
       emit "⏰ Autonomous mode: Duration expired ($ELAPSED seconds elapsed)."
       emit "   Session is free to exit."
       notify_terminal_stop "⏰ My autonomous run on \"$(goal_snippet)\" just hit its time limit and stopped. Ask me and I'll pick up where I left off."
+      run_end_call "duration-expiry"
       rm -f "$STATE_FILE"
       exit 0
     fi
@@ -492,6 +652,10 @@ fi
 if [[ -f ".instar/autonomous-emergency-stop" ]]; then
   emit "🛑 Autonomous mode: Emergency stop detected."
   notify_terminal_stop "🛑 My autonomous run on \"$(goal_snippet)\" was stopped (emergency stop)."
+  # SCOPE_ACCRETION: the emergency-stop file is a run-end surface a session could
+  # `touch` itself — so it fires run-end IDENTICALLY (R44): the one-step bypass
+  # is thereby exactly as LOUD as the two-step (spec §6).
+  run_end_call "emergency-stop"
   rm -f "$STATE_FILE"
   # NOTE: the emergency flag is left in place so OTHER topics' hooks also see it
   # and clear their own per-topic files; stop-all clears the flag when complete.
@@ -576,15 +740,38 @@ if [[ "$CD_ENABLED" == "1" ]] && [[ -n "$CD_JUDGE_TAIL" ]]; then
   done
 fi
 
+# SCOPE_ACCRETION — Layer B evasion-vocabulary scan (advisory, spec §2.7).
+# Scans the SAME already-extracted CD_JUDGE_TAIL window (no second transcript
+# read) for accretion-evasion vocabulary, with a fenced/quoted-region exclusion
+# that is NEW bash logic (the milestone/injection scans above are plain
+# substring matches): text inside ``` fences and `>`-quoted lines is stripped
+# BEFORE matching, so quoting this rule or a doc that names the anti-pattern
+# can never trip the signal. Advisory by construction — false negatives are
+# harmless (the server-side git-truth sweep is the defense, Layer 0).
+CD_SCOPE_SUSPECTED="false"
+if [[ "$CD_ENABLED" == "1" ]] && [[ "$SA_ENABLED" == "1" ]] && [[ -n "$CD_JUDGE_TAIL" ]]; then
+  CD_TAIL_SCOPE=$(printf '%s\n' "$CD_JUDGE_TAIL" \
+    | awk 'BEGIN{f=0} /^[[:space:]]*```/{f=1-f; next} f==0 && $0 !~ /^[[:space:]]*>/{print}' 2>/dev/null \
+    | tr '[:upper:]' '[:lower:]' || echo "")
+  for _sa in \
+    "documented stretch" "filed for a future session" "out of completion condition" \
+    "out of the completion condition" "drafts for later" "deferred as a follow-up spec"; do
+    if [[ "$CD_TAIL_SCOPE" == *"$_sa"* ]]; then CD_SCOPE_SUSPECTED="true"; break; fi
+  done
+fi
+
 # Assemble the signals JSON the judge payload carries (spec §2b.4 surface 1).
 # completionConditionMet is set false here and overwritten true only inside the
 # met-condition branch (the judge there is the completion judge, not this).
 build_signals_json() {
   local stop_kind="${1:-}" cond_met="${2:-false}"
-  local sk=""
+  local sk="" sa=""
   [[ "$stop_kind" == "hard-blocker" ]] && sk=',"stopKind":"hard-blocker"'
-  printf '{"completionConditionMet":%s,"uncheckedTaskCount":%s,"taskStructure":"%s","milestoneRationalizationDetected":%s,"injectionSuspected":%s%s}' \
-    "$cond_met" "$CD_UNCHECKED_COUNT" "$CD_TASK_STRUCTURE" "$CD_MILESTONE_DETECTED" "$CD_INJECTION_SUSPECTED" "$sk"
+  # SCOPE_ACCRETION — the advisory Layer-B boolean is included ONLY when the
+  # feature is on, so a disabled agent's judge prompt stays byte-identical.
+  [[ "$SA_ENABLED" == "1" ]] && sa=",\"scopeAccretionSuspected\":${CD_SCOPE_SUSPECTED:-false}"
+  printf '{"completionConditionMet":%s,"uncheckedTaskCount":%s,"taskStructure":"%s","milestoneRationalizationDetected":%s,"injectionSuspected":%s%s%s}' \
+    "$cond_met" "$CD_UNCHECKED_COUNT" "$CD_TASK_STRUCTURE" "$CD_MILESTONE_DETECTED" "$CD_INJECTION_SUSPECTED" "$sa" "$sk"
 }
 
 # ── COMPLETION_DISCIPLINE — circuit-breaker + verdict cache (in the backoff sidecar) ──
@@ -658,7 +845,7 @@ cd_raise_attention_item() {
   fi
   local at_port at_auth at_id at_summary
   at_port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-  at_auth=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+  at_auth=$(resolve_auth_token)
   # One item per run (id keyed on topic+started_at): a re-fire within the same run
   # reuses the id so the attention store de-dups rather than piling up items.
   at_id="autonomous-hard-blocker-${REPORT_TOPIC:-none}-$(printf '%s' "${STARTED_AT:-}" | tr -cd '0-9')"
@@ -751,7 +938,7 @@ p13_stop_allowed() {
   fi
   [[ -z "$p13_tail" ]] && return 0
   p13_port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-  p13_auth=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+  p13_auth=$(resolve_auth_token)
   if [[ "$CD_ENABLED" == "1" ]]; then
     local sig; sig=$(build_signals_json "$stop_kind" "false")
     p13_payload=$(jq -nc --arg t "$p13_tail" --argjson sig "$sig" '{transcriptTail:$t, signals:$sig}')
@@ -870,7 +1057,7 @@ realcheck_raise_attention() {
   fi
   local at_port at_auth at_id
   at_port=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-  at_auth=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+  at_auth=$(resolve_auth_token)
   at_id="autonomous-realcheck-stuck-${REPORT_TOPIC:-none}-$(printf '%s' "${STARTED_AT:-}" | tr -cd '0-9')"
   jq -nc \
     --arg id "$at_id" \
@@ -998,12 +1185,19 @@ run_verification() {
   # Run in a subshell so the resolved CWD + scrubbed env never disturb the hook itself.
   # Combined stdout+stderr is byte-capped AT THE SOURCE (head -c) so a runaway log can
   # never buffer whole. Exit code via ${PIPESTATUS[0]} (the command's, not head's).
+  # SIGNAL-DEATH MAPPING (cardinal invariant): when the child dies from a SIGNAL —
+  # e.g. SIGPIPE, the routine outcome once head -c hits the byte cap and closes the
+  # pipe while the command is still writing — the perl runner must report 128+signal
+  # (mirroring GNU timeout and shell $? semantics), NEVER `$?>>8` alone: the low byte
+  # holds the signal and the HIGH byte is 0, so a bare `$?>>8` would map a
+  # killed-by-signal FAILING check to exit 0 == PASS and allow a premature exit.
+  # (Observed on macOS, where no GNU timeout exists and the perl rung is the default.)
   if [[ "$rc_runner" == "perl" ]]; then
     rc_raw=$(
       env "${rc_env_args[@]}" PATH="$rc_path" \
         bash -c '
           cd "$1" 2>/dev/null || true
-          "$5" -e '\''my($t,@c)=@ARGV; my $p=fork; if($p==0){setpgrp(0,0); exec @c or exit 127} $SIG{ALRM}=sub{kill("-KILL",$p); exit 124}; alarm($t); waitpid($p,0); exit($?>>8)'\'' "$2" bash -c "$3" 2>&1 | head -c "$4"
+          "$5" -e '\''my($t,@c)=@ARGV; my $p=fork; if($p==0){setpgrp(0,0); exec @c or exit 127} $SIG{ALRM}=sub{kill("-KILL",$p); exit 124}; alarm($t); waitpid($p,0); exit(($?&127) ? 128+($?&127) : ($?>>8))'\'' "$2" bash -c "$3" 2>&1 | head -c "$4"
           exit "${PIPESTATUS[0]}"
         ' _ "$cwd" "$RC_TIMEOUT_S" "$cmd" "$RC_CAPTURE_BYTES" "$rc_runner_bin"
     )
@@ -1031,8 +1225,15 @@ run_verification() {
   # 1b. UTF-8 scrub: a source head -c byte-cap can split a multibyte char, leaving a lone
   #     continuation byte that would later break jq --arg. iconv -c drops invalid bytes;
   #     fall back to an LC_ALL=C printable-only filter when iconv is absent.
+  #     PORTABILITY: macOS (BSD/citrus) iconv -c EMITS the correctly-scrubbed prefix but
+  #     still EXITS NON-ZERO on a truncated trailing multibyte char — so the fallback must
+  #     key on "produced no output from non-empty input", never on iconv's exit code
+  #     (an exit-code `||` would APPEND the fallback's output to iconv's, duplicating text).
   if command -v iconv >/dev/null 2>&1; then
-    rc_utf8=$(printf '%s' "$rc_san" | iconv -c -f utf-8 -t utf-8 2>/dev/null || printf '%s' "$rc_san" | LC_ALL=C tr -cd '\11\12\15\40-\176')
+    rc_utf8=$(printf '%s' "$rc_san" | iconv -c -f utf-8 -t utf-8 2>/dev/null || true)
+    if [[ -z "$rc_utf8" && -n "$rc_san" ]]; then
+      rc_utf8=$(printf '%s' "$rc_san" | LC_ALL=C tr -cd '\11\12\15\40-\176')
+    fi
   else
     rc_utf8=$(printf '%s' "$rc_san" | LC_ALL=C tr -cd '\11\12\15\40-\176')
   fi
@@ -1041,7 +1242,7 @@ run_verification() {
   #    authToken literal + a generic Bearer token.
   local rc_leak=0 rc_auth_val
   if [[ "$(hb_leak_hit "$rc_utf8")" == "1" ]]; then rc_leak=1; fi
-  rc_auth_val=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+  rc_auth_val=$(resolve_auth_token)
   if [[ $rc_leak -eq 0 ]] && [[ -n "$rc_auth_val" ]] && printf '%s' "$rc_utf8" | grep -qF "$rc_auth_val" 2>/dev/null; then rc_leak=1; fi
   if [[ $rc_leak -eq 0 ]] && printf '%s' "$rc_utf8" | grep -qE 'Bearer [A-Za-z0-9._-]{20,}' 2>/dev/null; then rc_leak=1; fi
   if [[ $rc_leak -eq 1 ]]; then
@@ -1102,6 +1303,7 @@ realcheck_gate() {
     # fired to produce this met). Surface the breaker guidance + keep working.
     EVAL_REASON="The declared real check (\`${VERIFICATION_COMMAND}\`) has failed repeatedly — paused re-running it for a cooldown. This is likely an authoring problem (wrong directory, stale, or testing the wrong thing): fix the check or the work, then continue. I've queued it for the operator."
     realcheck_audit_row "fail" "" "0" "$VERIFICATION_COMMAND" "$(realcheck_resolve_cwd)" "1"
+    run_end_call "realcheck-fail" "true" "false"
     echo "[autonomous] real-check breaker OPEN — keeping working (no command run, no judge re-fire)" >&2
     return 1
   fi
@@ -1115,6 +1317,7 @@ realcheck_gate() {
   fi
   # FAIL | timeout | refused-destructive | unavailable → record + keep working.
   realcheck_record_failure
+  run_end_call "realcheck-fail" "true" "false"
   EVAL_REASON="$(realcheck_guidance "$VERIFICATION_COMMAND" "$RC_SANITIZED_OUTPUT")"
   echo "[autonomous] real-check ${RC_OUTCOME} (exit=${RC_EXIT}) — keeping working" >&2
   return 1
@@ -1203,6 +1406,8 @@ if [[ "$CD_ENABLED" == "1" ]] && [[ -n "$HARD_BLOCKER_NONCE" ]] && [[ "$HARD_BLO
         # (c) ONE plain-English notify-on-stop.
         notify_terminal_stop "🚧 My autonomous run on \"$(goal_snippet)\" stopped on a hard blocker I can't resolve myself. What I'd need: ${HB_NEEDED}. I've queued it for your attention."
         emit "🚧 Autonomous mode: hard blocker (external) — exit allowed. needed: ${HB_NEEDED}"
+        # SCOPE_ACCRETION (R40/R44): the hard-blocker exit is a run-end surface.
+        run_end_call "hard-blocker"
         # (d) Remove state; allow exit (write once — state removal prevents re-append).
         rm -f "$STATE_FILE" "$CD_BACKOFF_STATE" 2>/dev/null || true
         exit 0
@@ -1236,6 +1441,13 @@ fi
 EVAL_REASON=""
 if [[ "${CD_BLOCK_TERMINAL:-}" != "true" ]] && [[ -n "$COMPLETION_CONDITION" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[ -f "$TRANSCRIPT_PATH" ]]; then
   EVAL_MET=""
+  # Test seam (SCOPE_ACCRETION): record the signals + identity fields the judge
+  # payload would carry, WITHOUT a network call (mirrors INSTAR_HOOK_ATTENTION_RECORD).
+  if [[ -n "${INSTAR_HOOK_SIGNALS_RECORD:-}" ]] && [[ "$CD_ENABLED" == "1" ]]; then
+    printf '{"signals":%s,"topicId":"%s","runId":"%s"}\n' \
+      "$(build_signals_json "" "false")" "${REPORT_TOPIC:-}" "${RUN_ID:-}" \
+      >> "$INSTAR_HOOK_SIGNALS_RECORD" 2>/dev/null || true
+  fi
   # Decide whether to fire the judge at all (CD cost-discipline gate).
   CD_MIGHT_BE_DONE="true"
   if [[ "$CD_ENABLED" == "1" ]] && [[ -z "${INSTAR_HOOK_EVAL_OVERRIDE:-}" ]]; then
@@ -1266,13 +1478,18 @@ if [[ "${CD_BLOCK_TERMINAL:-}" != "true" ]] && [[ -n "$COMPLETION_CONDITION" ]] 
       | jq -r '.message.content | map(select(.type=="text")) | map(.text) | join("\n")' 2>/dev/null \
       | tail -c 8000 || echo "")
     EVAL_PORT=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('port',4040))" 2>/dev/null || echo 4040)
-    EVAL_AUTH=$(python3 -c "import json;print(json.load(open('.instar/config.json')).get('authToken',''))" 2>/dev/null || echo "")
+    EVAL_AUTH=$(resolve_auth_token)
+    # SCOPE_ACCRETION — echo topicId/runId/sessionId so the server resolves the
+    # run against its OWN registration record (R35 arming; R36 registered-
+    # condition authority; §6 runId pair check). Empty fields are omitted.
+    CD_IDS=$(jq -nc --arg topic "${REPORT_TOPIC:-}" --arg rid "${RUN_ID:-}" --arg sid "${HOOK_SESSION:-}" \
+      '(if $topic != "" then {topicId:$topic} else {} end) + (if $rid != "" then {runId:$rid} else {} end) + (if $sid != "" then {sessionId:$sid} else {} end)' 2>/dev/null || echo '{}')
     if [[ "$CD_ENABLED" == "1" ]]; then
       # Fold the milestone/buildable-work scrutiny into the completion judge (single call).
       CD_SIG=$(build_signals_json "" "false")
-      EVAL_BODY=$(jq -nc --arg c "$COMPLETION_CONDITION" --arg t "$EVAL_TAIL" --argjson sig "$CD_SIG" '{condition:$c,transcriptTail:$t,signals:$sig}')
+      EVAL_BODY=$(jq -nc --arg c "$COMPLETION_CONDITION" --arg t "$EVAL_TAIL" --argjson sig "$CD_SIG" --argjson ids "$CD_IDS" '{condition:$c,transcriptTail:$t,signals:$sig} + $ids')
     else
-      EVAL_BODY=$(jq -nc --arg c "$COMPLETION_CONDITION" --arg t "$EVAL_TAIL" '{condition:$c,transcriptTail:$t}')
+      EVAL_BODY=$(jq -nc --arg c "$COMPLETION_CONDITION" --arg t "$EVAL_TAIL" --argjson ids "$CD_IDS" '{condition:$c,transcriptTail:$t} + $ids')
     fi
     EVAL_RESP=$(printf '%s' "$EVAL_BODY" \
       | curl -s -m "$JUDGE_TIMEOUT_S" -H "Authorization: Bearer $EVAL_AUTH" -H 'Content-Type: application/json' \
@@ -1302,6 +1519,7 @@ if [[ "${CD_BLOCK_TERMINAL:-}" != "true" ]] && [[ -n "$COMPLETION_CONDITION" ]] 
       if realcheck_gate; then
         emit "✅ Autonomous mode: completion condition met (independent evaluator): ${EVAL_REASON}"
         notify_terminal_stop "✅ My autonomous run on \"$(goal_snippet)\" finished — the goal was met."
+        run_end_call "met"
         rm -f "$STATE_FILE" "$CD_BACKOFF_STATE" 2>/dev/null || true
         exit 0
       fi
@@ -1311,6 +1529,7 @@ if [[ "${CD_BLOCK_TERMINAL:-}" != "true" ]] && [[ -n "$COMPLETION_CONDITION" ]] 
       if realcheck_gate; then
         emit "✅ Autonomous mode: completion condition met (independent evaluator): ${EVAL_REASON}"
         notify_terminal_stop "✅ My autonomous run on \"$(goal_snippet)\" finished — the goal was met."
+        run_end_call "met"
         rm -f "$STATE_FILE"
         exit 0
       fi
@@ -1343,6 +1562,7 @@ if [[ "${CD_BLOCK_TERMINAL:-}" != "true" ]] && [[ -n "$TRANSCRIPT_PATH" ]] && [[
             emit "✅ Autonomous mode: Completion promise detected — <promise>$COMPLETION_PROMISE</promise>"
             emit "   Session is free to exit. Good work!"
             notify_terminal_stop "✅ My autonomous run on \"$(goal_snippet)\" finished — all the work is done."
+            run_end_call "met (promise)"
             rm -f "$STATE_FILE"
             exit 0
           fi
@@ -1507,11 +1727,13 @@ except Exception:
     if [[ ! -f "$STATE_FILE" ]]; then
       rm -f "$BACKOFF_STATE" 2>/dev/null || true
       echo "[autonomous] state file removed during idle backoff — allowing exit" >&2
+      run_end_call "stopped (state file removed during backoff)"
       exit 0
     fi
     if [[ -f ".instar/autonomous-emergency-stop" ]]; then
       emit "🛑 Autonomous mode: Emergency stop detected (during idle backoff)."
       notify_terminal_stop "🛑 My autonomous run on \"$(goal_snippet)\" was stopped (emergency stop)."
+      run_end_call "emergency-stop (during backoff)"
       rm -f "$STATE_FILE" "$BACKOFF_STATE" 2>/dev/null || true
       exit 0
     fi
@@ -1528,6 +1750,7 @@ NEXT_ITERATION=$((ITERATION + 1))
 PROMPT_TEXT=$(awk '/^---$/{i++; next} i>=2' "$STATE_FILE")
 if [[ -z "$PROMPT_TEXT" ]]; then
   echo "⚠️  Autonomous mode: State file has no task content" >&2
+  run_end_call "state-corrupt (no task content)"
   rm -f "$STATE_FILE"
   exit 0
 fi
@@ -1550,14 +1773,14 @@ REPORT_DUE="false"
 NOW_EPOCH=$(date +%s)
 if [[ -z "$LAST_REPORT_AT" ]] || [[ "$LAST_REPORT_AT" == "null" ]]; then
   if [[ -n "$STARTED_AT" ]]; then
-    START_EPOCH_R=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$STARTED_AT" +%s 2>/dev/null || date -d "$STARTED_AT" +%s 2>/dev/null || echo "0")
+    START_EPOCH_R=$(iso8601_epoch "$STARTED_AT")
     ELAPSED_SINCE_START=$(( NOW_EPOCH - START_EPOCH_R ))
     if [[ $ELAPSED_SINCE_START -ge $REPORT_INTERVAL_SECS ]]; then
       REPORT_DUE="true"
     fi
   fi
 else
-  LAST_REPORT_EPOCH=$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_REPORT_AT" +%s 2>/dev/null || date -d "$LAST_REPORT_AT" +%s 2>/dev/null || echo "0")
+  LAST_REPORT_EPOCH=$(iso8601_epoch "$LAST_REPORT_AT")
   ELAPSED_SINCE_REPORT=$(( NOW_EPOCH - LAST_REPORT_EPOCH ))
   if [[ $ELAPSED_SINCE_REPORT -ge $REPORT_INTERVAL_SECS ]]; then
     REPORT_DUE="true"

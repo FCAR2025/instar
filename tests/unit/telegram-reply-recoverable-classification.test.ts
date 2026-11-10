@@ -33,6 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 
 const TEMPLATE_PATH = path.resolve(
@@ -123,12 +124,41 @@ interface RunResult {
  * the same loop. Synchronous `execFileSync` would deadlock against
  * curl waiting on the server.
  */
-function runScript(topicId: number, message: string): Promise<RunResult> {
+/**
+ * A genuinely hermetic environment for the spawned script.
+ *
+ * The script resolves its owning agent home from `INSTAR_AGENT_HOME` FIRST, so
+ * running this suite from inside a LIVE instar session made it resolve to the
+ * REAL agent home: it read the real config and wrote into the real outbound
+ * relay queue (`.instar/state/pending-relay.<agent>.sqlite`). Test fixture text
+ * was queued to real Telegram topics, and at least one — "Your weekly check
+ * finished — all clear." — was actually DELIVERED by the drainer on 2026-08-21.
+ * The tests also failed, because `queueRowCount()` looked in the tmp project
+ * while the rows landed elsewhere.
+ *
+ * An earlier version neutralised `INSTAR_PORT` and `INSTAR_AUTH_TOKEN` by name
+ * and was labelled "hermetic vs live-session env" — enumeration is exactly what
+ * failed here, because the harmful variable was not on the list. So: strip EVERY
+ * `INSTAR_*` variable rather than naming the ones we know about, then PIN
+ * `INSTAR_AGENT_HOME` to the tmp project so the resolution is explicit and does
+ * not depend on the child's cwd either.
+ */
+function hermeticEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (k.startsWith('INSTAR_')) continue;
+    env[k] = v;
+  }
+  env.INSTAR_AGENT_HOME = projectDir;
+  return env;
+}
+
+function runScript(topicId: number, message: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<RunResult> {
   const scriptPath = path.join(projectDir, '.claude', 'scripts', 'telegram-reply.sh');
   return new Promise((resolve) => {
     const child = spawn('bash', [scriptPath, String(topicId), message], {
       cwd: projectDir,
-      env: { ...process.env, INSTAR_PORT: '', INSTAR_AUTH_TOKEN: '' }, // hermetic vs live-session env
+      env: { ...hermeticEnv(), ...extraEnv },
     });
     let stdout = '';
     let stderr = '';
@@ -171,6 +201,28 @@ describe('telegram-reply.sh — recoverable-class detection', () => {
     expect(parsed.attempted_port).toBe(fake.port);
   });
 
+  it('a reply refused during boot keeps the session credential digest (never the credential) for recovery labelling', async () => {
+    const fake = await startFakeServer({ replyStatus: 503, replyBody: '{"status":"warming","phase":"booting"}' });
+    writeConfig(fake.port);
+    const token = 'ior1_' + 'A'.repeat(43);
+    const res = await runScript(51, 'sent while booting', { INSTAR_ORIGIN_TOKEN: token });
+    const plain = await runScript(52, 'sent without a session credential');
+    await fake.close();
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).toContain('Queued for recovery');
+    const dbPath = path.join(projectDir, '.instar', 'state', 'pending-relay.echo.sqlite');
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db.prepare('SELECT topic_id, origin_session_digest FROM entries ORDER BY topic_id').all() as Array<{ topic_id: number; origin_session_digest: string | null }>;
+      expect(plain.exitCode).toBe(1);
+      expect(rows).toEqual([
+        { topic_id: 51, origin_session_digest: createHash('sha256').update(token).digest('hex') },
+        { topic_id: 52, origin_session_digest: null },
+      ]);
+    } finally { db.close(); }
+    expect(fs.readFileSync(dbPath).includes(Buffer.from(token))).toBe(false);
+  });
+
   it('502 → enqueues', async () => {
     const fake = await startFakeServer({ replyStatus: 502, replyBody: '{}' });
     writeConfig(fake.port);
@@ -178,6 +230,17 @@ describe('telegram-reply.sh — recoverable-class detection', () => {
     await fake.close();
     expect(res.exitCode).toBe(1);
     expect(queueRowCount()).toBe(1);
+  });
+
+  it('never claims queued when canonical persistence cannot be verified', async () => {
+    const fake = await startFakeServer({ replyStatus: 503, replyBody: '{"error":"upstream"}' });
+    writeConfig(fake.port);
+    fs.writeFileSync(path.join(projectDir, '.instar', 'state'), 'not-a-directory');
+    const res = await runScript(8, 'must remain loud');
+    await fake.close();
+    expect(res.exitCode).toBe(1);
+    expect(res.stderr).not.toContain('Queued for recovery');
+    expect(res.stderr).toContain('recovery queue persistence could not be verified');
   });
 
   it('403 with structured agent_id_mismatch → enqueues', async () => {

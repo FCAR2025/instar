@@ -26,6 +26,12 @@
  */
 
 import {
+  SUBSCRIPTION_PROVIDERS,
+  SUBSCRIPTION_FRAMEWORKS,
+  SUBSCRIPTION_STATUSES,
+  SUBSCRIPTION_QUOTA_SOURCES,
+} from './subscriptionEnums.js';
+import {
   RESERVED_ENVELOPE_FIELDS,
   type StoreFieldSchema,
   type StoreValidateContext,
@@ -42,13 +48,25 @@ export const SUBSCRIPTION_ACCOUNT_META_IMPACT_TIER: ImpactTier = 'low';
 
 const MAX_FREETEXT = 256;
 
-// Mirrors the source-of-truth closed sets in SubscriptionPool.ts (PROVIDERS/FRAMEWORKS/STATUSES
-// are module-local there). KEEP IN SYNC — the receive-side validator must reject a value the
-// local pool would reject. A drift is caught by the schema-parity unit test below.
-const PROVIDERS = ['anthropic', 'openai', 'github-copilot', 'google'] as const;
-const FRAMEWORKS = ['claude-code', 'codex-cli', 'gemini-cli', 'pi-cli'] as const;
-const STATUSES = ['active', 'warming', 'rate-limited', 'needs-reauth', 'disabled'] as const;
-const QUOTA_SOURCES = ['claude-code-usage-screen', 'oauth-usage-endpoint-fallback'] as const;
+// The receive-side validator must reject exactly what the local pool would reject.
+// Round-12: BOTH sides now import the same definitions (src/core/subscriptionEnums.ts)
+// for all FOUR sets — providers, frameworks, statuses and quota sources — and the
+// pool's type unions are DERIVED from them. The old "KEEP IN SYNC … caught by the
+// schema-parity unit test below" comment was doubly wrong: the sets had already
+// drifted, and no such test existed.
+// Round-11/12 (lessons): these four sets were hand-copied here and had DRIFTED —
+// 'xai'/'grok-build' were missing, and the receive-side validator returns null
+// (a SILENT drop, no error) for an out-of-set value, so a record the local pool
+// would accept was discarded on receive. The Multi-machine posture names this
+// projection as the carrier for the grok wall-observed marker, so a declared
+// pool-SHARED value had a carrier that structurally could not carry it. The old
+// comment claimed "a drift is caught by the schema-parity unit test below" —
+// no such test existed. Both sides now IMPORT one definition: "keep in sync" is
+// a wish, a shared constant is a guarantee.
+const PROVIDERS = SUBSCRIPTION_PROVIDERS;
+const FRAMEWORKS = SUBSCRIPTION_FRAMEWORKS;
+const STATUSES = SUBSCRIPTION_STATUSES;
+const QUOTA_SOURCES = SUBSCRIPTION_QUOTA_SOURCES;
 const ID_RE = /^[a-z0-9-]+$/;
 
 const VALUE_FIELDS = ['id', 'nickname', 'email', 'provider', 'framework', 'status', 'quota'] as const;
@@ -80,10 +98,10 @@ function validateQuota(v: unknown): Record<string, unknown> | null | undefined {
   if (typeof v !== 'object' || Array.isArray(v)) return null;
   const q = v as Record<string, unknown>;
   const out: Record<string, unknown> = {};
-  const knownQuota = ['fiveHour', 'sevenDay', 'perModel', 'extraUsage', 'source', 'measuredAt'];
+  const knownQuota = ['fiveHour', 'sevenDay', 'fable', 'perModel', 'extraUsage', 'source', 'measuredAt', 'noQuotaWindow'];
   for (const k of Object.keys(q)) if (!knownQuota.includes(k)) return null; // extra key → reject
 
-  for (const win of ['fiveHour', 'sevenDay'] as const) {
+  for (const win of ['fiveHour', 'sevenDay', 'fable'] as const) {
     if (q[win] !== undefined) {
       const w = q[win];
       if (typeof w !== 'object' || w === null || Array.isArray(w)) return null;
@@ -119,6 +137,13 @@ function validateQuota(v: unknown): Record<string, unknown> | null | undefined {
   if (q.measuredAt !== undefined) {
     if (!isIso8601(q.measuredAt)) return null;
     out.measuredAt = q.measuredAt;
+  }
+  if (q.noQuotaWindow !== undefined) {
+    // Display-only marker ("the account answered but reports no usage window").
+    // Strict boolean like every other clamped field — a peer cannot smuggle
+    // anything else through it.
+    if (typeof q.noQuotaWindow !== 'boolean') return null;
+    out.noQuotaWindow = q.noQuotaWindow;
   }
   return out;
 }

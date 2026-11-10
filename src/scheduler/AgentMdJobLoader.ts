@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * AgentMdJobLoader — Phase 1a loader-side support for the new agentmd job format.
  *
@@ -24,8 +25,11 @@ import type {
   JobPriority,
   ModelTier,
 } from '../core/types.js';
+import { validJobDependencyPath } from '../core/JobDependency.js';
+import type { IntelligenceFramework } from '../core/intelligenceProviderFactory.js';
 import {
   readLockFile,
+  hashScriptBytes,
   hashBody,
   hashFrontmatter,
   type LockFileLoadResult,
@@ -51,6 +55,7 @@ const READ_CONCURRENCY = 32;
 /** Spec §6: hard size caps to bound parser cost + adversarial payloads. */
 const MAX_FRONTMATTER_BYTES = 16 * 1024;
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_TOTAL_BYTES = MAX_FRONTMATTER_BYTES + MAX_BODY_BYTES + 1024;
 
 /** Spec §6: closed-set frontmatter key whitelist. Unknown keys → per-entry
  *  skip. Adding to this set is a deliberate change, never silent.
@@ -85,6 +90,9 @@ const ALLOWED_FRONTMATTER_KEYS: ReadonlySet<string> = new Set([
   'priority',
   'expectedDurationMinutes',
   'model',
+  'framework',
+  'frameworkModel',
+  'leanContext',
   'enabled',
   'tags',
   'unrestrictedTools',
@@ -94,6 +102,26 @@ const ALLOWED_FRONTMATTER_KEYS: ReadonlySet<string> = new Set([
   'machines',
   'supervision',
   'mcpAccess',
+  'perMachineIndependent',
+  'catchUpPolicy',
+  'requiredPaths',
+  // Jev job-completion audit (spec: jev-job-supervision.md) — both wired
+  // through PerSlugManifest + manifestToJobDefinition, never dead vocabulary:
+  'completionAudit',
+  'declaredEffects',
+  'conditionalEffects',
+  // job-cost-reduction §5.1 — script-runner vocabulary. Read ONLY on the
+  // instar-origin `execute.type: 'script'` branch (applyScriptRunnerFields);
+  // on any other entry they are inert.
+  'runner',
+  'script',
+  'scriptTimeoutMinutes',
+  'anomalies',
+  'scriptSupervision',
+  'triageEvidence',
+  'triageFields',
+  'triageBareOk',
+  'triageBareSkipped',
 ]);
 
 // ── Zod preprocessors (spec §6) ────────────────────────────────────────────
@@ -131,8 +159,15 @@ export interface PerSlugManifest {
   schedule: string;
   priority: JobPriority;
   model?: ModelTier;
+  framework?: IntelligenceFramework;
+  frameworkModel?: string;
+  leanContext?: boolean;
   expectedDurationMinutes: number;
   enabled: boolean;
+  catchUpPolicy?: 'skip' | 'run-once' | 'ask';
+  requiredPaths?: string[];
+  /** Explicit opt-in to private peer transfer; not execution approval. */
+  portable?: boolean;
   execute: { type: 'skill' | 'prompt' | 'script' | 'agentmd'; value?: string; args?: string };
   // optional pass-throughs preserved as-is
   tags?: string[];
@@ -142,12 +177,22 @@ export interface PerSlugManifest {
   gate?: string;
   unrestrictedTools?: boolean;
   manifestVersion?: number;
+  /** DOORWAY-MODEL-KNOWLEDGE-REGISTRY-SPEC §2.8 / D11 — run on every machine
+   *  independently (skip the global jobSlug claim/lease). See JobDefinition
+   *  for the misuse warning. Absent → false → today's claim/lease behavior. */
+  perMachineIndependent?: boolean;
   /** MCP access for the spawned session — 'none' spawns with zero project MCP
    *  servers (claude-code only). Absent → legacy full-project-MCP behavior. */
   mcpAccess?: 'project' | 'none';
   /** SHA of the body at the time an operator disabled the default — preserved
    *  across regeneration so a re-enabled default re-syncs intentionally. */
   disabledAtBodyHash?: string;
+  /** Jev job-completion audit eligibility (spec: jev-job-supervision.md). */
+  completionAudit?: 'excluded' | 'eligible' | 'priority';
+  /** Repo-relative expected outputs — jailed at load (no absolute, no '..'). */
+  declaredEffects?: string[];
+  /** Same jail; verified only when the run claims the path (`EFFECT: <path>`). */
+  conditionalEffects?: string[];
 }
 
 // ── Load-problems surface ──────────────────────────────────────────────────
@@ -177,6 +222,25 @@ export interface LoadProblem {
 export interface AgentMdLoadResult {
   jobs: JobDefinition[];
   problems: LoadProblem[];
+  /**
+   * Enabled agentmd manifests that VALIDATED but whose markdown body could
+   * not be loaded this pass (missing, unreadable, malformed frontmatter,
+   * oversize, symlinked). Each entry's `problem` is also present in
+   * `problems`. The live scheduler uses this list at the trigger-boundary
+   * reload to keep running the LAST VALIDATED body for a job whose manifest
+   * is still present and enabled, instead of silently dropping the job —
+   * the manifest (existence, enabled, schedule) stays disk-authoritative;
+   * only the body falls back. A manifest that was never hydrated has nothing
+   * to fall back to and stays dropped.
+   */
+  bodyFailures: Array<{
+    manifest: PerSlugManifest;
+    problem: LoadProblem;
+    /** The path the CURRENT manifest resolves its body to
+     *  (`<jobsRoot>/<origin>/<slug>.md`). A fallback is only valid when the
+     *  previously validated body came from exactly this path. */
+    expectedPath: string;
+  }>;
 }
 
 // ── Bounded-concurrency helper (kept for Phase 1b sync→async migration) ───
@@ -239,7 +303,7 @@ export function loadAgentMdJobs(
   jobsRootDir: string,
 ): AgentMdLoadResult {
   if (!fs.existsSync(scheduleDir)) {
-    return { jobs: [], problems: [] };
+    return { jobs: [], problems: [], bodyFailures: [] };
   }
 
   let entries: string[];
@@ -253,8 +317,51 @@ export function loadAgentMdJobs(
         path: scheduleDir,
         message: `Failed to enumerate ${scheduleDir}: ${err instanceof Error ? err.message : String(err)}`,
       }],
+      bodyFailures: [],
     };
   }
+
+  // Imported jobs require an active journal, matching local approval, and an
+  // unchanged manifest. Interrupted or revoked imports never reach scheduler.
+  const withheld = new Set<string>();
+  const stateDir = path.dirname(jobsRootDir);
+  try {
+    const file = path.join(stateDir, 'state', 'job-portable-import-journal.json');
+    const raw = fs.readFileSync(file, 'utf8');
+    if (raw.length > 8 * 1024 * 1024) throw new Error('portable-journal-oversized');
+    const journal = JSON.parse(raw);
+    if (journal.version !== 1 || !journal.jobs || typeof journal.jobs !== 'object') throw new Error('portable-journal-corrupt');
+    const disarmed = fs.existsSync(path.join(stateDir, 'state', 'job-portable-disarmed.json'));
+    let approvals: Record<string, { root: string }> = {};
+    try {
+      const approvalFile = path.join(stateDir, 'state', 'job-portable-activate-approval.json');
+      const approvalRaw = fs.readFileSync(approvalFile, 'utf8');
+      if (approvalRaw.length > 64 * 1024) throw new Error('portable-approval-oversized');
+      const parsed = JSON.parse(approvalRaw);
+      if (parsed.version !== 1 || !parsed.approvals || typeof parsed.approvals !== 'object')
+        throw new Error('portable-approval-corrupt');
+      approvals = parsed.approvals;
+    } catch { /* no valid approval means imported jobs are withheld */ }
+    for (const [slug, row] of Object.entries(journal.jobs)) {
+      const imported = row as { state?: string; root?: string; manifestHash?: string };
+      if (disarmed || fs.existsSync(path.join(stateDir, 'state', 'job-portable-pending', `${slug}.json`))
+        || imported.state === 'pending' || approvals[slug]?.root !== imported.root) {
+        withheld.add(slug); continue;
+      }
+      try {
+        const manifestPath = path.join(scheduleDir, `${slug}.json`);
+        const bytes = fs.readFileSync(manifestPath);
+        if (bytes.length > 256 * 1024 || createHash('sha256').update(bytes).digest('hex') !== imported.manifestHash)
+          withheld.add(slug);
+      } catch { withheld.add(slug); }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return { jobs: [], problems: [{ kind: 'unknown', path: scheduleDir,
+        message: 'Portable import journal cannot be verified; per-slug jobs withheld' }], bodyFailures: [] };
+    }
+  }
+  entries = entries.filter(filename => !withheld.has(filename.slice(0, -5)));
 
   // Step 1: read + validate every manifest sequentially. The hand-rolled
   // bounded-concurrency helper above is exported for Phase 1b's async
@@ -266,7 +373,8 @@ export function loadAgentMdJobs(
   });
 
   const validManifests: { manifest: PerSlugManifest; sourcePath: string }[] = [];
-  const problems: LoadProblem[] = [];
+  const problems: LoadProblem[] = [...withheld].map(slug => ({ kind: 'unknown', slug,
+    message: `Portable import ${slug} withheld: pending, revoked, disarmed, or changed` }));
 
   for (const r of manifestResults) {
     if (r.problem) problems.push(r.problem);
@@ -300,6 +408,7 @@ export function loadAgentMdJobs(
   // the entry is NOT added to jobs[]; the problem surfaces in the Dashboard
   // Issues card.
   const jobs: JobDefinition[] = [];
+  const bodyFailures: AgentMdLoadResult['bodyFailures'] = [];
   for (const { manifest } of survivors) {
     // A disabled/retired per-slug manifest must load as a disabled JobDefinition
     // WITHOUT requiring its markdown body — the body may have been deleted when
@@ -312,10 +421,57 @@ export function loadAgentMdJobs(
       continue;
     }
 
-    if (manifest.execute.type === 'agentmd') {
+    if (manifest.execute.type === 'script' && manifest.origin === 'instar') {
+      // job-cost-reduction §5.1 loader branch: an instar-origin script job
+      // loads its .md body + frontmatter (the narrator context and the
+      // rollback prompt) and the lock-file trust — body hash AND script hash.
       const loaded = loadAgentMdBody(manifest, jobsRootDir);
       if (loaded.problem) {
         problems.push(loaded.problem);
+        continue;
+      }
+      const job = loaded.job!;
+      const fieldProblem = applyScriptRunnerFields(job, manifest);
+      if (fieldProblem) {
+        problems.push(fieldProblem);
+        continue;
+      }
+      const trustCheck = applyLockFileTrust(job, lockResult);
+      if (trustCheck.problem) {
+        problems.push(trustCheck.problem);
+        if (trustCheck.skipEntry) continue;
+      }
+      job.lockTrust = trustCheck.trust;
+      if (trustCheck.trust === 'trusted') {
+        const entry = lockResult.state === 'present-trusted' ? lockResult.bySlug.get(job.slug) : undefined;
+        const scriptPath = path.join(jobsRootDir, 'instar', 'scripts', job.scriptFile!);
+        const verdict = verifyScriptHash(scriptPath, entry?.scriptHash);
+        if (verdict.ok) {
+          job.scriptHashExpected = entry!.scriptHash;
+        } else {
+          // Kept LOADED (not skipped) so the scheduler records a failed run
+          // with reason script-untrusted and the consecutive-failure alert
+          // fires — a silently absent job alerts no one.
+          job.lockTrust = 'untrusted-hash-mismatch';
+          problems.push({
+            kind: 'lock-mismatch',
+            slug: job.slug,
+            origin: 'instar',
+            path: scriptPath,
+            message: `Script for "${job.slug}" failed verification: ${verdict.reason}. The script will not run.`,
+          });
+        }
+      }
+      jobs.push(job);
+    } else if (manifest.execute.type === 'agentmd') {
+      const loaded = loadAgentMdBody(manifest, jobsRootDir);
+      if (loaded.problem) {
+        problems.push(loaded.problem);
+        bodyFailures.push({
+          manifest,
+          problem: loaded.problem,
+          expectedPath: path.join(jobsRootDir, manifest.origin, `${manifest.slug}.md`),
+        });
         continue;
       }
       const job = loaded.job!;
@@ -340,7 +496,50 @@ export function loadAgentMdJobs(
     }
   }
 
-  return { jobs, problems };
+  return { jobs, problems, bodyFailures };
+}
+
+/**
+ * Rebuild an agentmd JobDefinition from the CURRENT on-disk manifest plus the
+ * LAST VALIDATED body that a previous load hydrated.
+ *
+ * Used by the scheduler's trigger-boundary reload when an enabled manifest is
+ * still present but its markdown body cannot be loaded right now (deleted,
+ * unreadable, malformed frontmatter, oversize, symlinked). The manifest stays
+ * disk-authoritative — `enabled`, `schedule`, `priority`, `machines`, … are
+ * taken from disk as of THIS pass — while `body`/`frontmatter`/`resolvedPath`
+ * (and the lock-file trust already established for that body) carry over from
+ * the previously validated load. Returns null when the previous definition
+ * has no validated body to fall back to, OR when that body was validated from
+ * a DIFFERENT path than the current manifest resolves to (`expectedPath`,
+ * i.e. `<jobsRoot>/<origin>/<slug>.md`) — an origin change on the same slug
+ * must never keep reading (and running) the old origin's file.
+ */
+export function rehydrateAgentMdJobFromLastValidatedBody(
+  manifest: PerSlugManifest,
+  previous: JobDefinition,
+  expectedPath: string,
+): JobDefinition | null {
+  if (
+    manifest.execute.type !== 'agentmd' ||
+    previous.execute.type !== 'agentmd' ||
+    typeof previous.body !== 'string' ||
+    typeof previous.resolvedPath !== 'string' ||
+    previous.resolvedPath !== expectedPath
+  ) {
+    // No validated body, no path to re-check it against, or a body validated
+    // from another path → nothing to fall back to; the caller leaves the job
+    // dropped, exactly as the loader did.
+    return null;
+  }
+  const job = manifestToJobDefinition(
+    manifest,
+    previous.frontmatter,
+    previous.body,
+    previous.resolvedPath,
+  );
+  if (previous.lockTrust !== undefined) job.lockTrust = previous.lockTrust;
+  return job;
 }
 
 /**
@@ -403,6 +602,107 @@ function applyLockFileTrust(
   }
 
   return { trust: 'trusted', problem: null, skipEntry: false };
+}
+
+/**
+ * job-cost-reduction §5.1 — re-hash a shipped script against its lock-file
+ * entry. Called at load AND by the scheduler immediately before every
+ * execution, so a file changed after loading never runs.
+ */
+export function verifyScriptHash(
+  scriptPath: string,
+  expected: string | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (!expected) return { ok: false, reason: 'the signed lock-file has no scriptHash for this job' };
+  let buf: Buffer;
+  try {
+    const st = fs.lstatSync(scriptPath);
+    if (st.isSymbolicLink() || !st.isFile()) return { ok: false, reason: 'script is not a regular file' };
+    buf = fs.readFileSync(scriptPath);
+  } catch (err) {
+    return { ok: false, reason: `script unreadable: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const actual = hashScriptBytes(buf);
+  if (actual !== expected) return { ok: false, reason: `script hash ${actual} does not match the signed ${expected}` };
+  return { ok: true };
+}
+
+const ANOMALY_KIND_RE = /^[a-z0-9][a-z0-9_.:-]{0,62}(:\*)?$/;
+const TRIAGE_FIELD_KEY_RE = /^[a-z][a-z0-9_]{0,31}$/;
+const REASON_CODE_RE = /^[A-Za-z0-9_.:/-]{1,64}$/;
+
+/**
+ * Carry the script-runner frontmatter (all strings under FAILSAFE_SCHEMA)
+ * onto the JobDefinition with strict coercion. Returns a problem (entry
+ * skipped) on any malformed value — a half-understood script job never runs.
+ */
+export function applyScriptRunnerFields(job: JobDefinition, manifest: PerSlugManifest): LoadProblem | null {
+  const fm = job.frontmatter ?? {};
+  const bad = (message: string): LoadProblem => ({
+    kind: 'agentmd-frontmatter-invalid',
+    slug: manifest.slug,
+    origin: manifest.origin,
+    message,
+  });
+  if (fm.runner !== 'script') return bad('an origin:instar script manifest needs frontmatter runner: script');
+  const scriptFile = manifest.execute.value;
+  if (fm.script !== scriptFile) return bad(`frontmatter script (${JSON.stringify(fm.script)}) must equal the manifest's ${JSON.stringify(scriptFile)}`);
+  job.runner = 'script';
+  job.scriptFile = scriptFile;
+
+  if (fm.scriptTimeoutMinutes !== undefined) {
+    const parsed = IntField.safeParse(fm.scriptTimeoutMinutes);
+    if (!parsed.success || parsed.data <= 0) return bad('"scriptTimeoutMinutes" must be a positive integer');
+    job.scriptTimeoutMinutes = parsed.data;
+  }
+  if (fm.anomalies !== undefined) {
+    if (!Array.isArray(fm.anomalies)) return bad('"anomalies" must be a list of { kind, class }');
+    const out: NonNullable<JobDefinition['anomalies']> = [];
+    for (const a of fm.anomalies as unknown[]) {
+      const o = a as Record<string, unknown> | null;
+      if (!o || typeof o !== 'object' || typeof o.kind !== 'string' || !ANOMALY_KIND_RE.test(o.kind)) {
+        return bad(`"anomalies" entry ${JSON.stringify(a)} needs a kind matching ${ANOMALY_KIND_RE}`);
+      }
+      if (o.class !== 'critical' && o.class !== 'recoverable') {
+        return bad(`"anomalies" entry ${o.kind} needs class critical | recoverable`);
+      }
+      out.push({ kind: o.kind, class: o.class });
+    }
+    job.anomalies = out;
+  }
+  if (fm.scriptSupervision !== undefined) {
+    if (fm.scriptSupervision !== 'triage' && fm.scriptSupervision !== 'deterministic') {
+      return bad('"scriptSupervision" must be triage | deterministic');
+    }
+    job.scriptSupervision = fm.scriptSupervision;
+  }
+  if (fm.triageEvidence !== undefined) {
+    if (fm.triageEvidence !== 'full' && fm.triageEvidence !== 'structured-only') {
+      return bad('"triageEvidence" must be full | structured-only');
+    }
+    job.triageEvidence = fm.triageEvidence;
+  }
+  const strList = (key: string, re?: RegExp): string[] | LoadProblem | undefined => {
+    const v = fm[key];
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v) || v.some((e) => typeof e !== 'string' || (re ? !re.test(e) : !e.trim()))) {
+      return bad(`"${key}" must be a list of strings${re ? ` matching ${re}` : ''}`);
+    }
+    return v as string[];
+  };
+  for (const [key, re] of [
+    ['triageFields', TRIAGE_FIELD_KEY_RE],
+    ['triageBareOk', undefined],
+    ['triageBareSkipped', REASON_CODE_RE],
+  ] as const) {
+    const r = strList(key, re);
+    if (r && !Array.isArray(r)) return r;
+    if (r) (job as unknown as Record<string, unknown>)[key] = r;
+  }
+  if (job.supervision === undefined && (fm.supervision === 'tier0' || fm.supervision === 'tier1' || fm.supervision === 'tier2')) {
+    job.supervision = fm.supervision as JobDefinition['supervision'];
+  }
+  return null;
 }
 
 // Re-export the bounded-concurrency helper for downstream callers. Phase 1b's
@@ -489,6 +789,20 @@ export function validateManifest(raw: unknown, sourceLabel?: string): PerSlugMan
   if (j.model !== undefined && !VALID_MODELS.includes(j.model as ModelTier)) {
     throw new Error(`${prefix}: "model" must be one of ${VALID_MODELS.join(', ')}, got "${j.model}"`);
   }
+  const frameworks = ['claude-code', 'codex-cli', 'gemini-cli', 'pi-cli', 'grok-build'];
+  if (j.framework !== undefined && !frameworks.includes(j.framework as string)) {
+    throw new Error(`${prefix}: "framework" must be a known framework`);
+  }
+  if (j.frameworkModel !== undefined &&
+      (typeof j.frameworkModel !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(j.frameworkModel))) {
+    throw new Error(`${prefix}: "frameworkModel" must be a bounded model id`);
+  }
+  if ((j.framework === undefined) !== (j.frameworkModel === undefined)) {
+    throw new Error(`${prefix}: "framework" and "frameworkModel" must be set together`);
+  }
+  if (j.leanContext !== undefined && typeof j.leanContext !== 'boolean') {
+    throw new Error(`${prefix}: "leanContext" must be a boolean`);
+  }
 
   // Cron expression
   try {
@@ -506,6 +820,19 @@ export function validateManifest(raw: unknown, sourceLabel?: string): PerSlugMan
   // Enabled
   if (typeof j.enabled !== 'boolean') {
     throw new Error(`${prefix}: "enabled" must be a boolean`);
+  }
+
+  if (j.catchUpPolicy !== undefined && !['skip', 'run-once', 'ask'].includes(j.catchUpPolicy as string)) {
+    throw new Error(`${prefix}: catchUpPolicy must be skip, run-once, or ask`);
+  }
+
+  if (j.portable !== undefined && typeof j.portable !== 'boolean') {
+    throw new Error(`${prefix}: portable must be a boolean`);
+  }
+
+  if (j.requiredPaths !== undefined && (!Array.isArray(j.requiredPaths) || j.requiredPaths.length > 32
+    || j.requiredPaths.some(value => !validJobDependencyPath(value)))) {
+    throw new Error(`${prefix}: requiredPaths must be at most 32 safe project-relative paths`);
   }
 
   // Execute block
@@ -526,6 +853,14 @@ export function validateManifest(raw: unknown, sourceLabel?: string): PerSlugMan
     // Legacy types still require value.
     if (typeof exec.value !== 'string' || !(exec.value as string).trim()) {
       throw new Error(`${prefix}: execute.value is required for type === "${exec.type}"`);
+    }
+  }
+  // job-cost-reduction §5.1: an instar-origin script manifest names a bare
+  // shipped filename, never a command line. (User-origin script jobs keep
+  // their shell command value unchanged.)
+  if (exec.type === 'script' && j.origin === 'instar') {
+    if (!/^[a-z0-9-]+\.mjs$/.test(exec.value as string) || exec.value !== `${j.slug}.mjs`) {
+      throw new Error(`${prefix}: an origin:instar script manifest must name "${j.slug}.mjs" (^[a-z0-9-]+\\.mjs$), got "${exec.value}"`);
     }
   }
   if (exec.args !== undefined && typeof exec.args !== 'string') {
@@ -580,6 +915,34 @@ export function validateManifest(raw: unknown, sourceLabel?: string): PerSlugMan
   // Optional mcpAccess
   if (j.mcpAccess !== undefined && j.mcpAccess !== 'project' && j.mcpAccess !== 'none') {
     throw new Error(`${prefix}: "mcpAccess" must be "project" or "none" if provided, got "${j.mcpAccess}"`);
+  }
+
+  // Optional Jev job-completion audit fields (spec: jev-job-supervision.md).
+  if (
+    j.completionAudit !== undefined &&
+    j.completionAudit !== 'excluded' &&
+    j.completionAudit !== 'eligible' &&
+    j.completionAudit !== 'priority'
+  ) {
+    throw new Error(`${prefix}: "completionAudit" must be "excluded", "eligible" or "priority" if provided, got "${j.completionAudit}"`);
+  }
+  // Both effect lists share one jail and one shape; the only difference is
+  // WHEN the audit verifies them (always vs. only-when-claimed).
+  for (const key of ['declaredEffects', 'conditionalEffects'] as const) {
+    const list = j[key];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.some((e) => typeof e !== 'string')) {
+      throw new Error(`${prefix}: "${key}" must be an array of strings if provided`);
+    }
+    if (list.length > 8) {
+      throw new Error(`${prefix}: "${key}" allows at most 8 entries`);
+    }
+    // Load-time jail: repo-relative only — no absolute paths, no traversal.
+    for (const e of list as string[]) {
+      if (e.startsWith('/') || e.startsWith('\\') || /^[A-Za-z]:/.test(e) || e.split('/').includes('..')) {
+        throw new Error(`${prefix}: "${key}" entry "${e}" is refused — repo-relative paths only (no absolute, no "..")`);
+      }
+    }
   }
 
   return j as unknown as PerSlugManifest;
@@ -683,7 +1046,6 @@ function loadAgentMdBody(
   // Size check on the raw file. Body cap = 64 KB; frontmatter cap = 16 KB.
   // We bound the total read to (16 + 64 + small framing) KB so an
   // adversarial 10 MB file cannot blow memory before parse.
-  const MAX_TOTAL_BYTES = MAX_FRONTMATTER_BYTES + MAX_BODY_BYTES + 1024;
   const stat = fs.statSync(resolved);
   if (stat.size > MAX_TOTAL_BYTES) {
     return {
@@ -1052,6 +1414,62 @@ function splitFrontmatter(text: string): { frontmatterText: string; body: string
   return { frontmatterText, body };
 }
 
+/**
+ * Read the current body hash for an already-resolved agentmd file.
+ *
+ * This is intentionally narrower than {@link loadAgentMdJobs}: runtime drift
+ * detection only needs to know whether the prompt body changed after boot. It
+ * reuses the loader's frontmatter split and body hash normalization without
+ * reparsing YAML, rebuilding manifests, or changing the cached JobDefinition.
+ */
+export function readAgentMdBody(
+  resolvedPath: string,
+): { ok: true; body: string; bodyHash: string } | { ok: false; reason: string } {
+  try {
+    const stat = fs.lstatSync(resolvedPath);
+    if (stat.isSymbolicLink()) {
+      return { ok: false, reason: 'path became a symbolic link' };
+    }
+    if (!stat.isFile()) {
+      return { ok: false, reason: 'path is not a regular file' };
+    }
+    if (stat.size > MAX_TOTAL_BYTES) {
+      return {
+        ok: false,
+        reason: `file is ${stat.size} bytes — exceeds total cap of ${MAX_TOTAL_BYTES} bytes`,
+      };
+    }
+
+    const split = splitFrontmatter(fs.readFileSync(resolvedPath, 'utf-8'));
+    if (!split) {
+      return { ok: false, reason: 'file no longer has valid frontmatter boundaries' };
+    }
+    if (Buffer.byteLength(split.body, 'utf-8') > MAX_BODY_BYTES) {
+      return {
+        ok: false,
+        reason: `body exceeds cap of ${MAX_BODY_BYTES} bytes`,
+      };
+    }
+
+    return { ok: true, body: split.body, bodyHash: hashBody(split.body) };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** Backwards-compatible hash-only probe for observability consumers. */
+export function readAgentMdBodyHash(
+  resolvedPath: string,
+): { ok: true; bodyHash: string } | { ok: false; reason: string } {
+  const result = readAgentMdBody(resolvedPath);
+  return result.ok
+    ? { ok: true, bodyHash: result.bodyHash }
+    : result;
+}
+
 // ── Manifest → JobDefinition ───────────────────────────────────────────────
 
 function manifestToJobDefinition(
@@ -1077,7 +1495,13 @@ function manifestToJobDefinition(
     priority: manifest.priority,
     expectedDurationMinutes: manifest.expectedDurationMinutes,
     model: manifest.model ?? 'sonnet',
+    framework: manifest.framework,
+    frameworkModel: manifest.frameworkModel,
+    leanContext: manifest.leanContext,
     enabled: manifest.enabled,
+    catchUpPolicy: manifest.catchUpPolicy,
+    requiredPaths: manifest.requiredPaths,
+    portable: manifest.portable,
     execute: manifest.execute as JobDefinition['execute'],
     origin: manifest.origin,
     tags: manifest.tags,
@@ -1088,9 +1512,13 @@ function manifestToJobDefinition(
     unrestrictedTools: manifest.unrestrictedTools,
     manifestVersion: manifest.manifestVersion,
     mcpAccess: manifest.mcpAccess,
+    perMachineIndependent: manifest.perMachineIndependent,
+    completionAudit: manifest.completionAudit,
+    declaredEffects: manifest.declaredEffects,
+    conditionalEffects: manifest.conditionalEffects,
   };
 
-  if (manifest.execute.type === 'agentmd') {
+  if (manifest.execute.type === 'agentmd' || (manifest.execute.type === 'script' && manifest.origin === 'instar')) {
     if (body !== undefined) job.body = body;
     if (frontmatter !== undefined) job.frontmatter = frontmatter;
     if (resolvedPath !== undefined) job.resolvedPath = resolvedPath;

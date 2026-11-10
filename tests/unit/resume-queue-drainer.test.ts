@@ -13,6 +13,9 @@ import path from 'node:path';
 import { ResumeQueue, type ResumeCandidateInput } from '../../src/monitoring/ResumeQueue.js';
 import {
   ResumeQueueDrainer,
+  buildResumeSanityPrompt,
+  buildResumeSanityEvaluationOptions,
+  RESUME_SANITY_CHECK_PROMPT_ID,
   type ResumeQueueDrainerDeps,
 } from '../../src/monitoring/ResumeQueueDrainer.js';
 import {
@@ -20,6 +23,7 @@ import {
   COMMITMENT_ACTIVE_RUN_REASON,
   isAutoResumableEmergencyPauseReason,
 } from '../../src/core/WorkEvidence.js';
+import { DP_RESUME_SANITY_CHECK } from '../../src/data/provenanceCoverage.js';
 
 let tmpDir: string;
 
@@ -126,6 +130,25 @@ function harness(over?: {
 async function warmCalm(h: Harness, ticks = 3): Promise<void> {
   for (let i = 0; i < ticks; i++) await h.drainer.tick();
 }
+
+describe('ResumeQueueDrainer — Tier-1 provenance', () => {
+  it('enrolls queue evidence without storing the reason or evidence text', () => {
+    const entry = candidate({
+      reason: 'cobalt-lantern private completion contradiction',
+      workEvidence: ['cobalt-lantern-private-signal'],
+    }) as any;
+    const prompt = buildResumeSanityPrompt(entry);
+    const options = buildResumeSanityEvaluationOptions({ promptText: prompt, entry });
+
+    expect(prompt).toContain('cobalt-lantern');
+    expect(options.provenance).toMatchObject({
+      decisionPoint: DP_RESUME_SANITY_CHECK,
+      optionsPresented: ['sensible', 'not-sensible'],
+      promptId: RESUME_SANITY_CHECK_PROMPT_ID,
+    });
+    expect(JSON.stringify(options.provenance?.context)).not.toContain('cobalt-lantern');
+  });
+});
 
 describe('ResumeQueueDrainer — calm gates (R2.4)', () => {
   it('does not resume until requiredCalmTicks consecutive normal ticks', async () => {
@@ -730,5 +753,96 @@ describe('ResumeQueueDrainer — GAP-B D9 commitment drain-time re-check (both s
     h.queue.considerEnqueue(committedCandidate());
     await warmCalm(h, 2);
     expect((await h.drainer.tick()).resumed).toBe(true);
+  });
+});
+
+describe('ResumeQueueDrainer — G2: no silent pressure-held revival (agent-always-reachable)', () => {
+  const NOTICE_MS = 10_000;
+
+  /** Pressure-held: tier stays moderate (calm-ticks never satisfied) + entry waited past the window. */
+  function heldHarness(over?: Parameters<typeof harness>[0]): Harness {
+    const h = harness({ drainerCfg: { pressureHeldNoticeMs: NOTICE_MS }, ...over });
+    h.setTier('moderate'); // calmTicks resets to 0 every tick ⇒ permanent calm-ticks block
+    return h;
+  }
+
+  it('emits ONE pressure-held notice when a revival is held past the window — never silent', async () => {
+    const h = heldHarness();
+    h.queue.considerEnqueue(candidate()); // queuedAt = now
+    h.advance(NOTICE_MS); // the entry has now waited the full window under pressure
+
+    const r = await h.drainer.tick();
+    expect(r.blocked).toBe('calm-ticks'); // still held — the notice does NOT bypass the gate
+    expect(r.resumed).toBeFalsy();
+
+    const held = h.aggregated.filter((a) => a.kind === 'pressure-held');
+    expect(held).toHaveLength(1);
+    expect(held[0].detail).toContain('under memory/CPU pressure');
+    expect(held[0].detail).toContain('freeing resources');
+  });
+
+  it('does NOT emit while the entry has waited LESS than the window (no premature notice)', async () => {
+    const h = heldHarness();
+    h.queue.considerEnqueue(candidate());
+    h.advance(NOTICE_MS - 1); // one ms short of the window
+
+    await h.drainer.tick();
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(0);
+  });
+
+  it('suppresses repeats — the notice fires ONCE per pressure episode, not every tick', async () => {
+    const h = heldHarness();
+    h.queue.considerEnqueue(candidate());
+    h.advance(NOTICE_MS);
+
+    await h.drainer.tick();
+    await h.drainer.tick();
+    await h.drainer.tick();
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(1);
+  });
+
+  it('is SILENT in dry-run (a dry-run queue must never page)', async () => {
+    const h = heldHarness({ queueCfg: { dryRun: true } });
+    h.queue.considerEnqueue(candidate());
+    h.advance(NOTICE_MS);
+
+    await h.drainer.tick();
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(0);
+  });
+
+  it('does NOT fire for a NON-pressure hold (quota), and re-arms for a later pressure episode', async () => {
+    // Quota-blocked (not calm-ticks): no pressure-held notice even though time has passed.
+    const h = harness({
+      drainerCfg: { pressureHeldNoticeMs: NOTICE_MS },
+      deps: { canSpawnSession: () => false },
+    });
+    h.queue.considerEnqueue(candidate());
+    // Clear the calm-ticks gate FIRST (entry still fresh) so the blocking gate is
+    // purely 'quota' — only THEN age the entry. The notice keys on a calm-ticks
+    // hold, not a quota hold, so a quota-blocked aged entry must stay silent.
+    await warmCalm(h, 3);
+    h.advance(NOTICE_MS);
+    expect((await h.drainer.tick()).blocked).toBe('quota');
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(0);
+  });
+
+  it('re-arms after the gate clears — a second pressure episode notifies again', async () => {
+    const h = heldHarness();
+    h.queue.considerEnqueue(candidate());
+    h.advance(NOTICE_MS);
+    await h.drainer.tick(); // first notice
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(1);
+
+    // Pressure eases: warm calm so the gate fully clears and the entry resumes (re-arms the flag).
+    h.setTier('normal');
+    await warmCalm(h, 3); // calm satisfied → resume → pressureHeldNotified reset
+    expect(h.respawns).toHaveLength(1);
+
+    // A NEW held entry under a fresh pressure episode notifies again.
+    h.setTier('moderate');
+    h.queue.considerEnqueue(candidate({ tmuxSession: 'tmux-2', resumeUuid: '22222222-2222-4222-8222-222222222222' }));
+    h.advance(NOTICE_MS);
+    await h.drainer.tick();
+    expect(h.aggregated.filter((a) => a.kind === 'pressure-held')).toHaveLength(2);
   });
 });

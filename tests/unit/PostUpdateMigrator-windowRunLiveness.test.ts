@@ -1,0 +1,108 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { PostUpdateMigrator } from '../../src/core/PostUpdateMigrator.js';
+import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { generateClaudeMd } from '../../src/scaffold/templates.js';
+import { applyDefaults, getMigrationDefaults } from '../../src/config/ConfigDefaults.js';
+
+type Result = { upgraded: string[]; skipped: string[]; errors: string[] };
+const dirs: string[] = [];
+
+function migrate(projectDir: string): Result {
+  const result: Result = { upgraded: [], skipped: [], errors: [] };
+  const migrator = new PostUpdateMigrator({ projectDir, stateDir: path.join(projectDir, '.instar'), port: 4042, hasTelegram: false, projectName: 'echo' });
+  (migrator as unknown as { migrateClaudeMd(value: Result): void }).migrateClaudeMd(result);
+  return result;
+}
+
+describe('Window run liveness agent awareness migration', () => {
+  afterEach(() => { for (const dir of dirs.splice(0)) SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'tests/unit/PostUpdateMigrator-windowRunLiveness.test.ts' }); });
+
+  it('keeps new and existing agents in idempotent awareness parity', () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w32-awareness-'));
+    dirs.push(projectDir);
+    fs.writeFileSync(path.join(projectDir, 'CLAUDE.md'), '# Existing agent\n');
+    const first = migrate(projectDir);
+    const migrated = fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8');
+    expect(first.upgraded).toContain('CLAUDE.md: added Authoritative Window Run Liveness section');
+    expect(migrated).toContain('/window-run-liveness/work-advance');
+    expect(migrated).toContain('callers never submit task refs, predicate booleans');
+    expect(migrated).toContain('W32 cadence executor:');
+    expect(migrated).toContain('/window-run-liveness/cadence/tick');
+    const beforeSecond = migrated;
+    expect(migrate(projectDir).upgraded).not.toContain('CLAUDE.md: added Authoritative Window Run Liveness section');
+    expect(fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8')).toBe(beforeSecond);
+
+    const fresh = generateClaudeMd('instar', 'Echo', 4042, true);
+    expect(fresh).toContain('Authoritative Window Run Liveness');
+    expect(fresh).toContain('http://localhost:4042/window-run-liveness');
+    expect(fresh).toContain('W32 cadence executor:');
+  });
+
+  it('teaches existing and new agents the exact register body, once', () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w32-register-awareness-'));
+    dirs.push(projectDir);
+    // An agent that already has the section from an earlier release, without the register line.
+    const legacySection = '\n### Authoritative Window Run Liveness (Echo, dev-gated, observe-first)\n- W32 cadence executor: present\n';
+    fs.writeFileSync(path.join(projectDir, 'CLAUDE.md'), `# Existing agent\n${legacySection}`);
+    const first = migrate(projectDir);
+    expect(first.upgraded).toContain('CLAUDE.md: added window-run-liveness register body awareness');
+    const migrated = fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8');
+    expect(migrated).toContain('"autonomousRunId":"<runId from POST /autonomous/register>"');
+    expect(migrated.split('**Registering a window:**').length - 1).toBe(1);
+    migrate(projectDir);
+    expect(fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8')).toBe(migrated);
+    expect(generateClaudeMd('instar', 'Echo', 4042, true)).toContain('**Registering a window:**');
+  });
+
+  it('replaces the one-binding-per-agent register sentence with the per-topic one, once', () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'w32-per-topic-awareness-'));
+    dirs.push(projectDir);
+    const oldLine = '- **Registering a window:** POST /window-run-liveness/register takes exactly five fields. A finished (failed/stalled/closed) window does not block a new one; a different window that is still live does (`window-run-liveness-active-binding-exists`).';
+    fs.writeFileSync(path.join(projectDir, 'CLAUDE.md'), `# Existing agent\n### Authoritative Window Run Liveness\n${oldLine}\n- W32 cadence executor: present\n`);
+    const first = migrate(projectDir);
+    expect(first.upgraded).toContain('CLAUDE.md: window-run-liveness holds one binding per topic');
+    const migrated = fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8');
+    expect(migrated).toContain('Each topic keeps its own binding, so a run in one topic never blocks a run in another.');
+    expect(migrated).toContain('`window-run-liveness-window-bound-elsewhere`');
+    expect(migrated).not.toContain('a different window that is still live does (');
+    migrate(projectDir);
+    expect(fs.readFileSync(path.join(projectDir, 'CLAUDE.md'), 'utf8')).toBe(migrated);
+    expect(generateClaudeMd('instar', 'Echo', 4042, true)).toContain('Each topic keeps its own binding');
+  });
+
+  it('backfills dark exact-cadence defaults without overwriting an operator override', () => {
+    const freshTarget = {} as Record<string, unknown>;
+    applyDefaults(freshTarget, getMigrationDefaults('managed-project'));
+    expect((freshTarget as any).monitoring.windowRunLiveness.cadenceExecutor).toEqual({
+      enabled: false, dryRun: true, receiptIntervalMs: 1_800_000, reportIntervalMs: 10_800_000,
+      checkpointLeadMs: 300_000, receiptGraceMs: 300_000, checkpointRetryMaxAttempts: 2, checkpointRetryBackoffMs: 60_000,
+      reportRetryMaxAttempts: 3, reportRetryBackoffMs: 60_000,
+    });
+
+    const target = { monitoring: { windowRunLiveness: { cadenceExecutor: { enabled: true, dryRun: false, receiptGraceMs: 60_000 } } } } as Record<string, unknown>;
+    applyDefaults(target, getMigrationDefaults('managed-project'));
+    expect((target as any).monitoring.windowRunLiveness.cadenceExecutor).toEqual({
+      enabled: true, dryRun: false, receiptGraceMs: 60_000,
+      receiptIntervalMs: 1_800_000, reportIntervalMs: 10_800_000, checkpointLeadMs: 300_000,
+      checkpointRetryMaxAttempts: 2, checkpointRetryBackoffMs: 60_000,
+      reportRetryMaxAttempts: 3, reportRetryBackoffMs: 60_000,
+    });
+    const before = JSON.stringify(target);
+    applyDefaults(target, getMigrationDefaults('managed-project'));
+    expect(JSON.stringify(target)).toBe(before);
+  });
+
+  it('ships a preparation-aware autonomous setup script gated on live enforcement', () => {
+    const script = fs.readFileSync(path.resolve('.claude/skills/autonomous/scripts/setup-autonomous.sh'), 'utf8');
+    expect(script).toContain('W32_PREPARING_LIVENESS');
+    expect(script).toContain('REG_INITIAL_STATUS');
+    expect(script).toContain("raw.get('dryRun',True) is False");
+    expect(script).toContain('RUN_ACTIVE="true"');
+    expect(script).toContain('RUN_ACTIVE="false"');
+    expect(script).toContain('active: $RUN_ACTIVE');
+    expect(script).toContain('status: $RUN_STATUS');
+  });
+});

@@ -231,18 +231,26 @@ export interface HotPathState {
    * state where manual merging is recreated manual work.
    */
   greenPrBlock?: GreenPrBlock | null;
+  /**
+   * Turn-End Self-Deferral Guard (Phase A) — whether the dev-gated
+   * `monitoring.selfDeferralGuard` guard is on for this agent. Set by the
+   * hot-path ROUTE (which holds the config), NOT by getHotPathState. The
+   * stop-gate hook reads this to decide whether to do the (otherwise wasted)
+   * transcript tail-read for user-turn context; when false it skips it entirely.
+   */
+  selfDeferralGuardOn?: boolean;
 }
 
 export interface GreenPrBlock {
   pr: number;
   message: string;
-  variant: 'mergeable' | 'protected-paths' | 'disarmed';
+  variant: 'mergeable' | 'code-owner-review' | 'disarmed';
 }
 
 /** A minimal projection of the watcher's last-tick snapshot for Layer 2. */
 export interface GreenPrSnapshotForBlock {
   at: number;
-  entries: Array<{ pr: number; headRefName: string; kind: 'mergeable' | 'protected-paths' }>;
+  entries: Array<{ pr: number; headRefName: string; kind: 'mergeable' | 'code-owner-review' }>;
 }
 
 /**
@@ -271,14 +279,14 @@ export function computeGreenPrBlock(args: {
     return {
       pr: match.pr,
       variant: 'disarmed',
-      message: `PR #${match.pr} (your branch) is green, but the auto-merge watcher is disabled by operator rollback — do NOT merge it manually; confirm with the operator.`,
+      message: `PR #${match.pr} (your branch) is green, but the auto-merge watcher is stopped — do NOT merge it manually. If the stop is the agent's own, the watcher status names its marker and release condition; if it is the operator's, confirm with the operator.`,
     };
   }
-  if (match.kind === 'protected-paths') {
+  if (match.kind === 'code-owner-review') {
     return {
       pr: match.pr,
-      variant: 'protected-paths',
-      message: `PR #${match.pr} (your branch) is green but touches protected paths — it needs the operator's review and merge; it is already on the attention queue. Do NOT merge it manually.`,
+      variant: 'code-owner-review',
+      message: `PR #${match.pr} (your branch) is green but changes a constitution file — it waits for the operator's code-owner review on GitHub, then the watcher lands it. Do NOT merge it manually.`,
     };
   }
   return {

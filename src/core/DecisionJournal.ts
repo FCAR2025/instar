@@ -42,8 +42,185 @@ export interface DecisionJournalStats {
   latest: string | null;
   /** Top principles referenced, sorted by frequency */
   topPrinciples: Array<{ principle: string; count: number }>;
+  /**
+   * Entries that DID name the principle/intent that guided the choice.
+   *
+   * Exists because `topPrinciples: []` is otherwise ambiguous between two
+   * very different journals: one with no entries at all, and one with many
+   * entries where nobody ever filled `principle`. The second is the failure
+   * this journal was built to detect (a decision kept, its reasoning
+   * discarded) and it previously rendered identically to a healthy empty
+   * journal — absence reading as presence.
+   */
+  principledCount: number;
+  /** Entries that did NOT name a guiding principle. */
+  unprincipledCount: number;
   /** Number of entries flagged as conflicting */
   conflictCount: number;
+}
+
+/** Fields a caller may submit over the agent-authored HTTP path. */
+export const DECISION_JOURNAL_WRITABLE_FIELDS = [
+  'sessionId',
+  'decision',
+  'principle',
+  'topicId',
+  'jobSlug',
+  'alternatives',
+  'confidence',
+  'context',
+  'conflict',
+  'tags',
+  'evidence',
+] as const;
+
+export interface DecisionSubmissionVerdict {
+  ok: boolean;
+  /** Machine-readable refusal reason; null when accepted. */
+  reason: 'missing-required' | 'unknown-fields' | 'invalid-field' | null;
+  /** Human-facing explanation naming the offending fields. */
+  message: string | null;
+  /** Submitted keys that are not recorded by any reader. */
+  unknownFields: string[];
+  /** Required keys the submission omitted. */
+  missingFields: string[];
+  /** Known fields whose runtime value violates the stored contract. */
+  invalidFields: string[];
+}
+
+export type ParsedDecisionConfidence =
+  | { status: 'missing' }
+  | { status: 'valid'; value: number }
+  | { status: 'invalid' };
+
+/**
+ * Parse the boundary representation without inventing meaning. Numeric strings
+ * have one unambiguous numeric value and are normalized; qualitative labels do
+ * not, so they remain invalid rather than being mapped to arbitrary scores.
+ */
+export function classifyDecisionConfidence(value: unknown): ParsedDecisionConfidence {
+  if (value === undefined) return { status: 'missing' };
+
+  const numeric = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim() !== ''
+      ? Number(value)
+      : Number.NaN;
+
+  return Number.isFinite(numeric) && numeric >= 0 && numeric <= 1
+    ? { status: 'valid', value: numeric }
+    : { status: 'invalid' };
+}
+
+/** Raised by the canonical writer before an invalid confidence reaches disk. */
+export class DecisionJournalValidationError extends Error {
+  readonly field = 'confidence';
+  readonly code = 'invalid-confidence';
+
+  constructor() {
+    super(
+      `Decision confidence must be a finite number in [0, 1]. ` +
+      `Use numeric confidence such as 0.8; qualitative labels such as "high" are not recorded.`,
+    );
+    this.name = 'DecisionJournalValidationError';
+  }
+}
+
+function normalizeDecisionConfidence(value: unknown): number | undefined {
+  const parsed = classifyDecisionConfidence(value);
+  if (parsed.status === 'invalid') throw new DecisionJournalValidationError();
+  return parsed.status === 'valid' ? parsed.value : undefined;
+}
+
+/**
+ * Validate an agent-authored decision submission BEFORE it is recorded.
+ *
+ * Two refusals, both earned from the same incident: an agent POSTed
+ * `reasoning` and `checkedAgainst`, believed it had recorded what the
+ * decision was checked against, and had not — neither key is read by
+ * anything. The write silently succeeded, so nothing could have caught it.
+ *
+ *  1. `principle` is REQUIRED. A decision recorded without naming what
+ *     guided it preserves THAT a choice was made and not WHY, which is the
+ *     one thing the journal exists to preserve.
+ *  2. Unknown fields are REFUSED rather than swallowed. Accepting a key no
+ *     reader consumes lets a caller believe it recorded something it did
+ *     not — the failure this function exists to make impossible.
+ *  3. `confidence`, when present, is a finite number from 0 through 1. The
+ *     scorer performs numeric arithmetic over this field, so accepting a
+ *     qualitative string would poison the aggregate with NaN.
+ *
+ * Pure: no I/O, no clock, no config. The machine-generated path
+ * (DispatchDecisionJournal → journal.log) deliberately does NOT run this —
+ * an auto-applied dispatch has no principle to cite and must not be blocked.
+ */
+export function validateDecisionSubmission(
+  body: Record<string, unknown> | null | undefined,
+): DecisionSubmissionVerdict {
+  const submitted = body && typeof body === 'object' ? body : {};
+  const allowed = new Set<string>(DECISION_JOURNAL_WRITABLE_FIELDS);
+
+  const unknownFields = Object.keys(submitted).filter(k => !allowed.has(k)).sort();
+
+  const missingFields = (['sessionId', 'decision', 'principle'] as const).filter(k => {
+    const v = (submitted as Record<string, unknown>)[k];
+    return typeof v !== 'string' || v.trim() === '';
+  });
+  const confidence = classifyDecisionConfidence(submitted.confidence);
+  const invalidFields = confidence.status === 'invalid' ? ['confidence'] : [];
+
+  if (missingFields.length > 0) {
+    return {
+      ok: false,
+      reason: 'missing-required',
+      message:
+        `Missing required field(s): ${missingFields.join(', ')}. ` +
+        `A decision must name the principle or intent that guided it — ` +
+        `recording the choice without the reasoning is what this journal exists to prevent.`,
+      unknownFields,
+      missingFields: [...missingFields],
+      invalidFields,
+    };
+  }
+
+  if (unknownFields.length > 0) {
+    return {
+      ok: false,
+      reason: 'unknown-fields',
+      message:
+        `Unrecognised field(s): ${unknownFields.join(', ')}. ` +
+        `These would be stored but never read, so the submission would look ` +
+        `recorded without being recorded. Put the reasoning in 'context' and ` +
+        `the guiding intent in 'principle'. Writable fields: ` +
+        `${DECISION_JOURNAL_WRITABLE_FIELDS.join(', ')}.`,
+      unknownFields,
+      missingFields: [],
+      invalidFields,
+    };
+  }
+
+  if (invalidFields.length > 0) {
+    return {
+      ok: false,
+      reason: 'invalid-field',
+      message:
+        `Invalid field(s): ${invalidFields.join(', ')}. ` +
+        `Decision confidence must be a finite number in [0, 1]. ` +
+        `Use numeric confidence such as 0.8; qualitative labels such as "high" are not recorded.`,
+      unknownFields: [],
+      missingFields: [],
+      invalidFields,
+    };
+  }
+
+  return {
+    ok: true,
+    reason: null,
+    message: null,
+    unknownFields: [],
+    missingFields: [],
+    invalidFields: [],
+  };
 }
 
 export class DecisionJournal {
@@ -129,6 +306,17 @@ export class DecisionJournal {
       );
     }
 
+    // Runtime enforcement belongs at the canonical write boundary, not only
+    // at the HTTP validator. TypeScript types do not protect JavaScript
+    // callers, old integrations, or cast values.
+    const confidence = normalizeDecisionConfidence(
+      (entry as { confidence?: unknown }).confidence,
+    );
+    const normalizedEntry = {
+      ...entry,
+      ...(confidence === undefined ? {} : { confidence }),
+    };
+
     const timestamp = new Date().toISOString();
     let entityId: string | undefined;
 
@@ -140,14 +328,14 @@ export class DecisionJournal {
         entityId = this.semanticMemory.rememberWithEvidence(
           {
             type: 'decision',
-            name: entry.decision.slice(0, 200),
-            content: entry.decision,
-            source: entry.sessionId ? `session:${entry.sessionId}` : 'decision-journal',
-            sourceSession: entry.sessionId,
-            confidence: entry.confidence ?? 0.8,
+            name: normalizedEntry.decision.slice(0, 200),
+            content: normalizedEntry.decision,
+            source: normalizedEntry.sessionId ? `session:${normalizedEntry.sessionId}` : 'decision-journal',
+            sourceSession: normalizedEntry.sessionId,
+            confidence: normalizedEntry.confidence ?? 0.8,
             lastVerified: timestamp,
-            domain: entry.jobSlug,
-            tags: entry.tags ?? [],
+            domain: normalizedEntry.jobSlug,
+            tags: normalizedEntry.tags ?? [],
             privacyScope: this.entityPrivacyScope,
           },
           evidence,
@@ -172,7 +360,7 @@ export class DecisionJournal {
     }
 
     const full: DecisionJournalEntry = {
-      ...entry,
+      ...normalizedEntry,
       timestamp,
       evidence,
       ...(entityId ? { entityId } : {}),
@@ -234,6 +422,8 @@ export class DecisionJournal {
         earliest: null,
         latest: null,
         topPrinciples: [],
+        principledCount: 0,
+        unprincipledCount: 0,
         conflictCount: 0,
       };
     }
@@ -244,10 +434,12 @@ export class DecisionJournal {
     // Count principles
     const principleCounts: Record<string, number> = {};
     let conflictCount = 0;
+    let principledCount = 0;
 
     for (const entry of entries) {
       if (entry.principle) {
         principleCounts[entry.principle] = (principleCounts[entry.principle] || 0) + 1;
+        principledCount++;
       }
       if (entry.conflict) {
         conflictCount++;
@@ -263,6 +455,8 @@ export class DecisionJournal {
       earliest: entries[0].timestamp,
       latest: entries[entries.length - 1].timestamp,
       topPrinciples,
+      principledCount,
+      unprincipledCount: entries.length - principledCount,
       conflictCount,
     };
   }

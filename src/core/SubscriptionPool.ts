@@ -35,26 +35,42 @@
  * entirely unaffected.
  */
 
+import {
+  SUBSCRIPTION_PROVIDERS,
+  SUBSCRIPTION_FRAMEWORKS,
+  SUBSCRIPTION_STATUSES,
+  type SubscriptionProviderValue,
+  type SubscriptionFrameworkValue,
+  type SubscriptionStatusValue,
+  type SubscriptionQuotaSourceValue,
+} from './subscriptionEnums.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ComponentHealth } from './types.js';
 import type { SubscriptionAccountMetaReplicationEmitter } from './SubscriptionAccountMetaReplicatedStore.js';
+import type { IdentityOracle } from './CredentialLocationLedger.js';
+import { frameworkHasNoUsageSurface } from './frameworkFacts.js';
+import {
+  SubscriptionPoolAuthorityReadError,
+  SubscriptionPoolAuthorityStore,
+  parseAccountsAuthority,
+  readAuthorityFileBounded,
+} from './SubscriptionPoolAuthority.js';
 
 // ── Types ─────────────────────────────────────────────────────────
 
 /** Provider behind a subscription (the account's billing identity). */
-export type SubscriptionProvider =
-  | 'anthropic'
-  | 'openai'
-  | 'github-copilot'
-  | 'google';
+/**
+ * Provider behind a subscription (the account's billing identity).
+ * DERIVED from the shared const (round-12): a hand-written union is covariant
+ * with the runtime list — it catches a const value missing from the type, never
+ * a type value missing from the const, which is the direction that actually
+ * failed in rounds 9, 10 and 11.
+ */
+export type SubscriptionProvider = SubscriptionProviderValue;
 
 /** Framework client that drives the account. */
-export type SubscriptionFramework =
-  | 'claude-code'
-  | 'codex-cli'
-  | 'gemini-cli'
-  | 'pi-cli';
+export type SubscriptionFramework = SubscriptionFrameworkValue;
 
 /**
  * Account lifecycle status.
@@ -64,12 +80,7 @@ export type SubscriptionFramework =
  *   needs-reauth  — login genuinely failed (refresh token revoked / pw change)
  *   disabled      — operator-disabled; scheduler never selects it
  */
-export type SubscriptionAccountStatus =
-  | 'active'
-  | 'warming'
-  | 'rate-limited'
-  | 'needs-reauth'
-  | 'disabled';
+export type SubscriptionAccountStatus = SubscriptionStatusValue;
 
 /**
  * Live per-account quota reading (decision C: hybrid read). Populated by the
@@ -78,6 +89,12 @@ export type SubscriptionAccountStatus =
 export interface AccountQuotaSnapshot {
   fiveHour?: { utilizationPct: number; resetsAt: string };
   sevenDay?: { utilizationPct: number; resetsAt: string };
+  /**
+   * Fable-5 weekly usage window (scope.model.display_name === 'Fable' in the
+   * usage API `limits[]`). Same shape as fiveHour/sevenDay so the dashboard
+   * renders it with the identical quota bar.
+   */
+  fable?: { utilizationPct: number; resetsAt: string };
   perModel?: Record<string, number | null>;
   extraUsage?: {
     isEnabled: boolean;
@@ -85,8 +102,16 @@ export interface AccountQuotaSnapshot {
     monthlyLimit: number;
   };
   /** Which read path produced this snapshot (decision C provenance). */
-  source?: 'claude-code-usage-screen' | 'oauth-usage-endpoint-fallback';
+  source?: SubscriptionQuotaSourceValue;
   measuredAt?: string;
+  /**
+   * The account produced a usage reading that reports NO window at all (a
+   * codex entitlement/credits-only account). Distinct from an absent snapshot,
+   * which means we found nothing to read. Display-only: it lets the dashboard
+   * name the condition instead of implying a poll is still pending. It never
+   * feeds placement, shedding or swap decisions.
+   */
+  noQuotaWindow?: boolean;
 }
 
 export interface SubscriptionAccount {
@@ -98,7 +123,7 @@ export interface SubscriptionAccount {
    *  "SageMind - Justin" vs "SageMind - Adriana"). Auto-populated from the
    *  account's own login (oauthAccount.emailAddress) on poll, so the stored email
    *  always reflects which account actually authenticated. NEVER a secret. */
-  email?: string;
+  email: string;
   /** Billing provider. */
   provider: SubscriptionProvider;
   /** Framework client that drives this account. */
@@ -124,8 +149,124 @@ export interface SubscriptionAccount {
    * rather than a re-auth event.
    */
   lastRefreshAt?: string;
+  /**
+   * The credential currently found in this account's labelled slot proved to
+   * belong to another pool account. This is first-class operational state:
+   * drifted accounts are never capacity-counted or selected as swap targets.
+   * It self-closes on the first identity-confirmed poll of the labelled slot.
+   */
+  identityDrifted?: boolean;
+  /** Public, credential-free identity evidence for the active drift episode. */
+  identityDrift?: {
+    expectedAccountId: string;
+    actualAccountId: string;
+    actualEmail?: string;
+    slot: string;
+    detectedAt: string;
+    lastConfirmedAt: string;
+    repairState: 'planned' | 'dry-run' | 'repairing' | 'owner-relogin-required';
+  };
+  /**
+   * Codex device-limit tripwire (spec codex-device-limit-tripwire §4/§6). Machine-local
+   * bookkeeping; never replicated (projectAccountToMeta allowlists it out) and never accepted from
+   * the PATCH route. `statusCause` names WHY the account is `needs-reauth`; see
+   * isDeviceLimitBenched. All six are cleared by the store whenever a write moves `status` to
+   * anything other than `needs-reauth` without setting them itself.
+   */
+  statusCause?: 'codex-device-limit';
+  /** ISO time the account was benched for a suspected device limit. */
+  deviceLimitSince?: string;
+  /** ISO time of the first device-limit judgement (suspected, not yet benched). */
+  deviceLimitSuspectedAt?: string;
+  /** ISO time the next scheduled read for a benched account may run (backoff). */
+  deviceLimitNextReadAt?: string;
+  /** Consecutive refused scheduled reads at the backoff cap (breaker count). */
+  deviceLimitRefusedReads?: number;
+  /** The breaker tripped: scheduled reads for this benched account stopped. */
+  deviceLimitReadsStopped?: boolean;
   /** Monotonic version for optimistic CAS in update(). */
   version: number;
+}
+
+/**
+ * Benched for a suspected Codex device limit (spec codex-device-limit-tripwire §4). Every reader
+ * uses exactly this predicate on the attributed pool record.
+ */
+export function isDeviceLimitBenched(account: Pick<SubscriptionAccount, 'status' | 'statusCause'>): boolean {
+  return account.status === 'needs-reauth' && account.statusCause === 'codex-device-limit';
+}
+
+/** True only for the explicit local-login-loss drift episode. Drift of a
+ * different kind remains quarantined but does not authorize a session kill. */
+export function requiresOwnerRelogin(account: SubscriptionAccount): boolean {
+  const drift = account.identityDrift;
+  return account.identityDrifted === true && !!drift && (
+    drift.repairState === 'owner-relogin-required' ||
+    drift.actualAccountId === 'missing-local-login'
+  );
+}
+
+/**
+ * Which accounts may serve as the SIBLING position in the router's failure tail —
+ * the same door on a different login, tried before the tail changes door (whose last
+ * position is `claude-code`, the main subscription that door exists to protect).
+ *
+ * Eligibility lives here rather than in the router because the pool owns account
+ * state. Three rules, each protecting a bounded gating deadline:
+ *
+ *  - SAME framework. A Codex session cannot run on a Claude login; a cross-framework
+ *    "sibling" is a guaranteed-failed attempt (and would be the very spend we are
+ *    avoiding). This mirrors SwapAntiThrash's existing same-framework restriction.
+ *  - `active` ONLY. A rate-limited, warming, disabled or needs-reauth account is a
+ *    known-bad attempt. Excluding it is not caution, it is correctness: the tail is
+ *    trying to find a working answer quickly.
+ *  - NOT the account that just failed. Retrying the failing login under a fresh label
+ *    spends the deadline on an attempt already known to fail — and, worse, reports it
+ *    as a swap, so the logs claim a move that never happened.
+ *
+ * IDENTIFYING THE FAILED ACCOUNT is the subtle part. A call that named its account is
+ * easy (`failedAccountId`). A call that ran on the AMBIENT login is not: the router
+ * cannot see which login the child inherited. For those, the caller supplies the
+ * ambient home (`ambientConfigHome`) and the match is made on that instead.
+ *
+ * When NEITHER identifier is available we return nothing rather than guess. A guess is
+ * not merely unhelpful here: on a single-account agent every candidate IS the account
+ * that just failed, so guessing would reliably re-run the failure — the exact defect
+ * the self-exclusion rule exists to prevent.
+ *
+ * An ambient home matching NO enrolled account is not a failure: the primary ran on an
+ * unenrolled login, so every enrolled account is genuinely a different one.
+ *
+ * Bounded by `limit` (default 1): the tail exists to find an answer, not to walk an
+ * entire pool while a gate waits.
+ */
+export function eligibleSiblingAccounts(
+  accounts: readonly SubscriptionAccount[],
+  framework: SubscriptionFramework,
+  failedAccountId: string | null,
+  opts: { ambientConfigHome?: string | null; limit?: number } = {},
+): Array<{ accountId: string; configHome: string }> {
+  const limit = opts.limit ?? 1;
+  const ambient = opts.ambientConfigHome;
+  const hasAmbient = typeof ambient === 'string' && ambient.length > 0;
+  if (!Array.isArray(accounts) || limit <= 0) return [];
+  // Neither identifier ⇒ we cannot tell a sibling from the account that just failed.
+  if (failedAccountId === null && !hasAmbient) return [];
+  return accounts
+    .filter(
+      (a) =>
+        !!a &&
+        a.framework === framework &&
+        a.status === 'active' &&
+        typeof a.configHome === 'string' &&
+        a.configHome.length > 0 &&
+        typeof a.id === 'string' &&
+        a.id.length > 0 &&
+        a.id !== failedAccountId &&
+        !(hasAmbient && a.configHome === ambient),
+    )
+    .slice(0, limit)
+    .map((a) => ({ accountId: a.id, configHome: a.configHome }));
 }
 
 /**
@@ -145,19 +286,120 @@ export function isLocallyExecutable(a: SubscriptionAccount): boolean {
   return (
     typeof a.configHome === 'string' &&
     a.configHome.trim().length > 0 &&
-    (a.status === 'active' || a.status === 'warming')
+    (a.status === 'active' || a.status === 'warming') &&
+    a.identityDrifted !== true
   );
 }
 
 interface SubscriptionPoolStore {
   version: 1;
-  accounts: SubscriptionAccount[];
+  accounts: StoredSubscriptionAccount[];
   lastModified: string;
+}
+
+type StoredSubscriptionAccount = Omit<SubscriptionAccount, 'email'> & { email?: string };
+
+export interface SubscriptionAccountEmailGap {
+  accountId: string;
+  nickname: string;
+  provider: SubscriptionProvider;
+  framework: SubscriptionFramework;
+  configHome: string;
+  status: SubscriptionAccountStatus;
+  identityDrifted: boolean;
 }
 
 export interface SubscriptionPoolConfig {
   /** Agent stateDir (e.g. `.instar`). The store lives at <stateDir>/subscription-pool.json. */
   stateDir: string;
+  /** Persisted MachineIdentityManager id. Omit only in legacy/test compatibility callers. */
+  machineId?: string | null;
+}
+
+export type SubscriptionPoolAvailabilityReason =
+  | 'not-initialized'
+  | 'io-read'
+  | 'io-stat'
+  | 'size-limit'
+  | 'row-limit'
+  | 'parse'
+  | 'root-version'
+  | 'root-shape'
+  | 'invalid-row'
+  | 'duplicate-id'
+  | 'machine-identity-unavailable'
+  | 'foreign-authority'
+  | 'initialization-incomplete'
+  | 'missing-after-initialization'
+  | 'recovery-conflict';
+
+export interface SubscriptionPoolAvailability {
+  state: 'unconfigured' | 'ready' | 'invalid' | 'unavailable';
+  reason: SubscriptionPoolAvailabilityReason | null;
+  maintenance: 'rollback-cleanup-pending' | null;
+}
+
+export interface BoundedSubscriptionAccountScan {
+  accounts: SubscriptionAccount[];
+  truncated: boolean;
+  examined: number;
+}
+
+export class SubscriptionPoolUnavailableError extends Error {
+  readonly code = 'subscription-pool-unavailable';
+  constructor(readonly availability: SubscriptionPoolAvailability) {
+    super(`subscription pool authority is ${availability.state}`);
+    this.name = 'SubscriptionPoolUnavailableError';
+  }
+}
+
+export interface SubscriptionPoolMutationResult {
+  committed: true;
+  cleanupPending: boolean;
+}
+
+export class SubscriptionPoolCleanupPendingError extends Error {
+  readonly code = 'subscription-pool-cleanup-pending';
+  readonly priorCommitMayHaveSucceeded = true;
+  readonly recovery = 're-read-and-restart';
+  constructor() {
+    super('subscription pool rollback cleanup is pending; re-read state and restart before mutating');
+    this.name = 'SubscriptionPoolCleanupPendingError';
+  }
+}
+
+export interface SubscriptionEmailBindingAuthority {
+  tenantOf(slot: string): string | null;
+  readonly version: number;
+}
+
+export class SubscriptionEmailReconciliationBarrier {
+  private phase: 'running' | 'complete' | 'degraded' = 'running';
+  private unresolved = 0;
+  private readonly timedOut = new Set<string>();
+  status(): 'running' | 'complete' | 'degraded' { return this.phase; }
+  finish(unresolved: number | Array<{ accountId: string; reason: string }>): void {
+    const rows = typeof unresolved === 'number' ? null : unresolved;
+    this.unresolved = rows?.length ?? unresolved as number;
+    this.timedOut.clear();
+    for (const row of rows ?? []) {
+      if (row.reason === 'reconciliation-timeout') this.timedOut.add(row.accountId);
+    }
+    this.phase = this.unresolved > 0 ? 'degraded' : 'complete';
+  }
+  isBlocking(): boolean { return this.phase === 'running'; }
+  timedOutAccount(accountId: string): boolean { return this.timedOut.has(accountId); }
+  snapshot(): {
+    state: 'running' | 'complete' | 'degraded';
+    unresolvedCount: number;
+    repairRunsFreshProbe: true;
+  } {
+    return {
+      state: this.phase,
+      unresolvedCount: this.unresolved,
+      repairRunsFreshProbe: true,
+    };
+  }
 }
 
 export interface AddAccountInput {
@@ -167,8 +409,8 @@ export interface AddAccountInput {
   framework: SubscriptionFramework;
   configHome: string;
   status?: SubscriptionAccountStatus;
-  /** Optional at add time; auto-populated from the account's login on poll. */
-  email?: string;
+  /** Provider-attested identity. Registration callers cannot omit it. */
+  email: string;
 }
 
 /** Fields an operator may patch. id/provider/enrolledAt/version are immutable here. */
@@ -180,29 +422,57 @@ export interface UpdateAccountInput {
   lastQuota?: AccountQuotaSnapshot | null;
   lastUsedAt?: string;
   lastRefreshAt?: string;
-  email?: string;
+  identityDrifted?: boolean;
+  identityDrift?: SubscriptionAccount['identityDrift'] | null;
+  /** Device-limit tripwire fields (internal writers only; the PATCH route never forwards them).
+   *  `null` removes the field. */
+  statusCause?: 'codex-device-limit' | null;
+  deviceLimitSince?: string | null;
+  deviceLimitSuspectedAt?: string | null;
+  deviceLimitNextReadAt?: string | null;
+  deviceLimitRefusedReads?: number | null;
+  deviceLimitReadsStopped?: boolean | null;
+}
+
+const DEVICE_LIMIT_FIELDS = [
+  'statusCause',
+  'deviceLimitSince',
+  'deviceLimitSuspectedAt',
+  'deviceLimitNextReadAt',
+  'deviceLimitRefusedReads',
+  'deviceLimitReadsStopped',
+] as const;
+type DeviceLimitField = typeof DEVICE_LIMIT_FIELDS[number];
+const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && ISO_TIMESTAMP_RE.test(value) && Number.isFinite(Date.parse(value));
 }
 
 const ID_RE = /^[a-z0-9-]+$/;
-const PROVIDERS: readonly SubscriptionProvider[] = [
-  'anthropic',
-  'openai',
-  'github-copilot',
-  'google',
-];
-const FRAMEWORKS: readonly SubscriptionFramework[] = [
-  'claude-code',
-  'codex-cli',
-  'gemini-cli',
-  'pi-cli',
-];
-const STATUSES: readonly SubscriptionAccountStatus[] = [
-  'active',
-  'warming',
-  'rate-limited',
-  'needs-reauth',
-  'disabled',
-];
+const PROVIDERS: readonly SubscriptionProvider[] = SUBSCRIPTION_PROVIDERS;
+const FRAMEWORKS: readonly SubscriptionFramework[] = SUBSCRIPTION_FRAMEWORKS;
+const STATUSES: readonly SubscriptionAccountStatus[] = SUBSCRIPTION_STATUSES;
+const VERIFIED_EMAIL_COMMIT = Symbol('verified-email-commit');
+const VERIFIED_ACCOUNT_ADD = Symbol('verified-account-add');
+export const MAX_BOUNDED_POOL_SCAN = 4_096;
+
+/** Provider-scoped identity comparison; intentionally does not rewrite aliases. */
+export function normalizeSubscriptionEmail(value: unknown): { display: string; key: string } {
+  if (typeof value !== 'string') throw new ValidationError('email is required');
+  const display = value.trim();
+  if (
+    !display ||
+    display.length > 254 ||
+    /[\x00-\x1f\x7f]/.test(display) ||
+    display.startsWith('@') ||
+    display.endsWith('@') ||
+    display.split('@').length !== 2
+  ) {
+    throw new ValidationError('email must be a valid non-blank provider account email');
+  }
+  return { display, key: display.toLowerCase() };
+}
 
 /**
  * Field names that would smuggle a credential into the registry. Rejected at
@@ -232,6 +502,17 @@ export class ValidationError extends Error {
 export class SubscriptionPool {
   private storePath: string;
   private store: SubscriptionPoolStore;
+  private accountIndex = new Map<string, StoredSubscriptionAccount>();
+  private authorityStore: SubscriptionPoolAuthorityStore<StoredSubscriptionAccount> | null = null;
+  private authorityGeneration: string | null = null;
+  private pendingMaintenance: 'rollback-cleanup-pending' | null = null;
+  private lastMutationResult: SubscriptionPoolMutationResult = { committed: true, cleanupPending: false };
+  private machineIdentityUnavailable = false;
+  private availability: SubscriptionPoolAvailability = {
+    state: 'unconfigured',
+    reason: 'not-initialized',
+    maintenance: null,
+  };
   /**
    * WS5.2 §6.1a — optional emit seam for cross-machine registry follow-me (metadata only).
    * Wired in server.ts ONLY when `multiMachine.accountFollowMe` resolves enabled; null = no
@@ -243,7 +524,32 @@ export class SubscriptionPool {
 
   constructor(config: SubscriptionPoolConfig) {
     this.storePath = path.join(config.stateDir, 'subscription-pool.json');
+    this.machineIdentityUnavailable = config.machineId === null;
+    if (config.machineId) {
+      this.authorityStore = new SubscriptionPoolAuthorityStore(
+        config.stateDir,
+        config.machineId,
+        (value): value is StoredSubscriptionAccount => this.isStoredAccount(value),
+      );
+    }
     this.store = this.load();
+    this.rebuildIndex();
+  }
+
+  static getContractCapability(): { version: 1 } {
+    return { version: 1 };
+  }
+
+  getContractCapability(): { version: 1 } {
+    return SubscriptionPool.getContractCapability();
+  }
+
+  getAvailability(): SubscriptionPoolAvailability {
+    return { ...this.availability };
+  }
+
+  getLastMutationResult(): SubscriptionPoolMutationResult {
+    return { ...this.lastMutationResult };
   }
 
   /** Inject the follow-me meta emitter (server.ts, gated behind accountFollowMe). */
@@ -254,14 +560,96 @@ export class SubscriptionPool {
   // ── Reads ────────────────────────────────────────────────────────
 
   /** All accounts (a shallow copy — callers can't mutate the store). */
+  /**
+   * One-time migration of the legacy single file `<stateDir>/subscription-pool.json`
+   * into this machine's authority store (spec subscription-pool-authority-foundation,
+   * `legacy-migrate`). Rows whose configHome does not exist on THIS machine are
+   * dropped and reported: the legacy file was shared between machines through the
+   * agent home's git repo, so a joined machine inherited another machine's login
+   * locations (instar#2122). The witness binds the untouched source bytes.
+   *
+   * `removeLegacy:false` keeps the source on disk (the caller passes it when the
+   * file is git-tracked, since a deletion would propagate to peers that have not
+   * migrated). Idempotent: an existing authority or a missing legacy is a no-op.
+   */
+  migrateLegacyToMachineLocal(opts: { removeLegacy: boolean; homeExists?: (configHome: string) => boolean }):
+    | { status: 'already-machine-local' }
+    | { status: 'no-legacy' }
+    | { status: 'machine-identity-unavailable' }
+    | { status: 'migrated'; kept: string[]; dropped: Array<{ id: string; configHome: string }>; legacyRemoved: boolean } {
+    if (!this.authorityStore) return { status: 'machine-identity-unavailable' };
+    const homeExists = opts.homeExists ?? ((configHome: string) => fs.existsSync(configHome));
+    if (this.authorityGeneration !== null) {
+      // A crash-recovery rebuild republishes the WHOLE legacy source (the
+      // store cannot know the caller's row filter). While the authority still
+      // carries the legacy-migrate witness, re-apply the filter here so another
+      // machine's homes never stay published under this machine's id.
+      if (this.authorityStore.witnessOperation() === 'legacy-migrate') {
+        const foreign = this.store.accounts.filter((a) => !homeExists(a.configHome));
+        if (foreign.length > 0) {
+          const next = this.cloneStore();
+          next.accounts = next.accounts.filter((a) => homeExists(a.configHome));
+          this.persist(next);
+          this.publish(next);
+          return { status: 'migrated', kept: next.accounts.map((a) => a.id), dropped: foreign.map((a) => ({ id: a.id, configHome: a.configHome })), legacyRemoved: false };
+        }
+      }
+      return { status: 'already-machine-local' };
+    }
+    if (!fs.existsSync(this.storePath)) return { status: 'no-legacy' };
+    const captured = readAuthorityFileBounded(this.storePath);
+    const accounts = parseAccountsAuthority<StoredSubscriptionAccount>(captured, (value): value is StoredSubscriptionAccount => this.isStoredAccount(value));
+    const kept = accounts.filter((a) => homeExists(a.configHome));
+    const dropped = accounts.filter((a) => !homeExists(a.configHome)).map((a) => ({ id: a.id, configHome: a.configHome }));
+    const root: SubscriptionPoolStore = { version: 1, accounts: kept, lastModified: new Date().toISOString() };
+    const snapshot = this.authorityStore.migrateLegacy(root, { removeLegacy: opts.removeLegacy });
+    this.authorityGeneration = snapshot.generation;
+    this.pendingMaintenance = null;
+    this.publish({ version: 1, accounts: snapshot.accounts, lastModified: root.lastModified });
+    return { status: 'migrated', kept: kept.map((a) => a.id), dropped, legacyRemoved: opts.removeLegacy && !fs.existsSync(this.storePath) };
+  }
+
   list(): SubscriptionAccount[] {
-    return this.store.accounts.map((a) => ({ ...a }));
+    this.assertReadable();
+    return this.store.accounts
+      .filter((a): a is SubscriptionAccount => typeof a.email === 'string' && a.email.trim().length > 0)
+      .map((a) => ({ ...a }));
+  }
+
+  /** Legacy rows are visible for repair, but never enter normal selectors. */
+  listEmailGaps(): SubscriptionAccountEmailGap[] {
+    this.assertReadable();
+    return this.store.accounts
+      .filter((a) => !a.email?.trim())
+      .map((a) => ({
+        accountId: a.id,
+        nickname: a.nickname,
+        provider: a.provider,
+        framework: a.framework,
+        configHome: a.configHome,
+        status: a.status,
+        identityDrifted: a.identityDrifted === true,
+      }));
   }
 
   /** One account by id, or null. */
   get(id: string): SubscriptionAccount | null {
-    const found = this.store.accounts.find((a) => a.id === id);
-    return found ? { ...found } : null;
+    this.assertReadable();
+    const found = this.accountIndex.get(id);
+    return found?.email?.trim() ? { ...found, email: found.email } : null;
+  }
+
+  scanAccountsBounded(limit: number = MAX_BOUNDED_POOL_SCAN): BoundedSubscriptionAccountScan {
+    this.assertReadable();
+    const boundedLimit = Math.max(0, Math.min(Math.floor(limit), MAX_BOUNDED_POOL_SCAN));
+    const prefix = this.store.accounts.slice(0, boundedLimit);
+    return {
+      accounts: prefix
+        .filter((account): account is SubscriptionAccount => !!account.email?.trim())
+        .map((account) => ({ ...account })),
+      truncated: this.store.accounts.length > prefix.length,
+      examined: prefix.length,
+    };
   }
 
   /**
@@ -270,12 +658,12 @@ export class SubscriptionPool {
    * every swap/placement path; a credential-less meta projection is excluded.
    */
   locallyExecutable(): SubscriptionAccount[] {
-    return this.store.accounts.filter(isLocallyExecutable).map((a) => ({ ...a }));
+    return this.list().filter(isLocallyExecutable);
   }
 
   /** Count of accounts. A pool of 0 is the dark/no-op default. */
   size(): number {
-    return this.store.accounts.length;
+    return this.list().length;
   }
 
   // ── Writes ───────────────────────────────────────────────────────
@@ -285,7 +673,8 @@ export class SubscriptionPool {
    * `rawExtra` (if provided) is scanned for credential-bearing field names and
    * rejected — the registry never stores tokens.
    */
-  add(input: AddAccountInput, rawExtra?: Record<string, unknown>): SubscriptionAccount {
+  [VERIFIED_ACCOUNT_ADD](input: AddAccountInput, rawExtra?: Record<string, unknown>): SubscriptionAccount {
+    this.assertAvailable(true);
     this.assertNoCredentialFields(input as unknown as Record<string, unknown>);
     if (rawExtra) this.assertNoCredentialFields(rawExtra);
 
@@ -312,10 +701,11 @@ export class SubscriptionPool {
       throw new ValidationError(`status must be one of: ${STATUSES.join(', ')}`);
     }
 
+    const email = normalizeSubscriptionEmail(input.email).display;
     const account: SubscriptionAccount = {
       id,
       nickname,
-      ...(input.email?.trim() ? { email: input.email.trim() } : {}),
+      email,
       provider: input.provider,
       framework: input.framework,
       configHome,
@@ -324,10 +714,60 @@ export class SubscriptionPool {
       enrolledAt: new Date().toISOString(),
       version: 1,
     };
-    this.store.accounts.push(account);
-    this.save();
+    const next = this.cloneStore();
+    next.accounts.push(account);
+    this.persist(next);
+    this.publish(next);
     this.metaReplication?.emitPut(account);
     return { ...account };
+  }
+
+  /** Test-only fixture seam. Production identity admission is symbol-gated. */
+  addFixture(input: AddAccountInput, rawExtra?: Record<string, unknown>): SubscriptionAccount {
+    if (process.env.NODE_ENV !== 'test') {
+      throw new ValidationError('addFixture is available only in the test environment');
+    }
+    return this[VERIFIED_ACCOUNT_ADD](input, rawExtra);
+  }
+
+  /**
+   * Identity-authority commit seam. Only SubscriptionAccountEmailRegistrar,
+   * defined in this module, possesses the symbol needed to call it.
+   */
+  [VERIFIED_EMAIL_COMMIT](
+    id: string,
+    email: string,
+    patch?: Pick<UpdateAccountInput, 'nickname' | 'configHome' | 'status'>,
+  ): SubscriptionAccount | null {
+    this.assertAvailable();
+    const next = this.cloneStore();
+    const acct = next.accounts.find((candidate) => candidate.id === id);
+    if (!acct) return null;
+    acct.email = normalizeSubscriptionEmail(email).display;
+    if (patch?.nickname !== undefined) {
+      const nickname = patch.nickname.trim();
+      if (!nickname) throw new ValidationError('nickname cannot be empty');
+      acct.nickname = nickname;
+    }
+    if (patch?.configHome !== undefined) {
+      const configHome = patch.configHome.trim();
+      if (!configHome) throw new ValidationError('configHome cannot be empty');
+      acct.configHome = configHome;
+    }
+    if (patch?.status !== undefined) {
+      if (!STATUSES.includes(patch.status)) {
+        throw new ValidationError(`status must be one of: ${STATUSES.join(', ')}`);
+      }
+      const priorStatus = acct.status;
+      acct.status = patch.status;
+      // Enrollment never sets the device-limit fields, so a move off needs-reauth ends any bench.
+      this.clearDeviceLimitOnStatusMove(acct, priorStatus, {});
+    }
+    acct.version += 1;
+    this.persist(next);
+    this.publish(next);
+    this.metaReplication?.emitPut(acct as SubscriptionAccount);
+    return { ...acct } as SubscriptionAccount;
   }
 
   /**
@@ -336,11 +776,16 @@ export class SubscriptionPool {
    * Throws ValidationError on bad field values or credential-bearing input.
    */
   update(id: string, patch: UpdateAccountInput, rawExtra?: Record<string, unknown>): SubscriptionAccount | null {
+    this.assertAvailable();
     this.assertNoCredentialFields(patch as unknown as Record<string, unknown>);
     if (rawExtra) this.assertNoCredentialFields(rawExtra);
 
-    const acct = this.store.accounts.find((a) => a.id === id);
+    const existing = this.store.accounts.find((a) => a.id === id);
+    if (!existing?.email?.trim()) return null;
+    const next = this.cloneStore();
+    const acct = next.accounts.find((a) => a.id === id)!;
     if (!acct) return null;
+    const priorStatus = acct.status;
 
     if (patch.nickname !== undefined) {
       const nn = patch.nickname.trim();
@@ -364,7 +809,27 @@ export class SubscriptionPool {
       }
       acct.status = patch.status;
     }
+    this.applyDeviceLimitPatch(acct, patch);
+    if (patch.status !== undefined) this.clearDeviceLimitOnStatusMove(acct, priorStatus, patch);
     if (patch.lastQuota !== undefined) {
+      // ROUND-21: a quota snapshot for a framework that exposes NO usage
+      // surface is not a reading — there is nothing that could have produced
+      // it. This mattered because "grok quota is always unknown, never
+      // healthy" was a stated guarantee, and it rested entirely on
+      // `lastQuota` staying null: the downstream headroom calculation reads
+      // whatever is here and emits a numeric percentage with `degraded:false`,
+      // skipping the unknown branch entirely. Since this field was accepted
+      // verbatim from an ordinary authenticated write, one PATCH was enough
+      // to make an unmeasurable account report full headroom.
+      //
+      // Refused at the store, not at the route: the route is one caller, and
+      // the guarantee has to hold for all of them.
+      if (frameworkHasNoUsageSurface(acct.framework)) {
+        throw new ValidationError(
+          `lastQuota cannot be set for framework '${acct.framework}': it exposes no usage `
+            + 'surface, so any quota reading for it is fabricated. Quota stays unknown.',
+        );
+      }
       acct.lastQuota = patch.lastQuota;
     }
     if (patch.lastUsedAt !== undefined) {
@@ -373,25 +838,32 @@ export class SubscriptionPool {
     if (patch.lastRefreshAt !== undefined) {
       acct.lastRefreshAt = patch.lastRefreshAt;
     }
-    if (patch.email !== undefined) {
-      const em = patch.email.trim();
-      acct.email = em || undefined;
+    if (patch.identityDrifted !== undefined) {
+      acct.identityDrifted = patch.identityDrifted;
+    }
+    if (patch.identityDrift !== undefined) {
+      if (patch.identityDrift === null) delete acct.identityDrift;
+      else acct.identityDrift = { ...patch.identityDrift };
     }
 
     acct.version += 1;
-    this.save();
+    this.persist(next);
+    this.publish(next);
     // Re-emit on any mutation — a peer must SEE a status/quota change (§6.1a holder stream).
-    this.metaReplication?.emitPut(acct);
-    return { ...acct };
+    this.metaReplication?.emitPut(acct as SubscriptionAccount);
+    return { ...acct } as SubscriptionAccount;
   }
 
   /** Remove an account. Returns true if one was removed. */
   remove(id: string): boolean {
-    const before = this.store.accounts.length;
-    this.store.accounts = this.store.accounts.filter((a) => a.id !== id);
-    const removed = this.store.accounts.length < before;
+    this.assertAvailable();
+    const next = this.cloneStore();
+    const before = next.accounts.length;
+    next.accounts = next.accounts.filter((a) => a.id !== id);
+    const removed = next.accounts.length < before;
     if (removed) {
-      this.save();
+      this.persist(next);
+      this.publish(next);
       this.metaReplication?.emitDelete(id, new Date().toISOString());
     }
     return removed;
@@ -402,7 +874,7 @@ export class SubscriptionPool {
   getHealth(): ComponentHealth {
     const total = this.store.accounts.length;
     const usable = this.store.accounts.filter(
-      (a) => a.status === 'active' || a.status === 'warming',
+      (a) => (a.status === 'active' || a.status === 'warming') && !a.identityDrifted,
     ).length;
     return {
       status: 'healthy',
@@ -425,36 +897,283 @@ export class SubscriptionPool {
   }
 
   private load(): SubscriptionPoolStore {
-    try {
-      if (fs.existsSync(this.storePath)) {
-        const data = JSON.parse(fs.readFileSync(this.storePath, 'utf-8'));
-        if (data && data.version === 1 && Array.isArray(data.accounts)) {
-          // Backfill version field on any pre-CAS record (defensive).
-          for (const a of data.accounts) {
-            if (typeof a.version !== 'number') a.version = 1;
-          }
-          return data as SubscriptionPoolStore;
-        }
-      }
-    } catch {
-      // @silent-fallback-ok — corrupt/unreadable store starts fresh; the
-      // registry is metadata only, never credentials, so a fresh start loses
-      // nothing irrecoverable (the operator re-enrolls / accounts re-detect).
+    if (this.machineIdentityUnavailable) {
+      this.availability = {
+        state: 'unavailable', reason: 'machine-identity-unavailable', maintenance: null,
+      };
+      return { version: 1, accounts: [], lastModified: new Date().toISOString() };
     }
-    return { version: 1, accounts: [], lastModified: new Date().toISOString() };
+    if (this.authorityStore) {
+      try {
+        const snapshot = this.authorityStore.loadSteadyState();
+        if (snapshot) {
+          this.authorityGeneration = snapshot.generation;
+          this.pendingMaintenance = snapshot.cleanupPending ? 'rollback-cleanup-pending' : null;
+          this.availability = {
+            state: 'ready', reason: null, maintenance: this.pendingMaintenance,
+          };
+          return {
+            version: 1,
+            accounts: snapshot.accounts,
+            lastModified: new Date().toISOString(),
+          };
+        }
+      } catch (error) {
+        const reason = error instanceof SubscriptionPoolAuthorityReadError ? error.reason : 'io-read';
+        this.availability = {
+          state: reason === 'io-read' || reason === 'io-stat' ? 'unavailable' : 'invalid',
+          reason,
+          maintenance: null,
+        };
+        return { version: 1, accounts: [], lastModified: new Date().toISOString() };
+      }
+    }
+    if (!fs.existsSync(this.storePath)) {
+      this.availability = { state: 'unconfigured', reason: 'not-initialized', maintenance: null };
+      return { version: 1, accounts: [], lastModified: new Date().toISOString() };
+    }
+    try {
+      const captured = readAuthorityFileBounded(this.storePath);
+      const accounts = parseAccountsAuthority<StoredSubscriptionAccount>(captured, (value): value is StoredSubscriptionAccount => this.isStoredAccount(value));
+      for (const account of accounts) {
+        if (typeof account.version !== 'number') account.version = 1;
+      }
+      const root = JSON.parse(captured.bytes.toString('utf8')) as SubscriptionPoolStore;
+      this.availability = { state: 'ready', reason: null, maintenance: null };
+      return { ...root, accounts };
+    } catch (error) {
+      const reason = error instanceof SubscriptionPoolAuthorityReadError ? error.reason : 'io-read';
+      const unavailable = reason === 'io-read' || reason === 'io-stat';
+      this.availability = {
+        state: unavailable ? 'unavailable' : 'invalid',
+        reason,
+        maintenance: null,
+      };
+      return { version: 1, accounts: [], lastModified: new Date().toISOString() };
+    }
   }
 
-  private save(): void {
-    this.store.lastModified = new Date().toISOString();
-    try {
-      const dir = path.dirname(this.storePath);
-      fs.mkdirSync(dir, { recursive: true });
-      const tmpPath = `${this.storePath}.${process.pid}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify(this.store, null, 2) + '\n');
-      fs.renameSync(tmpPath, this.storePath);
-    } catch {
-      // @silent-fallback-ok — state persistence failure; the in-memory store
-      // remains authoritative for this process and the next write retries.
+  private assertAvailable(firstCreate = false): void {
+    if (this.pendingMaintenance) throw new SubscriptionPoolCleanupPendingError();
+    if (this.availability.state === 'ready') return;
+    if (firstCreate && this.availability.state === 'unconfigured') return;
+    throw new SubscriptionPoolUnavailableError(this.getAvailability());
+  }
+
+  private assertReadable(): void {
+    if (this.availability.state === 'ready' || this.availability.state === 'unconfigured') return;
+    throw new SubscriptionPoolUnavailableError(this.getAvailability());
+  }
+
+  private rebuildIndex(): void {
+    this.accountIndex = new Map(this.store.accounts.map((account) => [account.id, account]));
+  }
+
+  private publish(next: SubscriptionPoolStore): void {
+    this.store = next;
+    this.availability = { state: 'ready', reason: null, maintenance: this.pendingMaintenance };
+    this.rebuildIndex();
+  }
+
+  private cloneStore(): SubscriptionPoolStore {
+    return structuredClone(this.store);
+  }
+
+  private persist(next: SubscriptionPoolStore): void {
+    next.lastModified = new Date().toISOString();
+    // The per-machine authority is the store once it exists (a published
+    // generation was loaded), even while a legacy file is still on disk — a
+    // legacy copy shared through the agent home's git repo is left in place by
+    // the migration, and writing to it again would re-share this machine's
+    // homes and diverge from what load() reads (instar#2122).
+    if (this.authorityStore && (this.authorityGeneration !== null || !fs.existsSync(this.storePath))) {
+      const snapshot = this.authorityGeneration
+        ? this.authorityStore.update(this.authorityGeneration, next)
+        : this.authorityStore.create(next);
+      this.authorityGeneration = snapshot.generation;
+      this.pendingMaintenance = snapshot.cleanupPending ? 'rollback-cleanup-pending' : null;
+      this.lastMutationResult = { committed: true, cleanupPending: snapshot.cleanupPending };
+      return;
     }
+    const dir = path.dirname(this.storePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = `${this.storePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + '\n');
+    fs.renameSync(tmpPath, this.storePath);
+    this.lastMutationResult = { committed: true, cleanupPending: false };
+  }
+
+  /** Validate + apply the device-limit fields of a patch (`null` removes a field). */
+  private applyDeviceLimitPatch(acct: StoredSubscriptionAccount, patch: UpdateAccountInput): void {
+    if (patch.statusCause !== undefined) {
+      if (patch.statusCause !== null && patch.statusCause !== 'codex-device-limit') {
+        throw new ValidationError("statusCause must be 'codex-device-limit' or null");
+      }
+    }
+    for (const field of ['deviceLimitSince', 'deviceLimitSuspectedAt', 'deviceLimitNextReadAt'] as const) {
+      const value = patch[field];
+      if (value !== undefined && value !== null && !isIsoTimestamp(value)) {
+        throw new ValidationError(`${field} must be an ISO-8601 timestamp or null`);
+      }
+    }
+    const refused = patch.deviceLimitRefusedReads;
+    if (refused !== undefined && refused !== null && !(Number.isSafeInteger(refused) && refused >= 0)) {
+      throw new ValidationError('deviceLimitRefusedReads must be a non-negative integer or null');
+    }
+    const stopped = patch.deviceLimitReadsStopped;
+    if (stopped !== undefined && stopped !== null && typeof stopped !== 'boolean') {
+      throw new ValidationError('deviceLimitReadsStopped must be a boolean or null');
+    }
+    const target = acct as unknown as Record<DeviceLimitField, unknown>;
+    for (const field of DEVICE_LIMIT_FIELDS) {
+      const value = patch[field];
+      if (value === undefined) continue;
+      if (value === null) delete target[field];
+      else target[field] = value;
+    }
+  }
+
+  /**
+   * The one release rule (spec codex-device-limit-tripwire §6): a write that MOVES `status` to
+   * anything other than `needs-reauth` clears every device-limit field the same write did not set
+   * itself. Both status writers (update() and the enrollment commit) call it, so every writer of
+   * `active` ends a bench consistently.
+   */
+  private clearDeviceLimitOnStatusMove(
+    acct: StoredSubscriptionAccount,
+    priorStatus: SubscriptionAccountStatus,
+    patch: Partial<Record<DeviceLimitField, unknown>>,
+  ): void {
+    if (acct.status === 'needs-reauth' || acct.status === priorStatus) return;
+    const target = acct as unknown as Record<DeviceLimitField, unknown>;
+    for (const field of DEVICE_LIMIT_FIELDS) {
+      if (patch[field] === undefined) delete target[field];
+    }
+  }
+
+  private isStoredAccount(value: unknown): value is StoredSubscriptionAccount {
+    if (!value || typeof value !== 'object') return false;
+    const account = value as Partial<StoredSubscriptionAccount>;
+    return typeof account.id === 'string' && ID_RE.test(account.id)
+      && typeof account.nickname === 'string' && account.nickname.trim().length > 0
+      && PROVIDERS.includes(account.provider as SubscriptionProvider)
+      && FRAMEWORKS.includes(account.framework as SubscriptionFramework)
+      && typeof account.configHome === 'string' && account.configHome.trim().length > 0
+      && STATUSES.includes(account.status as SubscriptionAccountStatus)
+      && typeof account.enrolledAt === 'string';
+  }
+}
+
+/**
+ * The sole authority that turns credential identity evidence into a pool email.
+ * Generic pool mutation deliberately cannot create, replace, or repair identity.
+ */
+export class SubscriptionAccountEmailRegistrar {
+  constructor(
+    private readonly pool: SubscriptionPool,
+    private readonly oracle: IdentityOracle,
+    private readonly binding?: SubscriptionEmailBindingAuthority,
+  ) {}
+
+  async register(
+    input: Omit<AddAccountInput, 'email'> & { email?: string },
+    rawExtra?: Record<string, unknown>,
+  ): Promise<SubscriptionAccount> {
+    const identity = await this.oracle.resolveSlotTenant(input.configHome);
+    if (identity.unavailable || !identity.email) {
+      throw new SubscriptionIdentityError(
+        'subscription-account-email-unresolved',
+        'The credential slot identity could not be verified. Sign in to that slot, then try again.',
+      );
+    }
+    const attested = normalizeSubscriptionEmail(identity.email);
+    if (input.email !== undefined && normalizeSubscriptionEmail(input.email).key !== attested.key) {
+      throw new SubscriptionIdentityError(
+        'subscription-account-email-mismatch',
+        'The supplied email does not match the account signed in at this credential slot.',
+      );
+    }
+    return this.pool[VERIFIED_ACCOUNT_ADD]({ ...input, email: attested.display }, rawExtra);
+  }
+
+  completeNewValidated(input: AddAccountInput): SubscriptionAccount {
+    return this.pool[VERIFIED_ACCOUNT_ADD](input);
+  }
+
+  async repairLegacy(
+    accountId: string,
+    options: { canCommit?: () => boolean } = {},
+  ): Promise<SubscriptionAccount> {
+    const gap = this.pool.listEmailGaps().find((candidate) => candidate.accountId === accountId);
+    if (!gap) {
+      throw new SubscriptionIdentityError(
+        'subscription-account-not-found',
+        `Subscription account "${accountId}" has no repairable email gap.`,
+      );
+    }
+    if (gap.identityDrifted) {
+      throw new SubscriptionIdentityError(
+        'identity-drifted',
+        `Subscription account "${accountId}" is identity-drifted and cannot be repaired automatically.`,
+      );
+    }
+    if (gap.provider !== 'anthropic' || gap.framework !== 'claude-code') {
+      throw new SubscriptionIdentityError(
+        'subscription-account-identity-provider-unsupported',
+        `Provider identity verification is not supported for ${gap.provider}/${gap.framework}.`,
+      );
+    }
+    const epoch = this.binding?.version;
+    if (!this.binding || this.binding.tenantOf(gap.configHome) !== accountId) {
+      throw new SubscriptionIdentityError(
+        'account-binding-unproven',
+        `Subscription account "${accountId}" is not bound to its credential slot.`,
+      );
+    }
+    const identity = await this.oracle.resolveSlotTenant(gap.configHome);
+    if (identity.unavailable || !identity.email) {
+      throw new SubscriptionIdentityError(
+        'identity-oracle-unavailable',
+        'The credential slot identity could not be verified.',
+      );
+    }
+    if (this.binding.version !== epoch || this.binding.tenantOf(gap.configHome) !== accountId) {
+      throw new SubscriptionIdentityError(
+        'account-binding-changed',
+        `Subscription account "${accountId}" changed credential binding during repair.`,
+      );
+    }
+    if (options.canCommit && !options.canCommit()) {
+      throw new SubscriptionIdentityError(
+        'reconciliation-timeout',
+        `Subscription account "${accountId}" was not repaired before the reconciliation deadline.`,
+      );
+    }
+    return this.pool[VERIFIED_EMAIL_COMMIT](accountId, identity.email)!;
+  }
+
+  /**
+   * A completed enrollment has already passed EnrollmentWizard's expected-email
+   * validation, so its provider-returned email is credential-attested evidence.
+   */
+  completeValidated(
+    accountId: string,
+    email: string,
+    patch: Pick<UpdateAccountInput, 'nickname' | 'configHome' | 'status'>,
+  ): SubscriptionAccount | null {
+    return this.pool[VERIFIED_EMAIL_COMMIT](accountId, email, patch);
+  }
+}
+
+export class SubscriptionIdentityError extends Error {
+  constructor(
+    readonly code: 'subscription-account-email-unresolved' | 'subscription-account-email-mismatch' |
+      'identity-oracle-unavailable' | 'subscription-account-not-found' | 'identity-drifted' |
+      'account-binding-unproven' | 'account-binding-changed' |
+      'subscription-account-identity-provider-unsupported' | 'reconciliation-timeout',
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SubscriptionIdentityError';
   }
 }

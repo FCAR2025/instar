@@ -9,17 +9,32 @@
  *   2. The §Design 1 structured-intermediate flows end-to-end: a model that
  *      returns pass:true but structured fields flagging an agent-state stop is
  *      DERIVED to a B15 block at the route (suppressed).
- *   3. FAIL-CLOSED: when the provider throws, the route HOLDS the message
- *      (pass=false, not delivered) — No Silent Degradation, end-to-end.
+ *   3. F4 graceful degradation: when the provider throws (LLM-backend outage)
+ *      with failClosedOnExhaustion unset, the route DEGRADES to the deterministic
+ *      leak floor end-to-end — a clean message SENDS (200), a leak HOLDS (422),
+ *      and the operator strict override restores pure-hold. (Replaces the prior
+ *      pure-fail-closed assertion; tone-gate-graceful-degradation, postmortem F4.)
  *   4. The happy path still delivers (200) — the rule does not over-block.
  */
 
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import express from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createRoutes } from '../../src/server/routes.js';
 import { MessagingToneGate } from '../../src/core/MessagingToneGate.js';
+import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 import type { IntelligenceProvider } from '../../src/core/types.js';
+
+// UNIQUE per-run stateDir — never a shared literal '/tmp'. The routes wire a
+// DURABLE OutboundContentDedup store at `<stateDir>/outbound-dedup.db`; with a
+// shared '/tmp' every suite run on the same machine within the 15-min dedup
+// window sees the PREVIOUS run's successful send of the fixed test text and
+// wrongly suppresses it (observed 2026-07-02: the happy-path delivery test
+// failed on back-to-back local runs).
+const tmpStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'b15-judge-'));
 
 interface TestServer { url: string; close: () => Promise<void>; }
 async function listen(app: express.Express): Promise<TestServer> {
@@ -42,9 +57,9 @@ function buildApp(toneGate: MessagingToneGate, sent: Array<{ topicId: number; te
   const app = express();
   app.use(express.json());
   const ctx: any = {
-    config: { authToken: 'test', stateDir: '/tmp', port: 0, projectName: 'echo' },
+    config: { authToken: 'test', stateDir: tmpStateDir, port: 0, projectName: 'echo' },
     messagingToneGate: toneGate,
-    telegram: { sendToTopic: async (topicId: number, text: string) => { sent.push({ topicId, text }); } },
+    telegram: { sendToTopic: async (topicId: number, text: string) => { sent.push({ topicId, text });  return { messageId: 1, topicId: Number(topicId) }; } },
     sessionManager: { clearInjectionTracker: () => {} },
   };
   app.use(createRoutes(ctx));
@@ -54,6 +69,13 @@ function buildApp(toneGate: MessagingToneGate, sent: Array<{ topicId: number; te
 describe('gate-prompts-judge-by-meaning — POST /telegram/reply integration', () => {
   let server: TestServer;
   afterEach(async () => { await server?.close(); });
+  afterAll(() => {
+    SafeFsExecutor.safeRmSync(tmpStateDir, {
+      recursive: true,
+      force: true,
+      operation: 'tests/integration/telegram-reply-b15-judge-by-meaning.test.ts',
+    });
+  });
 
   async function reply(topicId: number, text: string) {
     const res = await fetch(`${server.url}/telegram/reply/${topicId}`, {
@@ -94,11 +116,32 @@ describe('gate-prompts-judge-by-meaning — POST /telegram/reply integration', (
     expect(sent.length).toBe(0);
   });
 
-  it('FAILS CLOSED end-to-end when the provider throws — message HELD, not delivered', async () => {
+  // tone-gate-graceful-degradation F4: when the provider throws (LLM-backend
+  // outage) with failClosedOnExhaustion UNSET (the default), the route DEGRADES
+  // to the in-process deterministic leak floor end-to-end — a CLEAN message
+  // SENDS (200; the user is never silently cut off) while a real leak still
+  // HOLDS (422). Operators restore pure-hold with failClosedOnExhaustion:true.
+  it('F4: provider throws + CLEAN message → DEGRADE-SEND end-to-end (200, delivered)', async () => {
     const sent: Array<{ topicId: number; text: string }> = [];
     server = await listen(buildApp(new MessagingToneGate(providerThrowing()), sent));
     const r = await reply(28130, 'any outbound message');
-    expect(r.status).toBe(422); // held (pass=false) — not a 200 delivery
+    expect(r.status).toBe(200); // degrade-send — the floor passed a clean message
+    expect(sent).toEqual([{ topicId: 28130, text: 'any outbound message' }]);
+  });
+
+  it('F4: provider throws + LEAK → still HELD end-to-end (422), degrade is not a blanket pass', async () => {
+    const sent: Array<{ topicId: number; text: string }> = [];
+    server = await listen(buildApp(new MessagingToneGate(providerThrowing()), sent));
+    const r = await reply(28130, 'see .instar/config.json');
+    expect(r.status).toBe(422); // a real leak is held even on the degrade path
+    expect(sent.length).toBe(0);
+  });
+
+  it('F4 operator override: failClosedOnExhaustion:true + provider throws → pure-HOLD even for clean (422)', async () => {
+    const sent: Array<{ topicId: number; text: string }> = [];
+    server = await listen(buildApp(new MessagingToneGate(providerThrowing(), { failClosedOnExhaustion: true }), sent));
+    const r = await reply(28130, 'any outbound message');
+    expect(r.status).toBe(422); // strict mode restores the legacy fail-closed hold
     expect(sent.length).toBe(0);
   });
 

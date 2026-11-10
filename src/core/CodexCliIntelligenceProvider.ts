@@ -23,7 +23,12 @@ import { mkdtempSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { IntelligenceProvider, IntelligenceOptions } from './types.js';
-import { resolveCliModelFlag } from '../providers/adapters/openai-codex/models.js';
+import {
+  CODEX_CHATGPT_FALLBACK_MODEL,
+  resolveCliModelFlag,
+} from '../providers/adapters/openai-codex/models.js';
+import { classifyCodexErrorMessage } from '../providers/adapters/openai-codex/observability/eventNormalizer.js';
+import { KNOWN_CODEX_MODEL_IDS } from './ModelTierEscalation.js';
 import {
   buildCodexChildEnv,
   spawnCodexExecJson,
@@ -32,6 +37,7 @@ import {
   maybeSweepStaleCodexOutDirs,
 } from '../providers/adapters/openai-codex/transport/codexSpawn.js';
 import { CodexUsageAccumulator } from '../providers/adapters/openai-codex/transport/codexUsageParser.js';
+import { scrubForStore } from './durableSecretScrub.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -92,6 +98,15 @@ function resolveIntelligenceScratchDir(): string {
 const EXEC_JSON_RECOVERY_LEVERS =
   'If this codex CLI predates --json/--output-last-message (< 0.20), disable exec-json mode via ' +
   '`intelligence.codexExecJson: false` in .instar/config.json or env INSTAR_CODEX_EXEC_JSON=0.';
+
+/**
+ * One line, at most 240 chars, secrets redacted — safe to carry inside a
+ * thrown Error. Scrubs a 3,000-char window FIRST, then cuts, so a secret
+ * straddling the cut is still recognised whole (same order as outputExcerpt).
+ */
+function boundedErrorEvent(message: string): string {
+  return scrubForStore(message.replace(/\s+/g, ' ').trim().slice(0, 3_000), { maxBytes: 8_192 }).text.slice(0, 240);
+}
 
 function unknownFlagHint(stderrTail: string): string {
   return /unexpected argument|unrecognized option|unknown (option|flag)/i.test(stderrTail)
@@ -209,6 +224,67 @@ export function _resetUsageDriftEmissionForTest(): void {
   warnedConfigParseFailure = false;
 }
 
+/**
+ * Parse one `codex exec --json` line for the two fields the exec-json result
+ * path needs to settle EARLY under the codex 0.144 shutdown-linger regression
+ * (see codexSpawn.ts `settleOnTerminalLine`): the agent's final answer text
+ * (`item.completed` → `agent_message` → `text`) and whether the turn terminally
+ * completed (`turn.completed`).
+ *
+ * SECURITY / SIGNAL-vs-AUTHORITY: this is a TYPED, top-level `JSON.parse` with
+ * explicit shape checks — the SAME trust surface the usage parser already
+ * applies to `turn.completed.usage` (never substring/regex matching, which
+ * model content embedded in a string field could match). The `agent_message`
+ * `text` field is codex's OWN structured final-answer channel — it carries the
+ * IDENTICAL bytes codex writes to `--output-last-message` (codex writes that
+ * file FROM the same last message). It is used as the result ONLY on the
+ * early-terminal-settle path (when the child lingered past the grace and the
+ * file has not yet been written); a promptly-exiting CLI still reads the file
+ * as the authority, unchanged.
+ */
+function tryParseCodexResultEvent(
+  line: string,
+): { agentMessageText?: string; turnCompleted?: boolean; errorMessage?: string } | null {
+  const t = line.trim();
+  if (!t.startsWith('{') || !t.endsWith('}')) return null;
+  // Perf pre-filter — decides only whether to ATTEMPT the parse; it cannot
+  // extract values (extraction is strictly the top-level JSON.parse below).
+  if (!t.includes('turn.completed') && !t.includes('agent_message') && !t.includes('"error"') && !t.includes('turn.failed')) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(t);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const p = parsed as Record<string, unknown>;
+  if (p['type'] === 'turn.completed') return { turnCompleted: true };
+  // In --json mode codex reports WHY a run failed on stdout, not stderr: a
+  // top-level `error` event (`{"type":"error","message":…}`) or a
+  // `turn.failed` carrying `error.message` (e.g. "exceeded retry limit, last
+  // status: 429 Too Many Requests"). Without this the thrown Error read only
+  // "exit 1" — the 2026-10-14 four-day sorter pause looked like a mystery.
+  if (p['type'] === 'error' && typeof p['message'] === 'string') return { errorMessage: p['message'] };
+  if (p['type'] === 'turn.failed') {
+    const err = p['error'];
+    if (typeof err === 'object' && err !== null && typeof (err as Record<string, unknown>)['message'] === 'string') {
+      return { errorMessage: (err as Record<string, unknown>)['message'] as string };
+    }
+  }
+  if (p['type'] === 'item.completed') {
+    const item = p['item'];
+    if (
+      typeof item === 'object' &&
+      item !== null &&
+      (item as Record<string, unknown>)['type'] === 'agent_message' &&
+      typeof (item as Record<string, unknown>)['text'] === 'string'
+    ) {
+      return { agentMessageText: (item as Record<string, unknown>)['text'] as string };
+    }
+  }
+  return null;
+}
+
 export interface CodexCliIntelligenceProviderOptions {
   /** Absolute path to the `codex` CLI binary. */
   codexPath: string;
@@ -235,17 +311,106 @@ export interface CodexCliIntelligenceProviderOptions {
    * working rollback lever.
    */
   resolveExecJson?: () => boolean;
+  /**
+   * Optional per-call resolver naming WHICH pool account this call runs on.
+   *
+   * Internal Codex calls have never chosen an account: the child inherits the
+   * ambient `CODEX_HOME`, so every one of them lands on the default login. That
+   * is why "swap a degrading Codex session onto the other Codex account" has no
+   * mechanism behind it for internal calls — there is only ever one account in
+   * play, and nothing records which.
+   *
+   * This supplies the missing degree of freedom. It is a per-call CLOSURE, not a
+   * constructor value, for the same reason `resolveExecJson` is: the router
+   * caches built providers, so a value captured at construction would freeze the
+   * first answer forever.
+   *
+   * ABSENT OR NULL ⇒ ambient behaviour, byte-identical to today. The account is
+   * only ever narrowed when a caller deliberately supplies one, so wiring this
+   * is a separate, deliberate act — nothing changes by adding the capability.
+   *
+   * The resolver must not throw; if it does, the call falls back to ambient
+   * rather than failing, because losing every internal Codex call would be
+   * strictly worse than losing account selection for one of them.
+   */
+  resolveAccount?: () => CodexCallAccount | null;
+  /**
+   * Optional observer for per-account health: reports how each call actually
+   * went, so "is THIS account unwell" has a measurement behind it.
+   *
+   * Instar records LLM metrics against the COMPONENT that asked, never the
+   * account that answered — the right shape for cost, the wrong shape for a
+   * degradation trigger. This supplies the missing dimension.
+   *
+   * Called ONLY when an account was actually named. With no account there is
+   * nothing to attribute a sample to, and attributing it to "the default" would
+   * invent a measurement. Must not throw; a throwing observer is swallowed
+   * rather than allowed to break the call it is measuring.
+   */
+  onCallObserved?: (sample: { accountId: string; latencyMs: number; ok: boolean }) => void;
+}
+
+/** Which pool account an internal Codex call should run under. */
+export interface CodexCallAccount {
+  /** Pool account id — recorded so a later reading can be attributed to it. */
+  accountId: string;
+  /** That account's credential slot; becomes the child's `CODEX_HOME`. */
+  configHome: string;
 }
 
 export class CodexCliIntelligenceProvider implements IntelligenceProvider {
+  readonly frameworkId = 'codex-cli';
   private readonly codexPath: string;
+  /** @see CodexCliIntelligenceProviderOptions.resolveAccount */
+  private readonly resolveAccount: (() => CodexCallAccount | null) | undefined;
+  /** @see CodexCliIntelligenceProviderOptions.onCallObserved */
+  private readonly onCallObserved:
+    | ((sample: { accountId: string; latencyMs: number; ok: boolean }) => void)
+    | undefined;
   private readonly sandboxMode: 'read-only' | 'workspace-write' | 'danger-full-access';
   private readonly resolveExecJson: () => boolean;
+
+  /**
+   * Resolve the account for this call, or null for ambient.
+   *
+   * Never throws: a broken resolver degrades to the ambient default rather than
+   * failing the call. Losing account SELECTION is a small loss; losing every
+   * internal Codex call is not.
+   */
+  private accountForCall(options?: IntelligenceOptions): CodexCallAccount | null {
+    // A per-call override wins over the provider's resolver. The failure tail uses
+    // it to retry ONE call on the sibling account — a decision that belongs to that
+    // attempt, not to the provider, and that a provider-level closure cannot express.
+    const override = options?.accountOverride;
+    if (options?.requiredRoute && !override) {
+      throw new Error('CodexCliIntelligenceProvider: required subscription account missing');
+    }
+    if (options?.requiredRoute && override &&
+      (typeof override.accountId !== 'string' || override.accountId.length === 0 ||
+        typeof override.configHome !== 'string' || override.configHome.length === 0)) {
+      throw new Error('CodexCliIntelligenceProvider: invalid required account override');
+    }
+    if (override && typeof override.configHome === 'string' && override.configHome.length > 0) {
+      return { accountId: override.accountId, configHome: override.configHome };
+    }
+    if (!this.resolveAccount) return null;
+    try {
+      const a = this.resolveAccount();
+      if (!a || typeof a.configHome !== 'string' || a.configHome.length === 0) return null;
+      return a;
+    } catch {
+      /* @silent-fallback-ok: degrade to ambient. Documented on the option; the
+         alternative is failing calls that would otherwise have succeeded. */
+      return null;
+    }
+  }
 
   constructor(options: CodexCliIntelligenceProviderOptions) {
     this.codexPath = options.codexPath;
     this.sandboxMode = options.sandboxMode ?? 'read-only';
     this.resolveExecJson = options.resolveExecJson ?? execJsonEnvDefault;
+    this.resolveAccount = options.resolveAccount;
+    this.onCallObserved = options.onCallObserved;
     // options.workingDirectory is intentionally NOT stored: judgment calls
     // always run in an empty scratch dir (resolveIntelligenceScratchDir), so
     // the agent's project identity + hooks never load. The option is retained
@@ -264,8 +429,11 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
 
   /** Hygiene args shared by BOTH modes (clean-call spec; pinned by the
    * both-modes unit test). */
-  private hygieneArgs(model: string, scratchDir: string): string[] {
+  private hygieneArgs(model: string, scratchDir: string, noLocalTools = false): string[] {
     return [
+      // A read-only sandbox can still read local files, so a call carrying outside text
+      // asks for no tools at all (docs/specs/ecosystem-idea-pipeline.md §1).
+      ...(noLocalTools ? ['--disable', 'shell_tool', '--disable', 'unified_exec', '--disable', 'apps', '--disable', 'browser_use', '--disable', 'computer_use', '-c', 'mcp_servers={}'] : []),
       '--model',
       model,
       '--sandbox',
@@ -307,10 +475,87 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
     } catch {
       execJson = execJsonEnvDefault(); // a throwing resolver must not take the call down
     }
-    if (execJson) {
-      return this.evaluateExecJson(prompt, options, model);
+
+    // Resolve the account ONCE and thread it down, rather than re-reading it at
+    // each spawn site. If the recorded account could differ from the account
+    // actually used, the health gauge would be quietly wrong — and a gauge that
+    // can disagree with reality is worse than no gauge, because a trigger would
+    // act on it with confidence.
+    const account = this.accountForCall(options);
+    const startedAtMs = Date.now();
+    let ok = false;
+    try {
+      const result = await this.evaluateWithModelObserved(
+        prompt,
+        options,
+        model,
+        execJson,
+        account,
+      );
+      ok = true;
+      return result;
+    } finally {
+      // Per-account health is recorded ONLY when an account was actually named.
+      // With no account there is nothing to attribute the sample to, and
+      // attributing it to "the default" would invent a measurement.
+      if (account && this.onCallObserved) {
+        try {
+          this.onCallObserved({
+            accountId: account.accountId,
+            latencyMs: Date.now() - startedAtMs,
+            ok,
+          });
+        } catch {
+          /* @silent-fallback-ok: observation is a gauge. A throwing observer must
+             never break the call it is measuring. */
+        }
+      }
     }
-    return this.evaluatePlain(prompt, options, model);
+  }
+
+  /** The pre-existing evaluate body: model-retirement self-heal around the call. */
+  private async evaluateWithModelObserved(
+    prompt: string,
+    options: IntelligenceOptions | undefined,
+    model: string,
+    execJson: boolean,
+    account: CodexCallAccount | null,
+  ): Promise<string> {
+    try {
+      return await this.evaluateWithModel(prompt, options, model, execJson, account);
+    } catch (error) {
+      if (
+        !options?.strictModelPin &&
+        model !== CODEX_CHATGPT_FALLBACK_MODEL &&
+        classifyCodexErrorMessage((error as Error).message) === 'unsupported' &&
+        KNOWN_CODEX_MODEL_IDS.includes(CODEX_CHATGPT_FALLBACK_MODEL)
+      ) {
+        // @silent-fallback-ok — deliberate, bounded self-heal for Codex's
+        // exact ChatGPT-account model-retirement signature. The retry uses a
+        // live-verified known-good floor and is never recursively retried.
+        try { options?.onModel?.({ model: CODEX_CHATGPT_FALLBACK_MODEL, framework: 'codex-cli' }); } catch { /* @silent-fallback-ok: onModel is pure observability */ }
+        return this.evaluateWithModel(
+          prompt,
+          options,
+          CODEX_CHATGPT_FALLBACK_MODEL,
+          execJson,
+          account,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private evaluateWithModel(
+    prompt: string,
+    options: IntelligenceOptions | undefined,
+    model: string,
+    execJson: boolean,
+    account: CodexCallAccount | null,
+  ): Promise<string> {
+    return execJson
+      ? this.evaluateExecJson(prompt, options, model, account)
+      : this.evaluatePlain(prompt, options, model, account);
   }
 
   /**
@@ -329,13 +574,15 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
     prompt: string,
     options: IntelligenceOptions | undefined,
     model: string,
+    account: CodexCallAccount | null,
   ): Promise<string> {
     const scratchDir = resolveIntelligenceScratchDir();
 
     return new Promise((resolve, reject) => {
       const args = [
         'exec',
-        ...this.hygieneArgs(model, scratchDir),
+        ...(account && options?.requiredRoute ? ['-c', 'cli_auth_credentials_store="file"'] : []),
+        ...this.hygieneArgs(model, scratchDir, options?.noLocalTools === true),
         // Pass the prompt as a positional arg. Codex CLI reads stdin
         // for very long prompts but the positional path is fine for the
         // narrow prompts reviewers/sentinels send (a few hundred tokens
@@ -354,8 +601,18 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
       // CLAUDECODE / CLAUDE_SESSION_ID are not in the allowlist so they
       // are dropped automatically — the prior explicit deletes are now
       // redundant but the hygiene intent is preserved by the allowlist.
-      const childEnv = buildCodexChildEnv();
+      const childEnv = buildCodexChildEnv(
+        account ? { codexHome: account.configHome, subscriptionOnly: options?.requiredRoute !== undefined }
+          : { subscriptionOnly: options?.requiredRoute !== undefined },
+      );
 
+      if (options?.signal?.aborted || (options?.launchGuard && !options.launchGuard())) {
+        reject(new Error('CodexCliIntelligenceProvider: launch guard refused'));
+        return;
+      }
+
+      let aborted = false;
+      let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
       const child = execFile(
         this.codexPath,
         args,
@@ -367,6 +624,14 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
           env: childEnv,
         },
         (error, stdout, stderr) => {
+          options?.signal?.removeEventListener('abort', onAbort);
+          if (forceKillTimer) clearTimeout(forceKillTimer);
+          // execFile invokes its callback after the child has closed. Retain
+          // the caller's capacity slot until then, even if SIGTERM was ignored.
+          if (aborted) {
+            reject(new Error('Codex CLI call aborted'));
+            return;
+          }
           if (error) {
             // Generous stderr slice so the circuit breaker's rate-limit
             // classifier can see usage/limit language past the first 200 chars.
@@ -381,6 +646,15 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
           resolve(stdout.trim());
         },
       );
+      const onAbort = (): void => {
+        if (aborted) return;
+        aborted = true;
+        child.kill('SIGTERM');
+        forceKillTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+        forceKillTimer.unref();
+      };
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options?.signal?.aborted) onAbort();
 
       // Stdin must be explicitly closed or Codex hangs waiting for EOF
       // even when the prompt was passed as a positional. Same bug class
@@ -399,6 +673,7 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
     prompt: string,
     options: IntelligenceOptions | undefined,
     model: string,
+    account: CodexCallAccount | null,
   ): Promise<string> {
     const scratchDir = resolveIntelligenceScratchDir();
     const outDir = createCodexOutDir();
@@ -408,35 +683,80 @@ export class CodexCliIntelligenceProvider implements IntelligenceProvider {
     const outFile = join(outDir, 'last-message.txt');
     const acc = new CodexUsageAccumulator();
     let exitedZero = false;
+    // The LAST `error` / `turn.failed` message seen on stdout — the only place
+    // codex says WHY a --json run failed (stderr is empty); carried into the
+    // thrown Error, bounded + scrubbed, when the child exits non-zero.
+    let lastErrorEvent: string | null = null;
+    // Early-terminal-settle capture (codex 0.144 shutdown-linger regression):
+    // codex writes --output-last-message and exits ~16-30s AFTER emitting
+    // turn.completed, which trips the 30s timeout on an ALREADY-COMPLETED call.
+    // We capture the agent's final answer from the structured event stream so
+    // the call can settle on the result it already holds. See
+    // spawnCodexExecJson `settleOnTerminalLine` + `tryParseCodexResultEvent`.
+    let agentMessageText: string | null = null;
+    let sawTerminalTurn = false;
 
     try {
       const args = [
         'exec',
+        ...(account && options?.requiredRoute ? ['-c', 'cli_auth_credentials_store="file"'] : []),
         '--json',
         '--output-last-message',
         outFile,
-        ...this.hygieneArgs(model, scratchDir),
+        ...this.hygieneArgs(model, scratchDir, options?.noLocalTools === true),
         // The prompt moves OFF argv in --json mode (argv is world-readable
         // via `ps`; macOS ARG_MAX ~1 MB would hard-fail large prompts). The
         // positional becomes `-` and the prompt is written to stdin.
         '-',
       ];
 
+      if (options?.signal?.aborted || (options?.launchGuard && !options.launchGuard())) {
+        throw new Error('CodexCliIntelligenceProvider: launch guard refused');
+      }
       const result = await spawnCodexExecJson(this.codexPath, args, {
         timeoutMs: options?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        env: buildCodexChildEnv(), // Spec 12 Rule 1a — both modes
+        signal: options?.signal,
+        env: buildCodexChildEnv(
+          account ? { codexHome: account.configHome, subscriptionOnly: options?.requiredRoute !== undefined }
+            : { subscriptionOnly: options?.requiredRoute !== undefined },
+        ), // Spec 12 Rule 1a — both modes
         prompt,
-        onLine: (line) => acc.feedLine(line),
+        onLine: (line) => {
+          acc.feedLine(line);
+          const ev = tryParseCodexResultEvent(line);
+          if (ev?.agentMessageText != null) agentMessageText = ev.agentMessageText;
+          if (ev?.turnCompleted) sawTerminalTurn = true;
+          if (ev?.errorMessage != null) lastErrorEvent = ev.errorMessage;
+        },
         onOversizedLine: () => acc.noteOversizedDiscard(),
+        // Settle EARLY once the terminal turn completed AND we hold its final
+        // message — the codex 0.144 process may then linger ~16-30s before
+        // writing the file and exiting. Requiring BOTH signals means a turn
+        // that produced no message never early-settles (it falls through to
+        // the file/exit path below), and a turn.failed (never turn.completed)
+        // is still a genuine failure.
+        settleOnTerminalLine: () => sawTerminalTurn && agentMessageText !== null,
       });
+
+      if (result.terminalCompletion) {
+        // The turn terminally completed and we hold its result via the
+        // structured agent_message event; the child was reaped instead of
+        // waiting for codex 0.144 to write the file and exit (which trips the
+        // timeout on an already-completed call and holds the spawn-cap slot).
+        // The turn completed successfully → finalize usage as a success.
+        exitedZero = true;
+        return (agentMessageText ?? '').trim();
+      }
 
       if (result.exitCode === 0) exitedZero = true;
       if (result.exitCode !== 0) {
-        // Bounded stderr tail only — JSONL payloads are never concatenated
-        // wholesale into thrown Errors.
+        // Bounded stderr tail plus the LAST error/turn.failed message from the
+        // event stream (bounded + secret-scrubbed) — JSONL payloads are never
+        // concatenated wholesale into thrown Errors.
         throw new Error(
           `Codex CLI error (exec --json, exit ${result.exitCode})` +
             (result.stderrTail ? ` — ${result.stderrTail}` : '') +
+            (lastErrorEvent ? ` — last event: ${boundedErrorEvent(lastErrorEvent)}` : '') +
             unknownFlagHint(result.stderrTail),
         );
       }

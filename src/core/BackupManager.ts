@@ -1,3 +1,5 @@
+import { ORIGIN_LOCAL_BACKUP_PREFIXES } from '../messaging/telegram-origin/OriginLocalPaths.js';
+import { KEY_MATERIAL_BACKUP_PREFIXES } from './keyMaterialPaths.js';
 /**
  * Backup Manager — snapshot and restore agent state files.
  *
@@ -16,6 +18,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type { BackupSnapshot, BackupConfig } from './types.js';
 import { SafeFsExecutor } from './SafeFsExecutor.js';
+import { mergeDefaults } from './mergeDefaults.js';
 
 const SNAPSHOT_ID_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{6}Z(-\d+)?$/;
 const BLOCKED_FILES = new Set(['config.json', 'secrets', 'machine']);
@@ -28,7 +31,34 @@ const BLOCKED_FILES = new Set(['config.json', 'secrets', 'machine']);
 // defense against that failure mode. Any entry under one of these prefixes is
 // skipped during snapshot creation regardless of config source.
 const BLOCKED_PATH_PREFIXES = new Set([
+  ...ORIGIN_LOCAL_BACKUP_PREFIXES,
+  // Key material (a2a-single-agent-identity §5.3), in BOTH spellings the set
+  // uses: an operator adding `identity.json` to `backup.includeFiles` must not
+  // ship the agent's private key in a snapshot that git-sync replicates.
+  // Stated cost: a lone machine's only identity recovery is then
+  // `init --standalone` + peer re-pins. Same source list as the file routes'
+  // never-served deny, the gitignore entries and the sync classifier.
+  ...KEY_MATERIAL_BACKUP_PREFIXES,
   '.instar/secrets/',
+  // Chrome profiles hold session cookies and the Linux driver's state names live processes on one
+  // machine; a restored auto-install file would also start a root install on another machine.
+  'state/playwright-profiles/',
+  'state/xdrive/',
+  // Team access (team-roles-and-access §7): an ordinary restore must not roll back who has access.
+  // /mobile/team/restore is the only way back.
+  'state/team-access/',
+  'state/team-access-last-good/',
+  '.instar/state/team-access/',
+  '.instar/state/team-access-last-good/',
+  '.instar/state/playwright-profiles/',
+  '.instar/state/xdrive/',
+  // includeFiles entries resolve RELATIVE TO stateDir (sourcePath = path.join(stateDir,
+  // entry)), so the project-relative '.instar/secrets/' spelling above never matched a
+  // stateDir-relative 'secrets/…' entry: `includeFiles: ['secrets/passkeys/']` or
+  // ['secrets/config.secrets.enc'] was copied into snapshots. The whole secrets tree —
+  // shared vault, agent-held passkey store, pending mint records, passkey browser
+  // profiles — is machine-local and never backed up (agent-held-google-passkey §3.1).
+  'secrets/',
   // Durable Inbound Message Queue (spec §5.5): the custody store + sidecars +
   // quarantined copies are in-flight per-machine state — restoring them to a
   // new machine would claim custody the new machine never took. Unconditional
@@ -36,11 +66,43 @@ const BLOCKED_PATH_PREFIXES = new Set([
   // how includeFiles entries resolve (sourcePath = path.join(stateDir, entry)).
   'state/pending-inbound.',
   'state/pending-inbound-quarantine/',
+  // A2A inbound message-id ledger (docs/specs/a2a-inbound-id-ledger.md): per-
+  // machine in-flight dedup state, never copied between machines.
+  'state/a2a-inbound-ids.',
   // Parallel-Hand PR Lease (spec parallel-hand-pr-lease §8): the lease store is
   // ephemeral per-machine coordination state (TTL-bounded, self-healing). Restoring
   // it to another machine would resurrect a stale lease as "live" — a regression.
   // Safe to lose (reconstructed on demand). stateDir-relative prefix.
   'state/pr-hand-leases.json',
+  // SelfActionGovernor durable admission-state snapshot + telemetry aggregates
+  // (unified-self-action-backpressure FD14/INT7-3): per-machine count-window
+  // state. Backups replicate to paired machines, where a RECENT foreign
+  // snapshot passes recency-validation while carrying the WRONG machine's
+  // counts, and a foreign aggregates file fabricates prior-flush evidence +
+  // pollutes the FD12 soak counters. The `state/self-action-governor` prefix
+  // covers the snapshot, the aggregates file, and their tmp siblings.
+  'state/self-action-governor',
+  // External-hog decision store (llm-decision-quality-meter spec §5.3): grading
+  // ground truth keyed on machine-specific pid + start-time tuples — a restored
+  // foreign copy would feed stale identities into the respawn predicate. Same
+  // per-machine-state posture as 'state/pr-hand-leases.json'. stateDir-relative
+  // literal.
+  'state/external-hog-decisions.json',
+  // Subscription authority is physical-credential-local machine state. The
+  // prefix covers the active directory, initialized witness, candidate,
+  // rollback, and atomic temp siblings. Keep both relative forms because
+  // callers may express paths relative to stateDir or projectDir.
+  'state/subscription-pool',
+  '.instar/state/subscription-pool',
+  // Login reliability evidence is physical-credential-local and may include
+  // machine identity, SQLite WAL/SHM, watermark, and refusal sidecar siblings.
+  'state/subscription-login-ledger',
+  '.instar/state/subscription-login-ledger',
+  // Assisted repair state is machine-bound and correlates local login/profile
+  // authority. Never restore it onto another machine or duplicate an in-flight
+  // repair through backup replication.
+  'state/subscription-relogin',
+  '.instar/state/subscription-relogin',
 ]);
 
 /**
@@ -68,6 +130,49 @@ export const REMEDIATION_EXCLUDED_PATH_PREFIXES: readonly string[] = Object.free
   '.instar/remediation/llm-raw-',
 ]);
 
+/**
+ * Path segments that are NEVER included in a backup snapshot, UNCONDITIONALLY
+ * (no feature-flag gate): judgment-call provenance rows are machine-local
+ * decision context (0700/0600, gitignored, never HTTP-served) — a backup that
+ * crosses machines must never carry them
+ * (ownership-gated-spawn-and-judgment-within-floors spec §3.5). Segment-matched
+ * (not prefix-matched) so a user-added includeFiles entry cannot smuggle the
+ * directory in under a different relative spelling.
+ */
+export const NEVER_BACKUP_PATH_SEGMENTS: readonly string[] = Object.freeze([
+  'judgment-provenance',
+  // Codex device-limit judge provenance (codex-device-limit-tripwire §1): machine-local only.
+  'codex-device-limit-provenance',
+  'claim-verification',
+  // External-hog decision store (llm-decision-quality-meter spec §5.3): same
+  // machine-local posture as the provenance rows; the filename segment closes
+  // alternate relative spellings the stateDir-relative prefix cannot.
+  'external-hog-decisions.json',
+]);
+
+/**
+ * Re-apply ALL THREE unconditional deny layers to a stateDir-relative path:
+ * BLOCKED_FILES (basename equality), BLOCKED_PATH_PREFIXES (prefix), and
+ * NEVER_BACKUP_PATH_SEGMENTS (segment). Every deny list is otherwise consulted
+ * against the includeFiles ENTRY string only — so a directory entry like
+ * 'state/' (or the './' root glob, whose entry basename '.' passes every
+ * entry-level check) would ship excluded per-machine state via its direct file
+ * children. Called per copied file in createSnapshot's directory-copy branch
+ * and per restored file in restoreSnapshot (a pre-fix snapshot must not
+ * re-import excluded state). llm-decision-quality-meter spec §5.3 / ACT-1201.
+ */
+function isDeniedForBackup(relPath: string): boolean {
+  const normalized = path.normalize(relPath);
+  if (BLOCKED_FILES.has(path.basename(normalized)) || BLOCKED_FILES.has(relPath)) return true;
+  // Case-folded: on a case-insensitive filesystem (macOS default) `Secrets/…` reaches
+  // the same files as `secrets/…`.
+  const folded = normalized.toLowerCase();
+  for (const prefix of BLOCKED_PATH_PREFIXES) {
+    if (folded.startsWith(prefix.toLowerCase())) return true;
+  }
+  return normalized.split(/[\\/]/).some((seg) => NEVER_BACKUP_PATH_SEGMENTS.includes(seg));
+}
+
 const DEFAULT_CONFIG: BackupConfig = {
   enabled: true,
   maxSnapshots: 20,
@@ -78,6 +183,12 @@ const DEFAULT_CONFIG: BackupConfig = {
     'jobs.json',
     'users.json',
     'relationships/',
+    // A person's choices, so a no survives restoring a lone machine.
+    'state/recommended-services/',
+    'state/offer-prerequisites/',
+    'state/recommended-service-setup/',
+    // Attribution paper trail: a restore without pins would turn good citations into uncheckable ones.
+    'attribution/',
     // Integrated-Being v1 (gated by config.integratedBeing.enabled at snapshot
     // time — see resolveIncludedFiles()). Glob matches the active ledger and
     // any rotated .jsonl.<epoch> archives.
@@ -86,6 +197,13 @@ const DEFAULT_CONFIG: BackupConfig = {
     // The bulky per-thread `threadline/threads/*.log.jsonl` are EXCLUDED by design
     // (large, reconstructable via backfill; the symmetry surface flags any gap).
     'threadline/conversations.json',
+    // ClassReview is the retained audit/correspondence artifact. Include the
+    // SQLite main file plus active WAL/SHM companions as one glob so restore
+    // cannot strand a filled review behind a missing journal.
+    'class-reviews.db*',
+    // Feedback Factory operated state: canonical source generations, durable
+    // drain DB/WAL, authority-registry sidecar/audit, and consumer promotion.
+    'state/feedback-factory/store/',
   ],
 };
 
@@ -148,8 +266,7 @@ export class BackupManager {
       new Set<string>([...DEFAULT_CONFIG.includeFiles, ...userIncludes]),
     );
     this.config = {
-      ...DEFAULT_CONFIG,
-      ...config,
+      ...mergeDefaults(DEFAULT_CONFIG, config),
       includeFiles: mergedIncludes,
     };
     this.isSessionActive = isSessionActive;
@@ -175,6 +292,10 @@ export class BackupManager {
     for (const entry of this.config.includeFiles) {
       // Gate: exclude the shared-state pattern when feature is disabled.
       if (sharedStateGateOff && entry.startsWith('shared-state.jsonl')) continue;
+      // UNCONDITIONAL never-backup segments (spec §3.5) — no flag gates this.
+      if (path.normalize(entry).split(/[\\/]/).some((seg) => NEVER_BACKUP_PATH_SEGMENTS.includes(seg))) {
+        continue;
+      }
       // F-7 / A35 gate: drop remediation runtime paths from any
       // user-added includeFiles entry. Same prefix-string shape as
       // BLOCKED_PATH_PREFIXES — caller is expected to normalize paths
@@ -271,7 +392,7 @@ export class BackupManager {
       const normalized = path.normalize(entry);
       let prefixBlocked = false;
       for (const prefix of BLOCKED_PATH_PREFIXES) {
-        if (normalized.startsWith(prefix)) {
+        if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
           prefixBlocked = true;
           break;
         }
@@ -286,19 +407,27 @@ export class BackupManager {
       if (entry.endsWith('/')) {
         // Directory — copy all files in it
         if (fs.existsSync(sourcePath) && fs.statSync(sourcePath).isDirectory()) {
-          const dirEntries = fs.readdirSync(sourcePath);
           const targetDir = path.join(snapshotDir, entry);
           fs.mkdirSync(targetDir, { recursive: true });
-
-          for (const file of dirEntries) {
-            const src = path.join(sourcePath, file);
-            if (fs.statSync(src).isFile()) {
-              const dest = path.join(targetDir, file);
-              fs.copyFileSync(src, dest);
-              const stat = fs.statSync(src);
-              totalBytes += stat.size;
-              files.push(path.join(entry, file));
+          const pending = fs.readdirSync(sourcePath).map((file) => ({ absolute: path.join(sourcePath, file), relative: path.join(entry, file) }));
+          while (pending.length > 0) {
+            const next = pending.pop()!;
+            if (isDeniedForBackup(next.relative)) {
+              console.warn(`[BackupManager] Skipping blocked file in directory copy: ${next.relative}`);
+              continue;
             }
+            const stat = fs.lstatSync(next.absolute);
+            if (stat.isSymbolicLink()) continue;
+            if (stat.isDirectory()) {
+              for (const child of fs.readdirSync(next.absolute)) pending.push({ absolute: path.join(next.absolute, child), relative: path.join(next.relative, child) });
+              continue;
+            }
+            if (!stat.isFile()) continue;
+            const dest = path.join(snapshotDir, next.relative);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.copyFileSync(next.absolute, dest);
+            totalBytes += stat.size;
+            files.push(next.relative);
           }
         }
       } else {
@@ -425,6 +554,13 @@ export class BackupManager {
 
     // Restore files
     for (const file of manifest.files) {
+      // A PRE-fix snapshot (or one crafted on another machine) may carry
+      // excluded per-machine state — apply the same three deny layers on the
+      // way back in, not just at snapshot time (ACT-1201).
+      if (isDeniedForBackup(file)) {
+        console.warn(`[BackupManager] Skipping excluded file during restore: ${file}`);
+        continue;
+      }
       const src = path.join(snapshotDir, file);
       const dest = path.join(this.stateDir, file);
 

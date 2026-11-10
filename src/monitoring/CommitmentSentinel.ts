@@ -18,6 +18,26 @@ import type { IntelligenceProvider } from '../core/types.js';
 import type { CommitmentTracker, CommitmentType } from './CommitmentTracker.js';
 import { DegradationReporter } from './DegradationReporter.js';
 import { readJsonlTailLines } from '../utils/jsonl-tail.js';
+import { buildBoundedContext, buildStructuredSha256Identity } from '../core/JudgmentProvenanceLog.js';
+import { DP_COMMITMENT_DETECT } from '../data/provenanceCoverage.js';
+
+export const COMMITMENT_SENTINEL_PROMPT_ID = 'commitment-detect-v1';
+
+/** Identity-only envelope for the exact exchange set shown to the detector. */
+export function buildCommitmentDecisionContext(input: {
+  promptText: string;
+  conversationText: string;
+  pairCount: number;
+}): Record<string, unknown> {
+  return buildBoundedContext({
+    promptIdentitySha256: buildStructuredSha256Identity(input.promptText),
+    promptChars: input.promptText.length,
+    promptBytes: Buffer.byteLength(input.promptText, 'utf8'),
+    conversationIdentitySha256: buildStructuredSha256Identity(input.conversationText),
+    conversationChars: input.conversationText.length,
+    pairCount: input.pairCount,
+  });
+}
 
 // ── Types ─────────────────────────────────────────────────────────
 
@@ -48,6 +68,7 @@ interface TelegramMessage {
   fromUser: boolean;
   timestamp: string;
   sessionName?: string | null;
+  provenance?: 'user' | 'agent' | 'automation';
 }
 
 interface DetectedCommitment {
@@ -273,15 +294,24 @@ export class CommitmentSentinel {
     const pairs: Array<{ user: string; agent: string }> = [];
 
     for (let i = 0; i < messages.length - 1; i++) {
-      if (messages[i].fromUser && !messages[i + 1].fromUser) {
-        // Drop bare approval/continuation exchanges before the LLM sees them —
-        // the dominant false-positive source (#49). A message that asks for
-        // nothing durable cannot seed a commitment.
-        if (isBareContinuation(messages[i].text)) continue;
-        pairs.push({
-          user: messages[i].text,
-          agent: messages[i + 1].text,
-        });
+      const userMessage = messages[i];
+      if (!userMessage.fromUser) continue;
+      // Drop bare approval/continuation exchanges before the LLM sees them —
+      // the dominant false-positive source (#49). A message that asks for
+      // nothing durable cannot seed a commitment.
+      if (isBareContinuation(userMessage.text)) continue;
+
+      // Automation may legitimately appear between a user request and the
+      // conversational reply (health notice, proxy update, watcher status).
+      // Skip structurally automated rows, but stop at the next user message so
+      // a reply is never paired with the wrong request. Legacy outbound rows
+      // have no provenance and retain the old immediate-agent behavior.
+      for (let j = i + 1; j < messages.length; j++) {
+        const candidate = messages[j];
+        if (candidate.fromUser) break;
+        if (candidate.provenance === 'automation') continue;
+        pairs.push({ user: userMessage.text, agent: candidate.text });
+        break;
       }
     }
 
@@ -310,7 +340,7 @@ A "commitment" is when:
 2. The agent acknowledges and agrees to do it
 
 Types of commitments:
-- "config-change": User asks to change a setting (e.g., "turn off auto-updates", "set max sessions to 5")
+- "config-change": User asks to change a GLOBAL agent setting (e.g., "turn off auto-updates", "set max sessions to 5"). configPath must be a real agent-wide config key. A request scoped to one topic or conversation ("swap this topic to Opus", "use gpt-6-sol here") is NOT config-change — record it as "one-time-action" with no configPath.
 - "behavioral": User asks agent to change ongoing behavior (e.g., "always check with me before deploying", "stop sending daily reports")
 - "one-time-action": User asks agent to do something once (e.g., "deploy the latest version", "clean up old logs")
 
@@ -333,6 +363,16 @@ IMPORTANT: Only return genuine commitments where the user asked for something du
         maxTokens: 500,
         temperature: 0,
         attribution: { component: 'CommitmentSentinel' }, // attribution for /metrics/features
+        provenance: {
+          decisionPoint: DP_COMMITMENT_DETECT,
+          context: buildCommitmentDecisionContext({
+            promptText: prompt,
+            conversationText,
+            pairCount: pairs.length,
+          }),
+          optionsPresented: ['no-commitment', 'config-change', 'behavioral', 'one-time-action'],
+          promptId: COMMITMENT_SENTINEL_PROMPT_ID,
+        },
         // Observable Intelligence: the sentinel ACTS (fired) when it detects at
         // least one genuine commitment; an empty array is a no-op. Mirrors the
         // parse below so /metrics/features reports a real fireRate.
@@ -364,6 +404,10 @@ IMPORTANT: Only return genuine commitments where the user asked for something du
       return parsed.filter((c: any) =>
         c.type && c.userRequest && c.agentResponse &&
         ['config-change', 'behavioral', 'one-time-action'].includes(c.type)
+      ).map((c: DetectedCommitment) =>
+        c.type === 'config-change' && (!c.configPath || c.configExpectedValue === undefined)
+          ? { ...c, type: 'one-time-action' as const, configPath: undefined, configExpectedValue: undefined }
+          : c
       ) as DetectedCommitment[];
     } catch (err) {
       // @silent-fallback-ok — LLM detection is best-effort; infrastructure enforcement still works

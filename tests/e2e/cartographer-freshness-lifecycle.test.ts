@@ -18,7 +18,7 @@
  *   POST /cartographer/node/refresh writes a summary, and GET /cartographer/health
  *   returns the spec #2 `freshness` backlog metric object.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import fs from 'node:fs';
@@ -26,6 +26,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { CartographerTree } from '../../src/core/CartographerTree.js';
+import type { CartographerRootRegistry } from '../../src/core/CartographerRootRegistry.js';
 import {
   CartographerSweepEngine,
   type SweepEngineConfig,
@@ -129,6 +130,7 @@ function engineFor(t: CartographerTree, router: SweepRouterLike): CartographerSw
     llmQueue: queueStub(),
     pressure: normalPressure,
     holdsLease: () => true,
+    authorizePaidAuthoring: () => ({ ok: true }),
     config: sweepConfig(),
     stateDir,
   });
@@ -190,18 +192,51 @@ describe('Cartographer doc-freshness sweep — feature is alive (Tier 3 E2E)', (
     const engine = engineFor(t, routerStub());
     const poller = new CartographerSweepPoller({ engine, cadenceMs: 50, idleCadenceMs: 50 });
     expect(poller.isBreakerOpen()).toBe(false);
-    poller.start();
-    // Let at least one cadence tick fire.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    poller.stop();
-    // A healthy author tick must NOT have tripped the degradation breaker.
-    expect(poller.isBreakerOpen()).toBe(false);
-    // The poller drove the real engine, which authored real nodes.
-    expect(t.computeStaleness('src/core/Widget.ts')).toBe('fresh');
+    const realRunPass = engine.runPass.bind(engine);
+    let completePass!: () => void;
+    let failPass!: (error: unknown) => void;
+    const completedPass = new Promise<void>((resolve, reject) => { completePass = resolve; failPass = reject; });
+    let activePass: ReturnType<typeof engine.runPass> | undefined;
+    const passSpy = vi.spyOn(engine, 'runPass').mockImplementation(() => {
+      activePass = realRunPass();
+      void activePass.then(completePass, failPass);
+      return activePass;
+    });
+    try {
+      poller.start();
+      // Await the real pass invoked by the poller, not an assumed duration of its work.
+      // The fixture's existing test timeout bounds a poller that never invokes the engine.
+      await completedPass;
+      expect(passSpy).toHaveBeenCalled();
+      // A healthy author tick must NOT have tripped the degradation breaker.
+      expect(poller.isBreakerOpen()).toBe(false);
+      // The poller drove the real engine, which authored real nodes.
+      expect(t.computeStaleness('src/core/Widget.ts')).toBe('fresh');
+    } finally {
+      poller.stop();
+      try { await activePass; } finally { passSpy.mockRestore(); }
+    }
   });
 
   // ── PART B — the spec #2 routes are alive (200, not 503) through the server ──
   function app(carto: CartographerTree): express.Express {
+    const cartographerRoots = {
+      resolve: () => ({
+        ok: true,
+        root: {
+          tree: carto,
+          assessment: {},
+          report: {
+            rootId: 'test-root', repositoryId: 'test-repository',
+            kind: 'active-project-checkout', canonicalPath: repo, revision: 'test-revision',
+            provenance: { source: 'server-project', projectName: 't' },
+            verificationState: 'verified', verificationReason: 'verified',
+            structuralPopulationAllowed: true, paidAuthoringAllowed: true,
+          },
+        },
+      }),
+      authorizePaidAuthoring: () => ({ ok: true }),
+    } as unknown as CartographerRootRegistry;
     const a = express();
     a.use(express.json());
     a.use(authMiddleware(() => AUTH, 'test'));
@@ -215,7 +250,7 @@ describe('Cartographer doc-freshness sweep — feature is alive (Tier 3 E2E)', (
           freshnessSweep: { enabled: true, egressAcknowledged: true, minSummaryChars: 10, maxSummaryChars: 600, maxLeafBytes: 24576 },
         },
       } as unknown as RouteContext['config'],
-      cartographer: carto,
+      cartographerRoots,
       startTime: new Date(),
     } as unknown as RouteContext));
     return a;
@@ -230,7 +265,12 @@ describe('Cartographer doc-freshness sweep — feature is alive (Tier 3 E2E)', (
     expect(res.body.sweepEnabled).toBe(true);
     // The spec #2 backlog object must be present with its real shape.
     expect(res.body.freshness).toBeDefined();
-    expect(typeof res.body.freshness.freshRatio).toBe('number');
+    // Honest denominator (convergence-towards-coherence Tier 1): this case has NO
+    // authored index, so there is nothing to divide by and the ratio must be null.
+    // This assertion previously required a NUMBER here, which locked in the old
+    // behaviour of reporting a perfect 1.0 over an empty tree — the value that made
+    // the CI freshness ratchet structurally unable to fail on an empty map.
+    expect(res.body.freshness.freshRatio).toBeNull();
     expect(typeof res.body.freshness.authorableCount).toBe('number');
     expect(res.body.freshness).toHaveProperty('neverAuthoredPastGrace');
     expect(res.body.freshness).toHaveProperty('staleCount');

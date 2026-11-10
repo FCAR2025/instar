@@ -28,9 +28,13 @@ import { getTelegramInboundDir } from '../../src/messaging/shared/telegramInboun
 
 // ── Test Constants ──────────────────────────────────────────────────
 
-const TMUX_PREFIX = 'sess-e2e-';
+// Process-unique because multiple worktrees may run this E2E concurrently on
+// the same tmux server. A global `sess-e2e-` cleanup prefix let one suite's
+// afterEach delete another suite's live fixtures.
+const TMUX_PREFIX = `instar-sm-e2e-${process.pid}-`;
 const tmuxPath = detectTmuxPath();
 const describeMaybe = tmuxPath ? describe : describe.skip;
+const maintenanceTicks = new WeakMap<SessionManager, () => Promise<void>>();
 
 // ── Mock Claude Scripts ─────────────────────────────────────────────
 
@@ -62,9 +66,11 @@ echo "  ⏵⏵ bypass permissions on (shift+tab to cycle)                    ◐
 read -r INPUT
 echo "Received: $INPUT"
 
-# After receiving input, stay alive briefly then exit
-sleep 1
-echo "Session ended"
+# Model an interactive REPL, not a one-shot command. Tests that need natural
+# completion use createMockClaudeOneShot/createMockClaudeCrash; this fixture is
+# explicitly used by concurrent-session liveness checks and is terminated by
+# afterEach cleanup. A one-second exit here raced those checks under suite load.
+while true; do sleep 30; done
 `);
   fs.chmodSync(scriptPath, '755');
   return scriptPath;
@@ -180,7 +186,7 @@ interface TestProject {
 }
 
 function createTestProject(): TestProject {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sess-e2e-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `instar-sm-e2e-${process.pid}-`));
   const stateDir = path.join(dir, '.instar');
   fs.mkdirSync(path.join(stateDir, 'state', 'sessions'), { recursive: true });
   fs.mkdirSync(path.join(stateDir, 'state', 'jobs'), { recursive: true });
@@ -194,7 +200,8 @@ function createTestProject(): TestProject {
 }
 
 function createManager(project: TestProject, claudePath: string, overrides?: Partial<SessionManagerConfig>): SessionManager {
-  return new SessionManager(
+  let maintenanceTick!: () => Promise<void>;
+  const manager = new SessionManager(
     {
       tmuxPath: tmuxPath!,
       claudePath,
@@ -205,7 +212,10 @@ function createManager(project: TestProject, claudePath: string, overrides?: Par
       ...overrides,
     },
     project.state,
+    { bindMaintenanceTickForTesting: (tick) => { maintenanceTick = tick; } },
   );
+  maintenanceTicks.set(manager, maintenanceTick);
+  return manager;
 }
 
 // ── BDD Tests ───────────────────────────────────────────────────────
@@ -394,7 +404,10 @@ describeMaybe('Session Management E2E', () => {
   describe('Feature: Subscription-pool pinning (B1, interactive lane)', () => {
     it('tags a real interactive session with the resolver-picked account + seeds its home onboarding-ready', async () => {
       const claudePath = createMockClaudeInteractive(project.dir);
-      const sm = createManager(project, claudePath);
+      // This scenario is specifically the Claude subscription-pool lane. Pin
+      // the framework so a Codex-hosted test runner cannot silently turn the
+      // pool resolver into the expected non-Claude no-op.
+      const sm = createManager(project, claudePath, { framework: 'claude-code' });
       managers.push(sm);
 
       // A headless-enrolled pool home: tokens present, interactive flags absent.
@@ -407,7 +420,7 @@ describeMaybe('Session Management E2E', () => {
 
       // When the user's interactive session spawns (no explicit configHome)
       const tmuxSession = await sm.spawnInteractiveSession(undefined, `${TMUX_PREFIX}pin-b1`);
-      await new Promise(r => setTimeout(r, 1500));
+      await waitFor(() => sm.isSessionAlive(tmuxSession), 10_000);
       expect(sm.isSessionAlive(tmuxSession)).toBe(true);
 
       // Then the persisted record is tagged with the pool account
@@ -436,7 +449,10 @@ describeMaybe('Session Management E2E', () => {
       const tmuxSession = await sm.spawnInteractiveSession(undefined, `${TMUX_PREFIX}detect-prompt`);
 
       // When we wait for readiness
-      await new Promise(r => setTimeout(r, 3000));
+      await waitFor(() => {
+        const out = sm.captureOutput(tmuxSession, 20) ?? '';
+        return out.includes('❯') || out.includes('bypass permissions');
+      }, 10_000);
 
       // Then the prompt should be visible in capture output
       const output = sm.captureOutput(tmuxSession, 20);
@@ -454,7 +470,10 @@ describeMaybe('Session Management E2E', () => {
       const tmuxSession = await sm.spawnInteractiveSession(undefined, `${TMUX_PREFIX}detect-bypass`);
 
       // When we wait for the TUI to render
-      await new Promise(r => setTimeout(r, 2000));
+      await waitFor(
+        () => (sm.captureOutput(tmuxSession, 20) ?? '').includes('bypass permissions'),
+        10_000,
+      );
 
       // Then "bypass permissions" should be detectable
       const output = sm.captureOutput(tmuxSession, 20);
@@ -468,7 +487,10 @@ describeMaybe('Session Management E2E', () => {
       managers.push(sm);
 
       const tmuxSession = await sm.spawnInteractiveSession(undefined, `${TMUX_PREFIX}detect-effort`);
-      await new Promise(r => setTimeout(r, 2000));
+      await waitFor(
+        () => (sm.captureOutput(tmuxSession, 20) ?? '').includes('/effort'),
+        10_000,
+      );
 
       // Then the effort indicator should be detectable
       const output = sm.captureOutput(tmuxSession, 20);
@@ -495,7 +517,7 @@ describeMaybe('Session Management E2E', () => {
 
       const output = sm.captureOutput(tmuxSession, 30);
       expect(output).toContain('Delayed hello');
-    });
+    }, 25_000);
   });
 
   // ── Feature: Session Lifecycle (kill, reap, monitor) ──────────────
@@ -721,7 +743,13 @@ describeMaybe('Session Management E2E', () => {
       managers.push(sm);
 
       const tmuxSession = await sm.spawnInteractiveSession(undefined, `${TMUX_PREFIX}routing`);
-      await new Promise(r => setTimeout(r, 3000));
+      // A tmux session can exist before its interactive child has reached the
+      // prompt, especially when the full E2E suite is under load. Gate the
+      // routing assertion on the provider-ready signal rather than wall time.
+      await waitFor(
+        () => (sm.captureOutput(tmuxSession, 30) ?? '').includes('bypass permissions on'),
+        10_000,
+      );
 
       // When the session is alive
       expect(sm.isSessionAlive(tmuxSession)).toBe(true);
@@ -819,7 +847,7 @@ describeMaybe('Session Management E2E', () => {
       buildSession.startedAt = new Date(Date.now() - 20_000).toISOString();
       project.state.saveSession(buildSession);
 
-      await (buildSm as any).monitorTick();
+      await maintenanceTicks.get(buildSm)!();
       execFileSync(tmuxPath!, ['kill-session', '-t', `=${buildTmux}`], { stdio: 'ignore' });
 
       await buildSm.spawnInteractiveSession('CONTINUATION — resume build', buildName, {
@@ -840,12 +868,17 @@ describeMaybe('Session Management E2E', () => {
 
       const homeName = `${TMUX_PREFIX}home-ctx`;
       const homeTmux = await homeSm.spawnInteractiveSession(undefined, homeName);
-      await waitFor(() => homeSm.isSessionAlive(homeTmux), 10_000);
+      // As above, session existence is weaker than prompt readiness. The
+      // maintenance tick must observe the mock after it has changed cwd.
+      await waitFor(
+        () => (homeSm.captureOutput(homeTmux, 30) ?? '').includes('bypass permissions on'),
+        10_000,
+      );
       const homeSession = project.state.listSessions({ status: 'running' }).find(s => s.tmuxSession === homeTmux)!;
       homeSession.startedAt = new Date(Date.now() - 20_000).toISOString();
       project.state.saveSession(homeSession);
 
-      await (homeSm as any).monitorTick();
+      await maintenanceTicks.get(homeSm)!();
       execFileSync(tmuxPath!, ['kill-session', '-t', `=${homeTmux}`], { stdio: 'ignore' });
 
       await homeSm.spawnInteractiveSession('CONTINUATION — home only', homeName, {

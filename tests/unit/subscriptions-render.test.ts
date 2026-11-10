@@ -18,12 +18,21 @@ import {
   friendlyProvider,
   countdown,
   relativeAge,
+  slowRetryLabel,
+  staleReadingAge,
   quotaBar,
+  quotaSeverity,
+  QUOTA_WARN_PCT,
+  QUOTA_CRITICAL_PCT,
   renderAccounts,
   renderPendingLogins,
   renderDisabled,
   renderAccountMatrix,
+  groupMatrixRowsByProvider,
   buildMatrixModel,
+  renderOutcomeCard,
+  providerClass,
+  isDeviceLimitBenched,
 } from '../../dashboard/subscriptions.js';
 
 let doc: Document;
@@ -75,6 +84,35 @@ describe('countdown', () => {
   });
 });
 
+describe('assisted re-login account controls', () => {
+  it('renders one-click repair without exposing hostile episode data as markup', () => {
+    const target = doc.createElement('div');
+    renderAccounts(doc, target, [{ id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'needs-reauth' }], NOW, null, [
+      { id: 'repair-<img src=x onerror=1>', accountId: 'a1', state: 'suggested' },
+    ]);
+    const button = target.querySelector('[data-relogin-action="approve"]');
+    expect(button?.textContent).toBe('Repair sign-in');
+    expect(target.querySelector('img')).toBeNull();
+  });
+
+  it('shows cancel for an active repair and retry only for a safe failed terminal', () => {
+    const account = [{ id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'needs-reauth' }];
+    const target = doc.createElement('div');
+    renderAccounts(doc, target, account, NOW, null, [{ id: 'r1', accountId: 'a1', state: 'browser-driving' }]);
+    expect(target.querySelector('[data-relogin-action="cancel"]')).toBeTruthy();
+    renderAccounts(doc, target, account, NOW, null, [{ id: 'r1', accountId: 'a1', state: 'failed' }]);
+    expect(target.querySelector('[data-relogin-action="retry"]')).toBeTruthy();
+  });
+
+  it('does not offer a stale failed repair after current account truth is active', () => {
+    const account = [{ id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'active' }];
+    const target = doc.createElement('div');
+    renderAccounts(doc, target, account, NOW, null, [{ id: 'r1', accountId: 'a1', state: 'failed' }]);
+    expect(target.querySelector('[data-relogin-action="retry"]')).toBeNull();
+    expect(target.textContent).not.toContain('Sign-in repair stopped safely');
+  });
+});
+
 describe('friendly wording', () => {
   it('maps status + provider to plain words', () => {
     expect(friendlyStatus('rate-limited')).toBe('At its limit');
@@ -91,6 +129,57 @@ describe('quotaBar', () => {
     expect(fill.style.width).toBe('100%'); // clamped from 171.6
     expect(bar.querySelector('.sub-quota-pct')!.textContent).toContain('100% used');
     expect(bar.querySelector('.sub-quota-pct')!.textContent).toContain('resets in 2h');
+  });
+
+  // Severity bands. Both sides of BOTH boundaries, so an off-by-one in either
+  // comparison fails here rather than shipping a bar that reads one band early.
+  it.each([
+    [0, 'ok'],
+    [74, 'ok'],
+    [QUOTA_WARN_PCT - 1, 'ok'],
+    [QUOTA_WARN_PCT, 'warn'],
+    [89, 'warn'],
+    [QUOTA_CRITICAL_PCT - 1, 'warn'],
+    [QUOTA_CRITICAL_PCT, 'critical'],
+    [100, 'critical'],
+  ])('quotaSeverity(%i) → %s', (pct, expected) => {
+    expect(quotaSeverity(pct)).toBe(expected);
+  });
+
+  it('severity is derived from the CLAMPED number, not the raw input', () => {
+    expect(quotaSeverity(1000)).toBe('critical'); // clamps to 100
+    expect(quotaSeverity(-50)).toBe('ok'); // clamps to 0
+    expect(quotaSeverity('not a number')).toBe('ok'); // non-finite → 0
+    expect(quotaSeverity(74.6)).toBe('warn'); // rounds to 75, crossing the band
+  });
+
+  it('the fill carries its severity class alongside the base class', () => {
+    const cls = (pct: number) =>
+      (quotaBar(doc, 'Weekly', pct, null, NOW).querySelector('.sub-quota-fill') as HTMLElement)
+        .getAttribute('class');
+    expect(cls(22)).toBe('sub-quota-fill sub-quota-ok');
+    expect(cls(83)).toBe('sub-quota-fill sub-quota-warn');
+    expect(cls(100)).toBe('sub-quota-fill sub-quota-critical');
+  });
+
+  it('the class attribute stays a closed-set literal — no data reaches it', () => {
+    // A hostile percent must not be able to smuggle anything into the attribute:
+    // the severity map is keyed by one of exactly three strings.
+    const fill = quotaBar(doc, 'Weekly', '50" onload="x' as unknown as number, null, NOW)
+      .querySelector('.sub-quota-fill') as HTMLElement;
+    expect(fill.getAttribute('class')).toBe('sub-quota-fill sub-quota-ok');
+    expect(fill.style.width).toBe('0%'); // non-finite → clamped to 0
+  });
+});
+
+describe('staleReadingAge', () => {
+  it('is empty below the threshold and an age above it', () => {
+    expect(staleReadingAge(new Date(NOW - 60 * 60 * 1000).toISOString(), NOW)).toBe('');
+    expect(staleReadingAge(new Date(NOW - 7 * 60 * 60 * 1000).toISOString(), NOW)).toBe('7h ago');
+  });
+  it('is empty for a missing or unparseable timestamp', () => {
+    expect(staleReadingAge(undefined, NOW)).toBe('');
+    expect(staleReadingAge('not a date', NOW)).toBe('');
   });
 });
 
@@ -111,6 +200,47 @@ describe('renderAccounts', () => {
     expect(t.querySelector('.sub-account-status')!.textContent).toBe('Active');
     expect(t.querySelectorAll('.sub-quota').length).toBe(2);
   });
+  it('shows needs sign-in when credential identity drift overrides active enrollment bookkeeping', () => {
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'active',
+      identityDrifted: true, identityDrift: { repairState: 'owner-relogin-required' },
+    }], NOW);
+    expect(t.querySelector('.sub-account-status')!.textContent).toBe('Needs sign-in');
+  });
+  it('renders a Fable 5 bar when the fable window is present', () => {
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'active',
+      lastQuota: {
+        fiveHour: { utilizationPct: 10, resetsAt: '2026-06-07T01:00:00Z' },
+        sevenDay: { utilizationPct: 71, resetsAt: '2026-06-12T00:00:00Z' },
+        fable: { utilizationPct: 100, resetsAt: '2026-07-15T00:00:00Z' },
+      },
+    }], NOW);
+    const bars = t.querySelectorAll('.sub-quota');
+    expect(bars.length).toBe(3);
+    const labels = Array.from(t.querySelectorAll('.sub-quota-label')).map(n => n.textContent);
+    expect(labels).toContain('Fable 5');
+  });
+  it('renders a Fable 5 bar even when it is the only quota window', () => {
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'active',
+      lastQuota: { fable: { utilizationPct: 36, resetsAt: '2026-07-18T00:00:00Z' } },
+    }], NOW);
+    expect(t.querySelectorAll('.sub-quota').length).toBe(1);
+    expect(t.querySelector('.sub-quota-label')!.textContent).toBe('Fable 5');
+    expect(t.querySelector('.sub-account-noquota')).toBeNull();
+  });
+  it('shows the no-quota message when no windows at all (fable included) are present', () => {
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'a1', nickname: 'personal', provider: 'anthropic', framework: 'claude-code', status: 'active',
+      lastQuota: {},
+    }], NOW);
+    expect(t.querySelector('.sub-account-noquota')).not.toBeNull();
+  });
   it('a malicious nickname survives only as inert text (no element injected)', () => {
     const t = el();
     renderAccounts(doc, t, [{ id: 'x', nickname: '<img src=x onerror=alert(1)>', provider: 'anthropic', framework: 'claude-code', status: 'active' }], NOW);
@@ -121,6 +251,53 @@ describe('renderAccounts', () => {
     const t = el();
     renderAccounts(doc, t, [{ id: 'a', nickname: 'n', provider: 'anthropic', framework: 'claude-code', status: 'warming' }], NOW);
     expect(t.querySelector('.sub-account-noquota')).toBeTruthy();
+    expect(t.querySelector('.sub-account-noquota')!.textContent).toContain('yet');
+  });
+  it('an entitlement-only codex account names the condition instead of implying a pending read', () => {
+    // The account ANSWERED the poll and reported no usage window at all. "yet"
+    // would promise a number no future poll can produce (the dawn@ case).
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'c', nickname: 'dawn', provider: 'openai', framework: 'codex-cli', status: 'active',
+      lastQuota: { source: 'codex-rollout', measuredAt: '2026-06-07T00:00:00Z', noQuotaWindow: true },
+    }], NOW);
+    const line = t.querySelector('.sub-account-noquota');
+    expect(line).toBeTruthy();
+    expect(line!.textContent).toContain('no usage window');
+    expect(line!.textContent).not.toContain('yet');
+  });
+
+  it('an account with NO reading at all still reads as pending, not as "no window"', () => {
+    const t = el();
+    renderAccounts(doc, t, [{
+      id: 'c2', nickname: 'codey', provider: 'openai', framework: 'codex-cli', status: 'active',
+    }], NOW);
+    expect(t.querySelector('.sub-account-noquota')!.textContent).toContain('yet');
+  });
+
+  it('a stale reading is labelled with its age; a fresh one is not', () => {
+    const card = (measuredAt) => {
+      const t = el();
+      renderAccounts(doc, t, [{
+        id: 'c3', nickname: 'amrch', provider: 'openai', framework: 'codex-cli', status: 'active',
+        lastQuota: { source: 'codex-rollout', measuredAt, sevenDay: { utilizationPct: 86, resetsAt: '2026-06-09T00:00:00Z' } },
+      }], NOW);
+      return t.querySelector('.sub-account-quota-age');
+    };
+    // Codex quota only advances when something runs on the account, so a bar
+    // shown without its age asserts a freshness we do not have.
+    expect(card('2026-06-01T00:00:00Z')!.textContent).toBe('Reading from 6d ago');
+    expect(card('2026-06-06T23:30:00Z')).toBeNull();
+  });
+
+  it('a grok account names the PERMANENT condition instead of implying a pending read', () => {
+    // grok-build has no usage surface at all, so no poll will ever produce a
+    // snapshot — "yet" would promise a reading that cannot arrive (round-11).
+    const t = el();
+    renderAccounts(doc, t, [{ id: 'g', nickname: 'grok', provider: 'xai', framework: 'grok-build', status: 'active' }], NOW);
+    const text = t.querySelector('.sub-account-noquota')!.textContent!;
+    expect(text).toContain('not readable');
+    expect(text).not.toContain('yet');
   });
   it('shows a token-health line when the account was auto-refreshed', () => {
     const t = el();
@@ -154,6 +331,15 @@ describe('renderAccounts', () => {
     const t = el();
     renderAccounts(doc, t, [{ id: 'gmail', nickname: 'Justin', provider: 'anthropic', framework: 'claude-code', status: 'active' }], NOW, null);
     expect(t.querySelector('.sub-account-inuse-badge')).toBeNull();
+  });
+  it('withholds repair approval when two accounts have the same visible name', () => {
+    const t = el();
+    renderAccounts(doc, t, [
+      { id: 'a1', nickname: 'Personal', status: 'needs-reauth' },
+      { id: 'a2', nickname: 'Personal', status: 'needs-reauth' },
+    ], NOW, null, [{ id: 'repair-1', accountId: 'a1', state: 'suggested' }]);
+    expect(t.querySelector('.sub-account-repair-approve')).toBeNull();
+    expect(t.textContent).toContain('A unique account name is needed');
   });
 });
 
@@ -194,7 +380,7 @@ describe('renderPendingLogins', () => {
   it('a url-code-paste login renders a code paste-back field + Submit (ws52-code-paste-back)', () => {
     const t = el();
     renderPendingLogins(doc, t, [{
-      id: 'adriana', label: 'adriana', kind: 'url-code-paste', machineId: 'm_mini', machineNickname: 'Mac Mini',
+      id: 'adriana', label: 'Adriana subscription', kind: 'url-code-paste', machineId: 'm_mini', machineNickname: 'Mac Mini',
       verificationUrl: 'https://claude.com/cai/oauth/authorize?code=true&client_id=x', ttlExpiresAt: '2026-06-07T00:12:00Z', reissueCount: 0,
     }], NOW);
     expect(t.querySelector('.sub-pending-codehint')!.textContent).toContain('paste the code');
@@ -218,6 +404,16 @@ describe('renderPendingLogins', () => {
     expect(t.querySelector('[data-submit-code]')).toBeNull();
   });
 
+  it('withholds sign-in actions when the account label is its ID or duplicates another visible login', () => {
+    const t = el();
+    const login = { id: 'acct-1', label: 'acct-1', kind: 'url-code-paste', machineNickname: 'Mini', verificationUrl: 'https://claude.com/oauth/authorize?code=x' };
+    renderPendingLogins(doc, t, [login], NOW);
+    expect(t.querySelector('.sub-pending-signin')).toBeNull();
+    expect(t.querySelector('.sub-pending-code-submit')).toBeNull();
+    renderPendingLogins(doc, t, [{ ...login, label: 'Adriana' }, { ...login, id: 'acct-2', label: 'Adriana' }], NOW);
+    expect(t.querySelectorAll('.sub-pending-signin')).toHaveLength(0);
+  });
+
   it('a javascript: URL renders as inert text, not an anchor', () => {
     const t = el();
     renderPendingLogins(doc, t, [{ id: 'x', label: 'l', kind: 'url-code-paste', verificationUrl: 'javascript:alert(1)', ttlExpiresAt: '2026-06-07T00:12:00Z', reissueCount: 0 }], NOW);
@@ -229,10 +425,10 @@ describe('renderPendingLogins', () => {
     renderPendingLogins(doc, t, [{
       id: 'sagemind-1', label: 'SageMind - Justin', kind: 'url-code-paste',
       verificationUrl: 'https://claude.com/oauth/authorize?code=abc',
-      notice: 'Heads up: a brand-new Claude login often asks for TWO codes in order — first an email-verification code, then the sign-in code.',
+      notice: 'Heads up: this provider may show an extra verification step.',
       ttlExpiresAt: '2026-06-07T00:12:00Z', reissueCount: 0,
     }], NOW);
-    expect(t.querySelector('.sub-pending-notice')!.textContent).toContain('TWO codes');
+    expect(t.querySelector('.sub-pending-notice')!.textContent).toContain('extra verification step');
   });
   it('omits the notice element when there is none', () => {
     const t = el();
@@ -267,7 +463,7 @@ describe('renderAccountMatrix', () => {
     scope: 'pool',
   };
   // A pending login for (a2, m1) → that cell is in-progress.
-  const pendingScope = { enabled: true, logins: [{ id: 'a2', machineId: 'm1' }] };
+  const pendingScope = { enabled: true, logins: [{ id: 'a2', machineId: 'm1', expectedEmail: 'a2@x.com' }] };
 
   it('renders ✓ active for an (account,machine) with an active pool row', () => {
     const t = el();
@@ -277,6 +473,169 @@ describe('renderAccountMatrix', () => {
     expect(cell).toBeTruthy();
     expect(cell!.textContent).toContain('✓');
     expect(cell!.querySelector('.sub-matrix-setup')).toBeNull();
+  });
+
+  it('renders an actionable needs-sign-in cell when an active row is identity-drifted', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'active', identityDrifted: true, machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, { enabled: true, logins: [] }, {});
+    const cell = t.querySelector('.sub-matrix-needs-reauth');
+    expect(cell).toBeTruthy();
+    expect(cell!.textContent).toContain('Needs sign-in');
+    expect(cell!.querySelector('.sub-matrix-setup')!.textContent).toBe('Sign in');
+    expect(t.querySelector('.sub-matrix-active')).toBeNull();
+  });
+
+  it('keeps every durable autonomous-repair state on the repair surface and suppresses competing manual sign-in', () => {
+    const pool = {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    };
+    for (const state of ['suggested', 'approved', 'cli-starting', 'artifact-ready', 'browser-driving',
+      'cli-finishing', 'identity-verifying', 'auth-verifying', 'waiting-operator-only']) {
+      const t = el();
+      renderAccountMatrix(doc, t, pool, { enabled: true, logins: [] }, {}, [
+        { id: 'repair-1', accountId: 'a1', machineId: 'm1', state },
+      ]);
+      const cell = t.querySelector('[data-cell-key="a1::m1"]');
+      if (state === 'waiting-operator-only') {
+        // A repair waiting on the operator also offers the one-tap phone Sign in
+        // (spec skill-driven-signin-repair, operator contact).
+        expect(cell!.querySelector('[data-matrix-setup]')!.textContent, state).toBe('Sign in');
+      } else {
+        expect(cell!.querySelector('[data-matrix-setup]'), state).toBeNull();
+      }
+      const action = state === 'suggested' ? 'approve' : 'cancel';
+      expect(cell!.querySelector(`[data-matrix-relogin][data-repair-action="${action}"]`), state).toBeTruthy();
+      if (state !== 'suggested') expect(cell!.textContent, state).toMatch(/Repairing sign-in|needs your help/);
+    }
+  });
+
+  it('offers retry after a safe failure and restores manual fallback after a refusal', () => {
+    const pool = {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    };
+    const failed = el();
+    renderAccountMatrix(doc, failed, pool, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-1', accountId: 'a1', machineId: 'm1', state: 'failed' },
+    ]);
+    expect(failed.querySelector('[data-repair-action="retry"]')!.textContent).toBe('Try repair again');
+    expect(failed.querySelector('[data-matrix-setup]')).toBeNull();
+
+    const refused = el();
+    renderAccountMatrix(doc, refused, pool, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-1', accountId: 'a1', machineId: 'm1', state: 'refused' },
+    ]);
+    expect(refused.querySelector('[data-matrix-relogin]')).toBeNull();
+    expect(refused.querySelector('[data-matrix-setup]')!.textContent).toBe('Sign in');
+  });
+
+  it('shows when a failed repair will try again on its own (spec relogin-unattended-agent-session-and-slow-retry)', () => {
+    const pool = {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    };
+    const scheduled = el();
+    renderAccountMatrix(doc, scheduled, pool, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-1', accountId: 'a1', machineId: 'm1', state: 'failed', nextAttemptAt: new Date(Date.now() + 5.6 * 3_600_000).toISOString() },
+    ]);
+    expect(scheduled.textContent).toContain('Trying again on its own in about 6 h.');
+    expect(scheduled.querySelector('[data-repair-action="retry"]')!.textContent).toBe('Try repair again');
+    const hold = scheduled.querySelector('.sub-matrix-repair-hold')!;
+    expect(hold.textContent).toBe('Don’t retry on its own');
+    expect(hold.getAttribute('data-repair-action')).toBe('cancel');
+    const none = el();
+    renderAccountMatrix(doc, none, pool, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-1', accountId: 'a1', machineId: 'm1', state: 'failed', nextAttemptAt: null },
+    ]);
+    expect(none.textContent).not.toContain('Trying again on its own');
+    expect(none.querySelector('.sub-matrix-repair-hold')).toBeNull();
+    const held = el();
+    renderAccountMatrix(doc, held, pool, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-1', accountId: 'a1', machineId: 'm1', state: 'failed', nextAttemptAt: null, slowRetryHeld: true },
+    ]);
+    expect(held.textContent).toContain('Won’t try again on its own. Try repair again any time.');
+    const now = Date.parse('2026-10-14T10:00:00Z');
+    expect(slowRetryLabel({ state: 'failed', nextAttemptAt: '2026-10-14T10:00:30Z' }, now)).toBe('Trying again on its own shortly.');
+    expect(slowRetryLabel({ state: 'failed', nextAttemptAt: '2026-10-14T10:20:00Z' }, now)).toBe('Trying again on its own in 20 min.');
+    expect(slowRetryLabel({ state: 'failed', nextAttemptAt: '2026-10-17T10:00:00Z' }, now)).toBe('Trying again on its own in about 3 days.');
+    expect(slowRetryLabel({ state: 'refused', nextAttemptAt: '2026-10-14T12:00:00Z' }, now)).toBe('');
+    expect(slowRetryLabel({ state: 'failed', nextAttemptAt: 'not-a-date' }, now)).toBe('');
+    expect(slowRetryLabel({ state: 'failed', mode: 'approval', nextAttemptAt: '2026-10-14T16:00:00Z' }, now)).toBe('Will offer to try again in about 6 h.');
+  });
+
+  it('lets current Active truth suppress a stale failed repair episode', () => {
+    const active = el();
+    renderAccountMatrix(doc, active, poolScope, { enabled: true, logins: [] }, {}, [
+      { id: 'repair-old', accountId: 'a1', machineId: 'm1', state: 'failed' },
+    ]);
+    const cell = active.querySelector('[data-cell-key="a1::m1"]');
+    expect(cell!.textContent).toContain('Active');
+    expect(cell!.textContent).not.toContain('Sign-in repair stopped safely');
+    expect(cell!.querySelector('[data-repair-action="retry"]')).toBeNull();
+  });
+
+  it('applies only known repair states with current-state precedence', () => {
+    const render = (status: string, state: string) => {
+      const target = el();
+      renderAccountMatrix(doc, target, {
+        enabled: true,
+        accounts: [{ id: 'a1', email: 'a1@x.com', status, machineId: 'm1', machineNickname: 'Laptop' }],
+        pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+      }, { enabled: true, logins: [] }, {}, [
+        { id: 'repair-1', accountId: 'a1', machineId: 'm1', state },
+      ]);
+      return target.querySelector('[data-cell-key="a1::m1"]');
+    };
+
+    expect(render('active', 'suggested')!.querySelector('[data-matrix-relogin]')).toBeNull();
+    expect(render('needs-reauth', 'suggested')!.querySelector('[data-repair-action="approve"]')).toBeTruthy();
+    expect(render('needs-reauth', 'failed')!.querySelector('[data-repair-action="retry"]')).toBeTruthy();
+    expect(render('active', 'auth-verifying')!.textContent).toContain('Repairing sign-in');
+    expect(render('active', 'future-state')!.querySelector('[data-matrix-relogin]')).toBeNull();
+  });
+
+  it('suppresses manual sign-in when the machine repair status is unavailable', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, { enabled: true, logins: [] }, {}, [], [{ machineId: 'm1', error: 'timeout' }]);
+    const cell = t.querySelector('[data-cell-key="a1::m1"]');
+    expect(cell!.textContent).toContain('Repair status is unavailable');
+    expect(cell!.querySelector('[data-matrix-setup]')).toBeNull();
+  });
+
+  it('says in plain words why a needs-sign-in cell will not repair on its own, and keeps Sign in', () => {
+    const render = (status: string, blockers: unknown[]) => {
+      const t = el();
+      renderAccountMatrix(doc, t, {
+        enabled: true,
+        accounts: [{ id: 'a1', email: 'a1@x.com', status, machineId: 'm1', machineNickname: 'Mini' }],
+        pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+      }, { enabled: true, logins: [] }, {}, [], [], blockers);
+      return t.querySelector('[data-cell-key="a1::m1"]')!;
+    };
+    const noProfile = render('needs-reauth', [{ accountId: 'a1', machineId: 'm1', reason: 'profile-unresolved' }]);
+    expect(noProfile.textContent).toContain('no browser profile signed in to this account');
+    expect(noProfile.querySelector('[data-matrix-setup]')).toBeTruthy();
+    expect(render('needs-reauth', [{ accountId: '*', machineId: 'm1', reason: 'feature-unavailable' }]).textContent)
+      .toContain('Automatic repair isn’t running on this machine');
+    expect(render('needs-reauth', [{ accountId: 'a1', machineId: 'm1', reason: 'some-future-reason' }]).textContent)
+      .toContain('Won’t repair on its own on this machine');
+    // Another cell's blocker, or an active cell, adds nothing.
+    expect(render('needs-reauth', [{ accountId: 'a2', machineId: 'm1', reason: 'profile-unresolved' }]).textContent)
+      .not.toContain('Won’t repair');
+    expect(render('active', [{ accountId: 'a1', machineId: 'm1', reason: 'profile-unresolved' }]).textContent)
+      .not.toContain('Won’t repair');
   });
 
   it('renders a "Set up" button for a genuinely-empty (reachable) cell', () => {
@@ -296,6 +655,43 @@ describe('renderAccountMatrix', () => {
     const a1OnMini = Array.from(setupBtns).find((b) => b.getAttribute('data-account-id') === 'a1' && b.getAttribute('data-machine-id') === 'm1b');
     expect(a1OnMini).toBeTruthy();
     expect(a1OnMini!.textContent).toBe('Set up');
+  });
+
+  it('does not offer account actions when visible machine names are ambiguous', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'a2', email: 'a2@x.com', status: 'needs-reauth', machineId: 'm2', machineNickname: 'Laptop' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, { enabled: true, logins: [] }, {});
+    expect(t.querySelectorAll('[data-matrix-setup]')).toHaveLength(0);
+    expect(t.textContent).toContain('A unique account and machine name are needed');
+  });
+
+  it('renders an honest PIN-gated repair action for an email-less account record', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [],
+      emailGaps: [{
+        accountId: 'legacy',
+        nickname: 'Legacy',
+        machineId: 'm1',
+        machineNickname: 'Laptop',
+        reason: 'account-record-missing-email',
+      }],
+      pool: { selfMachineId: 'm1', failed: [] },
+      scope: 'pool',
+    }, { enabled: true, logins: [] }, {});
+    const cell = t.querySelector('.sub-matrix-email-missing');
+    expect(cell).toBeTruthy();
+    expect(cell!.textContent).toContain('Account record is missing its email');
+    const button = cell!.querySelector('[data-email-repair="1"]');
+    expect(button).toBeTruthy();
+    expect(button!.textContent).toBe('Repair identity');
   });
 
   it('renders an offline/disabled column for a pool.failed machine — no fabricated ✓', () => {
@@ -322,6 +718,47 @@ describe('renderAccountMatrix', () => {
     expect(cell).toBeTruthy();
     expect(cell!.textContent).toContain('◷');
     expect(cell!.querySelector('.sub-matrix-setup')).toBeNull();
+  });
+
+  it('#1428: a `cancelled` transient SUPPRESSES a still-cached pending login so the cell resets immediately', () => {
+    // A needs-reauth account with a still-cached in-flight login: after a confirmed
+    // cancel, the optimistic `cancelled` transient must drop the stale flow AT ONCE
+    // (not after the next ~40s poll) — the cell falls through to its true underlying
+    // "Sign in" state instead of rendering ◷ Signing in.
+    const pool = {
+      enabled: true,
+      accounts: [{ id: 'a3', email: 'a3@x.com', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] },
+      scope: 'pool',
+    };
+    const pending = { enabled: true, logins: [{ id: 'a3', machineId: 'm1', verificationUrl: 'https://x/y', ttlExpiresAt: Date.now() + 60000 }] };
+
+    // Without the transient: the cached pending login renders the in-flight flow.
+    const before = el();
+    renderAccountMatrix(doc, before, pool, pending, {});
+    expect(before.querySelector('.sub-matrix-in-progress'), 'stale flow shows without the transient').toBeTruthy();
+
+    // With the `cancelled` transient: the flow is gone; the cell is the clean "Sign in".
+    const after = el();
+    renderAccountMatrix(doc, after, pool, pending, { 'a3::m1': { state: 'cancelled', at: Date.now() } });
+    expect(after.querySelector('.sub-matrix-in-progress'), 'no in-flight flow after cancel').toBeNull();
+    const btn = Array.from(after.querySelectorAll('.sub-matrix-setup'))
+      .find((b) => b.getAttribute('data-account-id') === 'a3' && b.getAttribute('data-machine-id') === 'm1');
+    expect(btn, 'the cell reset to an actionable Sign-in button').toBeTruthy();
+    expect(btn!.textContent).toBe('Sign in');
+  });
+
+  it('#1428: buildMatrixModel drops a stale pending login under a `cancelled` transient (poll stays authority)', () => {
+    // The model-level proof: with the transient the cell is NOT in-progress; the next
+    // poll clears the transient (tested in the controller) so a genuinely-failed cancel
+    // re-derives in-progress from the fresh server state.
+    const held = buildMatrixModel(poolScope, pendingScope, { 'a2::m1': { state: 'cancelled', at: Date.now() } });
+    const cell = held.rows.flatMap((r) => r.cells).find((c) => c.accountId === 'a2' && c.machineId === 'm1');
+    expect(cell!.state).not.toBe('in-progress');
+    // negative control: WITHOUT the transient the same cached login IS in-progress.
+    const live = buildMatrixModel(poolScope, pendingScope, {});
+    const liveCell = live.rows.flatMap((r) => r.cells).find((c) => c.accountId === 'a2' && c.machineId === 'm1');
+    expect(liveCell!.state).toBe('in-progress');
   });
 
   it('renders a "Sign in" button (with the "Needs sign-in" word above it) for a needs-reauth cell', () => {
@@ -359,8 +796,514 @@ describe('renderAccountMatrix', () => {
     const a1m2 = model.rows.find((r: any) => r.account.accountId === 'a1')!.cells.find((c: any) => c.machineId === 'm2');
     expect(a1m2.state).toBe('offline');
   });
+
+  // ── topic 29836 D1–D5: the cell carries the complete flow + explicit terminal states ──
+
+  it('every cell carries a stable data-cell-key (the F9 hold/merge identity)', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, poolScope, pendingScope, {});
+    const cells = t.querySelectorAll('.sub-matrix-cell');
+    expect(cells.length).toBeGreaterThan(0);
+    Array.from(cells).forEach((c) => expect(c.getAttribute('data-cell-key')).toContain('::'));
+  });
+
+  it('D2: an in-progress cell with a full pending-login record renders the COMPLETE flow (link + expected email + code input + TTL + notice + Cancel)', () => {
+    const t = el();
+    const pending = {
+      enabled: true,
+      logins: [{
+        id: 'a2', machineId: 'm1', kind: 'url-code-paste', paneAlive: true,
+        verificationUrl: 'https://claude.com/oauth/authorize?code=true&client_id=x',
+        expectedEmail: 'headley.justin@gmail.com',
+        notice: 'Heads up: this provider may show an extra verification step.',
+        ttlExpiresAt: '2026-06-07T00:12:00Z',
+      }],
+    };
+    renderAccountMatrix(doc, t, poolScope, pending, {});
+    const cell = t.querySelector('.sub-matrix-in-progress')!;
+    // D3(a): the expected-account warning sits BESIDE the sign-in link.
+    expect(cell.querySelector('.sub-matrix-expected')!.textContent).toContain('headley.justin@gmail.com');
+    expect(cell.querySelector('.sub-matrix-expected')!.textContent).toContain('Switch account');
+    const a = cell.querySelector('a.sub-matrix-signin')!;
+    expect(a.getAttribute('href')).toBe('https://claude.com/oauth/authorize?code=true&client_id=x');
+    expect(cell.querySelector('input.sub-matrix-code-input')).toBeTruthy();
+    const submit = cell.querySelector('[data-matrix-code-submit]')!;
+    expect(submit.getAttribute('data-login-id')).toBe('a2');
+    expect(submit.getAttribute('data-machine-id')).toBe('m1');
+    expect(cell.querySelector('.sub-matrix-notice')!.textContent).toContain('extra verification step');
+    const ttl = cell.querySelector('.sub-matrix-ttl')!;
+    expect(ttl.getAttribute('data-ttl-expires')).toBe('2026-06-07T00:12:00Z');
+    expect(cell.querySelector('[data-matrix-cancel]')).toBeTruthy();
+  });
+
+  it('D5: an in-progress record whose pane is DEAD (paneAlive:false) renders the explicit needs-restart state with a Retry — never a code input', () => {
+    const t = el();
+    const pending = {
+      enabled: true,
+      logins: [{ id: 'a2', machineId: 'm1', kind: 'url-code-paste', paneAlive: false, verificationUrl: 'https://claude.com/oauth', expectedEmail: 'a2@x.com' }],
+    };
+    renderAccountMatrix(doc, t, poolScope, pending, {});
+    const cell = t.querySelector('.sub-matrix-broken')!;
+    expect(cell).toBeTruthy();
+    expect(cell.textContent).toContain('Sign-in needs a restart');
+    expect(cell.textContent).toContain('window closed');
+    expect(cell.querySelector('.sub-matrix-code-input')).toBeNull(); // NOT submittable
+    const btn = cell.querySelector('.sub-matrix-setup')!;
+    expect(btn.textContent).toBe('Retry');
+  });
+
+  it('D3: a held cell with the gate verdict detail names BOTH accounts in plain language', () => {
+    const t = el();
+    const transient = {
+      'a1::m1': { state: 'held', expected: 'headley.justin@gmail.com', got: 'justin@sagemindai.io', reason: 'email-mismatch', at: Date.now() },
+    };
+    renderAccountMatrix(doc, t, poolScope, { enabled: true, logins: [] }, transient);
+    const cell = t.querySelector('.sub-matrix-held')!;
+    const detail = cell.querySelector('.sub-matrix-held-detail')!;
+    expect(detail.textContent).toContain('justin@sagemindai.io');
+    expect(detail.textContent).toContain('headley.justin@gmail.com');
+    expect(cell.querySelector('.sub-matrix-setup')!.textContent).toBe('Retry');
+  });
+
+  it('D4: an expired transient renders the explicit expired state with a Retry', () => {
+    const t = el();
+    const pool = {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'aX', email: 'aX@x.com', status: 'active', machineId: 'm1b', machineNickname: 'Mini' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] },
+    };
+    const transient = { 'a1::m1b': { state: 'expired', at: Date.now() } };
+    renderAccountMatrix(doc, t, pool, { enabled: true, logins: [] }, transient);
+    const cell = t.querySelector('.sub-matrix-expired')!;
+    expect(cell.textContent).toContain('Sign-in link expired');
+    expect(cell.querySelector('.sub-matrix-outcome-failed')!.textContent).toContain('Didn’t finish');
+    expect(cell.querySelector('.sub-matrix-setup')!.textContent).toBe('Retry');
+  });
+
+  it('D4: just-verified bridges — a client-verified enrollment shows the verified ceremony even before the pool read catches up', () => {
+    const t = el();
+    const pool = {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'aX', email: 'aX@x.com', status: 'active', machineId: 'm1b', machineNickname: 'Mini' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] },
+    };
+    // a1 on m1b: server still says empty, but the client just observed a validated completion.
+    const transient = { 'a1::m1b': { state: 'just-verified', at: Date.now() } };
+    renderAccountMatrix(doc, t, pool, { enabled: true, logins: [] }, transient);
+    const cell = t.querySelector('.sub-matrix-just-verified')!;
+    expect(cell).toBeTruthy();
+    expect(cell.textContent).toContain('Set up complete');
+    expect(cell.querySelector('.sub-matrix-outcome-done')!.textContent).toContain('Done');
+    expect(cell.querySelector('.sub-matrix-setup')).toBeNull(); // never blinks back to "Set up"
+  });
+
+  it('D4: fresh completion wins over a stale needs-reauth pool row', () => {
+    const t = el();
+    const pool = {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', status: 'needs-reauth', identityDrifted: true, machineId: 'm1', machineNickname: 'Laptop' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] },
+    };
+    const transient = { 'a1::m1': { state: 'just-verified', at: Date.now() } };
+    renderAccountMatrix(doc, t, pool, { enabled: true, logins: [] }, transient);
+    const cell = t.querySelector('.sub-matrix-just-verified')!;
+    expect(cell.textContent).toContain('Set up complete');
+    expect(t.querySelector('.sub-matrix-needs-reauth')).toBeNull();
+  });
+
+  it('D4: an ACTIVE cell with a fresh just-verified transient carries the highlight class + "just set up" wording', () => {
+    const t = el();
+    const transient = { 'a1::m1': { state: 'just-verified', at: Date.now() } };
+    renderAccountMatrix(doc, t, poolScope, { enabled: true, logins: [] }, transient);
+    const cell = t.querySelector('.sub-matrix-active')!;
+    expect(cell.getAttribute('class')).toContain('sub-matrix-just-verified');
+    expect(cell.textContent).toContain('just set up');
+    expect(cell.querySelector('.sub-matrix-outcome-done')!.textContent).toContain('Done');
+  });
+});
+
+// ── topic 29836 D3/D4/D5: pending-panel wording, liveness, and outcome cards ──
+describe('renderPendingLogins — expected-account, liveness, wording floors, outcome cards', () => {
+  it('D3(a): renders the expected-account warning before the link when expectedEmail is present', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [{
+      id: 'a2', label: 'Justin', kind: 'url-code-paste', expectedEmail: 'headley.justin@gmail.com',
+      verificationUrl: 'https://claude.com/oauth/authorize?code=true', ttlExpiresAt: '2026-06-07T00:12:00Z',
+    }], NOW);
+    const warn = t.querySelector('.sub-pending-expected')!;
+    expect(warn.textContent).toContain('must show headley.justin@gmail.com');
+    expect(warn.textContent).toContain('Switch account');
+  });
+
+  it('omits the expected-account warning when there is no expectedEmail', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [{
+      id: 'codex-1', label: 'codex', kind: 'device-code', userCode: '7DAU-W4XJA',
+      verificationUrl: 'https://auth.openai.com/codex/device', ttlExpiresAt: '2026-06-07T00:12:00Z',
+    }], NOW);
+    expect(t.querySelector('.sub-pending-expected')).toBeNull();
+  });
+
+  it('D5 wording floors: the headline uses the account EMAIL over the internal label, and the machine NICKNAME — never a raw m_<hex> id', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [{
+      id: 'justin-gmail', label: 'Justin', kind: 'url-code-paste',
+      expectedEmail: 'headley.justin@gmail.com',
+      machineId: 'm_cc2ec651a91f03f85abb19bfe5e7e8f7', machineNickname: 'Laptop',
+      verificationUrl: 'https://claude.com/oauth', ttlExpiresAt: '2026-06-07T00:12:00Z',
+    }], NOW);
+    const headline = t.querySelector('.sub-pending-headline')!.textContent!;
+    expect(headline).toContain('headley.justin@gmail.com');
+    expect(headline).toContain('Laptop');
+    expect(headline).not.toContain('m_cc2ec651a91f03f85abb19bfe5e7e8f7');
+  });
+
+  it('D5 wording floor: with NO nickname, a raw m_<hex> machine id is suppressed — never shown to the operator', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [{
+      id: 'justin-gmail', label: 'Justin', kind: 'url-code-paste',
+      expectedEmail: 'headley.justin@gmail.com', machineId: 'm_cc2ec651a91f03f85abb19bfe5e7e8f7',
+      verificationUrl: 'https://claude.com/oauth', ttlExpiresAt: '2026-06-07T00:12:00Z',
+    }], NOW);
+    expect(t.textContent).not.toContain('m_cc2ec651a91f03f85abb19bfe5e7e8f7');
+  });
+
+  it('D5: a pending login whose pane is DEAD renders the explicit can\'t-finish card — no link, no code input', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [{
+      id: 'justin-gmail', label: 'Justin', kind: 'url-code-paste', paneAlive: false,
+      expectedEmail: 'headley.justin@gmail.com', machineNickname: 'Laptop', machineId: 'm_x',
+      verificationUrl: 'https://claude.com/oauth', ttlExpiresAt: '2026-06-07T00:12:00Z',
+    }], NOW);
+    const row = t.querySelector('.sub-pending-failed')!;
+    expect(row.textContent).toContain('can’t finish');
+    expect(row.textContent).toContain('Laptop');
+    expect(row.querySelector('a')).toBeNull();
+    expect(row.querySelector('.sub-pending-code-input')).toBeNull();
+    // The restart guidance points at an affordance that actually exists on this surface.
+    expect(row.textContent).toContain('grid');
+    expect(row.textContent).not.toContain('Approve');
+  });
+
+  it('D4: outcome cards render explicit done/failed/expired presentations (never a vanishing line)', () => {
+    const t = el();
+    renderPendingLogins(doc, t, [], NOW, [
+      { kind: 'validated', accountId: 'a1', machineId: 'm1', machineNickname: 'Mini', email: 'headley.justin@gmail.com', at: NOW },
+      { kind: 'held', accountId: 'a2', machineId: 'm1', expected: 'a@x.com', got: 'b@x.com', reason: 'email-mismatch', at: NOW },
+      { kind: 'expired', accountId: 'a3', machineId: 'm1', machineNickname: 'Mini', at: NOW },
+    ]);
+    const done = t.querySelector('.sub-pending-done')!;
+    expect(done.textContent).toContain('Done');
+    expect(done.textContent).toContain('headley.justin@gmail.com is now set up on Mini');
+    const failed = t.querySelectorAll('.sub-pending-failed');
+    expect(failed.length).toBe(2);
+    expect(failed[0].textContent).toContain('b@x.com'); // both accounts named
+    expect(failed[0].textContent).toContain('a@x.com');
+    expect(failed[1].textContent).toContain('expired');
+    // With outcome cards present, the bare "no logins" empty line is omitted.
+    expect(t.querySelector('.sub-empty')).toBeNull();
+  });
+
+  it('renderOutcomeCard sanitizes hostile outcome content into inert text', () => {
+    const card = renderOutcomeCard(doc, {
+      kind: 'validated', accountId: '<img src=x onerror=alert(1)>', machineId: 'm1', at: NOW,
+    });
+    expect(card.querySelector('img')).toBeNull();
+    expect(card.textContent).toContain('the account');
+  });
 });
 
 function el(): HTMLElement {
   return doc.createElement('div');
 }
+
+/**
+ * Provider grouping (operator request, 2026-08-15): the accounts list was a flat
+ * interleaved run of Claude and Codex cards, distinguishable only by a small meta
+ * line on each card. Grouping makes the split scannable.
+ *
+ * The load-bearing property is NOT that grouping happens — it is that grouping
+ * RE-ASSOCIATES without RE-RANKING, and that a single-provider install is untouched.
+ */
+describe('renderAccounts — provider grouping', () => {
+  const acct = (id: string, provider: string) => ({
+    id, nickname: `Account ${id}`, provider, framework: provider === 'openai' ? 'codex-cli' : 'claude-code',
+    status: 'active', configHome: `/h/${id}`,
+  });
+
+  const headings = (t: Element) =>
+    Array.from(t.querySelectorAll('.sub-provider-heading')).map((n) => n.textContent);
+  const order = (t: Element) =>
+    Array.from(t.querySelectorAll('.sub-provider-heading, .sub-account-nick')).map((n) => n.textContent);
+
+  it('THE POINT: mixed providers are grouped, each under its own heading', () => {
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('a1', 'anthropic'), acct('c1', 'openai'), acct('a2', 'anthropic')], NOW);
+    expect(headings(t)).toEqual(['Claude', 'Codex']);
+    // Every Claude account sits under Claude; the Codex one does not get stranded.
+    expect(order(t)).toEqual(['Claude', 'Account a1', 'Account a2', 'Codex', 'Account c1']);
+  });
+
+  it('colors each provider at a glance: heading and every card carry the provider class', () => {
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('a1', 'anthropic'), acct('c1', 'openai')], NOW);
+    const hs = Array.from(t.querySelectorAll('.sub-provider-heading'));
+    expect(hs.map((h) => h.classList.contains('sub-prov-claude'))).toEqual([true, false]);
+    expect(hs.map((h) => h.classList.contains('sub-prov-codex'))).toEqual([false, true]);
+    const cards = Array.from(t.querySelectorAll('.sub-account'));
+    expect(cards.map((c) => [c.classList.contains('sub-prov-claude'), c.classList.contains('sub-prov-codex')]))
+      .toEqual([[true, false], [false, true]]);
+  });
+
+  it('providerClass is a closed mapping; an unknown or hostile provider never becomes a raw class', () => {
+    expect(providerClass('anthropic')).toBe('sub-prov-claude');
+    expect(providerClass('openai')).toBe('sub-prov-codex');
+    expect(providerClass('x" onmouseover="alert(1)')).toBe('sub-prov-other');
+    expect(providerClass(undefined)).toBe('sub-prov-other');
+  });
+
+  it('CONTROL: a single-provider list is UNCHANGED — no heading at all', () => {
+    // Most installs have one provider. Without this, "we grouped everything" would
+    // silently add a redundant heading to the common case.
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('a1', 'anthropic'), acct('a2', 'anthropic')], NOW);
+    expect(headings(t)).toEqual([]);
+    expect(order(t)).toEqual(['Account a1', 'Account a2']);
+  });
+
+  it('accounts keep their ORDER within a group — grouping re-associates, it does not re-rank', () => {
+    // Pool order carries meaning the dashboard cannot see (enrolment order, which
+    // account is default). Sorting would silently discard it.
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('zeta', 'anthropic'), acct('alpha', 'anthropic')], NOW);
+    expect(order(t)).toEqual(['Account zeta', 'Account alpha']);
+  });
+
+  it('groups appear in FIRST-APPEARANCE order, not alphabetical', () => {
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('c1', 'openai'), acct('a1', 'anthropic')], NOW);
+    expect(headings(t)).toEqual(['Codex', 'Claude']);
+  });
+
+  it('every account still renders exactly once — grouping must not drop or duplicate', () => {
+    const t = doc.createElement('div');
+    const accounts = [acct('a1', 'anthropic'), acct('c1', 'openai'), acct('g1', 'google'), acct('a2', 'anthropic')];
+    renderAccounts(doc, t, accounts, NOW);
+    const nicks = Array.from(t.querySelectorAll('.sub-account-nick')).map((n) => n.textContent);
+    expect(nicks.sort()).toEqual(['Account a1', 'Account a2', 'Account c1', 'Account g1']);
+    expect(t.querySelectorAll('.sub-account').length).toBe(4);
+  });
+
+  it('SECURITY: a hostile provider string is sanitized in the heading, never raw', () => {
+    // The heading is the one NEW dynamic string reaching the DOM, so it inherits the
+    // module's contract: textContent only, sanitized, no injected element survives.
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [
+      acct('x', '<img src=x onerror=alert(1)>'),
+      acct('a1', 'anthropic'),
+    ], NOW);
+    // The property is that the value arrives as TEXT, not that the characters vanish.
+    // Asserting innerHTML lacks the substring would be wrong: correctly-escaped text
+    // still reads "onerror" inside &lt;img …&gt;, so that assertion fails on working code.
+    expect(t.querySelector('img')).toBeNull();
+    for (const node of Array.from(t.querySelectorAll('*'))) {
+      expect(node.hasAttribute('onerror')).toBe(false);
+    }
+    const heading = t.querySelector('.sub-provider-heading')!;
+    expect(heading.children.length).toBe(0); // text only — no injected element survived
+  });
+
+  it('an account with no provider still renders under an honest heading', () => {
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [{ id: 'n', nickname: 'n', status: 'active' }, acct('a1', 'anthropic')], NOW);
+    // It is grouped rather than dropped, and the label does not invent a provider.
+    expect(t.querySelectorAll('.sub-account').length).toBe(2);
+    expect(headings(t)).toContain('Other');
+  });
+
+  it('the in-use marker survives grouping', () => {
+    const t = doc.createElement('div');
+    renderAccounts(doc, t, [acct('a1', 'anthropic'), acct('c1', 'openai')], NOW, 'c1');
+    const inUse = t.querySelector('.sub-account-inuse');
+    expect(inUse).not.toBeNull();
+    expect(inUse!.textContent).toContain('Account c1');
+  });
+});
+
+// ── the grid groups by provider (the operator's second report) ──────────────
+describe('renderAccountMatrix — provider grouping', () => {
+  const el2 = () => doc.createElement('div');
+  const pending = { enabled: true, logins: [] };
+  const mixedPool = {
+    enabled: true,
+    accounts: [
+      { id: 'a1', email: 'a1@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+      { id: 'c1', email: 'c1@x.com', provider: 'openai', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+      { id: 'a2', email: 'a2@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+    ],
+    pool: { selfMachineId: 'm1', failed: [] },
+    scope: 'pool',
+  };
+
+  it('THE POINT: Claude and Codex rows carry a provider band, and same-provider rows sit together', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, mixedPool, pending, {});
+    const bands = Array.from(t.querySelectorAll('.sub-matrix-group')).map((n) => n.textContent);
+    expect(bands).toEqual(['Claude', 'Codex']);
+    // a2 (anthropic) must be re-associated under the Claude band, not left after Codex.
+    const rowText = Array.from(t.querySelectorAll('tbody tr')).map((r) => r.textContent || '');
+    const claudeAt = rowText.findIndex((x) => x.startsWith('Claude'));
+    const codexAt = rowText.findIndex((x) => x.startsWith('Codex'));
+    const a2At = rowText.findIndex((x) => x.includes('a2@x.com'));
+    expect(claudeAt).toBeLessThan(a2At);
+    expect(a2At).toBeLessThan(codexAt);
+  });
+
+  it('colors the grid: each band and each account row carry their provider class', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, mixedPool, pending, {});
+    const bands = Array.from(t.querySelectorAll('.sub-matrix-group'));
+    expect(bands.map((b) => b.className)).toEqual(['sub-matrix-group sub-prov-claude', 'sub-matrix-group sub-prov-codex']);
+    const rows = Array.from(t.querySelectorAll('tbody tr')).filter((r) => r.querySelector('.sub-matrix-acct'));
+    const byEmail = Object.fromEntries(rows.map((r) => [r.querySelector('.sub-matrix-acct')!.textContent, r.className]));
+    expect(byEmail['a2@x.com']).toBe('sub-prov-claude');
+    expect(byEmail['c1@x.com']).toBe('sub-prov-codex');
+  });
+
+  it('the band spans the whole grid so it reads as a band, not a stray cell', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, mixedPool, pending, {});
+    const band = t.querySelector('.sub-matrix-group')!;
+    // account column + one column per machine
+    expect(band.getAttribute('colspan')).toBe('2');
+  });
+
+  it('CONTROL: a single-provider install gets NO band at all', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [{ id: 'a1', email: 'a1@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' }],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, pending, {});
+    expect(t.querySelector('.sub-matrix-group')).toBeNull();
+  });
+
+  it('the same account seen on a SECOND machine keeps its provider', () => {
+    // Pool scope carries one row per (account, machine). A later row without a provider
+    // must not blank the one the first row established, or the account falls into "Other".
+    const model = buildMatrixModel({
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'a1', email: 'a1@x.com', status: 'active', machineId: 'm2', machineNickname: 'Mini' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, pending, {});
+    expect(model.accounts.find((a) => a.accountId === 'a1')!.provider).toBe('anthropic');
+  });
+
+  it('a row whose provider never arrived is grouped honestly, never guessed', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'u1', email: 'u1@x.com', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, pending, {});
+    const bands = Array.from(t.querySelectorAll('.sub-matrix-group')).map((n) => n.textContent);
+    expect(bands).toEqual(['Claude', 'Other']);
+  });
+
+  it('grouping is text-only — a hostile provider string cannot reach the DOM as markup', () => {
+    const t = el2();
+    renderAccountMatrix(doc, t, {
+      enabled: true,
+      accounts: [
+        { id: 'a1', email: 'a1@x.com', provider: 'anthropic', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+        { id: 'x1', email: 'x1@x.com', provider: '<img src=x onerror=alert(1)>', status: 'active', machineId: 'm1', machineNickname: 'Laptop' },
+      ],
+      pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool',
+    }, pending, {});
+    expect(t.querySelector('img')).toBeNull();
+    for (const band of Array.from(t.querySelectorAll('.sub-matrix-group'))) {
+      expect(band.children.length).toBe(0);
+    }
+  });
+
+  it('groupMatrixRowsByProvider keeps every row — grouping re-associates, never drops', () => {
+    const model = buildMatrixModel(mixedPool, pending, {});
+    const grouped = groupMatrixRowsByProvider(model.rows);
+    expect(grouped.filter((g) => g.__row).length).toBe(model.rows.length);
+  });
+});
+
+describe('Codex device-limit tripwire cell (spec codex-device-limit-tripwire §8)', () => {
+  const pool = (accounts) => ({ enabled: true, accounts, pool: { selfMachineId: 'm1', failed: [] }, scope: 'pool' });
+  const row = (extra) => ({ id: 'c1', email: 'c1@x.com', provider: 'openai', status: 'needs-reauth', machineId: 'm1', machineNickname: 'Laptop', ...extra });
+
+  it('isDeviceLimitBenched requires needs-reauth AND the exact cause', () => {
+    expect(isDeviceLimitBenched(row({ statusCause: 'codex-device-limit' }))).toBe(true);
+    expect(isDeviceLimitBenched(row({ statusCause: 'unknown' }))).toBe(false);
+    expect(isDeviceLimitBenched(row({}))).toBe(false);
+    expect(isDeviceLimitBenched(row({ status: 'active', statusCause: 'codex-device-limit' }))).toBe(false);
+    expect(isDeviceLimitBenched(null)).toBe(false);
+  });
+
+  it('a benched cell shows the bench and hides Sign in and every repair action, even with a repair episode', () => {
+    for (const state of ['suggested', 'failed', 'browser-driving', 'waiting-operator-only']) {
+      const t = el();
+      renderAccountMatrix(doc, t, pool([row({ statusCause: 'codex-device-limit' })]), { enabled: true, logins: [] }, {}, [
+        { id: 'r1', accountId: 'c1', machineId: 'm1', state },
+      ]);
+      const cell = t.querySelector('[data-cell-key="c1::m1"]');
+      expect(cell!.className, state).toContain('sub-matrix-device-limit');
+      expect(cell!.textContent, state).toContain('Suspected device limit: benched on this machine');
+      expect(cell!.querySelector('[data-matrix-setup]'), state).toBeNull();
+      expect(cell!.querySelector('[data-matrix-relogin]'), state).toBeNull();
+    }
+  });
+
+  it('a pending login or client transient does not turn a benched cell back into an action', () => {
+    const t = el();
+    renderAccountMatrix(doc, t, pool([row({ statusCause: 'codex-device-limit' })]),
+      { enabled: true, logins: [{ id: 'c1', machineId: 'm1', expectedEmail: 'c1@x.com', verificationUrl: 'https://auth.openai.com/x' }] },
+      { 'c1::m1': { state: 'held' } });
+    const cell = t.querySelector('[data-cell-key="c1::m1"]');
+    expect(cell!.className).toContain('sub-matrix-device-limit');
+    expect(cell!.querySelector('button')).toBeNull();
+  });
+
+  it("a remote row with statusCause 'unknown' is ordinary needs-sign-in, not benched", () => {
+    const t = el();
+    renderAccountMatrix(doc, t, pool([row({ statusCause: 'unknown', machineId: 'm2', machineNickname: 'Studio', remote: true })]), { enabled: true, logins: [] }, {});
+    const cell = t.querySelector('[data-cell-key="c1::m2"]');
+    expect(cell!.className).toContain('sub-matrix-needs-reauth');
+    expect(cell!.textContent).not.toContain('device limit');
+    expect(cell!.querySelector('[data-matrix-setup]')!.textContent).toBe('Sign in');
+  });
+
+  it('the account card shows the bench and no repair controls', () => {
+    const t = el();
+    renderAccounts(doc, t, [row({ statusCause: 'codex-device-limit' })], NOW, null, [
+      { id: 'r1', accountId: 'c1', state: 'suggested' },
+    ]);
+    expect(t.textContent).toContain('Suspected device limit: benched on this machine');
+    expect(t.querySelector('[data-relogin-action]')).toBeNull();
+    const plain = el();
+    renderAccounts(doc, plain, [row({ statusCause: 'unknown' })], NOW, null, [
+      { id: 'r1', accountId: 'c1', state: 'suggested' },
+    ]);
+    expect(plain.textContent).not.toContain('device limit');
+    expect(plain.querySelector('[data-relogin-action="approve"]')).toBeTruthy();
+  });
+});

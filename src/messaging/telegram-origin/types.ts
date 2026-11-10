@@ -1,0 +1,179 @@
+import type { OriginJson } from './CanonicalOrigin.js';
+
+export type OriginEvidenceStatus = 'observed' | 'configured' | 'unknown' | 'not-applicable';
+export interface OriginEvidence {
+  value: string | null;
+  status: OriginEvidenceStatus;
+  sourceEventRef: string | null;
+  observedAt: number | null;
+  reason: string | null;
+}
+export interface TelegramOriginProducer {
+  agentId: string;
+  agentName: string;
+  originMachineId: string;
+  originMachineName: string;
+  sessionId: string | null;
+  sessionIncarnation: string | null;
+  turnId: string | null;
+  producerKind: 'session' | 'server-automation' | 'imported-legacy';
+  producerId: string;
+  harnessId: string | null;
+  harnessName: string | null;
+  machine: OriginEvidence;
+  harness: OriginEvidence;
+  model: OriginEvidence;
+  authorContributors?: Array<{ model: OriginEvidence; harness: OriginEvidence }>;
+  omittedAuthorContributors?: number;
+}
+export interface OriginDisplaySettings {
+  enabled: boolean;
+  machine: boolean;
+  harness: boolean;
+  model: boolean;
+}
+export interface OriginDisplaySnapshot extends OriginDisplaySettings { version: string; }
+export interface OriginDestination {
+  version: 1;
+  transport: 'bot-api' | 'telegram-web' | 'telegram-mtproto';
+  accountId: string;
+  chatId: string | null;
+  topicId: string | null;
+  messageId: string | null;
+  inlineMessageId: string | null;
+  scheduledMessageId: string | null;
+}
+export interface TelegramOriginRecord extends TelegramOriginProducer {
+  /** Origin-stamped structural notification provenance, signed with the record. */
+  notification?: import('../NotificationSelectivityGate.js').OutboundEnvelope;
+  /** Custody importer attests unknown legacy authorship, not its own authorship. */
+  importedByMachineId?: string;
+  legacySnapshotDigest?: string;
+  /** Pinned at preparation. A custody/lease move cannot silently authorize the
+   * same uncertain operation on another machine. Absent on imported legacy evidence. */
+  executionOwnerMachineId?: string;
+  childLinks?: Array<{ childId: string; companionOf: string | null }>;
+  forwardedFrom?: { chatId: string; messageIds: string[] };
+  /** Original retained message origin for an edit; null means legacy/unavailable authorship. */
+  revisionOf?: string | null;
+  schemaVersion: 'instar-telegram-origin-v1';
+  originId: string;
+  operationId: string;
+  deliveryId: string;
+  createdAt: number;
+  operationKind: string;
+  destination: OriginDestination;
+  contentDigest: string;
+  planDigest: string;
+  /** Signed execution bounds, materializations and derivation permissions. */
+  admissionDigest?: string;
+  display: OriginDisplaySnapshot;
+  attestation: OriginAttestation | null;
+}
+export interface OriginAttestation {
+  keyId: string;
+  keyEpoch: number;
+  envelopeDigest: string;
+  signature: string;
+  signedAt: number;
+}
+export interface SealedBotRequest {
+  /** Protected policy input; committed by the plan, never transmitted to Telegram. */
+  policy?: import('./OriginSendPolicy.js').OriginSendPolicyInput;
+  /** One bounded derivation may bind reply_parameters to this accepted child. */
+  companionOf?: string;
+  method: string;
+  accountId: string;
+  destination: OriginDestination;
+  contentType: 'application/json';
+  body: string;
+  /** Canonical parameters stay separate from byte custody; these refs are signed. */
+  multipart?: { boundary: string; wireDigest: string; attachments: OriginAttachmentRef[] };
+}
+export interface OriginAttachmentRef {
+  payloadId: string;
+  field: string;
+  filename: string;
+  mediaType: string;
+  digest: string;
+  size: number;
+}
+export interface OriginPreparedChild {
+  childId: string;
+  materializationId: string;
+  request: SealedBotRequest;
+  requestDigest: string;
+}
+/** `accepted-unrecorded`: Telegram accepted (its message id is in hand) but the
+ * origin store could not save the receipt; the message WAS delivered. */
+export type OriginSendOutcome = 'accepted' | 'accepted-unrecorded' | 'known-failed' | 'outcome-unknown' | 'scheduled' | 'suppressed' | 'held' | 'partial' | 'expired-unresolved';
+export interface OriginPlatformReceipt {
+  transport: OriginDestination['transport'];
+  accountId: string;
+  chatId: string | null;
+  topicId: string | null;
+  messageId: string | null;
+  inlineMessageId: string | null;
+  scheduledMessageId: string | null;
+  acceptedAt: number;
+}
+export interface OriginLimits {
+  maxActiveOperations: number;
+  maxActivePayloadBytes: number;
+  maxChildren: number;
+  deadlineMs: number;
+  maxAttempts: number;
+}
+export const DEFAULT_ORIGIN_LIMITS: Readonly<OriginLimits> = Object.freeze({
+  maxActiveOperations: 1000, maxActivePayloadBytes: 256 * 1024 * 1024,
+  maxChildren: 100, deadlineMs: 6 * 60 * 60 * 1000, maxAttempts: 9,
+});
+export interface OriginConfig {
+  display?: Partial<OriginDisplaySettings>;
+  /** One operator-approved, profile-bound Telegram Web destination outside this
+   * agent's own chat. It does not grant raw browser access or a second send path.
+   * The decisionRef identifies the recorded operator instruction. */
+  browserSendAllowance?: {
+    profileId: string; accountId: string; chatId: string; topicId: string | null; decisionRef: string;
+  };
+  /** Application permission for the pre-recorded operator-hub outage notice.
+   * Omitted means enabled; this never disables ordinary origin recording. */
+  outageNotice?: { enabled?: boolean };
+  /** a2a-single-agent-identity §4.3 — a reply from a machine that does not hold
+   * the lease is FORWARDED to the holder (omitted ⇒ enabled). The durable held
+   * state, its reason and the notice are NOT behind this switch. */
+  forwardToHolder?: { enabled?: boolean };
+  limits?: Partial<OriginLimits>;
+}
+export type BotParameters = { [key: string]: OriginJson };
+
+/** This process could not read its current messaging config (a failed, timed-out
+ * or stale observation; e.g. a starved event loop past the reader's deadline), so
+ * it cannot choose a destination or sender display. Raised while a send is being
+ * prepared, before admission or any network call: nothing was sent, and the send
+ * may be retried once config reads again. Never a claim that config is missing.
+ * The message stays `origin-display-authority-unavailable` for existing callers. */
+export class OriginConfigUnavailableError extends Error {
+  readonly retryable = true;
+  constructor(readonly reason: string) {
+    super('origin-display-authority-unavailable');
+    this.name = 'OriginConfigUnavailableError';
+  }
+}
+export class TelegramOriginHoldError extends Error {
+  readonly terminalForCallerRetry = true;
+  constructor(readonly reason: string, readonly operationId: string | null = null,
+    readonly outcome: OriginSendOutcome = 'held',
+    /** Set only with `accepted-unrecorded`: Telegram's own message id, and
+     * whether the fallback record (OriginUnrecordedReceipts) was written. */
+    readonly delivered?: { messageId: string | null; topicId: string | null; fallbackRecorded: boolean }) {
+    super(`Telegram message held: ${reason}`);
+    this.name = 'TelegramOriginHoldError';
+  }
+}
+/** a2a-single-agent-identity §4.2 — the forward-to-holder path found, during
+ * its lease-settling window, that THIS machine holds the lease after all. The
+ * caller sends locally; nothing was forwarded, recorded or held. */
+export class OriginForwardSettledLocallyError extends Error {
+  constructor() { super('telegram origin forward settled to this machine; send locally'); this.name = 'OriginForwardSettledLocallyError'; }
+}

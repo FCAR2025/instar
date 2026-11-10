@@ -137,8 +137,8 @@ describe('detectGeminiReviewer', () => {
     });
     expect(r.available).toBe(true);
     expect(r.framework).toBe('gemini-cli');
-    // capable tier → gemini-2.5-pro per gemini-cli/models.ts.
-    expect(r.model).toBe('gemini-2.5-pro');
+    // capable tier → gemini-3.1-pro-preview per gemini-cli/models.ts.
+    expect(r.model).toBe('gemini-3.1-pro-preview');
     // The canary contract: detection NEVER emits a bare tier word.
     expect(isConcreteReviewerModel(r.model)).toBe(true);
   });
@@ -337,9 +337,15 @@ describe('framework activation history (durable standing-framework baseline)', (
 
 describe('TRUSTED_REVIEWER_FRAMEWORKS (no spec egress to untrusted endpoints)', () => {
   it('trusts exactly the first-party OAuth CLI adapters', () => {
-    expect(TRUSTED_REVIEWER_FRAMEWORKS).toEqual(['codex-cli', 'gemini-cli']);
+    // claude-code added by REVIEWER-DOOR-REWIRING (§2.2), COUPLED with the §5.4
+    // baseline-predicate swap so it can never launder the externals-mandatory check.
+    // grok-build is first-party OAuth (subscription device-auth, no custom
+    // endpoint), so it joins the allowlist — see the pi-cli exclusion below for
+    // the line this list actually draws.
+    expect(TRUSTED_REVIEWER_FRAMEWORKS).toEqual(['codex-cli', 'gemini-cli', 'claude-code', 'grok-build']);
     expect(isTrustedReviewerFramework('codex-cli')).toBe(true);
     expect(isTrustedReviewerFramework('gemini-cli')).toBe(true);
+    expect(isTrustedReviewerFramework('claude-code')).toBe(true);
   });
 
   it('excludes pi-cli (multi-provider — may be a custom endpoint) and arbitrary ids', () => {
@@ -359,7 +365,9 @@ describe('TRUSTED_REVIEWER_FRAMEWORKS (no spec egress to untrusted endpoints)', 
 
 describe('geminiReviewer registry entry', () => {
   it('is the second registry entry (codex stays the preference leader)', () => {
-    expect(SUPPORTED_REVIEWER_FRAMEWORKS.map((f) => f.id)).toEqual(['codex-cli', 'gemini-cli']);
+    // claude-code is the third entry (REVIEWER-DOOR-REWIRING §1), config-gated
+    // out of the ACTIVE set on the fleet.
+    expect(SUPPORTED_REVIEWER_FRAMEWORKS.map((f) => f.id)).toEqual(['codex-cli', 'gemini-cli', 'grok-build', 'claude-code']);
   });
 
   it('ok: stub provider returns a structured review → status ok, gemini flag', async () => {
@@ -441,5 +449,25 @@ describe('geminiReviewer registry entry', () => {
     expect(r.status).toBe('degraded');
     expect(r.reason).toBe('model-resolution-canary');
     expect(providerInvoked).toBe(false);
+  });
+
+  it('pins the feedback secondary read to Sol and records the model actually invoked', async () => {
+    const codexEntry = SUPPORTED_REVIEWER_FRAMEWORKS.find((f) => f.id === 'codex-cli')!;
+    let invokedModel: unknown;
+    let strictPin: unknown;
+    const r = await codexEntry.review({
+      promptText: 'PROMPT', timeoutMs: 1000,
+      detectionOverride: { available: true, framework: 'codex-cli', model: 'gpt-6-astra' },
+      codexModelOverride: 'sol',
+      providerOverride: { evaluate: async (_prompt, options) => {
+        invokedModel = options?.model;
+        strictPin = options?.strictModelPin;
+        return 'Verdict: CLEAN';
+      } },
+    });
+    expect(invokedModel).toBe('balanced');
+    expect(strictPin).toBe(true);
+    expect(r.model).toBe('gpt-6-sol');
+    expect(r.status).toBe('ok');
   });
 });

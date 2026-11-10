@@ -129,7 +129,9 @@ describe('TunnelManager (provider/tier architecture)', () => {
         stateDir: project.stateDir,
         ...configOverrides,
       },
-      { providers, fetch: fetcher },
+      // 1ms probe-retry delays: keep the reachability grace window
+      // (probe retries) semantically intact without real sleeps.
+      { providers, fetch: fetcher, reachabilityRetryDelaysMs: [1] },
     );
     // EventEmitter throws on unhandled 'error' — every failure path
     // emits it, so absorb by default; tests assert via rejections.
@@ -215,6 +217,21 @@ describe('TunnelManager (provider/tier architecture)', () => {
       await tm.start();
       // Trailing slash stripped — exactly one /health.
       expect(fetchCalls).toContain('https://abc.trycloudflare.com/health');
+    });
+
+    it('changes connection generation when the same named URL receives a replacement handle', async () => {
+      const provider = new FakeProvider('cloudflare-named', 1, 'https://same.example.test');
+      const tm = createManager([provider], { type: 'named' });
+      const initial = tm.connectionGeneration;
+      await tm.start();
+      const first = tm.connectionGeneration;
+      expect(first).toBeGreaterThan(initial);
+      await tm.forceStop();
+      expect(tm.connectionGeneration).toBeGreaterThan(first);
+      const stopped = tm.connectionGeneration;
+      await tm.start();
+      expect(tm.url).toBe('https://same.example.test');
+      expect(tm.connectionGeneration).toBeGreaterThan(stopped);
     });
 
     it('emits the url event on success', async () => {

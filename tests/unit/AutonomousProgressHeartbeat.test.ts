@@ -15,7 +15,8 @@
  *   generic; no "still working" assertion), and the widening backoff + cap.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { DegradationReporter } from '../../src/monitoring/DegradationReporter.js';
 import {
   AutonomousProgressHeartbeat,
   type AutonomousHeartbeatDeps,
@@ -25,6 +26,10 @@ import {
 } from '../../src/monitoring/AutonomousProgressHeartbeat.js';
 import { ProxyCoordinator } from '../../src/monitoring/ProxyCoordinator.js';
 import { scrubFocus, FOCUS_MAX_LENGTH } from '../../src/monitoring/autonomousHeartbeatScrub.js';
+import type {
+  AutonomousHeartbeatRunState,
+  AutonomousHeartbeatRunStateStoreLike,
+} from '../../src/monitoring/AutonomousHeartbeatRunStateStore.js';
 
 const MIN = 60_000;
 const TOPIC = 4242;
@@ -46,14 +51,18 @@ interface Harness {
   };
 }
 
-function makeHarness(overrides: Partial<Harness['state']> = {}, cfg: { dryRun?: boolean; enabled?: boolean; silenceThresholdMinutes?: number; maxHeartbeatsPerRun?: number; recentOutputChangeWindowMs?: number } = {}): Harness {
+function makeHarness(
+  overrides: Partial<Harness['state']> = {},
+  cfg: { dryRun?: boolean; enabled?: boolean; guaranteedReporting?: boolean; silenceThresholdMinutes?: number; maxHeartbeatsPerRun?: number; recentOutputChangeWindowMs?: number } = {},
+  depsOverrides: Partial<AutonomousHeartbeatDeps> = {},
+): Harness {
   let now = 100 * MIN;
   const proxy = new ProxyCoordinator();
   const sent: Harness['sent'] = [];
   const startedAtMs = 0; // the run started long before `now` → warmup elapsed by default
   const state: Harness['state'] = {
     runs: [{ topicId: TOPIC, sessionName: 'ai.instar.topic-4242', remainingSeconds: 3600 }],
-    markers: { movedTo: null, moveSuspended: false, startedAtMs },
+    markers: { movedTo: null, moveSuspended: false, startedAtMs, runId: 'run-1' },
     alive: true,
     history: [], // no outbound → silent forever
     sharedLastOutputAt: now - 1 * MIN, // output advanced 1m ago (recent)
@@ -78,15 +87,113 @@ function makeHarness(overrides: Partial<Harness['state']> = {}, cfg: { dryRun?: 
       sent.push({ topicId, text, metadata });
     },
     now: () => now,
+    ...depsOverrides,
   };
   const hb = new AutonomousProgressHeartbeat(deps, {
     enabled: cfg.enabled ?? true,
     dryRun: cfg.dryRun ?? false,
+    guaranteedReporting: cfg.guaranteedReporting,
     silenceThresholdMinutes: cfg.silenceThresholdMinutes ?? 25,
     maxHeartbeatsPerRun: cfg.maxHeartbeatsPerRun,
     recentOutputChangeWindowMs: cfg.recentOutputChangeWindowMs,
   });
   return { hb, proxy, sent, state, setNow: (ms) => { now = ms; } };
+}
+
+describe('fleet autonomous reporting', () => {
+  const fleet = { guaranteedReporting: true, silenceThresholdMinutes: 30, maxHeartbeatsPerRun: 1 };
+
+  it('reports a live run even when its output snapshot is unavailable', async () => {
+    const h = makeHarness({ sharedLastOutputAt: null }, fleet);
+    await h.hb.tick();
+    expect(h.sent[0].text).toContain('cannot verify recent session activity');
+  });
+
+  it('says why a run is paused when the session is gone', async () => {
+    const h = makeHarness({ alive: false }, fleet);
+    await h.hb.tick();
+    expect(h.sent[0].text).toContain('session is not running');
+  });
+
+  it('reports an explicit pause and a suspended move', async () => {
+    const paused = makeHarness({ runs: [{ topicId: TOPIC, sessionName: null, remainingSeconds: 3600, paused: true }] }, fleet);
+    await paused.hb.tick();
+    expect(paused.sent[0].text).toContain('paused in its local run state');
+
+    const move = makeHarness(
+      { markers: { movedTo: 'm_destination', moveSuspended: true, startedAtMs: 0, runId: 'run-1' } },
+      fleet,
+      { isLocalTopicOwner: () => true },
+    );
+    await move.hb.tick();
+    expect(move.sent[0].text).toContain('move to another machine was suspended');
+
+    const movedAway = makeHarness(
+      { markers: { movedTo: 'm_destination', moveSuspended: true, startedAtMs: 0, runId: 'run-1' } },
+      fleet,
+      { isLocalTopicOwner: () => false },
+    );
+    await movedAway.hb.tick();
+    expect(movedAway.sent).toHaveLength(0);
+  });
+
+  it('holds a suspended move when ownership is unknown', async () => {
+    const h = makeHarness(
+      { markers: { movedTo: 'm_destination', moveSuspended: true, startedAtMs: 0, runId: 'run-1' } },
+      fleet,
+      { isLocalTopicOwner: () => null },
+    );
+    await h.hb.tick();
+    expect(h.sent).toHaveLength(0);
+  });
+
+  it.each([true, false])('reports a failed history read and preserves guaranteedReporting=%s behavior', async (guaranteedReporting) => {
+    const report = vi.spyOn(DegradationReporter.getInstance(), 'report').mockImplementation(() => {});
+    try {
+      const h = makeHarness({}, { ...fleet, guaranteedReporting }, {
+        getTopicHistory: () => { throw new Error('history-read-failed'); },
+      });
+      await h.hb.tick();
+      expect(report).toHaveBeenCalledWith(expect.objectContaining({
+        feature: 'AutonomousProgressHeartbeat.history',
+        reason: 'history-read-failed',
+        internalOnly: true,
+      }));
+      expect(h.sent).toHaveLength(guaranteedReporting ? 1 : 0);
+    } finally {
+      report.mockRestore();
+    }
+  });
+
+  it('keeps reporting after the legacy per-run budget is exhausted', async () => {
+    const h = makeHarness({}, fleet);
+    await h.hb.tick();
+    h.setNow(140 * MIN);
+    h.state.sharedLastOutputAt = 139 * MIN;
+    await h.hb.tick();
+    expect(h.sent).toHaveLength(2);
+  });
+});
+
+class MemoryRunStateStore implements AutonomousHeartbeatRunStateStoreLike {
+  readonly runs = new Map<string, AutonomousHeartbeatRunState>();
+  failWrites = false;
+
+  read(runId: string): AutonomousHeartbeatRunState | null {
+    const state = this.runs.get(runId);
+    return state ? { ...state } : null;
+  }
+
+  write(state: AutonomousHeartbeatRunState): void {
+    if (this.failWrites) throw new Error('fixture-write-failed');
+    this.runs.set(state.runId, { ...state });
+  }
+
+  retain(runIds: ReadonlySet<string>): void {
+    for (const runId of this.runs.keys()) {
+      if (!runIds.has(runId)) this.runs.delete(runId);
+    }
+  }
 }
 
 describe('AutonomousProgressHeartbeat — fires on the happy path', () => {
@@ -121,20 +228,20 @@ describe('AutonomousProgressHeartbeat — suppresses on each failing predicate',
   });
 
   it('#2 mid-move marker (moved_to) → no emit', async () => {
-    const h = makeHarness({ markers: { movedTo: 'mac-mini', moveSuspended: false, startedAtMs: 0 } });
+    const h = makeHarness({ markers: { movedTo: 'mac-mini', moveSuspended: false, startedAtMs: 0, runId: 'run-1' } });
     await h.hb.tick();
     expect(h.sent).toHaveLength(0);
   });
 
   it('#2 mid-move marker (move_suspended_at) → no emit', async () => {
-    const h = makeHarness({ markers: { movedTo: null, moveSuspended: true, startedAtMs: 0 } });
+    const h = makeHarness({ markers: { movedTo: null, moveSuspended: true, startedAtMs: 0, runId: 'run-1' } });
     await h.hb.tick();
     expect(h.sent).toHaveLength(0);
   });
 
   it('#3 warmup NOT elapsed: run started < one window ago → no emit', async () => {
     // now = 100m; started 10m ago (< 25m window)
-    const h = makeHarness({ markers: { movedTo: null, moveSuspended: false, startedAtMs: 90 * MIN } });
+    const h = makeHarness({ markers: { movedTo: null, moveSuspended: false, startedAtMs: 90 * MIN, runId: 'run-1' } });
     await h.hb.tick();
     expect(h.sent).toHaveLength(0);
   });
@@ -231,10 +338,84 @@ describe('AutonomousProgressHeartbeat — cooldown, budget, and backoff', () => 
     expect(h.sent).toHaveLength(1);
     // a fresh run on the same topic: new startedAtMs, still warmed up
     h.setNow(200 * MIN);
-    h.state.markers = { movedTo: null, moveSuspended: false, startedAtMs: 150 * MIN };
+    h.state.markers = { movedTo: null, moveSuspended: false, startedAtMs: 150 * MIN, runId: 'run-2' };
     h.state.sharedLastOutputAt = 200 * MIN - 1 * MIN;
     await h.hb.tick();
     expect(h.sent).toHaveLength(2); // budget reset → fires again
+  });
+
+  it('persists the per-run cap across a component/server restart', async () => {
+    const store = new MemoryRunStateStore();
+    const firstProcess = makeHarness({}, { maxHeartbeatsPerRun: 1 }, { runStateStore: store });
+    await firstProcess.hb.tick();
+    expect(firstProcess.sent).toHaveLength(1);
+    expect(store.runs.get('run-1')?.count).toBe(1);
+
+    const restartedProcess = makeHarness({}, { maxHeartbeatsPerRun: 1 }, { runStateStore: store });
+    await restartedProcess.hb.tick();
+    expect(restartedProcess.sent).toHaveLength(0);
+    expect(store.runs.get('run-1')?.count).toBe(1);
+  });
+
+  it('persists the widening backoff position across a component/server restart', async () => {
+    const store = new MemoryRunStateStore();
+    const firstProcess = makeHarness({}, {}, { runStateStore: store });
+    await firstProcess.hb.tick(); // first heartbeat at 100m
+
+    const restartedProcess = makeHarness({}, {}, { runStateStore: store });
+    restartedProcess.setNow(110 * MIN); // only 10m later; persisted 25m gap still holds
+    restartedProcess.state.sharedLastOutputAt = 109 * MIN;
+    await restartedProcess.hb.tick();
+    expect(restartedProcess.sent).toHaveLength(0);
+    expect(store.runs.get('run-1')?.lastHeartbeatAt).toBe(100 * MIN);
+  });
+
+  it('reserves the durable slot before send and suppresses if persistence fails', async () => {
+    const store = new MemoryRunStateStore();
+    store.failWrites = true;
+    const h = makeHarness({}, {}, { runStateStore: store });
+    await h.hb.tick();
+    expect(h.sent).toHaveLength(0);
+    expect(h.hb.status()).toMatchObject({ persistenceConfigured: true, persistenceHealthy: false });
+  });
+
+  it('keeps a pre-send reservation when a failed send cannot be durably rolled back', async () => {
+    const store = new MemoryRunStateStore();
+    let sendAttempts = 0;
+    const h = makeHarness({}, { maxHeartbeatsPerRun: 1 }, {
+      runStateStore: store,
+      sendMessage: async () => {
+        sendAttempts += 1;
+        store.failWrites = true; // make only the post-failure rollback fail
+        throw new Error('fixture-send-failed');
+      },
+    });
+    await h.hb.tick();
+    expect(sendAttempts).toBe(1);
+    expect(store.runs.get('run-1')?.count).toBe(1);
+
+    store.failWrites = false;
+    const restartedProcess = makeHarness({}, { maxHeartbeatsPerRun: 1 }, { runStateStore: store });
+    await restartedProcess.hb.tick();
+    expect(restartedProcess.sent).toHaveLength(0);
+  });
+});
+
+describe('AutonomousProgressHeartbeat — live config', () => {
+  it('applies a changed silence threshold at the next tick without a restart', async () => {
+    let silenceThresholdMinutes = 25;
+    const h = makeHarness(
+      { history: [{ fromUser: false, at: 90 * MIN }] },
+      { silenceThresholdMinutes },
+      { getConfig: () => ({ enabled: true, dryRun: false, silenceThresholdMinutes }) },
+    );
+    await h.hb.tick();
+    expect(h.sent).toHaveLength(0); // only 10m silent, below the original 25m gate
+
+    silenceThresholdMinutes = 5;
+    await h.hb.tick();
+    expect(h.sent).toHaveLength(1);
+    expect(h.hb.status().silenceThresholdMinutes).toBe(5);
   });
 });
 

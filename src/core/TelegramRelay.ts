@@ -1,3 +1,4 @@
+import type { QuietReceipt } from '../messaging/NotificationSelectivityGate.js';
 /**
  * TelegramRelay — the tokenless-standby outbound relay (bug #7), extracted as a
  * pure, testable unit.
@@ -23,9 +24,47 @@
  * unit-testable without real network or wall-clock.
  */
 
-export interface RelayResult {
+import type { MessageProvenance } from '../messaging/shared/MessageProvenance.js';
+
+export type RelayResult = QuietReceipt | {
+  recorded?: false;
   messageId: number;
   topicId: number;
+  destinationStoreConfirmed?: boolean;
+}
+
+/**
+ * A holder REFUSAL carried back verbatim (a 422: tone-gate nudge, credential
+ * wall, reason-required). Distinct from `null`, which means the relay could not
+ * reach a verdict at all. The distinction is load-bearing: a refusal is
+ * actionable by the agent, a transport failure is not, and reporting the first
+ * as the second is what made a relayed advisory unanswerable.
+ */
+export interface RelayRefusal {
+  refused: true;
+  status: 422;
+  body: Record<string, unknown>;
+}
+
+export function isRelayRefusal(r: RelayResult | RelayRefusal | null): r is RelayRefusal {
+  return !!r && (r as RelayRefusal).refused === true;
+}
+
+/**
+ * Thrown at the adapter boundary so a holder refusal travels up the existing
+ * throw-based send path (which expects `messageId | null`) WITHOUT the standby
+ *'s route having to special-case a third return shape. The route catches it and
+ * re-emits the holder's status + body verbatim.
+ */
+export class RelayRefusedError extends Error {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+  constructor(refusal: RelayRefusal) {
+    super(`telegram relay refused by holder (${refusal.status})`);
+    this.name = 'RelayRefusedError';
+    this.status = refusal.status;
+    this.body = refusal.body;
+  }
 }
 
 export interface RelayDeps {
@@ -47,14 +86,15 @@ export interface RelayDeps {
 
 /**
  * Relay one outbound reply through the lease holder. Returns the sent message's
- * RelayResult, or null when it could not be delivered (logged, never silent).
+ * RelayResult, a RelayRefusal when the holder REFUSED it with a reason (422), or
+ * null when it could not be delivered at all (logged, never silent).
  */
 export async function relayOutbound(
   topicId: number,
   text: string,
-  opts: { silent?: boolean; kindMetadata?: Record<string, unknown> } | undefined,
+  opts: { silent?: boolean; kindMetadata?: Record<string, unknown>; provenance?: Exclude<MessageProvenance, 'user'> } | undefined,
   deps: RelayDeps,
-): Promise<RelayResult | null> {
+): Promise<RelayResult | RelayRefusal | null> {
   const log = deps.log ?? (() => {});
   const holder = deps.leaseHolder();
   if (!holder || holder === deps.selfMachineId) return null; // we ARE the owner, or none known
@@ -80,15 +120,37 @@ export async function relayOutbound(
       body: JSON.stringify({
         text,
         ...(opts?.silent ? { silent: true } : {}),
-        ...(opts?.kindMetadata ? { metadata: opts.kindMetadata } : {}),
+        ...(opts?.kindMetadata || opts?.provenance
+          ? { metadata: { ...opts?.kindMetadata, ...(opts?.provenance ? { provenance: opts.provenance } : {}) } }
+          : {}),
       }),
       signal: ac.signal,
     });
     if (!resp.ok) {
+      // ── Refusal vs failure ────────────────────────────────────────────────
+      // A 422 from the holder is a REFUSAL WITH A REASON (a tone-gate nudge, a
+      // credential wall), not a transport failure. Collapsing it to `null` made
+      // the standby report "router unreachable" — so the agent saw a network
+      // error instead of the rule, the decisionRef, and how to proceed, and
+      // could never act on it. Surface the holder's own body so a relayed topic
+      // gets the same actionable refusal a direct send does.
+      if (resp.status === 422) {
+        const body = (await resp.json().catch(() => {
+          /* @silent-fallback-ok — an unparseable refusal body degrades to `{}`, and
+             that is the honest outcome: the REFUSAL itself (status 422) is still
+             surfaced, which is the load-bearing fact. Throwing here would collapse
+             a real refusal back into the transport-failure path this branch exists
+             to escape, turning an actionable nudge into "router unreachable" again. */
+          return {};
+        })) as Record<string, unknown>;
+        log(`[telegram-relay] holder ${url} REFUSED topic ${topicId}: ${String(body.error ?? body.blockedBy ?? '422')}`);
+        return { refused: true, status: 422, body };
+      }
       log(`[telegram-relay] holder ${url} returned ${resp.status} for topic ${topicId} (${Date.now() - started}ms) — reply not delivered`);
       return null;
     }
-    const j = (await resp.json().catch(() => ({}))) as { messageId?: number };
+    const j = (await resp.json().catch(() => ({}))) as { messageId?: number; destinationStoreConfirmed?: boolean; delivered?: boolean; recorded?: boolean; quietId?: string };
+    if (j.recorded === true && j.delivered === false && typeof j.quietId === 'string' && j.quietId.length > 0 && j.quietId.length <= 200) return { delivered: false, recorded: true, quietId: j.quietId, topicId };
     // Truthful success: the holder must report a REAL positive Telegram
     // messageId. A 2xx with a missing/0 messageId means the holder accepted the
     // request but did NOT confirm a Telegram delivery — treat that as FAILURE,
@@ -99,7 +161,11 @@ export async function relayOutbound(
       log(`[telegram-relay] holder ${url} returned ok but NO confirmed messageId for topic ${topicId} (${Date.now() - started}ms) — treating as undelivered`);
       return null;
     }
-    return { messageId: j.messageId, topicId };
+    if (j.destinationStoreConfirmed !== true) {
+      log(`[telegram-relay] holder ${url} returned messageId ${j.messageId} but NO destination-store confirmation for topic ${topicId} (${Date.now() - started}ms) — treating as undelivered`);
+      return null;
+    }
+    return { messageId: j.messageId, topicId, destinationStoreConfirmed: true };
   } catch (err) {
     const reason = ac.signal.aborted
       ? `timeout after ${deps.timeoutMs}ms`

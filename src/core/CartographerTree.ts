@@ -128,6 +128,12 @@ export interface CartographerConfig {
   projectDir: string;
   /** Instar state directory (cartographer state nests under here). */
   stateDir: string;
+  /**
+   * Optional verified-root namespace. When supplied, state is isolated under
+   * cartographer/roots/<namespace>. Omitted preserves the legacy singleton path
+   * exactly; PR 11B-1 adds the inert storage substrate without changing callers.
+   */
+  stateNamespace?: string;
   /** Hard cap on descent depth (default 12). */
   maxDepth?: number;
   /** File extensions that become leaf nodes (default ts/js/mjs/cjs). */
@@ -157,7 +163,12 @@ export class CartographerTree {
 
   constructor(config: CartographerConfig) {
     this.projectDir = config.projectDir;
-    this.cartoDir = path.join(config.stateDir, 'cartographer');
+    if (config.stateNamespace !== undefined && !/^root-[a-f0-9]{24}$/.test(config.stateNamespace)) {
+      throw new Error('Invalid Cartographer state namespace');
+    }
+    this.cartoDir = config.stateNamespace
+      ? path.join(config.stateDir, 'cartographer', 'roots', config.stateNamespace)
+      : path.join(config.stateDir, 'cartographer');
     this.nodesDir = path.join(this.cartoDir, 'nodes');
     this.indexPath = path.join(this.cartoDir, 'index.json');
     this.maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH;
@@ -325,14 +336,19 @@ export class CartographerTree {
     chunkNodes: number;
     onYield: () => Promise<void>;
     shouldAbort?: () => boolean;
+    maxChunkMs?: number;
   }): Promise<{ nodeCount: number }> {
     this.ensureDirs();
     const chunk = Math.max(1, opts.chunkNodes);
+    const maxChunkMs = Math.max(1, opts.maxChunkMs ?? 50);
     let ops = 0;
+    let lastYieldAt = Date.now();
     const tick = async (): Promise<void> => {
       ops += 1;
-      if (ops % chunk === 0) {
+      const now = Date.now();
+      if (ops % chunk === 0 || now - lastYieldAt >= maxChunkMs) {
         await opts.onYield();
+        lastYieldAt = Date.now();
         if (opts.shouldAbort?.()) throw new Error('cartographer-scaffold-aborted');
       }
     };
@@ -860,7 +876,10 @@ export class CartographerTree {
    * nodes (excludes `path-gone`), plus the two ABSOLUTE backlog counts the CI
    * ratchet also gates on so a green ratio over a small authored set cannot hide
    * a growing un-authored backlog (Goodhart guard). `freshRatio` is `fresh /
-   * authorable` with 1 when there are no authorable nodes. A node is
+   * authorable`, or **`null` when there are no authorable nodes** — an empty
+   * index has NOT earned a perfect score, and reporting 1 there made the CI
+   * ratchet structurally unable to fail on an empty map (the exact case it
+   * exists for). Callers MUST treat `null` as "could not assess", never as a pass. A node is
    * never-authored "past grace" when it has no summary AND was first seen longer
    * ago than `graceMs`.
    */
@@ -878,14 +897,14 @@ export class CartographerTree {
     neverAuthoredWithinGrace: number;
     neverAuthoredPastGrace: number;
     authorFailedCount: number;
-    freshRatio: number;
+    freshRatio: number | null;
     generatedAt: string | null;
   } {
     const index = this.loadIndex();
     const empty = {
       nodeCount: 0, authorableCount: 0, freshCount: 0, staleCount: 0,
       neverAuthoredCount: 0, neverAuthoredWithinGrace: 0, neverAuthoredPastGrace: 0,
-      authorFailedCount: 0, freshRatio: 1, generatedAt: null as string | null,
+      authorFailedCount: 0, freshRatio: null as number | null, generatedAt: null as string | null,
     };
     if (!index) return empty;
     const nowMs = opts.now ?? Date.parse(this.nowIso());
@@ -923,7 +942,7 @@ export class CartographerTree {
       neverAuthoredWithinGrace: neverWithin,
       neverAuthoredPastGrace: neverPast,
       authorFailedCount: authorFailed,
-      freshRatio: ratioDenom === 0 ? 1 : fresh / ratioDenom,
+      freshRatio: ratioDenom === 0 ? null : fresh / ratioDenom,
       generatedAt: index.generatedAt,
     };
   }

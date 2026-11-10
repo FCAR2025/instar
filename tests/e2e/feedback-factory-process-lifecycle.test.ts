@@ -182,7 +182,8 @@ describe('feedback-factory-process job — wiring integrity (spec §191)', () =>
     expect(() => validateManifest(manifest, 'feedback-factory-process')).not.toThrow();
     expect(manifest.schedule).toBe('*/30 * * * *');
     expect(manifest.origin).toBe('instar');
-    expect(manifest.execute.type).toBe('agentmd');
+    expect(manifest.execute.type).toBe('script');
+    expect(fs.existsSync(path.join(agentStateDir, 'jobs', 'instar', 'scripts', 'feedback-factory-process.mjs'))).toBe(true);
   });
 
   it('the loader constructs a scheduled JobDefinition from it (NOT dead code)', () => {
@@ -192,8 +193,9 @@ describe('feedback-factory-process job — wiring integrity (spec §191)', () =>
     const job = jobs.find((j) => j.slug === 'feedback-factory-process');
     expect(job, 'feedback-factory-process must load as a real JobDefinition').toBeTruthy();
     expect(job!.schedule).toBe('*/30 * * * *');
-    // Ships disabled (operator opt-in) — but is constructed + scheduled, which is
-    // exactly the §191 "not dead code" guarantee.
-    expect(job!.enabled).toBe(false);
+    // Operated-drain spec: cadence is live on development agents. The route
+    // remains fleet-dark and the job distinguishes expected fleet 503 from a
+    // misclassified development install.
+    expect(job!.enabled).toBe(true);
   });
 });

@@ -1,3 +1,4 @@
+import { ORIGIN_LOCAL_PROJECT_GLOBS } from '../messaging/telegram-origin/OriginLocalPaths.js';
 /**
  * FileClassifier — Routes files to appropriate merge strategies before LLM resolution.
  *
@@ -12,7 +13,10 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { KEY_MATERIAL_SECRET_PATTERNS } from './keyMaterialPaths.js';
 import { SafeGitExecutor } from './SafeGitExecutor.js';
+import { IDENTITY_AUTO_ACCEPT_PROTECTED_PATHS, isRemoteIdentityAuthorityPath } from './IdentityStore.js';
+import { mergeDefaults } from './mergeDefaults.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -120,6 +124,7 @@ const DEFAULT_BINARY_EXTENSIONS = new Set([
 ]);
 
 const DEFAULT_GENERATED_PATTERNS = [
+  ...ORIGIN_LOCAL_PROJECT_GLOBS,
   'dist/', 'build/', '.next/', 'out/',
   'node_modules/', '__pycache__/', '.pytest_cache/',
   '*.min.js', '*.min.css', '*.map',
@@ -145,13 +150,54 @@ const DEFAULT_GENERATED_PATTERNS = [
   '.instar/sessions/',
   '.instar/shadow-install*',
   '.instar/telegram-images/',
+  '.instar/app-media/',
   '.instar/telegram-inbound/',
   '.instar/threadline/',
   '.instar/views/',
   '.instar/worktree-monitor/',
+  // Standby-write reconciliation §3.1 (I9 second axis — the wave-1 build
+  // item): these stores are classified MACHINE-LOCAL (per-machine single
+  // writer with a logical convergence story — WS2.5 replication for the
+  // evolution action queue; pool-scope GET merge + WS4.1 for attention), so
+  // their FILES must not ride git-sync: two machines rewriting the same
+  // git-synced file manufacture recurring merge conflicts no matter how the
+  // logical state converges (the round-2 S1 lesson). Deliberately NOT the
+  // whole `.instar/state/` tree — only the paths whose classification names
+  // `git-sync-excluded` as its file-level arm.
+  '.instar/state/attention-items.json',
+  '.instar/state/evolution/',
+  // Context-aware outbound review (§D9.4b) — the review-canary-battery route's
+  // write targets, classified MACHINE-LOCAL with an ephemeral-rebuildable
+  // story: the per-machine topic-memory SQLite (canary fixtures transit its
+  // reserved negative topic ids; a live binary db must never git-sync) and the
+  // D8 decision log (per-machine soak evidence, never converged).
+  '.instar/topic-memory.db',
+  'logs/response-review-decisions.jsonl',
+  // External-hog sentinel arm marker — per-machine PIN consent to LIVE kills
+  // on THIS machine. Classified MACHINE-LOCAL with git-sync-excluded on BOTH
+  // axes: syncing the marker would silently arm a peer's sentinel the operator
+  // never consented to (the silent-re-arm class the armEpoch design prevents).
+  '.instar/state/external-hog-arm.json',
+  // Dashboard "default for dashboard-created topics" record — machine-local in
+  // v1 (dashboard-door-model-controls §7, migrating-to-unified via #2085). Its
+  // WriteDomainRegistry story names git-sync-excluded as the file-level arm.
+  '.instar/state/new-topic-default-profile.json',
+  // Job cost reduction (job-cost-reduction §5.4, §13): the anomaly episode store
+  // and the triage caps/cooldown state are live observations of THIS machine
+  // (its disk, sessions, process slots), written directly outside guardWrite.
+  // Classified MACHINE-LOCAL with git-sync-excluded as the file-level arm.
+  '.instar/state/job-anomaly-episodes.json',
+  '.instar/state/job-triage-state.json',
+  // Portable-job approvals, replay ledger, inbox, and import journal are local to
+  // one exact agent root. Git-sync must not carry consent or staged bundles.
+  '.instar/state/job-portable-*',
 ];
 
 const DEFAULT_SECRET_PATTERNS = [
+  // machine-self-assertion FD9: every file read by the identity auto-accept
+  // composite is excluded from git-sync by the same manifest that fences the
+  // files API. New evidence inputs must join this list or the static test fails.
+  ...IDENTITY_AUTO_ACCEPT_PROTECTED_PATHS,
   '.env', '.env.*',
   '*.pem', '*.key', '*.p12', '*.pfx',
   '*credentials*', '*secret*',
@@ -167,6 +213,15 @@ const DEFAULT_SECRET_PATTERNS = [
   '.instar/machine/identity.json',
   '.instar/machine/*key*',
   '.instar/secrets/',
+  // Signed-in Chrome profiles and the Linux driver's per-machine install state:
+  // the same folders the file routes and backups refuse.
+  '.instar/state/playwright-profiles/',
+  '.instar/state/xdrive/',
+  // Key material as PREFIXES (a2a-single-agent-identity §5.3): the exact
+  // `.instar/identity.json` match above left `identity.json.superseded-*`
+  // syncable; these cover every sibling and the other key files by the same
+  // list the file routes, backup and gitignore use.
+  ...KEY_MATERIAL_SECRET_PATTERNS,
 ];
 
 const SOURCE_CODE_EXTENSIONS = new Set([
@@ -206,10 +261,7 @@ export class FileClassifier {
       ...DEFAULT_LOCKFILE_PATTERNS,
       ...(config.extraLockfilePatterns ?? []),
     ];
-    this.regenCommands = {
-      ...DEFAULT_REGEN_COMMANDS,
-      ...(config.extraRegenCommands ?? {}),
-    };
+    this.regenCommands = mergeDefaults(DEFAULT_REGEN_COMMANDS, (config.extraRegenCommands ?? {}));
     this.binaryExtensions = new Set([
       ...DEFAULT_BINARY_EXTENSIONS,
       ...(config.extraBinaryExtensions ?? []),
@@ -228,14 +280,20 @@ export class FileClassifier {
    * Classify a file and determine its merge strategy.
    */
   classify(filePath: string): ClassificationResult {
-    const relPath = path.relative(this.projectDir, filePath);
+    // git's `diff --name-only` already yields paths relative to the repo root
+    // (= projectDir). Re-running path.relative on an already-relative path
+    // resolves it against process.cwd() — which mangles it whenever cwd differs
+    // from projectDir or projectDir has a symlink component, misclassifying
+    // .instar/ state files (machines/registry.json) as 'llm' so the
+    // deterministic resolvers never run. Only relativize an ABSOLUTE input.
+    const relPath = path.isAbsolute(filePath) ? path.relative(this.projectDir, filePath) : filePath;
     const basename = path.basename(relPath);
     const ext = path.extname(relPath).toLowerCase();
 
     // Check in priority order (most specific → most general)
 
     // 1. Secrets — never sync
-    if (this.isSecret(relPath, basename)) {
+    if (isRemoteIdentityAuthorityPath(relPath) || this.isSecret(relPath, basename)) {
       return {
         fileClass: 'secret',
         strategy: 'never-sync',

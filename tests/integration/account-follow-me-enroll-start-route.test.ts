@@ -47,11 +47,16 @@ function buildCtx(dir: string, opts: {
   driveCapture?: Array<Record<string, unknown>>;
   /** R6b — the configured remote scrape-timeout budget (ms) the route should thread. */
   remoteScrapeTimeoutMs?: number;
+  /**
+   * A peer that HOLDS the account (this machine does not). This is the follow-me case that
+   * matters: the account's provider/framework can only come from the holder.
+   */
+  peerHolds?: { accountId: string; email: string; provider?: string; framework?: string };
 }) {
   const pool = new SubscriptionPool({ stateDir: dir });
   if (opts.knowAccountEmail) {
     // The operator-approved account is known locally with its email (authoritative S7 source).
-    pool.add({ id: 'a1', nickname: 'main', provider: 'anthropic', framework: 'claude-code', configHome: '/x/a1', email: 'approved@x.com' });
+    pool.addFixture({ id: 'a1', nickname: 'main', provider: 'anthropic', framework: 'claude-code', configHome: '/x/a1', email: 'approved@x.com' });
   }
   const store = new PendingLoginStore({ stateDir: dir });
   const enrollmentWizard = new EnrollmentWizard({
@@ -76,8 +81,21 @@ function buildCtx(dir: string, opts: {
     subscriptionPool: pool,
     enrollmentWizard,
     coordination: { gate: { evaluate: () => ({ decision: opts.decision, reason: opts.decision === 'allow' ? 'mandate ok' : 'no mandate' }) } },
-    // No peer views in this harness; email resolution leans on the local pool (or fails closed).
-    accountFollowMePeerViews: async () => ([]),
+    // Email resolution leans on the local pool unless a peer holder is configured.
+    accountFollowMePeerViews: async () => (opts.peerHolds
+      ? [{
+          machineId: 'mini',
+          nickname: 'the Mini',
+          accounts: [{
+            accountId: opts.peerHolds.accountId,
+            email: opts.peerHolds.email,
+            status: 'active',
+            locallyHeld: true,
+            provider: opts.peerHolds.provider,
+            framework: opts.peerHolds.framework,
+          }],
+        }]
+      : []),
   } as unknown as Parameters<typeof createRoutes>[0];
 }
 
@@ -146,11 +164,56 @@ describe('/subscription-pool/follow-me/enroll/start (integration)', () => {
     app.use(createRoutes(ctx));
     server = await listen(app);
     const r = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
-    expect(r.status).toBe(409);
-    expect(r.body.error).toBe('cannot resolve approved account email');
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('subscription-account-not-found');
     // Fail-closed: NO pending login was started with a blank/wrong email.
     const wizard = (ctx as unknown as { enrollmentWizard: EnrollmentWizard }).enrollmentWizard;
     expect(wizard.pending()).toHaveLength(0);
+  });
+
+  // The live failure this reproduces: a Codex account held only by the peer was enrolled here as a
+  // Claude account — Claude sign-in flow, `.claude-followme-*` home — so the login could never
+  // complete and the consumer retried it indefinitely.
+  it('a peer-held Codex account enrolls AS Codex, into a codex config-home', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'afm-start-'));
+    const driveCapture: Array<Record<string, unknown>> = [];
+    const ctx = buildCtx(dir, {
+      dev: true,
+      decision: 'allow',
+      knowAccountEmail: false,
+      driveCapture,
+      peerHolds: { accountId: 'codex-sagemindai', email: 'justin@sagemindai.io', provider: 'openai', framework: 'codex-cli' },
+    });
+    const app = express(); app.use(express.json());
+    app.use(createRoutes(ctx));
+    server = await listen(app);
+    const r = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'codex-sagemindai' });
+    expect(r.status).toBe(201);
+    // The drive ran the OpenAI/codex login, not the Claude one.
+    expect(driveCapture[0]).toMatchObject({ provider: 'openai', framework: 'codex-cli' });
+    const wizard = (ctx as unknown as { enrollmentWizard: EnrollmentWizard }).enrollmentWizard;
+    const pending = wizard.pending();
+    expect(pending[0]).toMatchObject({ provider: 'openai', framework: 'codex-cli', expectedEmail: 'justin@sagemindai.io' });
+    // The credential lands where `codex` will actually read it.
+    expect(pending[0].configHome).toContain('.codex-followme-codex-sagemindai');
+    expect(pending[0].configHome).not.toContain('.claude-followme-');
+  });
+
+  it('a peer-held Claude account keeps its existing claude config-home path', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'afm-start-'));
+    const ctx = buildCtx(dir, {
+      dev: true,
+      decision: 'allow',
+      knowAccountEmail: false,
+      peerHolds: { accountId: 'a1', email: 'approved@x.com', provider: 'anthropic', framework: 'claude-code' },
+    });
+    const app = express(); app.use(express.json());
+    app.use(createRoutes(ctx));
+    server = await listen(app);
+    const r = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
+    expect(r.status).toBe(201);
+    const wizard = (ctx as unknown as { enrollmentWizard: EnrollmentWizard }).enrollmentWizard;
+    expect(wizard.pending()[0].configHome).toContain('.claude-followme-a1');
   });
 
   it('missing mandateId/accountId → 400', async () => {
@@ -187,7 +250,7 @@ describe('/subscription-pool/follow-me/enroll/start (integration)', () => {
     const ctx = buildCtx(dir, { dev: true, decision: 'allow', knowAccountEmail: false, driveCapture, remoteScrapeTimeoutMs: 180000 });
     // Inject an openai account locally so the email + provider resolve to the remote-aware kind.
     const pool = (ctx as unknown as { subscriptionPool: SubscriptionPool }).subscriptionPool;
-    pool.add({ id: 'a1', nickname: 'main', provider: 'openai', framework: 'codex-cli', configHome: '/x/a1', email: 'approved@x.com' });
+    pool.addFixture({ id: 'a1', nickname: 'main', provider: 'openai', framework: 'codex-cli', configHome: '/x/a1', email: 'approved@x.com' });
     const app = express(); app.use(express.json());
     app.use(createRoutes(ctx));
     server = await listen(app);
@@ -198,5 +261,46 @@ describe('/subscription-pool/follow-me/enroll/start (integration)', () => {
     expect(driveCapture[0].scrapeTimeoutMs).toBe(180000);
     // An openai (device-code-capable) provider on the remote path uses the device-code single-code flow.
     expect(driveCapture[0].kind).toBe('device-code');
+  });
+
+  // ── D5 (topic 29836) — single-attempt discipline at the mint chokepoint ──
+
+  it('(g) a re-request while a HEALTHY attempt is live returns THAT attempt (no parallel PKCE attempt, no second drive)', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'afm-start-'));
+    const driveCapture: Array<Record<string, unknown>> = [];
+    const ctx = buildCtx(dir, { dev: true, decision: 'allow', knowAccountEmail: true, driveCapture });
+    // Pane liveness verifiable and ALIVE.
+    (ctx as unknown as { sessionManager: unknown }).sessionManager = { captureOutput: () => 'Paste the code you receive back here:' };
+    const app = express(); app.use(express.json());
+    app.use(createRoutes(ctx));
+    server = await listen(app);
+    const first = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
+    expect(first.status).toBe(201);
+    const second = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
+    expect(second.status).toBe(201);
+    expect(second.body.reused).toBe(true);
+    expect(second.body.login.verificationUrl).toBe(first.body.login.verificationUrl); // ONE attempt, ONE URL
+    expect(driveCapture).toHaveLength(1); // the second request drove NOTHING
+    const wizard = (ctx as unknown as { enrollmentWizard: EnrollmentWizard }).enrollmentWizard;
+    expect(wizard.pending()).toHaveLength(1);
+  });
+
+  it('(h) a re-request while the existing attempt\'s pane is DEAD supersedes it atomically (abandon + fresh drive — record and pane replaced together)', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'afm-start-'));
+    const driveCapture: Array<Record<string, unknown>> = [];
+    const ctx = buildCtx(dir, { dev: true, decision: 'allow', knowAccountEmail: true, driveCapture });
+    // The 2026-07-10 zombie: the record says pending, tmux has NO pane at all.
+    (ctx as unknown as { sessionManager: unknown }).sessionManager = { captureOutput: () => null };
+    const app = express(); app.use(express.json());
+    app.use(createRoutes(ctx));
+    server = await listen(app);
+    const first = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
+    expect(first.status).toBe(201);
+    const second = await post('/subscription-pool/follow-me/enroll/start', { mandateId: 'm1', accountId: 'a1' });
+    expect(second.status).toBe(201);
+    expect(second.body.reused).toBeUndefined(); // NOT a reuse — the zombie was superseded
+    expect(driveCapture).toHaveLength(2); // a fresh drive replaced record AND pane together
+    const wizard = (ctx as unknown as { enrollmentWizard: EnrollmentWizard }).enrollmentWizard;
+    expect(wizard.pending()).toHaveLength(1); // exactly ONE live attempt — codes can never cross
   });
 });

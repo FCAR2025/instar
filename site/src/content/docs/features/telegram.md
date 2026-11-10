@@ -46,6 +46,12 @@ When a session expires or is compacted, the agent re-spawns with:
 
 The agent picks up exactly where it left off.
 
+## Outbound recording never latches off
+
+Every outbound Telegram message is recorded by a background worker before it is sent. If that worker is slow, the message waits or is held; nothing goes out unrecorded. A slow disk (for example right after a reboot) only affects the request that was slow. A worker that is truly stuck is replaced automatically, with growing waits between attempts and a cap. Held messages drain through the normal recovery tick once it is back. No server restart is needed.
+
+The authenticated `GET /health` includes `telegramOriginStorage.store` and `.spool`, with `state` (`ready`, `starting`, `restarting`, `exhausted` or `closed`), `restarts`, `lastFailure` and `downSince`. An outage raises one degradation report. `exhausted` means the restart cap was reached; the recovery tick then tries a replacement every 15 minutes.
+
 ## Markdown formatting
 
 As of v1.1.0, your agent writes in GitHub-flavored markdown and the adapter converts to Telegram-safe HTML on send. This is the default — agents don't need to know anything about Telegram's HTML escaping rules; they write normal markdown and the formatter handles the conversion.
@@ -71,6 +77,8 @@ If you set `telegramAdapter.lintStrict: true` in config, formatting issues that 
 Inbound voice messages are auto-transcribed via your configured voice provider. The adapter auto-detects which provider to use if `voiceProvider` isn't set explicitly.
 
 ## API
+
+Sessions reply through `POST /telegram/reply/:topicId`:
 
 ```bash
 # List topic-session mappings
@@ -100,3 +108,13 @@ curl 'localhost:4040/telegram/search?q=deploy&limit=20'
 # Outbound message audit log statistics
 curl localhost:4040/telegram/log-stats
 ```
+
+## Telegram Web K drift
+
+When Telegram ships a new Web K build, the managed browser profile used for message-origin checks stops matching the reviewed build list. Re-enroll it with:
+
+```bash
+instar telegram-origin enroll-browser <profileId> [--evidence-out canary.json]
+```
+
+This is a local-only command, never an HTTP route. It retires the profile's browser, runs an authenticated read-only canary, and enrolls the observed build only if it is on the reviewed list (keeping one prior reviewed build). It sends nothing. See `docs/specs/telegram-message-origin.md`.

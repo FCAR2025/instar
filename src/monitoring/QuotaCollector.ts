@@ -1,11 +1,12 @@
 /**
- * QuotaCollector — TypeScript module for collecting Claude Code quota data.
+ * QuotaCollector — TypeScript module for collecting framework quota data.
  *
  * Replaces the Python quota-collector.py with a native TypeScript implementation
- * suitable for the Instar npm package. Two-source strategy:
+ * suitable for the Instar npm package. Framework strategy:
  *
  *   1. PRIMARY: Anthropic OAuth API (/api/oauth/usage + /api/oauth/profile)
  *   2. FALLBACK: JSONL conversation file parsing (estimated, cannot trigger migrations)
+ *   3. CODEX: authoritative primary/secondary windows from local rollout data
  *
  * Features:
  * - Retry/backoff with jitter for API resilience
@@ -35,11 +36,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
+import readline from 'node:readline';
+import { setImmediate as yieldToEventLoop } from 'node:timers';
 import type { QuotaState } from '../core/types.js';
 import type { CredentialProvider, ClaudeCredentials } from './CredentialProvider.js';
 import { redactToken, redactEmail } from './CredentialProvider.js';
 import type { QuotaTracker } from './QuotaTracker.js';
 import { DegradationReporter } from './DegradationReporter.js';
+import {
+  readLatestCodexUsage,
+  type CodexUsageSnapshot,
+} from '../providers/adapters/openai-codex/observability/codexRateLimitReader.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -51,6 +59,10 @@ export interface RetryConfig {
 }
 
 export interface CollectorConfig {
+  /** Framework-specific collection path. Defaults to Claude for compatibility. */
+  framework?: 'claude-code' | 'codex-cli';
+  /** Injectable Codex rollout reader for deterministic tests. */
+  codexUsageReader?: () => Promise<CodexUsageSnapshot | null>;
   /** Account registry path (for multi-account polling) */
   registryPath?: string;
   /** Enable OAuth API collection (default: true) */
@@ -117,7 +129,7 @@ export interface OAuthProfileResponse {
 
 export interface CollectionResult {
   success: boolean;
-  dataSource: 'oauth' | 'jsonl-fallback' | 'none';
+  dataSource: 'oauth' | 'jsonl-fallback' | 'codex-rollout' | 'none';
   dataConfidence: 'authoritative' | 'estimated' | 'none';
   state: QuotaState | null;
   oauth?: {
@@ -477,32 +489,8 @@ export class JsonlParser {
 
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
-      const lines = content.split('\n');
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line);
-          if (entry.type !== 'assistant') continue;
-          const message = entry.message;
-          if (!message || message.role !== 'assistant') continue;
-          const usage = message.usage;
-          if (!usage) continue;
-
-          // Check timestamp window
-          if (entry.timestamp) {
-            const ts = new Date(entry.timestamp);
-            if (ts < windowStart || ts >= windowEnd) continue;
-          }
-
-          result.inputTokens += usage.input_tokens || 0;
-          result.outputTokens += usage.output_tokens || 0;
-          result.cacheCreationTokens += usage.cache_creation_input_tokens || 0;
-          result.cacheReadTokens += usage.cache_read_input_tokens || 0;
-        } catch {
-          // @silent-fallback-ok — individual JSONL line may be malformed
-          continue;
-        }
+      for (const line of content.split('\n')) {
+        JsonlParser.accumulateLine(line, windowStart, windowEnd, result);
       }
     } catch {
       // @silent-fallback-ok — file may be inaccessible or corrupt
@@ -511,6 +499,68 @@ export class JsonlParser {
     result.totalBilled = result.inputTokens + result.outputTokens +
       result.cacheCreationTokens + result.cacheReadTokens;
     return result;
+  }
+
+  /**
+   * Same counts as `parseFile`, read as a stream so the event loop is never
+   * held for a whole file (instar#2120: 1.8 GB of JSONL read and parsed
+   * synchronously stalled the server for 3-20 s at a time).
+   */
+  static async parseFileAsync(
+    filePath: string,
+    windowStart: Date,
+    windowEnd: Date,
+  ): Promise<JsonlTokenCounts> {
+    const result: JsonlTokenCounts = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalBilled: 0,
+    };
+    let stream: fs.ReadStream | null = null;
+    try {
+      stream = fs.createReadStream(filePath, { encoding: 'utf-8' });
+      const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      for await (const line of lines) {
+        JsonlParser.accumulateLine(line, windowStart, windowEnd, result);
+      }
+    } catch {
+      // @silent-fallback-ok — file may be inaccessible or corrupt
+    } finally {
+      stream?.destroy();
+    }
+    result.totalBilled = result.inputTokens + result.outputTokens +
+      result.cacheCreationTokens + result.cacheReadTokens;
+    return result;
+  }
+
+  /** Add one JSONL line's assistant usage to `result` when it falls in the window. */
+  static accumulateLine(line: string, windowStart: Date, windowEnd: Date, result: JsonlTokenCounts): void {
+    // Cheap pre-check: a line without "assistant" cannot be an assistant
+    // entry, so it is skipped without a JSON.parse.
+    if (!line.includes('assistant') || !line.trim()) return;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.type !== 'assistant') return;
+      const message = entry.message;
+      if (!message || message.role !== 'assistant') return;
+      const usage = message.usage;
+      if (!usage) return;
+
+      // Check timestamp window
+      if (entry.timestamp) {
+        const ts = new Date(entry.timestamp);
+        if (ts < windowStart || ts >= windowEnd) return;
+      }
+
+      result.inputTokens += usage.input_tokens || 0;
+      result.outputTokens += usage.output_tokens || 0;
+      result.cacheCreationTokens += usage.cache_creation_input_tokens || 0;
+      result.cacheReadTokens += usage.cache_read_input_tokens || 0;
+    } catch {
+      // @silent-fallback-ok — individual JSONL line may be malformed
+    }
   }
 
   /**
@@ -529,7 +579,7 @@ export class JsonlParser {
 // ── QuotaCollector ───────────────────────────────────────────────────
 
 export class QuotaCollector extends EventEmitter {
-  private provider: CredentialProvider;
+  private provider: CredentialProvider | null;
   private tracker: QuotaTracker;
   private config: Required<Pick<CollectorConfig, 'oauthEnabled' | 'staleAfterMs' | 'concurrencyLimit' | 'requestBudgetPer5Min'>> & CollectorConfig;
   private retryConfig: RetryConfig;
@@ -550,7 +600,7 @@ export class QuotaCollector extends EventEmitter {
   private static readonly OAUTH_BACKOFF_MS = 30 * 60 * 1000; // 30 minutes
 
   constructor(
-    provider: CredentialProvider,
+    provider: CredentialProvider | null,
     tracker: QuotaTracker,
     config: CollectorConfig = {},
   ) {
@@ -564,7 +614,7 @@ export class QuotaCollector extends EventEmitter {
       requestBudgetPer5Min: config.requestBudgetPer5Min ?? 60,
       ...config,
     };
-    this.retryConfig = { ...DEFAULT_RETRY, ...config.retry };
+    this.retryConfig = mergeDefaults(DEFAULT_RETRY, config.retry);
     this.budget = new RequestBudget(this.config.requestBudgetPer5Min);
     this.limiter = new ConcurrencyLimiter(this.config.concurrencyLimit);
     this.poller = new AdaptivePoller();
@@ -594,7 +644,69 @@ export class QuotaCollector extends EventEmitter {
     };
 
     try {
+      if (this.config.framework === 'codex-cli') {
+        let usage: CodexUsageSnapshot | null = null;
+        try {
+          usage = await (this.config.codexUsageReader ?? readLatestCodexUsage)();
+        } catch (err) {
+          errors.push(`Codex rollout quota read failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        const capturedAtMs = usage?.capturedAt ? new Date(usage.capturedAt).getTime() : NaN;
+        const now = Date.now();
+        const capturedAtTrustworthy = Number.isFinite(capturedAtMs) &&
+          capturedAtMs <= now + 5 * 60 * 1000 &&
+          now - capturedAtMs <= this.config.staleAfterMs;
+        if (usage?.primary && usage.secondary && capturedAtTrustworthy) {
+          const state: QuotaState = {
+            usagePercent: usage.rateLimitReachedType === 'secondary'
+              ? 100
+              : usage.secondary.usedPercent,
+            fiveHourPercent: usage.rateLimitReachedType === 'primary'
+              ? 100
+              : usage.primary.usedPercent,
+            source: 'codex-rollout',
+            model: usage.model ?? undefined,
+            blockReason: usage.rateLimitReachedType
+              ? `Codex rate limit reached: ${usage.rateLimitReachedType}`
+              : undefined,
+            lastUpdated: usage.capturedAt!,
+            recommendation: usage.rateLimitReachedType ? 'stop' : undefined,
+          };
+          result = {
+            ...result,
+            success: true,
+            dataSource: 'codex-rollout',
+            dataConfidence: 'authoritative',
+            state,
+          };
+          this.tracker.updateState(state);
+          this.poller.update(state.usagePercent, state.fiveHourPercent);
+        } else {
+          if (usage && !capturedAtTrustworthy) errors.push('Codex rollout quota reading has no trustworthy capture time');
+          else if (usage) errors.push('Codex rollout quota reading is incomplete');
+          else if (errors.length === 0) errors.push('Codex rollout quota reading unavailable');
+          // Persist uncertainty so a previously healthy cached/file snapshot
+          // cannot keep the solo Codex agent fail-open after the reader breaks.
+          const state: QuotaState = {
+            usagePercent: 0,
+            source: 'codex-rollout',
+            quotaUnknown: true,
+            blockReason: errors[errors.length - 1],
+            lastUpdated: new Date().toISOString(),
+            recommendation: 'stop',
+          };
+          result.state = state;
+          this.tracker.updateState(state);
+        }
+        result.durationMs = Date.now() - startTime;
+        result.errors = errors;
+        this.lastCollectionAt = new Date();
+        this.lastCollectionDurationMs = result.durationMs;
+        return result;
+      }
+
       // Step 1: Read credentials
+      if (!this.provider) throw new Error('Claude credential provider unavailable');
       const creds = await this.provider.readCredentials();
       const tokenState = classifyToken(creds);
 
@@ -682,7 +794,7 @@ export class QuotaCollector extends EventEmitter {
       // Step 3: JSONL fallback if OAuth failed/disabled
       if (!result.success && this.config.jsonlFallback?.enabled !== false) {
         try {
-          const jsonlResult = this.collectFromJsonl();
+          const jsonlResult = await this.collectFromJsonl();
           if (jsonlResult) {
             result = {
               ...result,
@@ -888,7 +1000,7 @@ export class QuotaCollector extends EventEmitter {
 
   // ── Private: JSONL Fallback ──────────────────────────────────────
 
-  private collectFromJsonl(): QuotaState | null {
+  private async collectFromJsonl(): Promise<QuotaState | null> {
     const projectsDir = this.getJsonlDir();
     if (!fs.existsSync(projectsDir)) return null;
 
@@ -908,7 +1020,11 @@ export class QuotaCollector extends EventEmitter {
     };
 
     for (const file of files) {
-      const counts = JsonlParser.parseFile(file, windowStart, windowEnd);
+      const counts = await JsonlParser.parseFileAsync(file, windowStart, windowEnd);
+      // Yield between files so other work (lease pulls, health probes) runs.
+      // The `node:timers` import is deliberate: a test's fake timers replace
+      // the global setImmediate, and this yield must not depend on them.
+      await new Promise<void>((resolve) => yieldToEventLoop(resolve));
       totalCounts.inputTokens += counts.inputTokens;
       totalCounts.outputTokens += counts.outputTokens;
       totalCounts.cacheCreationTokens += counts.cacheCreationTokens;

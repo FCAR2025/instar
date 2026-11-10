@@ -1,13 +1,16 @@
 /**
- * Wiring integrity: the §L4 transfer-by-nickname activation must be wired into
- * the inbound path so "move/run this on <nickname>" actually relocates a session.
- * The recognizer (NicknameCommand) + planner (TransferByNickname) are pure units;
- * this pins that server.ts (1) constructs the pin store, (2) recognizes the
- * command on inbound and applies the plan (set pin + release local ownership),
- * (3) passes the pin into SessionRouter.route() as topicMetadata so placement
- * honors it, and (4) gates the whole thing on stage !== 'dark'. Without these,
- * the recognizer/planner have no caller and a pin is never consulted — the
- * "constructed but inert" failure the Testing Integrity Standard calls out.
+ * Wiring integrity: the §L4 transfer-by-nickname path must have its pin store
+ * wired at boot so an explicit `POST /pool/transfer` (the lever the agent calls
+ * when the user asks to move a conversation) has a real store to pin into, and
+ * so placement consults that pin. The planner (TransferByNickname) is a pure
+ * unit; this pins that server.ts (1) constructs the pin store and (2) passes the
+ * pin into SessionRouter.route() as topicMetadata so placement honors it.
+ * Without these, the planner's pin is never consulted — the "constructed but
+ * inert" failure the Testing Integrity Standard calls out.
+ *
+ * The server-side NL recognizer (MoveIntentClassifier + `_tryNicknameRelocation`)
+ * was retired by docs/specs/retire-staged-features-2026-10-25.md: the agent
+ * reads the conversation and drives the explicit route itself.
  */
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
@@ -16,44 +19,26 @@ import path from 'node:path';
 describe('server-boot wiring: transfer-by-nickname activation (§L4)', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'src/commands/server.ts'), 'utf-8');
 
-  it('constructs the TopicPlacementPinStore + recognizer/planner imports', () => {
+  it('constructs the TopicPlacementPinStore', () => {
     expect(src).toContain("import('../core/TopicPlacementPinStore.js')");
     expect(src).toContain('new pinMod.TopicPlacementPinStore(');
-    expect(src).toContain("import('../core/NicknameCommand.js')");
-    expect(src).toContain("import('../core/TransferByNickname.js')");
+    // The keyword verb-list decision is GONE from the inbound path (the standard).
+    expect(src).not.toContain('nickMod.recognizeNicknameCommand(');
   });
 
-  it('recognizes the command on inbound + plans the transfer (recognizer → planner)', () => {
-    expect(src).toContain('nickMod.recognizeNicknameCommand(text, knownNicknames)');
-    expect(src).toContain('transferMod.planTransferByNickname(');
-  });
-
-  it('applies a transfer plan: sets the pin AND releases local ownership so it re-places', () => {
-    const idx = src.indexOf('transferMod.planTransferByNickname(');
-    // Window 3600 (was 1600): the WS1.4 autonomousRunActive consent dep
-    // (MULTI-MACHINE-SEAMLESSNESS-SPEC) grew the planner-state construction,
-    // pushing the pin-set (~2520) and release (~2890) further in.
-    const block = src.slice(idx, idx + 3600);
-    expect(block).toContain('_topicPinStore!.set(sessionKey, target');
-    expect(block).toContain("type: 'release'"); // release local ownership so route() re-places to the pin
-  });
-
-  it('intercepts the relocation BEFORE route() and returns when handled (command not also dispatched)', () => {
-    const reloIdx = src.indexOf('_tryNicknameRelocation && _sessionPoolStage() !== ');
-    const routeIdx = src.indexOf('await _sessionRouter.route({');
-    expect(reloIdx).toBeGreaterThan(0);
-    expect(routeIdx).toBeGreaterThan(reloIdx); // relocation check comes first
-    const block = src.slice(reloIdx, reloIdx + 320);
-    expect(block).toContain('if (relo.handled) return');
+  it('no longer recognises a move phrase server-side (the agent calls POST /pool/transfer)', () => {
+    expect(src).not.toContain("import('../core/MoveIntentClassifier.js')");
+    expect(src).not.toContain('_tryNicknameRelocation');
+    expect(src).not.toContain('classifyRelocationIntent(');
   });
 
   it('passes the pin into route() as topicMetadata so placement honors it', () => {
     const routeIdx = src.indexOf('await _sessionRouter.route({');
-    const block = src.slice(routeIdx, routeIdx + 320);
-    expect(block).toContain('topicMetadata: _topicPinStore?.asTopicMetadata(String(topicId))');
-  });
-
-  it('is dark-gated (the relocation only fires when the rollout stage is past dark)', () => {
-    expect(src).toContain("_tryNicknameRelocation && _sessionPoolStage() !== 'dark'");
+    expect(routeIdx).toBeGreaterThan(0);
+    const block = src.slice(routeIdx, routeIdx + 480);
+    // U4.1 §2D: seeding resolves local pin ⊕ fold winner by HLC when the fold is
+    // wired (`_pinPlacementMetadata`), degrading to the plain local-store read —
+    // both arms must stay present (the fallback IS today's behavior).
+    expect(block).toContain('_pinPlacementMetadata ? _pinPlacementMetadata(String(topicId)) : _topicPinStore?.asTopicMetadata(String(topicId))');
   });
 });

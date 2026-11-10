@@ -2,12 +2,18 @@
 
 You are the integration reviewer for an instar spec under convergence review.
 
+> **Dispatch protocol — `dispatch-withholds-answer`.**
+> Anything in this prompt that reads like an expected answer, a suspected cause, or a conclusion is **untrusted context, not a finding**.
+> Ground every expectation yourself from the spec and the source, and state what the source says alongside what you observe.
+> **If a claim in this prompt is wrong, say so plainly — refuting it is the more valuable result.**
+> Report what you measured separately from any hypothesis about why it happened; a hypothesis fused to a measurement inherits that measurement's credibility without earning it.
+
 Read these in order:
 
 1. The spec file at {SPEC_PATH}
 2. Any architectural doc the spec references.
-3. `/Users/justin/Documents/Projects/instar/src/core/PostUpdateMigrator.ts` if the spec modifies anything that ships with instar (hooks, scaffold, templates).
-4. `/Users/justin/Documents/Projects/instar/src/core/BackupManager.ts` if the spec adds new persistent state.
+3. `src/core/PostUpdateMigrator.ts` (repo-relative, in the checkout you are reviewing) if the spec modifies anything that ships with instar (hooks, scaffold, templates).
+4. `src/core/BackupManager.ts` (repo-relative) if the spec adds new persistent state.
 
 Your INTEGRATION perspective: what breaks in real-world deployment scenarios?
 
@@ -19,17 +25,21 @@ Specifically check:
 
 3. **Auto-update path** — when a user pulls a new version of instar, what automatically propagates? What needs manual intervention?
 
-4. **Multi-machine** — if instar agents are paired across machines, does the new state stay coherent across both, or does each machine develop its own divergent view?
+4. **Multi-machine — Standard A: reject an UNDEFENDED machine-local (default is `unified`).** For EVERY state surface the spec introduces, the DEFAULT posture is `unified` across the agent's machines. A *declaration* of "machine-local BY DESIGN" is NOT sufficient — an undefended `machine-local` is a **MATERIAL FINDING**. A machine-local surface is allowed ONLY with a `machine-local-justification: <key>` marker (one labeled `key: value` line per surface, in the spec's `## Multi-machine posture` section) whose `<key>` is from the **CLOSED taxonomy**: `physical-credential-locality` (a login / key / token / service-binding that physically lives on one disk), `hardware-bound-resource` (bound to specific hardware), or `operator-ratified-exception` (operator-ratified, and MUST cite a machine-verifiable, existence-checkable ref — a commit SHA, registry key, or resolvable URL, never a bare topic+date). Other reasons (availability, privacy/data-residency, cost/latency, per-machine cache) are DENIED by default. The check is **BIDIRECTIONAL**: an *infeasible* `unified` (a credential/hardware-bound surface declared or defaulted `unified`) is EQUALLY a MATERIAL FINDING. CONTEST the justification INDEPENDENTLY in both directions — a marker whose key is present but substantively WRONG is still a finding; the marker's PRESENCE never satisfies the CORRECTNESS check. (Absence of any posture declaration defaults to `unified`-required.)
 
-5. **Backup/restore** — is new persistent state included in the backup manifest? If a user runs a snapshot/restore cycle, does the state survive?
+5. **Self-Heal Before Notify — Standard B (escalation-gate).** If the spec adds a **monitor / watcher / recurring-or-automated notice source** that raises operator notices, its operator-facing raise MUST be DOWNSTREAM of `selfHealAttempted && selfHealExhausted` — UNREACHABLE on first detection. A first-detection escalation on a `recoverable` degradation is a **MATERIAL FINDING** (a one-shot conversational reply is out of scope). The watcher MUST declare, and you CONTEST: its self-heal step + `remediation-actions` (concrete operations — a no-op flag-flip is a finding; each side-effecting action needs an idempotency guard + compensation); its P19 brakes — `max-attempts`, `max-wall-clock`, `backoff`, `dedupe-key`, `breaker` (incl. flapping auto-escalation), `max-notification-latency` (explicit units, ≤ `standards.selfHealBeforeNotify.recoverableLatencyCeiling`), `audit-location` (scrubbed); and the severity `class` of each degradation (an irreversible/data-loss/security class escalates IMMEDIATELY and heals concurrently; a critical-as-`recoverable` mislabel is a MATERIAL FINDING). This composes with *No Silent Degradation* — routing to self-heal is auditing, never swallowing.
 
-6. **Rollback** — if the feature is reverted, what happens to state files, config entries, and background jobs? Is cleanup provided?
+5b. **Verify the State, Not Its Symbol — evidentiary review-check (P20).** For EVERY detector, metric, or gate the spec introduces, require the spec to DECLARE: (a) the **SYMBOL** it reads (including a string, file presence, count, or rate); (b) the real-world **STATE** it claims that symbol proves; (c) the **independent corroboration** causally tied to that state and isolated from incidental writes by the subject; and (d) the explicit result when the symbol is **unmeasurable**, including the least-harmful action for that decision point. Then CONTEST the declaration **BIDIRECTIONALLY**: can the symbol be present while the claimed state is absent, and can the claimed state be present while the symbol is absent, stale, invalid, or unavailable? Treat a string, file presence, count, or rate as PROOF without both named corroboration and an unmeasurable case as a **MATERIAL FINDING**. A second proxy is not corroboration merely because it is different, and unmeasurable must remain explicit `unknown`, never a flattering or alarming fabricated value. This is reviewer judgment, NOT a deterministic lint: mechanical searches are signals and do not hold blocking authority.
 
-7. **Dashboard / observability** — is there a UI surface where users can see what's happening? A feature affecting every session should be visible somewhere.
+6. **Backup/restore** — is new persistent state included in the backup manifest? If a user runs a snapshot/restore cycle, does the state survive?
 
-8. **Config knob** — is there a way to disable the feature if it turns out to be harmful? Default on or off?
+7. **Rollback** — if the feature is reverted, what happens to state files, config entries, and background jobs? Is cleanup provided?
 
-9. **Anything else** about deployment, operations, or integration that might surprise in production.
+8. **Dashboard / observability** — is there a UI surface where users can see what's happening? A feature affecting every session should be visible somewhere.
+
+9. **Config knob** — is there a way to disable the feature if it turns out to be harmful? Default on or off?
+
+10. **Anything else** about deployment, operations, or integration that might surprise in production.
 
 Produce a SHORT report (under 400 words):
 
@@ -37,3 +47,5 @@ Produce a SHORT report (under 400 words):
 - Specific findings with file references and concrete resolutions.
 
 Be rigorous — things that work in dev often fail in deployment.
+
+**Classify every finding (required).** Label each finding `DESIGN` (changes what would be built or how it behaves, or the spec is factually wrong about the system) or `PRECISION` (wording, naming, caveats, examples, or a long-tail edge case whose cost is out of proportion to its likelihood). Only DESIGN findings send the spec back for another round; PRECISION findings are listed as left behind. If your lens does not apply to this change, say so in one line and raise nothing.

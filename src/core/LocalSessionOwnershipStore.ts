@@ -23,7 +23,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { SessionOwnershipRecord } from './SessionOwnership.js';
-import type { SessionOwnershipStore } from './SessionOwnershipRegistry.js';
+import { isApplierStatusCorrection, type SessionOwnershipStore } from './SessionOwnershipRegistry.js';
 
 export interface LocalSessionOwnershipStoreDeps {
   /** Absolute directory holding one JSON file per session ownership record. */
@@ -44,6 +44,11 @@ export class LocalSessionOwnershipStore implements SessionOwnershipStore {
   private readonly cache = new Map<string, SessionOwnershipRecord>();
   /** Whether the full directory has been scanned into the cache (for all()). */
   private scanned = false;
+  /** Interface-level commit hook (standby-write-reconciliation §3.2, round-2
+   *  S4): fired inside `persist()` immediately after `cache.set` — the single
+   *  funnel BOTH mutation paths (`registry.cas()` → `casWrite`, and
+   *  `OwnershipApplier` → `casWrite`) pass through. */
+  onCommit?: (record: SessionOwnershipRecord) => void;
 
   constructor(deps: LocalSessionOwnershipStoreDeps) {
     this.d = deps;
@@ -81,6 +86,13 @@ export class LocalSessionOwnershipStore implements SessionOwnershipStore {
   private persist(rec: SessionOwnershipRecord): void {
     this.cache.set(rec.sessionKey, rec);
     try {
+      this.onCommit?.(rec);
+    } catch {
+      /* @silent-fallback-ok — the commit hook is an observability consumer
+         (WriteAdmission ownership index); a listener throw must never fail the
+         ownership persist. The index's own ingest never throws by design. */
+    }
+    try {
       if (!fs.existsSync(this.d.dir)) fs.mkdirSync(this.d.dir, { recursive: true });
       const fp = this.filePathFor(rec.sessionKey);
       const tmp = `${fp}.${process.pid}.tmp`;
@@ -113,6 +125,14 @@ export class LocalSessionOwnershipStore implements SessionOwnershipStore {
       return { ok: true, observed: candidate };
     }
     return { ok: false, observed: current };
+  }
+
+  /** See SessionOwnershipStore.correctMaterializedStatus — same-epoch, applier-own-write only. */
+  correctMaterializedStatus(candidate: SessionOwnershipRecord): boolean {
+    const current = this.loadOne(candidate.sessionKey);
+    if (!isApplierStatusCorrection(current, candidate)) return false;
+    this.persist(candidate);
+    return true;
   }
 
   /** Every known ownership record (cache + a one-time disk scan). */

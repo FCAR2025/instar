@@ -528,26 +528,42 @@ describe('CommitmentTracker', () => {
       expect(report.violations[0].autoCorrected).toBe(true);
     });
 
-    it('handles missing configPath gracefully', () => {
+    it('handles a historical missing configPath without a false violation', async () => {
       const tracker = makeTracker(stateDir);
       const c = tracker.record({
         type: 'config-change',
         userRequest: 'req',
         agentResponse: 'resp',
-        // Missing configPath!
+        configPath: 'updates.autoApply',
+        configExpectedValue: false,
       });
-
+      await tracker.mutate(c.id, prev => ({ ...prev, configPath: undefined }));
+      const before = tracker.get(c.id)!.violationCount;
       const result = tracker.verifyOne(c.id);
-      expect(result).not.toBeNull();
-      expect(result!.passed).toBe(false);
-      expect(result!.detail).toContain('Missing configPath');
+      expect(result).toBeNull();
+      expect(tracker.get(c.id)?.violationCount).toBe(before);
     });
   });
 
   // ── Verification: Behavioral ───────────────────────────
 
   describe('verification — behavioral', () => {
-    it('verifies when rule is present in rules file', () => {
+    // THESE THREE TESTS REPLACE ONES THAT ASSERTED THE DEFECT.
+    //
+    // The old trio pinned "a behavioural promise is verified iff its id appears in
+    // the rules file" as correct. That file is written by this class from its own
+    // active list and nothing else reads it, so the check verified the system's own
+    // bookkeeping and reported it as a verdict on the promise. Measured live
+    // 2026-07-26: 74 commitments WITH `behavioralRule` all read `verified`, 24
+    // WITHOUT it all read `violated` — 98 of 98, decided entirely by whether an
+    // optional field was populated.
+    //
+    // Worth naming: the middle test was called "detects violation when rules file
+    // is deleted" and its body asserted `passed: true`, with a comment conceding
+    // "so it should still pass". A test whose name contradicts its own assertion
+    // documents an intention nobody implemented.
+
+    it('does NOT produce a verdict for a behavioural promise — it cannot observe behaviour', () => {
       const tracker = makeTracker(stateDir);
       const c = tracker.record({
         type: 'behavioral',
@@ -556,13 +572,15 @@ describe('CommitmentTracker', () => {
         behavioralRule: 'Always check with user before deploying changes',
       });
 
-      // Recording should have created the rules file
-      const result = tracker.verifyOne(c.id);
-      expect(result).not.toBeNull();
-      expect(result!.passed).toBe(true);
+      // null = the sweep is a no-op, exactly as for an unverifiable one-time-action.
+      expect(tracker.verifyOne(c.id)).toBeNull();
+      // And the promise stays open rather than being declared kept or broken.
+      expect(tracker.get(c.id)!.status).toBe('pending');
+      expect(tracker.get(c.id)!.verificationCount).toBe(0);
+      expect(tracker.get(c.id)!.violationCount).toBe(0);
     });
 
-    it('detects violation when rules file is deleted', () => {
+    it('repairs the rules file when deleted, without treating that as evidence either way', () => {
       const tracker = makeTracker(stateDir);
       const c = tracker.record({
         type: 'behavioral',
@@ -571,32 +589,58 @@ describe('CommitmentTracker', () => {
         behavioralRule: 'Check before deploying',
       });
 
-      // First verify passes
-      expect(tracker.verifyOne(c.id)!.passed).toBe(true);
-
-      // Delete the rules file
       const rulesPath = path.join(stateDir, 'state', 'commitment-rules.md');
       SafeFsExecutor.safeUnlinkSync(rulesPath, { operation: 'tests/unit/CommitmentTracker.test.ts:580' });
 
-      // Verify again — it should regenerate the file and pass
-      const result = tracker.verifyOne(c.id);
-      // The verifyBehavioral method regenerates if file missing, so it should still pass
-      expect(result!.passed).toBe(true);
+      expect(tracker.verifyOne(c.id)).toBeNull();   // no verdict, either direction
+      expect(fs.existsSync(rulesPath)).toBe(true);  // but the bookkeeping self-heals
+      expect(tracker.get(c.id)!.status).toBe('pending');
     });
 
-    it('handles missing behavioralRule gracefully', () => {
+    it('a MISSING behavioralRule is not a broken promise', () => {
       const tracker = makeTracker(stateDir);
       const c = tracker.record({
         type: 'behavioral',
         userRequest: 'req',
         agentResponse: 'resp',
-        // Missing behavioralRule!
+        // Missing behavioralRule — an optional field, not a broken promise.
       });
 
-      const result = tracker.verifyOne(c.id);
-      expect(result).not.toBeNull();
-      expect(result!.passed).toBe(false);
-      expect(result!.detail).toContain('Missing behavioralRule');
+      expect(tracker.verifyOne(c.id)).toBeNull();
+      // Previously this read `violated` and accumulated a tick on every sweep.
+      expect(tracker.get(c.id)!.status).toBe('pending');
+      expect(tracker.get(c.id)!.violationCount).toBe(0);
+    });
+
+    it('REGRESSION: repeated sweeps never accumulate ticks on a behavioural promise', () => {
+      // The live signature this fixes: CMT-068 at 162,344 violations, and four
+      // commitments created in the same minute holding identical counts (80,425) —
+      // proof the counter tracked sweeps, not conduct.
+      const tracker = makeTracker(stateDir);
+      const withRule = tracker.record({
+        type: 'behavioral', userRequest: 'a', agentResponse: 'b', behavioralRule: 'r',
+      });
+      const withoutRule = tracker.record({ type: 'behavioral', userRequest: 'c', agentResponse: 'd' });
+
+      for (let i = 0; i < 25; i++) tracker.verify();
+
+      for (const id of [withRule.id, withoutRule.id]) {
+        const c = tracker.get(id)!;
+        expect(c.violationCount, `${id} violations after 25 sweeps`).toBe(0);
+        expect(c.verificationCount, `${id} verifications after 25 sweeps`).toBe(0);
+        expect(c.status).toBe('pending');
+      }
+    });
+
+    it('health does not claim "all verified" over promises it never observed', () => {
+      const tracker = makeTracker(stateDir);
+      tracker.record({ type: 'behavioral', userRequest: 'a', agentResponse: 'b', behavioralRule: 'r' });
+      tracker.verify();
+
+      const health = tracker.getHealth();
+      expect(health.status).toBe('healthy');          // nothing is wrong …
+      expect(health.message).not.toMatch(/all verified/); // … but nothing is verified either
+      expect(health.message).toMatch(/not automatically verifiable/);
     });
   });
 
@@ -675,6 +719,26 @@ describe('CommitmentTracker', () => {
       // Explicit closure still works — the intended path.
       tracker.deliver(c.id);
       expect(tracker.get(c.id)!.status).toBe('delivered');
+    });
+
+    it('rejects prose in verificationMethod before storing a new promise', () => {
+      const tracker = makeTracker(stateDir);
+      expect(() => tracker.record({ type: 'one-time-action', userRequest: 'Review the research',
+        agentResponse: 'I will review it', verificationMethod: 'Review the research evidence' as 'manual' })).toThrow('verificationMethod must be');
+      expect(tracker.getAll()).toHaveLength(0);
+    });
+
+    it('stops verification ticks on a legacy unsupported method without marking it delivered', () => {
+      const storePath = path.join(stateDir, 'state', 'commitments.json');
+      fs.writeFileSync(storePath, JSON.stringify({ version: 1, commitments: [{
+        id: 'CMT-LEGACY-UNSUPPORTED', type: 'one-time-action', status: 'violated',
+        userRequest: 'Review the research', agentResponse: 'I will review it',
+        createdAt: '2026-10-27T18:03:07.914Z', verificationMethod: 'Review the research evidence',
+        verificationCount: 0, violationCount: 4563, correctionCount: 0, correctionHistory: [], escalated: false, version: 4563,
+      }] }));
+      const tracker = makeTracker(stateDir);
+      for (let i = 0; i < 10; i++) expect(tracker.verifyOne('CMT-LEGACY-UNSUPPORTED')).toBeNull();
+      expect(tracker.get('CMT-LEGACY-UNSUPPORTED')).toMatchObject({ status: 'violated', violationCount: 4563 });
     });
 
     it('one-time-action with no verificationMethod stays PENDING across sweeps with zero violations (#76 spam + CMT-1101 evaporation both dead)', () => {
@@ -798,6 +862,17 @@ describe('CommitmentTracker', () => {
   // ── Full Verification Cycle ────────────────────────────
 
   describe('verify() — full cycle', () => {
+    it('does not count missing check coordinates as repeated failed verifications', async () => {
+      const tracker = makeTracker(stateDir);
+      expect(() => tracker.record({ type: 'config-change', userRequest: 'Change the schedule', agentResponse: 'I will do it' })).toThrow('config-change requires configPath');
+      const recorded = tracker.record({ type: 'config-change', userRequest: 'Change the schedule', agentResponse: 'I will do it',
+        configPath: 'updates.autoApply', configExpectedValue: false });
+      await tracker.mutate(recorded.id, prev => ({ ...prev, status: 'violated', violationCount: 23161,
+        configPath: undefined, configExpectedValue: undefined }));
+      tracker.verify();
+      tracker.verify();
+      expect(tracker.get(recorded.id)).toMatchObject({ status: 'violated', violationCount: 23161 });
+    });
     it('returns comprehensive report', () => {
       const liveConfig = new LiveConfig(stateDir);
       liveConfig.set('updates.autoApply', false);

@@ -10,10 +10,9 @@
  *     carrying the NEW status — else a peer never learns an action was already completed and
  *     redoes the work. This is the whole point of replicating actions.
  *   - TERMINAL-IS-NOT-A-DELETE: marking an action completed/cancelled does NOT emit a
- *     tombstone — its record is retained (history). Only an actual queue-removal tombstones.
- *   - PRUNE EMITS TOMBSTONE: when the queue exceeds maxActions, the REMOVED actions emit
- *     `op:delete` tombstones — else a peer re-replicates a locally-removed action forever
- *     (resurrection). This is the named §3 gate.
+ *     tombstone — its full record remains memory, including after operational eviction.
+ *   - PRUNE PRESERVES MEMORY: over-target terminal records leave the hot list only
+ *     after full archival; eviction emits no deletion authority to peers.
  *   - emit is best-effort: a throwing emitter NEVER breaks the local write.
  */
 import { describe, it, expect } from 'vitest';
@@ -46,6 +45,48 @@ function recorder(over: Partial<EvolutionActionReplicationEmitter> = {}): Record
 }
 
 describe('EvolutionManager evolution-action-record replication emit', () => {
+  it('auto-expiry archives only stale ordinary pending actions and emits reversible puts', () => {
+    const dir = mkDir();
+    try {
+      const stateDir = path.join(dir, 'state', 'evolution');
+      fs.mkdirSync(stateDir, { recursive: true });
+      const old = '2026-01-01T00:00:00.000Z';
+      const recent = new Date().toISOString();
+      const base = { description: 'd', priority: 'medium', status: 'pending', createdAt: old } as const;
+      const actions = [
+        { ...base, id: 'ACT-001', title: 'expire-me' },
+        { ...base, id: 'ACT-002', title: 'critical', priority: 'critical' },
+        { ...base, id: 'ACT-003', title: 'pinned', tags: ['pinned'] },
+        { ...base, id: 'ACT-004', title: 'in-progress', status: 'in_progress' },
+        { ...base, id: 'ACT-005', title: 'completed', status: 'completed' },
+        { ...base, id: 'ACT-006', title: 'cancelled', status: 'cancelled' },
+        { ...base, id: 'ACT-007', title: 'too-new', createdAt: recent },
+        { ...base, id: 'ACT-008', title: 'future-deadline', dueBy: '2099-01-01T00:00:00.000Z' },
+      ];
+      fs.writeFileSync(path.join(stateDir, 'action-queue.json'), JSON.stringify({ actions, stats: {} }));
+      const evo = new EvolutionManager({ stateDir: dir, autoExpiry: { enabled: false, maxAgeDays: 21, dryRun: false } });
+      const rec = recorder();
+      evo.setEvolutionActionReplicationEmitter(rec);
+      const result = evo.runActionAutoExpirySweep();
+      expect(result).toMatchObject({ eligible: 1, expired: 1, dryRun: false });
+      expect(evo.listActions().map((a) => a.title)).not.toContain('expire-me');
+      expect(evo.listActions()).toHaveLength(7);
+      // CMT-1132: archived, not deleted, so peers get a reversible close and no tombstone.
+      expect(rec.deletes).toEqual([]);
+      expect(rec.puts.find((p) => p.title === 'expire-me')).toMatchObject({ status: 'cancelled' });
+    } finally { cleanup(dir); }
+  });
+
+  it('auto-expiry defaults to dry-run and writes nothing', () => {
+    const dir = mkDir();
+    try {
+      const evo = new EvolutionManager({ stateDir: dir, autoExpiry: { enabled: false, maxAgeDays: 1 } });
+      const action = evo.addAction({ title: 'kept', description: 'd' });
+      const result = evo.runActionAutoExpirySweep();
+      expect(result.dryRun).toBe(true);
+      expect(evo.listActions().map((a) => a.id)).toContain(action.id);
+    } finally { cleanup(dir); }
+  });
   it('dark by default: NO emitter ⇒ addAction/updateAction emit nothing (strict no-op)', () => {
     const dir = mkDir();
     try {
@@ -112,12 +153,12 @@ describe('EvolutionManager evolution-action-record replication emit', () => {
     }
   });
 
-  it('PRUNE EMITS TOMBSTONE: an action REMOVED over maxActions emits op:delete (no resurrection)', () => {
+  it('PRUNE PRESERVES MEMORY: a terminal action evicted over target remains archived without delete authority', () => {
     const dir = mkDir();
     try {
       // maxActions=3. saveActions prunes completed/cancelled when the queue exceeds max,
       // keeping active + the most-recent done. Add 3 completed, then a 4th completed tips it
-      // over ⇒ the oldest completed is REMOVED from the queue ⇒ a tombstone fires.
+      // over target: the oldest completed leaves the hot list after archival.
       const evo = new EvolutionManager({ stateDir: dir, maxActions: 3 });
       const rec = recorder();
       evo.setEvolutionActionReplicationEmitter(rec);
@@ -132,7 +173,8 @@ describe('EvolutionManager evolution-action-record replication emit', () => {
       evo.updateAction(fourth.id, { status: 'completed' }); // tips over max=3 ⇒ prunes done-0
       const survivors = evo.listActions().map((a) => a.title);
       expect(survivors).not.toContain('done-0'); // it was REMOVED from the queue
-      expect(rec.deletes.map((d) => d.title)).toContain('done-0'); // tombstone emitted (resurrection guard)
+      expect(rec.deletes).toEqual([]);
+      expect(evo.getArchivePage({kind: 'actions'}).entries.map(e => e.record.title)).toContain('done-0'); // full content remains accessible
     } finally {
       cleanup(dir);
     }

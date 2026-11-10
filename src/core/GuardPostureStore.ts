@@ -30,6 +30,10 @@ interface StoreFileShape {
   machines: Record<string, StoredGuardPosture>;
 }
 
+function optionalStringArraysEqual(a: string[] | undefined, b: string[] | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
 
 /** Field-wise posture equality EXCLUDING generatedAt (which changes every
  *  beat by construction and must not defeat write-on-change). */
@@ -38,12 +42,15 @@ export function postureSemanticsEqual(a: GuardPostureSummary, b: GuardPostureSum
     a.onConfirmed === b.onConfirmed &&
     a.onUnverified === b.onUnverified &&
     a.onStale === b.onStale &&
+    a.onBlind === b.onBlind &&
     a.onDryRun === b.onDryRun &&
     a.offDeviant === b.offDeviant &&
     a.offRuntimeDivergent === b.offRuntimeDivergent &&
     a.divergedPendingRestart === b.divergedPendingRestart &&
     a.errored === b.errored &&
     a.missing === b.missing &&
+    a.loadBearingUninspectable === b.loadBearingUninspectable &&
+    optionalStringArraysEqual(a.loadBearingUninspectableKeys, b.loadBearingUninspectableKeys) &&
     a.offDeviantKeys.length === b.offDeviantKeys.length &&
     a.offDeviantKeys.every((k, i) => k === b.offDeviantKeys[i]) &&
     a.offRuntimeDivergentKeys.length === b.offRuntimeDivergentKeys.length &&

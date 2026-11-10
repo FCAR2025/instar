@@ -1,0 +1,90 @@
+import { notificationStamper, withNotificationEnvelope } from './notificationStampers.js';
+const stampNotification = notificationStamper('src/messaging/telegramSendSideComposition.ts');
+const stampQuota = notificationStamper('src/messaging/telegramSendSideComposition.ts', 'quota-notifier');
+const stampReap = notificationStamper('src/messaging/telegramSendSideComposition.ts', 'reap-notifier');
+import { bindOriginAutomationTransport } from './telegram-origin/OriginDeterministicSend.js';
+import type { TelegramAdapter } from '../messaging/TelegramAdapter.js';
+import type { NotificationBatcher } from '../messaging/NotificationBatcher.js';
+import type { JobScheduler } from '../scheduler/JobScheduler.js';
+import type { TelegramOriginService } from './telegram-origin/TelegramOriginService.js';
+
+export type TelegramStartupMode = 'send-only' | 'server-polling';
+
+export interface TelegramStartupTopologyInput {
+  telegramConfigured: boolean;
+  skipTelegram: boolean;
+  coordinatorAwake: boolean;
+  lifelineOwnsPolling: boolean;
+}
+
+export interface TelegramStartupTopology {
+  mode: TelegramStartupMode;
+  /** Threadline mirroring owns durable bindings, so only the awake owner may arm it. */
+  bridgeOwner: boolean;
+}
+
+/**
+ * Resolve the production Telegram messaging topology once, before either construction
+ * branch. The result carries both inbound poll ownership and the independent
+ * one-voice verdict for the stateful Threadline bridge.
+ */
+export function resolveTelegramStartupTopology(
+  input: TelegramStartupTopologyInput,
+): TelegramStartupTopology | undefined {
+  if (!input.telegramConfigured) return undefined;
+  const mode = input.skipTelegram || !input.coordinatorAwake || input.lifelineOwnsPolling
+    ? 'send-only'
+    : 'server-polling';
+  return { mode, bridgeOwner: input.coordinatorAwake };
+}
+
+export interface TelegramSendSideDeps {
+  mode: TelegramStartupMode;
+  telegram: TelegramAdapter;
+  scheduler?: JobScheduler;
+  notificationBatcher: NotificationBatcher;
+  originService?: TelegramOriginService;
+}
+
+export interface TelegramSendSideResult {
+  mode: TelegramStartupMode;
+  schedulerAttached: boolean;
+  batcherAttached: true;
+}
+
+/**
+ * Poll ownership controls only who calls getUpdates. Every TelegramAdapter can
+ * send, so all send-side dependency handoffs converge here after the ownership
+ * branches. Keeping this seam outside those branches makes an omitted handoff
+ * structurally difficult instead of relying on duplicated branch discipline.
+ */
+export function wireTelegramSendSide(deps: TelegramSendSideDeps): TelegramSendSideResult {
+  if (deps.originService) bindOriginAutomationTransport(deps.telegram, deps.originService);
+  if (deps.scheduler) {
+    deps.scheduler.setMessenger(deps.telegram);
+    deps.scheduler.setTelegram(deps.telegram);
+  }
+
+  deps.originService?.registerAutomationProducer('notification-batcher');
+  deps.notificationBatcher.setSendFunction(async (topicId, text, logicalSendId, origin) => {
+    const send = () => {
+      if (origin?.producerId === 'quota-notifier') return withNotificationEnvelope(stampQuota(), () => deps.telegram.sendToTopic(topicId, text));
+      if (origin?.producerId === 'reap-notifier') return withNotificationEnvelope(stampReap(), () => deps.telegram.sendToTopic(topicId, text));
+      return withNotificationEnvelope(stampNotification(), () => deps.telegram.sendToTopic(topicId, text));
+    };
+    if ((logicalSendId || origin) && deps.originService) {
+      const body = { text };
+      const producerId = origin?.producerId ?? 'notification-batcher';
+      deps.originService.registerAutomationProducer(producerId);
+      const credential = deps.originService.issueAutomationReply(producerId, topicId, body, origin?.author, logicalSendId);
+      return deps.originService.runWithAutomationReply(credential, topicId, body, send);
+    } else return send();
+  }, { supportsLogicalIds: !!deps.originService });
+  deps.notificationBatcher.start();
+
+  return {
+    mode: deps.mode,
+    schedulerAttached: deps.scheduler != null,
+    batcherAttached: true,
+  };
+}

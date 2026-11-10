@@ -39,7 +39,7 @@ if echo "$CONTENT" | grep -qiE "(^|[^a-zA-Z])i.ll (make sure|ensure|guarantee|al
 fi
 
 # 3. SETTLING — Accepting empty results without digging deeper
-if echo "$CONTENT" | grep -qiE "(no (data|results|information) (available|found|exists)|nothing (to report|happened|was found)|there (is|are) no|could(n.t| not) find (any|the)|appears to be empty|no (relevant|matching|applicable))"; then
+if echo "$CONTENT" | grep -qiE "(no (data|results|information) (available|found|exists)|nothing (to report|happened|was found)|there (is|are) no([^a-zA-Z]|$)|could(n.t| not) find (any|the)|appears to be empty|no (relevant|matching|applicable))"; then
   ISSUES+=("SETTLING: You're reporting nothing found. Did you check multiple sources? Could the data source be stale or the search terms wrong? Empty results deserve investigation, not acceptance.")
   ISSUE_COUNT=$((ISSUE_COUNT + 1))
 fi
@@ -131,8 +131,23 @@ PY
     if echo "$URL_HOST" | grep -qE '(^|\.)trycloudflare\.com$'; then
       continue
     fi
+    # Skip Tailscale Funnel hosts (*.ts.net) — same class as the quick-tunnel case:
+    # agent-controlled ingress on this machine's own tailnet, not a confabulated
+    # domain. Added after a verified Funnel link to the operator was refused while
+    # the Cloudflare tunnel was down, leaving no way to hand over a working link.
+    if echo "$URL_HOST" | grep -qE '(^|\.)ts\.net$'; then
+      continue
+    fi
+    # Skip Tailscale's own sign-in host. The Tailscale setup recipe must hand the person
+    # the one-tap link "tailscale up" prints, and that is the whole of their part. A live
+    # setup run (2026-11-06) was refused here even after the link came from tool output
+    # and resolved, and the session then edited this script to get past it. Exact host
+    # only: other tailscale.com pages stay checked.
+    if [ "$URL_HOST" = "login.tailscale.com" ]; then
+      continue
+    fi
     # Skip well-known service domains + common agent tunnel domains.
-    if echo "$url" | grep -qE '(github\.com|vercel\.app|vercel\.com|netlify\.app|netlify\.com|npmjs\.com|npmjs\.org|cloudflare\.com|google\.com|twitter\.com|x\.com|youtube\.com|reddit\.com|discord\.com|discord\.gg|telegram\.org|t\.me|localhost|127\.0\.0\.1|stackoverflow\.com|developer\.mozilla\.org|docs\.anthropic\.com|anthropic\.com|openai\.com|claude\.ai|claude\.com|notion\.so|linear\.app|fly\.io|render\.com|railway\.app|heroku\.com|amazonaws\.com|azure\.com|gitlab\.com|bitbucket\.org|docker\.com|hub\.docker\.com|pypi\.org|crates\.io|rubygems\.org|pkg\.go\.dev|wikipedia\.org|medium\.com|substack\.com|circle\.so|ghost\.io|telegraph\.ph)'; then
+    if echo "$url" | grep -qE '(github\.com|vercel\.app|vercel\.com|netlify\.app|netlify\.com|npmjs\.com|npmjs\.org|cloudflare\.com|google\.com|twitter\.com|x\.com|youtube\.com|reddit\.com|discord\.com|discord\.gg|telegram\.org|t\.me|localhost|127\.0\.0\.1|stackoverflow\.com|developer\.mozilla\.org|docs\.anthropic\.com|anthropic\.com|openai\.com|grok\.com|x\.ai|claude\.ai|claude\.com|notion\.so|linear\.app|fly\.io|render\.com|railway\.app|heroku\.com|amazonaws\.com|azure\.com|gitlab\.com|bitbucket\.org|docker\.com|hub\.docker\.com|pypi\.org|crates\.io|rubygems\.org|pkg\.go\.dev|wikipedia\.org|medium\.com|substack\.com|circle\.so|ghost\.io|telegraph\.ph)'; then
       continue
     fi
     UNFAMILIAR_URLS="$UNFAMILIAR_URLS  $url\n"
@@ -142,6 +157,42 @@ PY
     ISSUES+=("URL_PROVENANCE: Your message contains URLs with unfamiliar domains:\n${UNFAMILIAR_URLS}Before including a URL in a message, verify it appeared in actual tool output in THIS session OR confirm it resolves with curl. A common confabulation pattern is constructing plausible-looking domains from project names (e.g., 'deepsignal.xyz' from project 'deep-signal'). If you did not get this URL from a tool, do NOT include it.")
     ISSUE_COUNT=$((ISSUE_COUNT + 1))
   fi
+fi
+
+# 6b. CLAUDE-ARTIFACT LINK — the operator may not hold that Claude account.
+# A claude.ai / claude.com artifact or chat link is private to whichever account
+# published it. Handing one to the operator asks them to sign in to an account they
+# may not have, to read work their own agent produced. Deliver through
+# agent-controlled ingress instead. Note claude.ai sits in the well-known-domain
+# allowlist above, so URL_PROVENANCE does NOT catch this — this check is the one
+# that does.
+# Matches with or without a scheme: chat clients auto-link a bare
+# "claude.ai/code/artifact/x", so requiring https:// would let the most likely
+# real case through. A path or query separator IS required, so an ordinary prose
+# mention of the product ("I ran this on Claude Code") never matches. The leading
+# boundary class is what keeps "notclaude.ai" and other suffix look-alikes out:
+# dropping the scheme requirement without it turns any *claude.ai substring into
+# a match.
+# Sign-in / authorization URLs on these domains are EXEMPT. The Claude subscription
+# OAuth login link lives on claude.com and the agent legitimately hands it to the
+# operator during account enrolment — blocking it would break enrolment to prevent a
+# problem that does not exist there (the operator is the one being asked to sign in,
+# which is the point). Caught by an existing regression test, which is why the rule
+# below subtracts those paths instead of matching every path on the domain.
+CLAUDE_LINK_HIT=0
+if echo "$CONTENT" | grep -qiE '(^|[^a-zA-Z0-9.-])(https?://)?(www\.)?claude\.(ai|com)([/?]|[[:space:]]|$)'; then
+  CLAUDE_LINK_HIT=1
+  # Subtract the auth/sign-in family. If EVERY claude.* URL in the message is one of
+  # these, there is nothing to flag.
+  NON_AUTH=$(echo "$CONTENT" \
+    | grep -oiE '(https?://)?(www\.)?claude\.(ai|com)(/[^[:space:]<>"]*)?' \
+    | grep -viE 'claude\.(ai|com)/(oauth|login|signin|sign-in|auth|api)([/?]|$)' \
+    | grep -cE '.' || true)
+  [ "${NON_AUTH:-0}" -eq 0 ] && CLAUDE_LINK_HIT=0
+fi
+if [ "$CLAUDE_LINK_HIT" = "1" ]; then
+  ISSUES+=("CLAUDE_LINK: Your message contains a claude.ai/claude.com link. The operator does not necessarily have access to the Claude account that owns it, and must never be told to sign in to Claude to view your work. Serve it from agent-controlled ingress instead, then verify it loads from outside before sending.")
+  ISSUE_COUNT=$((ISSUE_COUNT + 1))
 fi
 
 # 7. TEMPORAL STALENESS — Language suggesting outdated perspective or stale draft

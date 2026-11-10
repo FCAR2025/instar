@@ -19,6 +19,9 @@ routes return `503` until it graduates.
 | `POST /topic-profile/:topicId/undo` | Revert the topic to its previous pinned profile. |
 | `POST /topic-profile/:topicId/clear` | Clear the topic's pin (fall back to defaults / policy). |
 | `POST /topic-profile/:topicId/reapply` | Re-apply the current pin (e.g. after a cooldown), reconciling the live session. |
+| `GET /topic-profile/options` | Show the frameworks and models this machine can offer. `?machine=<id>` asks for a reachable peer's options while retaining the local new-topic default. |
+| `POST /topic-profile/validate-choice` | Check a proposed framework and model against the target machine's available doors before creating a topic; requires the intent header and does not write a profile. |
+| `POST /topic-profile/new-topic-default` | Set or clear the local default for dashboard-created topics; requires the intent header. |
 
 Examples:
 
@@ -55,3 +58,9 @@ state-detection canary verifies an independent thinking-control read; otherwise 
 `claude --resume` restart (none-loss), or a continuation from recent history when no resume point is
 capturable. The `TopicProfileOrchestrator` never profile-kills a protected session, and "switch now"
 overrides a busy session but never overrides protection.
+
+The respawn's two outcomes are audited truthfully in `logs/topic-profile-changes.jsonl`: a kill that
+does not take aborts the attempt and records `respawn-kill-failed` (breaker-attributable as
+`kill-failed`, so an unkillable session settles at the breaker instead of retrying forever), and a
+spawn that lands on a different framework than the pin records `respawn-profile-mismatch` instead of
+`respawn-applied` — the success line is written only when the switch verifiably happened.

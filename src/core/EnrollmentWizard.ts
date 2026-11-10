@@ -32,6 +32,7 @@ import {
 } from './ensureInteractiveReady.js';
 import type { IdentityOracle } from './CredentialLocationLedger.js';
 import { validateEnrolledAccountEmail } from './AccountFollowMeEmailGate.js';
+import { ensureAgentOwnedMemory } from './AgentOwnedMemory.js';
 
 /** The public artifact a framework login yields (no secret). */
 export interface LoginArtifact {
@@ -52,6 +53,9 @@ export type LoginDriver = (req: {
    *  passes a larger value (cloud→provider latency + the two-code Claude window);
    *  omitted ⇒ the driver's own default (the local-LAN budget). */
   scrapeTimeoutMs?: number;
+  /** Consent boundary: only an explicit operator initiation may open a browser.
+   *  Background renewal still mints a fresh URL/code, but suppresses browser launch. */
+  openBrowser?: boolean;
 }) => Promise<LoginArtifact>;
 
 /**
@@ -91,6 +95,12 @@ export interface EnrollmentWizardConfig {
    */
   ensureReady?: (configHome: string) => EnsureInteractiveReadyResult;
   /**
+   * Agent-owned memory (operator rule 2026-09-25: logins hold tokens and quota,
+   * never data). The agent home whose memory a completed claude-code login is
+   * linked to. Absent ⇒ no linking at enrollment (spawns still link).
+   */
+  agentHome?: string;
+  /**
    * WS5.2 §5.3/S7 — identity oracle used by `completeFollowMe` to read the freshly-minted
    * login's account email from its config-home slot, for validation against operator
    * expectation. Absent ⇒ the follow-me gate fails CLOSED (the account is HELD, never
@@ -104,6 +114,35 @@ export interface EnrollmentWizardConfig {
    * is paged.
    */
   emitAttention?: (item: { id: string; title: string; body: string; priority: 'high'; source: 'agent' }) => void;
+  /**
+   * attention-lifecycle-close-on-cause §3.3 — the email-gate row for a login is
+   * over: its completion validated, or the login left the pending set. Called
+   * with the login/account id; the wiring clears by the gate's id prefix.
+   */
+  clearAttention?: (accountId: string, resolution: string) => void;
+  /**
+   * Witness for a login that completed WITHOUT telling instar.
+   *
+   * A `url-code-paste` flow (Claude) ends by the operator pasting a code back
+   * through the dashboard, which reaches a route that calls `complete()`. A
+   * `device-code` flow (Codex, grok) does not: the operator approves at the
+   * provider, the CLI writes its own credential and exits, and nothing informs
+   * instar. Without a witness that login stays `pending` forever, its TTL
+   * elapses, the reissue sweep kills the pane and mints a new code — so a
+   * SUCCESSFUL sign-in is destroyed and re-asked on a loop (33 reissues over 8h,
+   * observed 2026-08-16).
+   *
+   * Returns the epoch-ms mtime of the credential in the login's slot, or null
+   * when absent/unreadable. Compared against the login's `createdAt` so a
+   * credential that was ALREADY in the slot before this flow began cannot be
+   * mistaken for this flow succeeding. Absent ⇒ no witness ⇒ previous behaviour.
+   */
+  credentialWitness?: (login: PendingLogin) => Promise<number | null> | number | null;
+  /** Opaque revision of a follow-me slot's auth material. Captured before an
+   * artifact is issued and compared later; unchanged/unknown fails closed. */
+  authRevisionWitness?: (
+    login: Pick<PendingLogin, 'framework' | 'configHome'>,
+  ) => Promise<string | null> | string | null;
 }
 
 export interface StartEnrollmentInput {
@@ -127,6 +166,8 @@ export interface StartEnrollmentInput {
    *   so normal local enrollment is byte-for-byte unchanged.
    */
   remote?: boolean;
+  /** Automation owns the browser when false; defaults true for operator enrollment. */
+  openBrowser?: boolean;
   /** WS5.2 R6b — larger scrape-timeout budget (ms) used only when `remote` is true.
    *  Omitted ⇒ the driver's own default (the local-LAN budget). */
   remoteScrapeTimeoutMs?: number;
@@ -137,22 +178,39 @@ export class EnrollmentWizard {
   private readonly driveLogin: LoginDriver;
   private readonly logger: { log: (m: string) => void; warn: (m: string) => void };
   private readonly ensureReady: (configHome: string) => EnsureInteractiveReadyResult;
+  private readonly agentHome?: string;
   private readonly oracle?: IdentityOracle;
   private readonly emitAttention?: (item: { id: string; title: string; body: string; priority: 'high'; source: 'agent' }) => void;
+  private readonly clearAttention?: (accountId: string, resolution: string) => void;
+  private readonly credentialWitness?: (login: PendingLogin) => Promise<number | null> | number | null;
+  private readonly authRevisionWitness?: EnrollmentWizardConfig['authRevisionWitness'];
+  private readonly completionSweepInFlight = new Set<string>();
 
   constructor(cfg: EnrollmentWizardConfig) {
     this.store = cfg.store;
     this.driveLogin = cfg.driveLogin;
     this.logger = cfg.logger ?? { log: () => {}, warn: () => {} };
     this.ensureReady = cfg.ensureReady ?? ensureInteractiveReady;
+    this.agentHome = cfg.agentHome;
     this.oracle = cfg.oracle;
     this.emitAttention = cfg.emitAttention;
+    this.clearAttention = cfg.clearAttention;
+    this.credentialWitness = cfg.credentialWitness;
+    this.authRevisionWitness = cfg.authRevisionWitness;
   }
 
-  /** Default flow kind per provider: Codex/OpenAI = device-code (its endorsed
-   *  flow); everyone else = url-code-paste (the phone-friendly Claude path). */
+  /** Default flow kind per provider: Codex/OpenAI and xAI/grok = device-code
+   *  (their endorsed single-code flows); everyone else = url-code-paste (the
+   *  phone-friendly Claude path).
+   *
+   *  Round-12 (lessons, grok-build spec §3.3): `xai` fell into the else-branch,
+   *  so an operator enrolling grok without hand-passing `kind` got a
+   *  verification URL with NO device code on the phone surface — unusable for
+   *  `grok login --device-auth`, whose whole point is the code. The branch had
+   *  wired the login COMMAND and stopped there; §3.1.1's claim that the wizard
+   *  carries "the correct binary + phone-approvable flow" was half true. */
   static defaultKind(provider: LoginProvider): LoginFlowKind {
-    return provider === 'openai' ? 'device-code' : 'url-code-paste';
+    return provider === 'openai' || provider === 'xai' ? 'device-code' : 'url-code-paste';
   }
 
   /**
@@ -167,28 +225,9 @@ export class EnrollmentWizard {
    * is a SUPERSET of defaultKind — anything device-code-capable locally is also
    * device-code-capable remotely. */
   static remoteKind(provider: LoginProvider): LoginFlowKind {
-    return provider === 'openai' ? 'device-code' : EnrollmentWizard.defaultKind(provider);
-  }
-
-  /**
-   * Operator-facing heads-up about a flow's quirks, surfaced on the pending login.
-   * The url-code-paste (Claude) flow on a brand-new account slot frequently issues
-   * TWO codes in sequence: Anthropic first emails an email-VERIFICATION code, then
-   * (after that's accepted) the page shows the sign-in code to paste back. Enrolling
-   * is always a new slot, so the operator should expect — and not be confused by —
-   * the two-step sequence (this confusion was flagged in live testing, topic 20905).
-   * device-code (Codex) is a single code, so no notice. Returns undefined when there
-   * is nothing to warn about.
-   */
-  static flowNotice(kind: LoginFlowKind): string | undefined {
-    if (kind === 'url-code-paste') {
-      return (
-        'Heads up: a brand-new Claude login often asks for TWO codes in order — ' +
-        'first an email-verification code Anthropic sends you, then the sign-in code ' +
-        'shown after that. Enter the email code first; the sign-in code comes next.'
-      );
-    }
-    return undefined;
+    return provider === 'openai' || provider === 'xai'
+      ? 'device-code'
+      : EnrollmentWizard.defaultKind(provider);
   }
 
   /**
@@ -207,6 +246,16 @@ export class EnrollmentWizard {
     // drive succeeds, so a drive throw leaves NO pending-login behind; we re-raise
     // it as a typed EnrollmentDriveError the caller renders as "couldn't start the
     // login on <nickname> — retry?", never an opaque 500 / silently-stuck pending.
+    let authRevisionBaseline: string | null | undefined;
+    if (input.expectedEmail && this.authRevisionWitness) {
+      try {
+        authRevisionBaseline = await this.authRevisionWitness(input);
+      } catch {
+        // @silent-fallback-ok: without a baseline the automatic completion
+        // sweep stays off; explicit paste-back remains available.
+        authRevisionBaseline = undefined;
+      }
+    }
     let artifact: LoginArtifact;
     try {
       artifact = await this.driveLogin({
@@ -214,6 +263,7 @@ export class EnrollmentWizard {
         framework: input.framework,
         kind,
         configHome: input.configHome,
+        openBrowser: input.openBrowser !== false,
         // Threaded only for remote drives; omitted ⇒ the driver's local-LAN default.
         ...(input.remote && typeof input.remoteScrapeTimeoutMs === 'number'
           ? { scrapeTimeoutMs: input.remoteScrapeTimeoutMs }
@@ -236,8 +286,8 @@ export class EnrollmentWizard {
       configHome: input.configHome,
       verificationUrl: artifact.verificationUrl,
       userCode: artifact.userCode,
-      notice: EnrollmentWizard.flowNotice(kind),
       expectedEmail: input.expectedEmail,
+      ...(authRevisionBaseline !== undefined ? { authRevisionBaseline } : {}),
       ttlMs: artifact.ttlMs,
     });
     this.logger.log(`[EnrollmentWizard] started ${kind} login for ${input.label} (${input.provider})`);
@@ -252,31 +302,111 @@ export class EnrollmentWizard {
    * abort the sweep.
    */
   async reissueExpired(): Promise<PendingLogin[]> {
+    return this.reissueLogins(this.store.expired(), 'expired');
+  }
+
+  /**
+   * A server restart kills every framework login pane even though the durable
+   * pending-login record survives. Re-drive every non-terminal record once at
+   * boot so the durable flow regains a live backing process and fresh public
+   * URL/code before the dashboard can submit to it.
+   */
+  async recoverAfterRestart(): Promise<PendingLogin[]> {
+    const incomplete = this.store.list().filter((login) =>
+      login.status === 'pending' || login.status === 'expired');
+    return this.reissueLogins(incomplete, 'restart');
+  }
+
+  /** Refresh one known incomplete flow after its backing pane is found dead. */
+  async refresh(id: string): Promise<PendingLogin | null> {
+    const login = this.store.get(id);
+    if (!login || (login.status !== 'pending' && login.status !== 'expired')) return null;
+    const refreshed = await this.reissueLogins([login], 'dead-pane');
+    return refreshed[0] ?? null;
+  }
+
+  private async reissueLogins(
+    logins: PendingLogin[],
+    reason: 'expired' | 'restart' | 'dead-pane',
+  ): Promise<PendingLogin[]> {
     const reissued: PendingLogin[] = [];
-    for (const login of this.store.expired()) {
+    for (const login of logins) {
       try {
+        // A device-code login can succeed without telling instar, and every
+        // re-drive KILLS the pane it would have succeeded in. Ask the witness
+        // BEFORE destroying anything: an already-succeeded flow is completed,
+        // never re-asked.
+        if (await this.completedWithoutTelling(login)) {
+          const completed = this.complete(login.id);
+          if (completed) {
+            this.logger.log(
+              `[EnrollmentWizard] ${login.id} already signed in — completing instead of ${reason} refresh`,
+            );
+            continue;
+          }
+        }
+        let authRevisionBaseline: string | null | undefined;
+        if (login.expectedEmail && this.authRevisionWitness) {
+          try { authRevisionBaseline = await this.authRevisionWitness(login); }
+          catch { authRevisionBaseline = undefined; }
+        }
         const fresh = await this.driveLogin({
           provider: login.provider,
           framework: login.framework,
           kind: login.kind,
           configHome: login.configHome,
+          // Renewal is maintenance, not fresh operator consent. The new URL/code
+          // is stored and rendered; never pop a browser on a timer tick.
+          openBrowser: false,
         });
         const updated = this.store.reissue(login.id, {
           verificationUrl: fresh.verificationUrl,
           userCode: fresh.userCode,
           ttlMs: fresh.ttlMs,
+          ...(authRevisionBaseline !== undefined ? { authRevisionBaseline } : {}),
         });
         if (updated) {
           reissued.push(updated);
-          this.logger.log(`[EnrollmentWizard] auto-reissued expired login ${login.id} (reissue #${updated.reissueCount})`);
+          this.logger.log(`[EnrollmentWizard] refreshed ${reason} login ${login.id} (reissue #${updated.reissueCount})`);
         }
       } catch (err) {
         // @silent-fallback-ok: one re-drive failing must not abort the sweep;
         // the login stays expired and is retried next sweep.
-        this.logger.warn(`[EnrollmentWizard] reissue of ${login.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.logger.warn(`[EnrollmentWizard] ${reason} refresh of ${login.id} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     return reissued;
+  }
+
+  /**
+   * Did this login already succeed without instar being told?
+   *
+   * Only `device-code` flows can: a `url-code-paste` flow completes through the
+   * dashboard route that calls `complete()`, and its slot's credential is
+   * rewritten by ordinary token refresh, so witnessing it would risk marking a
+   * live re-enrolment "done" on an mtime bump that was never this flow.
+   *
+   * EVERY uncertainty answers false — no witness, unreadable slot, absent
+   * credential, unparseable timestamp, or a probe that throws. False is the
+   * previous behaviour (re-drive), so the witness can only ever PREVENT a
+   * destructive re-ask, never cause one, and can never strand an operator on a
+   * dead code by wrongly declaring success.
+   */
+  private async completedWithoutTelling(login: PendingLogin): Promise<boolean> {
+    if (!this.credentialWitness) return false;
+    if (login.kind !== 'device-code') return false;
+    try {
+      const credentialMs = await this.credentialWitness(login);
+      if (typeof credentialMs !== 'number' || !Number.isFinite(credentialMs)) return false;
+      const startedMs = Date.parse(login.createdAt);
+      if (!Number.isFinite(startedMs)) return false;
+      // A credential older than the flow was already there — a prior account in
+      // the slot, not this sign-in.
+      return credentialMs >= startedMs;
+    } catch {
+      // @silent-fallback-ok: an unreadable slot is not evidence of success.
+      return false;
+    }
   }
 
   /**
@@ -289,6 +419,13 @@ export class EnrollmentWizard {
    */
   complete(id: string): PendingLogin | null {
     const login = this.store.complete(id);
+    this.ensureCompletedLoginReady(login);
+    // §3.3 — the login left the pending set: any email-gate row about it is over.
+    if (login) { try { this.clearAttention?.(login.id, 'cleared: the login completed and left the pending set'); } catch { /* observability only */ } }
+    return login;
+  }
+
+  private ensureCompletedLoginReady(login: PendingLogin | null): void {
     if (login && login.framework === 'claude-code' && login.configHome) {
       const ready = this.ensureReady(login.configHome);
       if (ready.patched) {
@@ -296,8 +433,17 @@ export class EnrollmentWizard {
       } else if (ready.reason !== 'already interactive-ready') {
         this.logger.warn(`[EnrollmentWizard] could not verify ${login.configHome} interactive-ready — ${ready.reason}`);
       }
+      if (this.agentHome) {
+        try {
+          const linked = ensureAgentOwnedMemory({ agentHome: this.agentHome, configHome: login.configHome });
+          if (linked.action === 'linked' || linked.action === 'migrated') {
+            this.logger.log(`[EnrollmentWizard] agent-owned memory: ${linked.action} ${linked.linkPath}`);
+          }
+        } catch (err) {
+          this.logger.warn(`[EnrollmentWizard] could not link agent-owned memory into ${login.configHome} — ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
-    return login;
   }
 
   /**
@@ -318,11 +464,26 @@ export class EnrollmentWizard {
     targetMachineNickname: string,
   ): Promise<
     | { outcome: 'validated'; login: PendingLogin; email: string }
-    | { outcome: 'held'; login: PendingLogin; reason: string }
+    // `expected`/`got` are the gate verdict's account emails (operator-approved vs the
+    // account the sign-in ACTUALLY authenticated as) — surfaced so the dashboard can name
+    // BOTH accounts in plain language instead of a bare reason code (wrong-account hazard,
+    // topic 29836 case study D3). Never secrets: both are operator-visible account emails.
+    | { outcome: 'held'; login: PendingLogin; reason: string; expected: string | null; got: string | null }
     | { outcome: 'not-found' }
   > {
     const login = this.complete(id);
     if (!login) return { outcome: 'not-found' };
+
+    return this.validateFollowMeIdentity(login, targetMachineNickname);
+  }
+
+  private async validateFollowMeIdentity(
+    login: PendingLogin,
+    targetMachineNickname: string,
+  ): Promise<
+    | { outcome: 'validated'; login: PendingLogin; email: string }
+    | { outcome: 'held'; login: PendingLogin; reason: string; expected: string | null; got: string | null }
+  > {
 
     // Read the email the COMPLETED login actually authenticated as. No oracle / no config-home
     // / a probe failure are all treated as "unavailable" → the gate fails closed below.
@@ -348,17 +509,85 @@ export class EnrollmentWizard {
 
     if (verdict.selectable) {
       this.logger.log(`[EnrollmentWizard] follow-me completion ${login.id} validated as ${verdict.email}`);
+      try { this.clearAttention?.(login.id, 'cleared: the enrollment validated against the expected account email'); } catch { /* observability only */ }
       return { outcome: 'validated', login, email: verdict.email };
     }
 
     this.emitAttention?.(verdict.attentionItem);
     this.logger.warn(`[EnrollmentWizard] follow-me completion ${login.id} HELD (${verdict.reason}) — account NOT selected`);
-    return { outcome: 'held', login, reason: verdict.reason };
+    return { outcome: 'held', login, reason: verdict.reason, expected: verdict.expected, got: verdict.got };
   }
 
   /** The phone surface: still-valid logins awaiting approval. */
   pending(): PendingLogin[] {
     return this.store.active();
+  }
+
+  /**
+   * D5 (topic 29836) — the already-authorized short-circuit. A follow-me sign-in can
+   * complete WITHOUT ever showing a paste-back code: the provider short-circuits an
+   * already-authorized browser session ("You're all set up… you can close this window"),
+   * so nothing calls submit-code and the pending login would sit at "signing in" until
+   * TTL expiry even though the credential already landed in its config-home slot. This
+   * sweep detects the landed credential and drives the SAME identity-verified completion
+   * path (`completeFollowMe` — the S7 email gate ALWAYS runs; a mismatch/unverifiable
+   * account is HELD, never auto-enrolled). Follow-me logins only (expectedEmail set):
+   * a plain enrollment's completion stays the explicit /enroll/:id/complete call.
+   */
+  async sweepFollowMeCompletions(deps: {
+    /** Called on a VALIDATED completion so the caller adds the account to its pool. */
+    onValidated: (login: PendingLogin, email: string) => void;
+    targetMachineNickname?: string;
+  }): Promise<Array<{ id: string; outcome: 'validated' | 'held' }>> {
+    const results: Array<{ id: string; outcome: 'validated' | 'held' }> = [];
+    for (const login of this.store.active()) {
+      if (!login.expectedEmail || !login.configHome) continue;
+      if (this.completionSweepInFlight.has(login.id)) continue;
+      this.completionSweepInFlight.add(login.id);
+      try {
+        // Presence is not completion. Re-auth commonly starts in a slot that
+        // already contains settings and old auth material. Require the opaque auth
+        // revision to CHANGE from the baseline captured before this exact artifact.
+        if (!await this.authRevisionChanged(login)) continue;
+        const result = await this.validateFollowMeIdentity(login, deps.targetMachineNickname ?? 'this machine');
+        if (result.outcome === 'validated') {
+          try {
+            const completed = this.store.completeIfVersion(login.id, login.version, () => {
+              deps.onValidated(result.login, result.email);
+            });
+            if (completed) {
+              this.ensureCompletedLoginReady(completed);
+              results.push({ id: login.id, outcome: 'validated' });
+            }
+          } catch (err) {
+            // The store invokes this callback before its terminal CAS write. A
+            // failed pool finalization therefore leaves the login durably pending
+            // and eligible for the next bounded sweep.
+            this.logger.warn(`[EnrollmentWizard] completion-sweep pool-add failed for ${login.id}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        } else {
+          const completed = this.store.completeIfVersion(login.id, login.version, () => {});
+          if (completed) {
+            this.ensureCompletedLoginReady(completed);
+            results.push({ id: login.id, outcome: 'held' });
+          }
+        }
+      } finally {
+        this.completionSweepInFlight.delete(login.id);
+      }
+    }
+    return results;
+  }
+
+  private async authRevisionChanged(login: PendingLogin): Promise<boolean> {
+    if (!this.authRevisionWitness || typeof login.authRevisionBaseline !== 'string' || login.authRevisionBaseline.length === 0) return false;
+    try {
+      const current = await this.authRevisionWitness(login);
+      return typeof current === 'string' && current.length > 0 && current !== login.authRevisionBaseline;
+    } catch {
+      // @silent-fallback-ok: an unreadable auth slot is not completion proof.
+      return false;
+    }
   }
 
   /** Look up a single login by id INCLUDING terminal/expired records (unlike

@@ -31,18 +31,48 @@ Agent state synchronized via git with commit signing. Secrets encrypted with AES
 
 Distributed heartbeat coordination with split-brain detection. If the primary machine goes offline, the standby takes over.
 
+## Remote desktop across machines
+
+The dashboard's desktop picker shows only machines that report a ready screen and input adapter. The dashboard on the designated front machine checks the existing PIN and issues a short-lived `DesktopOperatorAssertion` for one selected machine. `DesktopAssertionReplayStore` rejects reuse, while `DesktopDelegatedSessionStore` ties the granted stream to that machine and revokes it on Stop, expiry, or disconnect. `DirectDesktopAccess` enforces the local controller lock. On Windows, `WindowsDesktopHost` reaches the signed-in Windows session through its local companion; a WSL display is never presented as the Windows desktop. See the [remote desktop guide](/guides/remote-desktop/) for setup and limits.
+
+## Lost-key identity recovery
+
+Pairing can establish a keychain-backed recovery root so a machine that loses its normal
+signing files can prove continuity without a blind re-pair. The recovery subsystem is split
+into explicit authorities and transports: `MachineRecoveryKey`, `IdentityStore`,
+`MachineOperatorDelegation`, `IdentityRecoveryRootRotationTransaction`,
+`MachineIdentityActivationGate`, `MachineIdentityBootRecovery`, `IdentityReannounce`,
+`IdentityReannounceClaimant`, `IdentityRecoveryBearer`, `IdentityProjectionEnvelope`,
+`IdentityDivergenceMonitor`, `IdentityRecoveryRootPropagation`,
+`IdentityPropagationTransport`, `IdentityPropagationReceipt`, `IdentityAckPropagation`,
+and `ObservedEndpointTracker`. See [Machine Identity Recovery](/architecture/machine-identity-recovery/)
+for the trust boundaries, bounded retry behavior, and operator review path.
+
 ## Write Authority
 
 Primary-machine-writes-only enforcement prevents conflicts. Secondary machines queue changes until they can sync.
 
 ```bash
 instar whoami               # Show this machine's identity
+instar identity status      # The AGENT identity this machine holds (a joined machine adopts it from siblings, never mints one)
 instar machines             # List all paired machines
 instar wakeup               # Transfer awake role to this machine
 instar leave                # Remove this machine from the mesh
 ```
 
 Note: `whoami`, `pair`, `join`, `wakeup`, and `leave` are top-level commands, not subcommands of `machines`.
+
+One agent, one identity: every machine of an agent holds the same Threadline identity (one key, one routing fingerprint). A machine that joins or is rebuilt adopts that identity from its siblings over signed mesh messages and never mints a second one; if two machines ever publish different fingerprints, the lease holder raises one Attention item naming which machine has which. Replacing an existing identity is a deliberate step after the operator's yes: `instar identity adopt --from <sibling>` on the affected machine (the old files are moved aside, never deleted). `GET /threadline/health` carries the live comparison as `identityCoherence`.
+
+## Capability Registry
+
+The development-agent capability registry is an advisory, read-only view of what
+the local machine can currently prove about doorway and model availability.
+`GET /capability-registry` returns the classified evidence, while
+`GET /capability-registry/health` reports observation counts and status
+measurements. The routes never admit, place, or route work; when the feature is
+dark or its receiver is unavailable they return a named `503` instead of an
+ambiguous empty success.
 
 ## Seamlessness Architecture (Components)
 
@@ -153,7 +183,17 @@ Once conversations can live on more than one machine, two everyday questions nee
 
 Both endpoints sit alongside `GET /pool`, `GET /pool/machines/:id`, and `GET /session-pool/e2e-results`, and like the rest of the pool they stay inert (`503`) until the pool is enabled.
 
+**Pin persistence (U4.1 — graduate + harden the WS1.3 pin machinery).** A deliberate pin ("run this on the mini") now survives lease handovers and machine bounces, and the placement read reports the **verified** actuation state, never intent alone: `GET /pool/placement?topic=N` carries `pinState` (`actuated` — the topic really runs on the pinned machine; `pending` — queued with the honest reason named, e.g. the pinned machine is offline or only just flapped back on; `diverged` — desired≠actual persisted past `ws13DivergedWindowMs`, raising one deduped attention item; `suspended-pending-owner-return` — a U4.2 stale-owner claim suspended the pin) plus `pinHeldSince` (the winning record's HLC physical) and the local-only `pinnedBy` provenance. Every pin mutation mints **one HLC** stamping both the local store and the replicated `topic-pin-record`, and an unpin (`POST /pool/unpin`) emits a replicated **tombstone**, so a stale replicated copy can never silently re-pin a topic the operator unpinned. The advisory read is an **answer-complete fold** (boot-time full-stream fold over own + peer-replica streams, then an offset-tracked incremental tail) instead of the old newest-500 tail window, storage is rotate-but-never-delete, and a corrupt pin file is quarantined aside loudly — never silently wiped. A pin record whose clock is future-skewed beyond the drift ceiling is excluded at the fold and quarantined **durably** (`GET /pool/pin-quarantine`) — clock progress never silently re-admits it, dismissing the alert never re-admits it, and the deliberate per-record re-admission is `POST /pool/pin-quarantine/readmit`. Pin-driven moves are paced (`ws13MaxMovesPerTick`), gated on the target being *sustained*-online (`ws13SustainedOnlineMs` — no transfer/abort churn toward an offline or flapping machine), and defer indefinitely on a live autonomous run; a pin pending past `ws13PendingPinMaxAgeMs` raises one fulfil-or-unpin attention item. Rollback = re-darken the `ws13*` flags; post-graduation an explicit `ws13Reconcile: false` survives migration as the operator's durable darken.
+
 **Scheduled-job claims across the pool (WS4.3).** On a multi-machine pool the scheduler must avoid two machines running the same cron job. Claims start on a best-effort AgentBus broadcast (`JobClaimManager`) and upgrade to a durable, epoch-fenced lease over the replicated journal (`JobLeaseClaimStore`) — but the cutover engages only when the `JobLeaseCutoverGate` confirms every online peer advertises the `ws43JournalLease` capability (flag coherence). That gate is the single decision point guaranteeing the journal lease and the legacy bus broadcast are never both live for the same job set; a mixed or single-machine pool stays on the bus path unchanged. Ships dark behind `multiMachine.seamlessness.ws43JournalLease` (dry-run first, so the intended journal claims are logged before any real cutover).
+
+### Mesh self-healing: stale-owner release + lease hand-back (U4.2 / U4.4)
+
+Two reconcilers close the "mesh drifted into the wrong shape and nobody fixed it" class.
+
+**Stale-owner release (U4.2, `multiMachine.sessionPool.staleOwnerRelease`, dev-gated dark, dry-run first).** When a topic's owner machine is genuinely dead or dark, its topics used to strand behind detection-only sentinels until a human demoted the machine. The `StaleOwnerReleaseEngine` — Case C of the ownership reconciler with an upgraded evidence bar — lets the serving-lease holder force-claim a provably-dead owner's topics. Every predicate is a mechanical check over authenticated state, and every ambiguity fails **closed**: observer-stamped death evidence (never the owner's self-reported clock), unreachability on *every* owner-authenticated transport, quorum, a claimant self-connectivity proof (a claimer with a broken NIC must never claim), and side-effect recency over a provably fresh replicated mirror. Claims are capped per tick, budgeted per topic on the replicated `topic-claim-annotation` record (budgets and an operator's declined-demote survive the claimer role moving with the lease), and every verdict — including every refusal — lands in `logs/stale-owner-release.jsonl`. The soak-judging telemetry is `GET /pool/stale-owner-release` (attempts, would-claims, refusals by reason, evidence classes, probe-breaker state, open episodes; 503 when dark). A claim suspends the topic's pin via the annotation (derived state — the pin record is never written), and a later operator re-pin clears it.
+
+**Lease hand-back (U4.4, `multiMachine.leaseSelfHeal.preferredCaptainHandback`, hard-dark, action-bearing).** After a failover moves the serving lease off the preferred captain (`preferredAwakeMachineId`), nothing used to hand it back — the mesh drifted onto the sleep-prone machine until a manual captain flip. The `LeaseHandbackReconciler` (holder-side, riding the existing lease pull tick) arms after the preferred captain is continuously healthy for 10 minutes, waits for a clean boundary (no in-flight forwards, no queued inbound, ~90s ingress quiet; bounded deferral with one honest notice), then hands back **claim-before-release**: the holder mints a signed, epoch-bound, TTL-bounded, single-use consent token; the preferred captain claims at the next epoch by presenting it (`handback-offer` mesh verb, holder-only RBAC); the old holder steps down only on observing the higher epoch — a failed claim leaves the holder holding, so zero-holder states are impossible by construction. The human always wins: the operator-flip latch (`POST /pool/lease-handback/latch`, written by the flip action itself, never inferred) holds the reconciler fully inert for 24h; clearing it early (`DELETE /pool/lease-handback/latch`) is PIN-gated. Hand-backs count as churn-breaker flips, an episode cap (offers included) bounds slow ping-pong, and a post-hand-back delivery canary verifies ingress on the new holder. Status: `GET /pool/lease-handback`.
 
 ### Closing a session on another machine
 

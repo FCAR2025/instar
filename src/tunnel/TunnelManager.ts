@@ -1,3 +1,5 @@
+import { notificationStamper, withNotificationEnvelope } from '../messaging/notificationStampers.js';
+const stampNotification = notificationStamper('src/tunnel/TunnelManager.ts');
 /**
  * TunnelManager — single owner of the tunnel lifecycle.
  *
@@ -111,6 +113,11 @@ export interface TunnelManagerInjections {
   providers?: TunnelProvider[];
   notifierSink?: NotifierSink;
   fetch?: typeof fetch;
+  /**
+   * Test seam: override the reachability-probe retry schedule (see
+   * REACHABILITY_RETRY_DELAYS_MS) so unit tests don't sleep real seconds.
+   */
+  reachabilityRetryDelaysMs?: number[];
 }
 
 /**
@@ -145,6 +152,20 @@ const MAX_BACKOFF_MS = 5 * 60_000;
 const MAX_BACKOFF_ATTEMPTS = 10;
 const REACHABILITY_TIMEOUT_MS = 8_000;
 /**
+ * Reachability-probe grace window. Right after cloudflared registers a
+ * named-tunnel connection, the Cloudflare edge can keep serving 530 for
+ * a few seconds while the route propagates. A single immediate probe
+ * mistakes that propagation window for a dead link, kills the healthy
+ * tunnel, falls through to quick tunnels (which can be rate-limited),
+ * and strands the lifecycle in `exhausted` — where the 15-min retry
+ * replays the exact same race indefinitely (observed on instar-codey
+ * 2026-07-09: a manually-started connector served HTTP 200 within ~6s
+ * while the manager kept declaring reachability-failed). Probe up to
+ * `delays.length + 1` times, sleeping the next delay between attempts,
+ * before declaring reachability-failed.
+ */
+const REACHABILITY_RETRY_DELAYS_MS = [2_000, 4_000, 6_000];
+/**
  * Post-exhausted retry cadence — the minimum-viable "self-heal"
  * placeholder for PR 2. After the bounded startup-reconnect ladder
  * exhausts (MAX_BACKOFF_ATTEMPTS), the manager keeps probing the
@@ -178,8 +199,10 @@ export class TunnelManager extends EventEmitter {
   private readonly providers: TunnelProvider[];
   private notifier: TunnelNotifier | null;
   private readonly fetcher: typeof fetch;
+  private readonly reachabilityRetryDelaysMs: number[];
 
   private currentHandle: TunnelProviderHandle | null = null;
+  private _connectionGeneration = 0;
   private currentProviderName: ProviderName | null = null;
   private _legacyState: TunnelState;
   private _autoReconnect = true; // always-on under the new design
@@ -229,6 +252,8 @@ export class TunnelManager extends EventEmitter {
       ? new TunnelNotifier({ sink: injections.notifierSink })
       : null;
     this.fetcher = injections?.fetch ?? globalThis.fetch.bind(globalThis);
+    this.reachabilityRetryDelaysMs =
+      injections?.reachabilityRetryDelaysMs ?? REACHABILITY_RETRY_DELAYS_MS;
 
     this._legacyState = {
       url: null,
@@ -239,6 +264,9 @@ export class TunnelManager extends EventEmitter {
     // Route lifecycle transitions through the notifier.
     this.lifecycle.on('transition', (e: TransitionEvent) => {
       if (this.notifier) void this.notifier.onTransition(e);
+      // Consumers that depend on the tier (the locked-screen password box)
+      // re-read it here instead of polling.
+      this.emit('lifecycle', e);
     });
 
     // Restore persisted snapshot (rotation-pending flag + consent cooldown).
@@ -250,6 +278,9 @@ export class TunnelManager extends EventEmitter {
   get url(): string | null { return this._legacyState.url; }
 
   get isRunning(): boolean { return this.currentHandle !== null && !this._stopped; }
+
+  /** Changes whenever the owned connector changes, including same-URL replacement. */
+  get connectionGeneration(): number { return this._connectionGeneration; }
 
   get state(): TunnelState { return { ...this._legacyState }; }
 
@@ -285,6 +316,9 @@ export class TunnelManager extends EventEmitter {
     this._startPromise = null;
 
     if (this.currentHandle) {
+      // Invalidate in-flight wake probes as soon as shutdown begins, before
+      // the provider's asynchronous stop can wait on a hung connector.
+      this._connectionGeneration++;
       try { await this.currentHandle.stop(); } catch { /* handle may be dead */ }
       this.currentHandle = null;
     }
@@ -423,7 +457,7 @@ export class TunnelManager extends EventEmitter {
       sendGroup: async (text: string) => {
         const topicId = adapter.getDashboardTopicId() ?? adapter.getLifelineTopicId();
         if (typeof topicId !== 'number') return; // no group destination
-        await adapter.sendToTopic(topicId, text);
+        await withNotificationEnvelope(stampNotification(), async () => (adapter)!.sendToTopic(topicId, text));
       },
       sendOwnerDM: async (text: string) => {
         await adapter.sendToOwnerDM(text);
@@ -528,6 +562,7 @@ export class TunnelManager extends EventEmitter {
 
         // Success.
         this.currentHandle = handle;
+        this._connectionGeneration++;
         this.currentProviderName = provider.name;
         this._legacyState.url = handle.url;
         this._legacyState.startedAt = new Date().toISOString();
@@ -724,6 +759,7 @@ export class TunnelManager extends EventEmitter {
 
       // new-then-old: the new Tier-1 handle is already up + verified.
       this.currentHandle = newHandle;
+      this._connectionGeneration++;
       this.currentProviderName = provider.name;
       this._legacyState.url = newHandle.url;
       this._legacyState.startedAt = new Date().toISOString();
@@ -751,6 +787,7 @@ export class TunnelManager extends EventEmitter {
     } catch {
       // Switch failed — try to stay on the relay rather than go dark.
       this.currentHandle = oldHandle;
+      this._connectionGeneration++;
       this.currentProviderName = oldProviderName;
       this._legacyState.url = oldUrl;
       const stateNow: TunnelLifecycleState = this.lifecycle.state;
@@ -868,6 +905,7 @@ export class TunnelManager extends EventEmitter {
       }
 
       this.currentHandle = handle;
+      this._connectionGeneration++;
       this.currentProviderName = provider.name;
       this._legacyState.url = handle.url;
       this._legacyState.startedAt = new Date().toISOString();
@@ -1025,8 +1063,26 @@ export class TunnelManager extends EventEmitter {
     }, POST_EXHAUSTED_RETRY_INTERVAL_MS);
   }
 
-  /** HTTP probe through the public URL — confirms the link actually serves. */
+  /**
+   * HTTP probe through the public URL — confirms the link actually
+   * serves. Retries across a bounded grace window (see
+   * REACHABILITY_RETRY_DELAYS_MS) so the edge-propagation 530s that
+   * follow connector registration don't get a healthy tunnel killed.
+   * A shutdown mid-window bails immediately instead of sleeping it out.
+   */
   private async probeReachability(url: string): Promise<boolean> {
+    const delays = this.reachabilityRetryDelaysMs;
+    for (let attempt = 0; ; attempt++) {
+      if (await this.probeReachabilityOnce(url)) return true;
+      if (this._stopped) return false; // shutting down — don't wait out the grace window
+      const delayMs = delays[attempt];
+      if (delayMs === undefined) return false; // grace window exhausted — genuinely unreachable
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  /** One probe attempt — a non-ok response or any fetch error reads as "not reachable yet". */
+  private async probeReachabilityOnce(url: string): Promise<boolean> {
     try {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), REACHABILITY_TIMEOUT_MS);
@@ -1036,6 +1092,9 @@ export class TunnelManager extends EventEmitter {
       clearTimeout(t);
       return res.ok;
     } catch {
+      // @silent-fallback-ok: probe failure IS the signal — `false` is the
+      // datum the retry loop and callers act on (recordAttempt with
+      // reachability-failed); nothing is swallowed.
       return false;
     }
   }

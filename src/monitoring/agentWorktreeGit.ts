@@ -9,12 +9,102 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { SafeGitExecutor } from '../core/SafeGitExecutor.js';
+import { SafeFsExecutor } from '../core/SafeFsExecutor.js';
+import { withSyncOp } from '../core/InFlightSyncOpMarker.js';
+import { classifyPorcelain } from '../core/worktreeDirtyCheck.js';
 import type { AgentWorktreeReaperDeps, WorktreeInfo } from './AgentWorktreeReaper.js';
+import { type WorktreeEnumeration, summarizeEnumerationError } from './worktreeEnumeration.js';
+
+/**
+ * Reaper-specific residue denylist (spec: worktree-reaper-untracked-blindspot).
+ * Empty by design. This gates an irreversible `git worktree remove`, and even
+ * cache/marker names can hold unique user-authored bytes. Keep any such file
+ * until it is explicitly inspected or archived by a separate cleanup path.
+ * We do NOT mutate DEFAULT_RESIDUE_DENYLIST (it feeds the separate yield-safety
+ * config list + other consumers); the reaper carries its own list.
+ */
+export const REAPER_RESIDUE_DENYLIST: readonly string[] = [];
 
 /** Read-only git executor signature (injected so this module is testable). */
 export type ReadGit = (args: string[], cwd: string) => string;
+
+/**
+ * The commit gate's own per-change records. Only names the gate itself writes
+ * match (ISO timestamp prefix, directly in the record folder, `.json`): a
+ * hand-named file there is still treated as work and keeps the checkout.
+ */
+const GATE_RECORD_PATH = /^\.instar\/instar-dev-(?:decisions|traces)\/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[^/]+\.json$/;
+
+export function isGateRecordPath(relPath: string): boolean {
+  return GATE_RECORD_PATH.test(relPath);
+}
+
+/**
+ * Untracked only. A staged record is someone's in-progress commit, and a locally
+ * edited tracked record cannot be put back here (the source-tree guard refuses
+ * `git restore`, deliberately), so both keep the checkout.
+ */
+function isUntrackedGateRecord(line: string): boolean {
+  return line.startsWith('?? ') && isGateRecordPath(line.slice(3));
+}
+
+function statusLines(porcelain: string): string[] {
+  return porcelain.split('\n').map((l) => l.replace(/\r$/, '')).filter((l) => l.length > 0);
+}
+
+/** `--untracked-files=all` so a wholly-untracked record folder lists each file, not the folder. */
+const statusArgs = (p: string): string[] => ['-C', p, 'status', '--porcelain', '--untracked-files=all'];
+const ignoredArgs = (p: string): string[] => ['-C', p, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'];
+
+/**
+ * Copy a checkout's gate records out to `<archiveRoot>/<worktree>/<relative path>`,
+ * verify each copy byte for byte, then delete the untracked ones, which would
+ * otherwise make a non-forced `git worktree remove` refuse. Throws (the reaper then keeps the checkout) on
+ * anything that is not a plain gate record, BEFORE changing the checkout.
+ */
+export function preserveGateRecords(p: string, archiveRoot: string, readGit: ReadGit): number {
+  const untracked: string[] = [];
+  for (const line of statusLines(readGit(statusArgs(p), p))) {
+    if (!isUntrackedGateRecord(line)) throw new Error(`not gate-records-only: ${line}`);
+    untracked.push(line.slice(3));
+  }
+  const ignored = readGit(ignoredArgs(p), p).split('\0').filter(Boolean);
+  for (const relPath of ignored) {
+    if (!isGateRecordPath(relPath)) throw new Error(`not gate-records-only: ${relPath}`);
+  }
+  const toCopy = [...untracked, ...ignored];
+  for (const relPath of toCopy) {
+    if (!fs.lstatSync(path.join(p, relPath)).isFile()) throw new Error(`not a regular file: ${relPath}`);
+  }
+  // A locked checkout will refuse removal, so leave its records where they are.
+  if (fs.existsSync(path.join(readGit(['-C', p, 'rev-parse', '--absolute-git-dir'], p).trim(), 'locked'))) {
+    throw new Error('checkout is locked');
+  }
+  const worktreeArchive = path.join(archiveRoot, path.basename(p));
+  for (const relPath of toCopy) {
+    const bytes = fs.readFileSync(path.join(p, relPath));
+    let dest = path.join(worktreeArchive, relPath);
+    if (fs.existsSync(dest) && !fs.readFileSync(dest).equals(bytes)) {
+      dest = `${dest}.${crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 8)}`;
+    }
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    // Machine-local, like the ignored traces it holds: state sync must not pick it up.
+    const ignoreFile = path.join(archiveRoot, '.gitignore');
+    if (!fs.existsSync(ignoreFile)) fs.writeFileSync(ignoreFile, '*\n');
+    // On disk before the original can be deleted.
+    const fd = fs.openSync(dest, 'w');
+    try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    if (!fs.readFileSync(dest).equals(bytes)) throw new Error(`archive verification failed: ${relPath}`);
+  }
+  for (const relPath of untracked) {
+    SafeFsExecutor.safeUnlinkSync(path.join(p, relPath), { operation: 'src/monitoring/agentWorktreeGit.ts:preserveGateRecords' });
+  }
+  // Ignored records are archived above; `git worktree remove` takes them with the checkout.
+  return toCopy.length;
+}
 
 const defaultReadGit: ReadGit = (args, cwd) =>
   SafeGitExecutor.readSync(args, {
@@ -70,6 +160,54 @@ export function isBranchMerged(readGit: ReadGit, repo: string, baseRef: string, 
   return lines.every((l) => l.startsWith('-'));
 }
 
+/** Run `gh` and return stdout, or null on ANY failure (gh missing, not authed,
+ *  not a GitHub repo, timeout). Null is the conservative signal → caller keeps. */
+export type RunGh = (args: string[], cwd: string) => string | null;
+
+const defaultRunGh: RunGh = (args, cwd) => {
+  try {
+    // Funnel through withSyncOp so the in-flight marker sees this blocking spawn
+    // (event-loop-resilience spec): the reaper runs in-process on a timer, and a
+    // bounded gh call must not read as a "stuck" event loop to the watchdogs.
+    return withSyncOp(() => execFileSync('gh', args, { cwd, encoding: 'utf-8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
+  } catch {
+    return null; // @silent-fallback-ok — gh unavailable ⇒ no PR signal ⇒ KEEP (conservative)
+  }
+};
+
+/**
+ * Fetch a map of `headRefName → headRefOid` for MERGED PRs, to detect
+ * MULTI-COMMIT squash-merges that `git cherry` (patch-id) cannot — the
+ * disk-accumulation root cause: a multi-commit branch squash-merged into one
+ * commit on main has different commit SHAs/patch-ids, so cherry reports it
+ * UNMERGED and the worktree is kept forever. A merged PR is the authoritative
+ * "the content is in main" signal; pairing it with an EXACT head-OID match (in
+ * the caller) ensures a branch with commits ADDED AFTER the merge is still kept.
+ *
+ * ONE `gh` call per sweep (bounded `--limit`); fail-safe to an EMPTY map on any
+ * error so the reaper degrades to exactly today's cherry-only behavior (KEEP).
+ */
+export function fetchMergedPrHeadOids(repo: string, opts?: { runGh?: RunGh; limit?: number }): Map<string, string> {
+  const runGh = opts?.runGh ?? defaultRunGh;
+  const limit = opts?.limit ?? 500;
+  const map = new Map<string, string>();
+  const out = runGh(['pr', 'list', '--state', 'merged', '--json', 'headRefName,headRefOid', '--limit', String(limit)], repo);
+  if (!out) return map; // conservative: no signal
+  let arr: unknown;
+  try { arr = JSON.parse(out); } catch { return map; }
+  if (!Array.isArray(arr)) return map;
+  for (const row of arr) {
+    if (!row || typeof row !== 'object') continue;
+    const name = (row as { headRefName?: unknown }).headRefName;
+    const oid = (row as { headRefOid?: unknown }).headRefOid;
+    if (typeof name === 'string' && typeof oid === 'string' && name && oid) {
+      // Latest merged PR for a (reused) branch name wins — gh returns newest first.
+      if (!map.has(name)) map.set(name, oid);
+    }
+  }
+  return map;
+}
+
 /**
  * Build the production git/fs-backed deps for the AgentWorktreeReaper.
  * `worktreesDir` bounds which `git worktree list` entries are considered (the
@@ -83,10 +221,22 @@ export function makeAgentWorktreeReaperDeps(opts: {
   /** Override the process-cwd scanner (testing). Returns the set of worktree
    *  ROOT paths that currently have a live process cwd inside them. */
   cwdRoots?: () => Set<string>;
+  /** When true (default), `isMerged` falls back to GitHub merged-PR state to
+   *  detect multi-commit squash-merges that `git cherry` cannot. Fail-safe:
+   *  any gh error degrades to cherry-only (KEEP). Set false to disable the
+   *  network call entirely (the legacy cherry-only behavior). */
+  githubMergeCheck?: boolean;
+  /** Override the merged-PR map source (testing). Returns headRefName→headRefOid. */
+  mergedPrMap?: () => Map<string, string>;
+  /** Where gate records go before a checkout is removed. Default: `<agent home>/.instar/instar-dev-decisions-archive`. */
+  gateRecordArchiveDir?: string;
   now?: () => number;
 }): AgentWorktreeReaperDeps {
   const readGit = opts.readGit ?? defaultReadGit;
+  const gateRecordArchiveDir = opts.gateRecordArchiveDir
+    ?? path.join(path.dirname(opts.worktreesDir), '.instar', 'instar-dev-decisions-archive');
   const repo = opts.instarRepo;
+  const githubMergeCheck = opts.githubMergeCheck ?? true;
   const worktreesReal = (() => { try { return fs.realpathSync(opts.worktreesDir); } catch { return opts.worktreesDir; } })();
   const within = (p: string): boolean => {
     const real = (() => { try { return fs.realpathSync(p); } catch { return p; } })();
@@ -126,11 +276,42 @@ export function makeAgentWorktreeReaperDeps(opts: {
     return cwdCache;
   };
 
+  // Merged-PR map (headRefName→headRefOid), cached for a short TTL so a single
+  // reap pass makes ONE `gh` call, not one per worktree. The map only fixes the
+  // multi-commit-squash blind spot in `git cherry`; it is consulted lazily (only
+  // when cherry says unmerged) so a fully cherry-detectable repo never calls gh.
+  const mergedPrMapFn = opts.mergedPrMap ?? (() => fetchMergedPrHeadOids(repo));
+  let prMapCache: Map<string, string> | null = null;
+  let prMapCacheAt = 0;
+  const mergedPrMapCached = (): Map<string, string> => {
+    const t = Date.now();
+    if (!prMapCache || t - prMapCacheAt > 60_000) { prMapCache = mergedPrMapFn(); prMapCacheAt = t; }
+    return prMapCache;
+  };
+
   return {
-    listWorktrees: (): WorktreeInfo[] => {
+    listWorktrees: (): WorktreeEnumeration<WorktreeInfo> => {
       let porcelain: string;
+      // REPORT the failure as a state, do not swallow it. `catch { return [] }`
+      // here made an enumeration FAILURE indistinguishable from "this agent has no
+      // worktrees", so a mis-wired `repo` produced a permanent clean bill of health
+      // (2026-07-29: `reclaimable: 0` reported against 73 real worktrees because
+      // `git -C <repo>` was failing outright).
+      //
+      // Returning `{ ok: false }` rather than throwing is the structural half: a
+      // caller cannot reach the list without narrowing on `ok`, so "forgot to
+      // handle failure" is a compile error instead of a silent zero.
       try { porcelain = readGit(['-C', repo, 'worktree', 'list', '--porcelain'], repo); }
-      catch { return []; }
+      catch (err) {
+        // @silent-fallback-ok — this is a typed failure result, not a fallback:
+        // the caller records the failure event/history and enters on-blind posture.
+        return {
+          ok: false,
+          error: summarizeEnumerationError(
+            new Error(`worktree enumeration failed for repo "${repo}": ${err instanceof Error ? err.message : String(err)}`),
+          ),
+        };
+      }
       const out: WorktreeInfo[] = [];
       let cur: Partial<WorktreeInfo> = {};
       for (const line of porcelain.split('\n')) {
@@ -152,18 +333,40 @@ export function makeAgentWorktreeReaperDeps(opts: {
       if (cur.path && within(cur.path)) {
         out.push({ path: cur.path, branch: cur.branch ?? null, headSha: cur.headSha ?? '' });
       }
-      return out;
+      return { ok: true, worktrees: out };
     },
 
     isClean: (p: string): boolean => {
-      try { return readGit(['-C', p, 'status', '--porcelain'], p).trim() === ''; }
-      catch { return false; } // cannot determine cleanliness → treat as dirty (KEEP)
+      // ANY change — tracked, untracked, or ignored — is dirty, because even a
+      // marker name may hold unique bytes. The one exception is the commit gate's
+      // own records: removeWorktree archives those before anything is deleted.
+      // FAIL-CLOSED on any error: cannot determine cleanliness → treat as dirty
+      // (KEEP). This is the deletion-safe direction (spec
+      // worktree-reaper-untracked-blindspot, convergence BLOCKER): a transient
+      // `git status` failure must never make a worktree look reapable.
+      try {
+        const work = statusLines(readGit(statusArgs(p), p)).filter((line) => !isUntrackedGateRecord(line));
+        if (classifyPorcelain(work.join('\n'), REAPER_RESIDUE_DENYLIST)) return false;
+        return readGit(ignoredArgs(p), p).split('\0').filter(Boolean).every(isGateRecordPath);
+      }
+      catch { return false; }
     },
 
     isMerged: (info: WorktreeInfo): boolean => {
       const base = resolveBaseRef(readGit, repo);
       if (!base || !info.headSha) return false;
-      return isBranchMerged(readGit, repo, base, info.headSha);
+      // 1) Patch-id equivalence (fast, offline): fast-forward / merge / rebase /
+      //    single-commit-squash. Never false-positives "merged".
+      if (isBranchMerged(readGit, repo, base, info.headSha)) return true;
+      // 2) Multi-commit squash-merge: `git cherry` cannot see it (SHAs differ).
+      //    Consult GitHub merged-PR state — but require an EXACT head-OID match so
+      //    a branch with commits ADDED AFTER the merge is still KEPT (those would
+      //    be unmerged work). Fail-safe: an empty/missing map ⇒ KEEP.
+      if (githubMergeCheck && info.branch) {
+        const oid = mergedPrMapCached().get(info.branch);
+        if (oid && oid === info.headSha) return true;
+      }
+      return false;
     },
 
     isInUse: (p: string): boolean => {
@@ -179,11 +382,42 @@ export function makeAgentWorktreeReaperDeps(opts: {
       return false;
     },
 
+    currentBranch: (p: string): string | null => {
+      // The LIVE checked-out branch, read at RECLAIM time to close the enumerate→reclaim
+      // TOCTOU. Format matches listWorktrees' info.branch (short name, no refs/heads/).
+      // FAIL-CLOSED: any error → null, which cannot equal a real info.branch, so the
+      // reclaimRaceGuard KEEPS (never reap on an unreadable live branch).
+      try {
+        const b = (readGit(['-C', p, 'rev-parse', '--abbrev-ref', 'HEAD'], p) ?? '').trim();
+        return b && b !== 'HEAD' ? b : null; // 'HEAD' = detached → null
+      } catch {
+        // @silent-fallback-ok: fail-closed — an unreadable live branch returns null,
+        // which can never equal a real info.branch, so the reclaim guard KEEPS (never
+        // reaps on an uncertain branch). The delete-safe direction, not a swallowed bug.
+        return null;
+      }
+    },
+
+    hasActiveBuildMarker: (p: string): boolean => {
+      // Belt-and-suspenders: an in-flight builder's explicit "don't reap me" claim.
+      // FAIL-CLOSED: an error reading the marker is treated as PRESENT (KEEP), the
+      // deletion-safe direction.
+      try { return fs.existsSync(path.join(p, '.instar-build-active')); }
+      catch {
+        // @silent-fallback-ok: fail-closed — an fs error reading the marker is treated
+        // as PRESENT (KEEP), the delete-safe direction. Not a swallowed bug.
+        return true;
+      }
+    },
+
     removeWorktree: (p: string): void => {
       // Deliberately NOT --force: the non-forced form refuses to remove a worktree
       // with uncommitted changes or a lock, so it can never destroy in-flight work.
       // The SourceTreeGuard mirrors this — it allows `worktree remove` against the
       // source tree only without --force (see isAllowedWorktreeManagerSubcommand).
+      // Gate records go to the archive first; if that fails this throws and the
+      // reaper keeps the checkout.
+      preserveGateRecords(p, gateRecordArchiveDir, readGit);
       SafeGitExecutor.execSync(['-C', repo, 'worktree', 'remove', p], {
         timeout: 60_000,
         operation: 'src/monitoring/agentWorktreeGit.ts:removeWorktree',

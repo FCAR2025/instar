@@ -36,6 +36,26 @@ export interface GateResult {
   unresponsiveSessions?: string[];
   /** Background job sessions that were safe to ignore for restart gating */
   nonBlockingJobSessions?: string[];
+  /**
+   * Observability-only split of {@link blockingSessions}: the subset that is
+   * "restart-safe" — tied to a topic that resumes cleanly across a restart (a
+   * resumable autonomous topic). Populated only when a `restartSafetyResolver`
+   * is provided; otherwise empty. This does NOT yet change the restart
+   * decision — a restart-safe session still blocks exactly as today. It only
+   * surfaces which blockers could, in a later step, be safely restarted
+   * through. See docs/specs/restart-safe-blocker-classification-spec.md.
+   */
+  restartSafeSessions?: string[];
+  /** Observability-only split of {@link blockingSessions}: the complement of
+   * {@link restartSafeSessions} — blockers with no known clean-resume path. */
+  hardBlockingSessions?: string[];
+}
+
+/** In-flight work a restart would lose, held until `until` (epoch ms) at the latest. */
+export interface RestartHold {
+  name: string;
+  until: number;
+  reason: string;
 }
 
 export interface UpdateGateConfig {
@@ -56,6 +76,18 @@ export interface UpdateGateConfig {
    * session-aware deferral untouched. Spec: docs/specs/restart-immediately-spec.md.
    */
   alwaysRestartImmediately?: boolean;
+  /**
+   * Optional predicate: given a blocking session, returns true when that
+   * session is "restart-safe" — its topic resumes cleanly across a restart
+   * (e.g. a resumable autonomous topic with a per-topic state file). Used ONLY
+   * to split {@link GateResult.blockingSessions} into a restart-safe vs hard
+   * subset for observability; it does NOT change the restart decision (a
+   * restart-safe session still blocks exactly as today). When omitted, no
+   * session is treated as restart-safe and behavior is identical to before.
+   * The "act on this classification" step is deliberately deferred.
+   * Spec: docs/specs/restart-safe-blocker-classification-spec.md.
+   */
+  restartSafetyResolver?: (session: SessionInfo) => boolean;
 }
 
 export interface UpdateGateStatus {
@@ -71,6 +103,15 @@ export interface UpdateGateStatus {
   deferralReason: string | null;
   /** Sessions currently blocking restart */
   blockingSessions: string[];
+  /**
+   * Observability-only split of {@link blockingSessions}: the restart-safe
+   * subset (resumable autonomous topics). Empty unless a
+   * `restartSafetyResolver` is wired. Does not yet affect the restart decision.
+   */
+  restartSafeSessions: string[];
+  /** Observability-only split of {@link blockingSessions}: blockers with no
+   * known clean-resume path (the complement of {@link restartSafeSessions}). */
+  hardBlockingSessions: string[];
   /** Whether the first warning (T-30min) has been sent */
   firstWarningSent: boolean;
   /** Whether the final warning (T-5min) has been sent */
@@ -93,10 +134,13 @@ export interface SessionMonitorLike {
 }
 
 export class UpdateGate {
-  private config: Required<UpdateGateConfig>;
+  private config: Required<Omit<UpdateGateConfig, 'restartSafetyResolver'>>;
+  private restartSafetyResolver?: (session: SessionInfo) => boolean;
   private deferralStartedAt: number | null = null;
   private deferralReason: string | null = null;
   private blockingSessions: string[] = [];
+  private restartSafeSessions: string[] = [];
+  private hardBlockingSessions: string[] = [];
   private firstWarningSent = false;
   private firstWarningPending = false;
   private finalWarningSent = false;
@@ -110,6 +154,7 @@ export class UpdateGate {
       retryIntervalMs: config?.retryIntervalMs ?? 5 * 60_000,
       alwaysRestartImmediately: config?.alwaysRestartImmediately ?? false,
     };
+    this.restartSafetyResolver = config?.restartSafetyResolver;
   }
 
   /**
@@ -151,8 +196,13 @@ export class UpdateGate {
       return { allowed: true };
     }
 
-    const { activeSessions, unresponsiveSessions, nonBlockingJobSessions } =
-      this.classifyRunningSessions(sessions, sessionManager, sessionMonitor);
+    const {
+      activeSessions,
+      unresponsiveSessions,
+      nonBlockingJobSessions,
+      restartSafeSessions,
+      hardBlockingSessions,
+    } = this.classifyRunningSessions(sessions, sessionManager, sessionMonitor);
 
     // No active sessions → restart (idle/dead/unresponsive don't block)
     if (activeSessions.length === 0) {
@@ -175,6 +225,9 @@ export class UpdateGate {
 
     this.deferralReason = `${activeSessions.length} active session(s): ${activeSessions.join(', ')}`;
     this.blockingSessions = activeSessions;
+    // Observability-only split — recorded for getStatus(); does NOT gate.
+    this.restartSafeSessions = restartSafeSessions;
+    this.hardBlockingSessions = hardBlockingSessions;
 
     // Max deferral exceeded — but only force restart if no HEALTHY sessions.
     // Active, healthy sessions should NEVER be killed for an update.
@@ -203,6 +256,8 @@ export class UpdateGate {
       blockingSessions: activeSessions,
       unresponsiveSessions: unresponsiveSessions.length > 0 ? unresponsiveSessions : undefined,
       nonBlockingJobSessions: nonBlockingJobSessions.length > 0 ? nonBlockingJobSessions : undefined,
+      restartSafeSessions: restartSafeSessions.length > 0 ? restartSafeSessions : undefined,
+      hardBlockingSessions: hardBlockingSessions.length > 0 ? hardBlockingSessions : undefined,
     };
   }
 
@@ -237,7 +292,13 @@ export class UpdateGate {
     sessions: SessionInfo[],
     sessionManager: SessionManagerLike,
     sessionMonitor?: SessionMonitorLike | null,
-  ): { activeSessions: string[]; unresponsiveSessions: string[]; nonBlockingJobSessions: string[] } {
+  ): {
+    activeSessions: string[];
+    unresponsiveSessions: string[];
+    nonBlockingJobSessions: string[];
+    restartSafeSessions: string[];
+    hardBlockingSessions: string[];
+  } {
     // Check session health if monitor is available
     const health = sessionMonitor?.getStatus().sessionHealth ?? [];
     const healthMap = new Map(health.map(h => [h.sessionName, h]));
@@ -245,6 +306,23 @@ export class UpdateGate {
     const activeSessions: string[] = [];
     const unresponsiveSessions: string[] = [];
     const nonBlockingJobSessions: string[] = [];
+    // Observability-only split of activeSessions (the blockers). A session is
+    // restart-safe when the injected resolver says its topic resumes cleanly.
+    // No resolver → every blocker is "hard" → identical to pre-change behavior.
+    const restartSafeSessions: string[] = [];
+    const hardBlockingSessions: string[] = [];
+    const recordBlocker = (session: SessionInfo): void => {
+      activeSessions.push(session.name);
+      let safe = false;
+      try {
+        safe = this.restartSafetyResolver?.(session) ?? false;
+      } catch {
+        // @silent-fallback-ok — a faulty resolver fails closed to a hard blocker.
+        // A faulty resolver must never change gating — fail safe to "hard".
+        safe = false;
+      }
+      (safe ? restartSafeSessions : hardBlockingSessions).push(session.name);
+    };
 
     for (const session of sessions) {
       if (this.isSafeIdleJobSession(session, sessionManager)) {
@@ -265,16 +343,22 @@ export class UpdateGate {
         healthMap.get(session.name);
       if (!h) {
         // No health data — be conservative, treat as active
-        activeSessions.push(session.name);
+        recordBlocker(session);
       } else if (h.status === 'healthy') {
-        activeSessions.push(session.name);
+        recordBlocker(session);
       } else if (h.status === 'unresponsive') {
         unresponsiveSessions.push(session.name);
       }
       // 'idle' and 'dead' sessions don't block
     }
 
-    return { activeSessions, unresponsiveSessions, nonBlockingJobSessions };
+    return {
+      activeSessions,
+      unresponsiveSessions,
+      nonBlockingJobSessions,
+      restartSafeSessions,
+      hardBlockingSessions,
+    };
   }
 
   private isSafeIdleJobSession(session: SessionInfo, sessionManager: SessionManagerLike): boolean {
@@ -296,6 +380,8 @@ export class UpdateGate {
       maxDeferralHours: this.config.maxDeferralHours,
       deferralReason: this.deferralReason,
       blockingSessions: this.blockingSessions,
+      restartSafeSessions: this.restartSafeSessions,
+      hardBlockingSessions: this.hardBlockingSessions,
       firstWarningSent: this.firstWarningSent,
       finalWarningSent: this.finalWarningSent,
       alwaysRestartImmediately: this.config.alwaysRestartImmediately,
@@ -326,6 +412,42 @@ export class UpdateGate {
     return false;
   }
 
+  // ── Restart holds (in-flight work that is not a session) ─────────────
+  //
+  // Some work in flight lives only in this process's memory and is LOST by a restart, not
+  // resumed: the first one is a pairing invite waiting for the operator's approval, whose secret
+  // is deliberately never written to disk (docs/specs/a2a-pairing-invite-link.md §8). A hold
+  // names that work and the time it ends by itself (the invite's expiry). The AutoUpdater's
+  // existing deferral path (recordRestartDeferral + scheduleDeferredRestartRetry) consults
+  // getActiveHolds() and waits while any is active; a hold past its `until` is ignored, so every
+  // hold is bounded by construction. A provider that throws holds nothing (fail open: a broken
+  // reminder must not strand an update).
+  private readonly holdProviders = new Map<string, () => RestartHold[]>();
+
+  /** Register (or replace) a hold provider under `key`. */
+  setRestartHoldProvider(key: string, provider: () => RestartHold[]): void {
+    this.holdProviders.set(key, provider);
+  }
+
+  /** Holds whose `until` is still in the future, soonest-ending first. Pure. */
+  getActiveHolds(now: number = Date.now()): RestartHold[] {
+    const out: RestartHold[] = [];
+    for (const [key, provider] of this.holdProviders) {
+      let holds: RestartHold[] = [];
+      try {
+        holds = provider() ?? [];
+      } catch (err) {
+        // @silent-fallback-ok — a faulty hold provider holds nothing; logged, never strands an update.
+        console.warn(`[UpdateGate] restart hold provider "${key}" failed: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      for (const h of holds) {
+        if (h && typeof h.name === 'string' && Number.isFinite(h.until) && h.until > now) out.push(h);
+      }
+    }
+    return out.sort((a, b) => a.until - b.until);
+  }
+
   /**
    * Reset deferral state (called after restart proceeds or update is cancelled).
    */
@@ -333,6 +455,8 @@ export class UpdateGate {
     this.deferralStartedAt = null;
     this.deferralReason = null;
     this.blockingSessions = [];
+    this.restartSafeSessions = [];
+    this.hardBlockingSessions = [];
     this.firstWarningSent = false;
     this.firstWarningPending = false;
     this.finalWarningSent = false;

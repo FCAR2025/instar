@@ -164,18 +164,52 @@ describe('Drift & Alignment Routes (integration)', () => {
       expect(res.body.previous).toBeTruthy();
       expect(res.body.previous.decisionCount).toBe(4);
     });
+
+    it('reports legacy qualitative confidence as explicitly unmeasurable', async () => {
+      fs.writeFileSync(
+        path.join(stateDir, 'decision-journal.jsonl'),
+        JSON.stringify({
+          timestamp: daysAgo(1),
+          sessionId: 'legacy',
+          decision: 'Legacy decision',
+          principle: 'safety',
+          confidence: 'medium',
+        }) + '\n',
+      );
+
+      const res = await request(app).get('/intent/drift');
+
+      expect(res.status).toBe(200);
+      expect(res.body.current.avgConfidence).toBeNull();
+      expect(res.body.current.confidenceSampleSize).toBe(0);
+      expect(res.body.current.invalidConfidenceCount).toBe(1);
+      expect(res.body.signals).toContainEqual(expect.objectContaining({
+        type: 'confidence_unmeasurable',
+        severity: 'warning',
+      }));
+      expect(res.body.summary).not.toMatch(/^Stable:/);
+    });
   });
 
   // ── GET /intent/alignment ─────────────────────────────────────────
 
   describe('GET /intent/alignment', () => {
-    it('returns score for empty journal', async () => {
+    it('reports an empty journal as NOT ASSESSED, not as a failing grade', async () => {
+      // Previously asserted `grade === 'F'`, which locked in the defect at the
+      // API layer: an API consumer reading `.grade` could not tell "no data"
+      // from "assessed and failing". The route passes the score through
+      // verbatim, so the honest state has to be in the payload itself.
       const res = await request(app).get('/intent/alignment');
 
       expect(res.status).toBe(200);
       expect(res.body.score).toBe(0);
-      expect(res.body.grade).toBe('F');
+      expect(res.body.grade).toBe('N/A');
+      expect(res.body.assessable).toBe(false);
+      expect(res.body.summary).toMatch(/cannot be assessed/i);
       expect(res.body.sampleSize).toBe(0);
+      expect(res.body.populationSize).toBe(0);
+      expect(res.body.excludedSampleSize).toBe(0);
+      expect(res.body.sampleCoverage).toBe(0);
       expect(res.body.components).toBeTruthy();
       expect(res.body.components.conflictFreedom).toBe(0);
       expect(res.body.components.confidenceLevel).toBe(0);
@@ -204,12 +238,44 @@ describe('Drift & Alignment Routes (integration)', () => {
       expect(res.body.score).toBeGreaterThan(0);
       expect(['A', 'B', 'C', 'D', 'F']).toContain(res.body.grade);
       expect(res.body.sampleSize).toBe(20);
+      expect(res.body.populationSize).toBe(20);
+      expect(res.body.excludedSampleSize).toBe(0);
+      expect(res.body.sampleCoverage).toBe(1);
       expect(res.body.periodDays).toBe(30);
       expect(typeof res.body.components.conflictFreedom).toBe('number');
       expect(typeof res.body.components.confidenceLevel).toBe('number');
       expect(typeof res.body.components.principleConsistency).toBe('number');
       expect(typeof res.body.components.journalHealth).toBe('number');
       expect(typeof res.body.summary).toBe('string');
+    });
+
+    it('reports an all-legacy population as excluded rather than grading it F', async () => {
+      fs.writeFileSync(
+        path.join(stateDir, 'decision-journal.jsonl'),
+        JSON.stringify({
+          timestamp: daysAgo(1),
+          sessionId: 'legacy',
+          decision: 'Legacy decision',
+          principle: 'safety',
+          confidence: 'high',
+          conflict: false,
+        }) + '\n',
+      );
+
+      const res = await request(app).get('/intent/alignment');
+
+      expect(res.status).toBe(200);
+      expect(res.body.sampleSize).toBe(0);
+      expect(res.body.populationSize).toBe(1);
+      expect(res.body.excludedSampleSize).toBe(1);
+      expect(res.body.exclusions).toEqual({ missingConfidence: 0, invalidConfidence: 1 });
+      expect(res.body.sampleCoverage).toBe(0);
+      expect(res.body.score).toBe(0);
+      expect(res.body.components.confidenceLevel).toBe(0);
+      expect(res.body.grade).toBe('N/A');
+      expect(res.body.assessable).toBe(false);
+      expect(res.body.summary).toMatch(/invalid confidence/i);
+      expect(JSON.stringify(res.body)).not.toContain('null');
     });
   });
 
@@ -248,6 +314,8 @@ describe('Drift & Alignment Routes (integration)', () => {
       const alignRes = await request(app).get('/intent/alignment');
       expect(alignRes.status).toBe(200);
       expect(alignRes.body.sampleSize).toBe(5);
+      expect(alignRes.body.populationSize).toBe(5);
+      expect(alignRes.body.sampleCoverage).toBe(1);
       expect(alignRes.body.score).toBeGreaterThan(0);
     });
   });

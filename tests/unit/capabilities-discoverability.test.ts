@@ -41,6 +41,13 @@ const ROUTE_SOURCE_FILES = [
   'src/server/topicIntentRoutes.ts',
   'src/server/specReviewRoutes.ts',
   'src/server/usherRoutes.ts',
+  'src/server/queuePaceRoutes.ts',
+  'src/server/maturationLadderRoutes.ts',
+  'src/server/mobilePairingRoutes.ts',
+  'src/server/mobileConversationRoutes.ts',
+  'src/server/ecosystemIdeaRoutes.ts',
+  'src/server/attributionRoutes.ts',
+  'src/server/recommendedServiceRoutes.ts',
 ];
 const routesSource = ROUTE_SOURCE_FILES
   .map((rel) => fs.readFileSync(path.join(process.cwd(), rel), 'utf-8'))
@@ -82,6 +89,31 @@ describe('Capabilities Discoverability', () => {
     expect(capabilityKeys).toContain('secrets');
     expect(capabilityPrefixToKey.get('secrets')).toBe('secrets');
     expect(internalPrefixes).not.toContain('secrets');
+  });
+
+  it('reports Codex continuation enablement from the same live-config source as the routes', () => {
+    const entry = CAPABILITY_INDEX.find((candidate) => candidate.key === 'codexTaskContinuation');
+    expect(entry).toBeDefined();
+    const result = entry!.build({
+      ctx: {
+        config: { autonomousSessions: { codexTaskContinuation: { enabled: false } } },
+        liveConfig: { get: () => ({ enabled: true }) },
+      },
+      scripts: [],
+      secretDrop: {},
+    } as never) as { enabled: boolean; endpoints: string[] };
+    expect(result.enabled).toBe(true);
+    expect(result.endpoints).toContain('POST /autonomous/preparation/start — begin a bounded inactive preparation carrier');
+  });
+
+  it('keeps the window-lifecycle capability endpoint inventory exact', () => {
+    const registered = [...routesSource.matchAll(/router\.(get|post|put|delete|patch)\s*\(\s*['"](\/window-lifecycle(?:\/[^'"]*)?)['"]/g)]
+      .map((match) => `${match[1].toUpperCase()} ${match[2]}`)
+      .sort();
+    const entry = CAPABILITY_INDEX.find((candidate) => candidate.key === 'windowLifecycle');
+    expect(entry).toBeDefined();
+    const block = entry!.build({ ctx: { config: { projectName: 'echo' } }, scripts: [], secretDrop: {} } as never) as { endpoints: string[] };
+    expect([...block.endpoints].sort()).toEqual(registered);
   });
 
   it('no prefix is both claimed by CAPABILITY_INDEX and listed in INTERNAL_PREFIXES', () => {

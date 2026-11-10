@@ -27,9 +27,11 @@ import {
   deriveLearningRecordKey,
 } from '../../src/core/LearningsReplicatedStore.js';
 import type { HlcTimestamp } from '../../src/core/HybridLogicalClock.js';
-import type { JournalEntry } from '../../src/core/CoherenceJournal.js';
+import type { JournalEntry, JournalFs } from '../../src/core/CoherenceJournal.js';
 import type { LearningEntry, LearningSource } from '../../src/core/types.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
+import { ReplicatedRecordEmitter, type ReplicatedRecordEmitterClock } from '../../src/core/ReplicatedRecordEmitter.js';
+import type { OriginRecord } from '../../src/core/UnionReader.js';
 
 const SELF = 'm_self';
 const PEER = 'm_peer';
@@ -58,6 +60,39 @@ function applyPeerRecord(applier: JournalSyncApplier, data: Record<string, unkno
   applier.apply(PEER, batch);
 }
 
+function attachWitnessObservers(
+  journal: CoherenceJournal,
+  applier: JournalSyncApplier,
+  readerRef: () => ReplicatedPeerStreamReader,
+): void {
+  journal.setReplicatedRecordCommitObserver((kind, entries) => readerRef().observeCommittedEntries(kind, entries));
+  applier.setReplicatedRecordCommitObserver((_sender, kind, entries) => readerRef().observeCommittedEntries(kind, entries));
+}
+
+function maxHlc(records: OriginRecord[]): HlcTimestamp | undefined {
+  let max: HlcTimestamp | undefined;
+  for (const r of records) {
+    if (!max || r.envelope.hlc.physical > max.physical || (r.envelope.hlc.physical === max.physical && r.envelope.hlc.logical > max.logical)) {
+      max = r.envelope.hlc;
+    }
+  }
+  return max;
+}
+
+function countingFs(): { io: JournalFs; reads: () => number; reset: () => void } {
+  let readCount = 0;
+  const io = { ...fs } as unknown as JournalFs;
+  io.readSync = (...args: Parameters<typeof fs.readSync>) => {
+    readCount++;
+    return fs.readSync(...args);
+  };
+  return {
+    io,
+    reads: () => readCount,
+    reset: () => { readCount = 0; },
+  };
+}
+
 describe('ReplicatedPeerStreamReader', () => {
   let dir: string;
   let journal: CoherenceJournal;
@@ -71,11 +106,29 @@ describe('ReplicatedPeerStreamReader', () => {
     journal.open();
     journal.setReplicatedKindRegistry(registry);
     applier = new JournalSyncApplier({ stateDir: dir, replicatedRegistry: registry });
-    reader = new ReplicatedPeerStreamReader({ stateDir: dir, registry, selfMachineId: SELF });
+    reader = new ReplicatedPeerStreamReader({ stateDir: dir, registry, selfMachineId: SELF, autoRebuild: false });
+    attachWitnessObservers(journal, applier, () => reader);
   });
   afterEach(() => {
     try { journal.close(); } catch { /* best-effort */ }
     SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'tests/unit/ReplicatedPeerStreamReader.test.ts' });
+  });
+
+  it('does not scan a large journal on the boot-critical constructor path', () => {
+    const journalDir = path.join(dir, 'state', 'coherence-journal');
+    fs.mkdirSync(journalDir, { recursive: true });
+    const data = buildLearningRecordData({ record: learning(), hlc: hlc(1000, SELF), origin: SELF })!;
+    const line = `${JSON.stringify({ seq: 1, ts: '2026-07-10T00:00:00.000Z', machine: SELF, kind: LEARNING_RECORD_KIND, data })}\n`;
+    fs.writeFileSync(path.join(journalDir, `${SELF}.${LEARNING_RECORD_KIND}.jsonl`), line.repeat(25_000));
+    const counted = countingFs();
+
+    const started = performance.now();
+    const bootReader = new ReplicatedPeerStreamReader({ stateDir: dir, registry: reg(), selfMachineId: SELF, fsImpl: counted.io });
+    const elapsedMs = performance.now() - started;
+
+    expect(counted.reads()).toBe(0);
+    expect(elapsedMs).toBeLessThan(50);
+    void bootReader;
   });
 
   it('materializes OWN + PEER records as distinct origins for the same recordKey', () => {
@@ -129,6 +182,65 @@ describe('ReplicatedPeerStreamReader', () => {
     expect(reader.loadWitness(LEARNING_STORE_KEY, 'never-seen')).toBeUndefined();
   });
 
+  it('keeps the derived witness index correct across own and peer updates', () => {
+    const rk = deriveLearningRecordKey('tmux colon', 'ops', SRC)!;
+    journal.emitReplicatedRecord(LEARNING_RECORD_KIND, buildLearningRecordData({ record: learning({ applied: false }), hlc: hlc(1000, SELF), origin: SELF })!);
+    journal.flush();
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)).toEqual(maxHlc(reader.loadOriginRecords(LEARNING_STORE_KEY, rk)));
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)?.physical).toBe(1000);
+
+    applyPeerRecord(applier, buildLearningRecordData({ record: learning({ applied: false }), hlc: hlc(2500, PEER), origin: PEER })!, 1);
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)).toEqual(maxHlc(reader.loadOriginRecords(LEARNING_STORE_KEY, rk)));
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)?.physical).toBe(2500);
+
+    journal.emitReplicatedRecord(LEARNING_RECORD_KIND, buildLearningRecordData({ record: learning({ applied: true }), hlc: hlc(3000, SELF), origin: SELF })!);
+    journal.flush();
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)).toEqual(maxHlc(reader.loadOriginRecords(LEARNING_STORE_KEY, rk)));
+    expect(reader.loadWitness(LEARNING_STORE_KEY, rk)?.physical).toBe(3000);
+  });
+
+  it('does not read journal bytes during an emit witness lookup once the index is built', async () => {
+    const rk = deriveLearningRecordKey('tmux colon', 'ops', SRC)!;
+    journal.emitReplicatedRecord(LEARNING_RECORD_KIND, buildLearningRecordData({ record: learning(), hlc: hlc(1000, SELF), origin: SELF })!);
+    journal.flush();
+
+    const counted = countingFs();
+    const indexedReader = new ReplicatedPeerStreamReader({ stateDir: dir, registry: reg(), selfMachineId: SELF, fsImpl: counted.io, autoRebuild: false });
+    expect(counted.reads()).toBe(0);
+    await indexedReader.rebuildWitnessIndexAsync();
+    expect(counted.reads()).toBeGreaterThan(0);
+    counted.reset();
+
+    const emitted: Record<string, unknown>[] = [];
+    const emitter = new ReplicatedRecordEmitter({
+      journal: { emitReplicatedRecord: (_kind, data) => { emitted.push(data); } },
+      clock: { tick: () => hlc(2000, SELF) } satisfies ReplicatedRecordEmitterClock,
+      registry: reg(),
+      origin: SELF,
+      stores: () => ({ learnings: { enabled: true } }),
+      loadWitness: (store, recordKey) => indexedReader.loadWitness(store, recordKey),
+    });
+    emitter.emit(LEARNING_STORE_KEY, rk, (nextHlc, origin, observed) => ({
+      ...buildLearningRecordData({ record: learning({ applied: true }), hlc: nextHlc, origin })!,
+      ...(observed ? { observed } : {}),
+    }));
+
+    expect(emitted).toHaveLength(1);
+    expect((emitted[0].observed as HlcTimestamp).physical).toBe(1000);
+    expect(counted.reads()).toBe(0);
+  });
+
+  it('rebuilds the witness index from authoritative journal streams after in-memory loss', async () => {
+    const rk = deriveLearningRecordKey('tmux colon', 'ops', SRC)!;
+    journal.emitReplicatedRecord(LEARNING_RECORD_KIND, buildLearningRecordData({ record: learning(), hlc: hlc(1000, SELF), origin: SELF })!);
+    journal.flush();
+    applyPeerRecord(applier, buildLearningRecordData({ record: learning(), hlc: hlc(2500, PEER), origin: PEER })!, 1);
+
+    const rebuilt = new ReplicatedPeerStreamReader({ stateDir: dir, registry: reg(), selfMachineId: SELF, autoRebuild: false });
+    await rebuilt.rebuildWitnessIndexAsync();
+    expect(rebuilt.loadWitness(LEARNING_STORE_KEY, rk)?.physical).toBe(2500);
+  });
+
   it('loadOwnEntries serves only THIS machine\'s own entries; {} for a foreign origin', () => {
     journal.emitReplicatedRecord(LEARNING_RECORD_KIND, buildLearningRecordData({ record: learning(), hlc: hlc(1000, SELF), origin: SELF })!);
     journal.flush();
@@ -139,5 +251,66 @@ describe('ReplicatedPeerStreamReader', () => {
     expect(own[LEARNING_RECORD_KIND][0].machine).toBe(SELF);
     // Single-origin: a request for a foreign origin returns nothing.
     expect(reader.loadOwnEntries(LEARNING_STORE_KEY, PEER)).toEqual({});
+  });
+
+  describe('fold cache', () => {
+    const write = (id: string, physical: number, seq: number) => applyPeerRecord(applier,
+      buildLearningRecordData({ record: learning({ id, title: id }), hlc: hlc(physical, PEER), origin: PEER })!, seq);
+    const keys = () => reader.listRecordKeys(LEARNING_STORE_KEY);
+    const counted = () => {
+      const c = countingFs();
+      return { c, r: new ReplicatedPeerStreamReader({ stateDir: dir, registry: reg(), selfMachineId: SELF, fsImpl: c.io, autoRebuild: false }) };
+    };
+
+    it('an unchanged store is read once, however many keys are asked for', () => {
+      write('LRN-001', 1000, 1);
+      const { c, r } = counted();
+      const [key] = r.listRecordKeys(LEARNING_STORE_KEY);
+      expect(c.reads()).toBeGreaterThan(0);
+      c.reset();
+      for (let i = 0; i < 5; i++) r.loadOriginRecords(LEARNING_STORE_KEY, key);
+      r.loadAllOriginRecords(LEARNING_STORE_KEY);
+      expect(c.reads()).toBe(0);
+    });
+
+    it('a write is seen by the very next read', () => {
+      write('LRN-001', 1000, 1);
+      expect(keys()).toHaveLength(1);
+      write('LRN-002', 2000, 2);
+      expect(keys()).toHaveLength(2);
+    });
+
+    it('a new peer stream file is seen', () => {
+      expect(keys()).toHaveLength(0);
+      write('LRN-001', 1000, 1);
+      expect(keys()).toHaveLength(1);
+    });
+
+    it('what a caller changes never reaches the next caller', () => {
+      write('LRN-001', 1000, 1);
+      const [key] = keys();
+      const first = reader.loadOriginRecords(LEARNING_STORE_KEY, key);
+      (first[0].data as Record<string, unknown>).title = 'changed';
+      first[0].envelope.origin = 'someone-else';
+      reader.loadAllOriginRecords(LEARNING_STORE_KEY).get(key)![0].envelope.origin = 'someone-else';
+      const again = reader.loadOriginRecords(LEARNING_STORE_KEY, key);
+      expect(again[0].envelope.origin).toBe(PEER);
+      expect((again[0].data as Record<string, unknown>).title).not.toBe('changed');
+    });
+
+    it('a failed read is not remembered as an empty store', () => {
+      write('LRN-001', 1000, 1);
+      const io = { ...fs } as unknown as JournalFs;
+      let fail = true;
+      const realRead = fs.readSync;
+      io.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+        if (fail) throw new Error('EIO');
+        return realRead(...args);
+      }) as typeof fs.readSync;
+      const r = new ReplicatedPeerStreamReader({ stateDir: dir, registry: reg(), selfMachineId: SELF, fsImpl: io, autoRebuild: false });
+      expect(r.listRecordKeys(LEARNING_STORE_KEY)).toHaveLength(0);
+      fail = false;
+      expect(r.listRecordKeys(LEARNING_STORE_KEY)).toHaveLength(1);
+    });
   });
 });

@@ -43,6 +43,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withSyncOp } from './InFlightSyncOpMarker.js';
 import {
   assertNotInstarSourceTree,
   SourceTreeGuardError,
@@ -51,87 +52,110 @@ import {
 // ── Verb classification ─────────────────────────────────────────────
 
 /**
- * Verbs treated as destructive. Closed enumeration; additions are spec changes.
+ * How the funnel classes a verb.
+ *   read  — every form is treated as a read.
+ *   write — every form is treated as a write.
+ *   shape — the verb has both forms; isReadOnlyShape decides per call.
  */
-export const DESTRUCTIVE_GIT_VERBS: ReadonlySet<string> = new Set([
-  'add',
-  'am',
-  'apply',
-  'branch', // shape-checked: bare `branch <name>` is destructive
-  'checkout',
-  'cherry-pick',
-  'clean',
-  'clone',
-  'commit',
-  'fetch',
-  'gc',
-  'init',
-  'merge',
-  'mv',
-  'pull',
-  'push',
-  'rebase',
-  'reset',
-  'restore',
-  'revert',
-  'rm',
-  'stash',
-  'submodule',
-  'switch',
-  'tag',
-  'update-ref',
-  'worktree', // shape-checked: `worktree list` is read-only
-  'prune',
-  'notes',
-  'replace',
-  'filter-branch',
-  'remote', // shape-checked: `remote get-url` is read-only
-  'config', // shape-checked: `config --get` is read-only
-  'format-patch', // shape-checked: --inline is destructive
-]);
+export type GitVerbClass = 'read' | 'write' | 'shape';
 
 /**
- * Read-only verbs explicitly safe to call. Closed enumeration.
+ * The one verb classification every surface reads. Closed enumeration; an
+ * addition is a spec change. A verb that is not listed is unclassified, and no
+ * surface will run it. Kept as raw entries so a test can see a duplicate, which
+ * the Map built from them would hide.
  */
-export const READONLY_GIT_VERBS: ReadonlySet<string> = new Set([
-  'status',
-  'log',
-  'diff',
-  'show',
-  'rev-parse',
-  'rev-list',
-  'ls-files',
-  'ls-tree',
-  'ls-remote',
-  'describe',
-  'name-rev',
-  'blame',
-  'cat-file',
-  'cherry', // read-only: lists +/- patch-equivalence vs an upstream; no mutation
-  'grep',
-  'shortlog',
-  'count-objects',
-  'fsck',
-  'var',
-  'version',
-  '--version',
-  'help',
-  'write-tree',
-  'interpret-trailers',
-  'check-ref-format',
-  'symbolic-ref',
-  'show-ref',
-  'for-each-ref',
-  'merge-base',
-  'reflog', // read-only by default; reflog expire/delete is destructive (caller must use execSync)
-  'hash-object',
-  'config', // overlap with destructive set; readSync shape-check enforces --get only
-  'remote', // overlap; readSync shape-check enforces list/get-url only
-  'branch', // overlap; readSync shape-check enforces --list / -l / --show-current / -v
-  'worktree', // overlap; readSync shape-check enforces list only
-  'format-patch', // overlap; readSync shape-check rejects --inline
-  'stash', // shape-check: `stash list` / `stash show` allowed
-]);
+const GIT_VERB_CLASS_ENTRIES: ReadonlyArray<readonly [string, GitVerbClass]> = [
+  // Writes.
+  ['add', 'write'],
+  ['am', 'write'],
+  ['apply', 'write'],
+  ['checkout', 'write'],
+  ['cherry-pick', 'write'],
+  ['clean', 'write'],
+  ['clone', 'write'],
+  ['commit', 'write'],
+  ['fetch', 'write'],
+  ['gc', 'write'],
+  ['init', 'write'],
+  ['merge', 'write'],
+  ['mv', 'write'],
+  ['pull', 'write'],
+  ['push', 'write'],
+  ['rebase', 'write'],
+  ['reset', 'write'],
+  ['restore', 'write'],
+  ['revert', 'write'],
+  ['rm', 'write'],
+  ['submodule', 'write'],
+  ['switch', 'write'],
+  ['tag', 'write'],
+  ['update-ref', 'write'],
+  // Object-database writers (no ref or working-tree change); destructive-classified so
+  // they route through execSync. local-verify's merge-tree/commit-tree path (§2 step 1).
+  ['merge-tree', 'write'],
+  ['commit-tree', 'write'],
+  ['prune', 'write'],
+  ['notes', 'write'],
+  ['replace', 'write'],
+  ['filter-branch', 'write'],
+  // Reads.
+  ['status', 'read'],
+  ['log', 'read'],
+  ['diff', 'read'],
+  ['show', 'read'],
+  ['rev-parse', 'read'],
+  ['rev-list', 'read'],
+  ['ls-files', 'read'],
+  ['ls-tree', 'read'],
+  ['ls-remote', 'read'],
+  ['describe', 'read'],
+  ['name-rev', 'read'],
+  ['blame', 'read'],
+  ['cat-file', 'read'],
+  ['cherry', 'read'], // lists +/- patch-equivalence vs an upstream; no mutation
+  ['grep', 'read'],
+  ['shortlog', 'read'],
+  ['count-objects', 'read'],
+  ['fsck', 'read'],
+  ['var', 'read'],
+  ['version', 'read'],
+  ['--version', 'read'],
+  ['help', 'read'],
+  ['write-tree', 'read'],
+  ['interpret-trailers', 'read'],
+  ['check-ref-format', 'read'],
+  ['check-ignore', 'read'], // exit code is the answer: 0 matched, 1 no match, 128 git failed
+  ['symbolic-ref', 'read'],
+  ['show-ref', 'read'],
+  ['for-each-ref', 'read'],
+  ['merge-base', 'read'],
+  ['hash-object', 'read'],
+  // Both forms; isReadOnlyShape decides.
+  ['branch', 'shape'], // bare `branch <name>` writes; --list / -l / --show-current / -v read
+  ['stash', 'shape'], // `stash list` / `stash show` read
+  ['worktree', 'shape'], // `worktree list` reads
+  ['remote', 'shape'], // `remote get-url` / `remote show` read
+  ['config', 'shape'], // `config --get` reads
+  ['format-patch', 'shape'], // --inline writes
+  ['reflog', 'shape'], // bare / show / exists read; everything else goes through execSync
+];
+
+export const GIT_VERB_CLASSES: ReadonlyMap<string, GitVerbClass> = new Map(GIT_VERB_CLASS_ENTRIES);
+
+/** Verbs a write surface can run: `write` and `shape`. Derived from the table. */
+export const DESTRUCTIVE_GIT_VERBS: ReadonlySet<string> = new Set(
+  GIT_VERB_CLASS_ENTRIES.filter(([, cls]) => cls !== 'read').map(([verb]) => verb),
+);
+
+/**
+ * Verbs a read surface can run: `read` and `shape`. Derived from the table.
+ * Membership is the funnel's classification, NOT proof the verb writes nothing:
+ * some forms of these verbs can write or run a program (EVO-029 items 4 and 5).
+ */
+export const READONLY_GIT_VERBS: ReadonlySet<string> = new Set(
+  GIT_VERB_CLASS_ENTRIES.filter(([, cls]) => cls !== 'write').map(([verb]) => verb),
+);
 
 /**
  * Verbs that are "data-pull": they touch the object database and FETCH_HEAD
@@ -140,9 +164,8 @@ export const READONLY_GIT_VERBS: ReadonlySet<string> = new Set([
  * standpoint they are read-tier. Permitted on the instar source tree ONLY
  * when the caller opts in via `SafeGitOptions.sourceTreeReadOk: true`.
  *
- * Currently: `fetch` only. (`ls-remote` is pure-read and already in
- * READONLY_GIT_VERBS — it goes through readSync which never trips the
- * source-tree guard.)
+ * `ls-remote` is pure-read but still passes through readSync's defense-in-depth
+ * source-tree check, so it is named here as an explicit opt-in read-tier verb.
  */
 export const SOURCE_TREE_READ_TIER_VERBS: ReadonlySet<string> = new Set([
   // data-pull verbs (execSync path)
@@ -157,12 +180,15 @@ export const SOURCE_TREE_READ_TIER_VERBS: ReadonlySet<string> = new Set([
   'diff',
   'cat-file',
   'merge-base',
+  'ls-remote',
   'remote', // shape-checked to list/get-url only; needed by resolveCanonicalRemote
   // read-tier verbs the AgentWorktreeReaper needs against the source tree to
   // decide whether a worktree is reclaimable. Both are pure reads (no mutation
   // possible): `status --porcelain` for cleanliness, `cherry` for merged-detection.
   'status',
   'cherry',
+  'ls-files', // reaper checks ignored files before allowing worktree removal
+  'check-ignore', // reads ignore rules; a caller may need the answer on the source tree itself
 ]);
 
 // ── Env denylist ────────────────────────────────────────────────────
@@ -679,6 +705,20 @@ function isReadOnlyShape(
   }
 }
 
+export type GitInvocationClass = 'read' | 'write' | 'unclassified';
+
+/**
+ * The one answer to "what does the funnel class this invocation as". `read`
+ * means the funnel classifies it as a read, not that git will write nothing.
+ * A verb outside GIT_VERB_CLASSES is `unclassified`, never read or write.
+ */
+export function classifyGitInvocation(verb: string, verbArgs: readonly string[]): GitInvocationClass {
+  const cls = GIT_VERB_CLASSES.get(verb);
+  if (cls === undefined) return 'unclassified';
+  if (cls === 'shape') return isReadOnlyShape(verb, verbArgs) === false ? 'write' : 'read';
+  return cls;
+}
+
 /** Return the verbArgs (slice after the verb), accounting for pre-verb flags. */
 function sliceAfterVerb(
   args: readonly string[],
@@ -1029,6 +1069,41 @@ export interface SafeGitOptions {
    * `isSourceTreeWorktreeManagerInvocation`.
    */
   sourceTreeWorktreeManagerOk?: boolean;
+  /**
+   * Opt-in: allow the feedback executor's trusted git operations inside its OWN throwaway
+   * attempt clones (docs/specs/feedback-triage-and-execution.md §4). Those clones are copies
+   * of the instar source, so SourceTreeGuard would refuse every write; this narrow carve-out
+   * admits only an enumerated verb set, and only when EVERY target is inside a directory named
+   * `feedback-<slug>-a<n>[-publish|-base]` directly under a `.worktrees` directory. It never
+   * applies to the agent's own checkout or any other tree.
+   */
+  feedbackAttemptCloneOk?: boolean;
+  /**
+   * Opt-in: allow local-verify's trusted git operations inside THIS agent's private bare clone
+   * and run worktrees (docs/specs/local-verify-merge-authority.md §2 step 1). The run worktrees
+   * are copies of the instar source, so SourceTreeGuard would refuse every write; this carve-out
+   * admits only an enumerated verb set and only when ALL of these hold:
+   *  - every target (cwd, -C, the explicit git dir and work tree, worktree path args resolved
+   *    against cwd) has a realpath at or below `verifyRoot` (itself realpath'd);
+   *  - repository discovery is closed: the executor sets `GIT_DIR=gitDir` (and `GIT_WORK_TREE`
+   *    when given) plus `GIT_CEILING_DIRECTORIES=<parent of verifyRoot>` on the child, overriding
+   *    the env denylist for these three keys only;
+   *  - `git rev-parse --absolute-git-dir`, run with the same cwd and env, resolves inside
+   *    `verifyRoot` (a damaged clone fails here instead of git searching upward to the agent's
+   *    own checkout).
+   * Otherwise it falls through to the normal guard, which refuses. The shared read tier
+   * (`sourceTreeReadOk`) is not widened.
+   */
+  localVerifyCloneOk?: LocalVerifyCloneScope;
+}
+
+export interface LocalVerifyCloneScope {
+  /** `<agentHome>/.worktrees/.verify` of the agent doing the verify. */
+  verifyRoot: string;
+  /** The repository: the bare clone, or `<bare>/worktrees/<name>` for a run worktree. */
+  gitDir: string;
+  /** The run worktree, for steps that read or write its working tree. */
+  workTree?: string;
 }
 
 // ── Errors ─────────────────────────────────────────────────────────
@@ -1048,32 +1123,37 @@ export class SafeGitExecutor {
    * Synchronous destructive git execution.
    *
    * 1. Extract the verb and ALL target directories from args + opts.cwd.
-   * 2. Canonicalize each target and call assertNotInstarSourceTree on each.
-   * 3. Verify the verb is in DESTRUCTIVE_GIT_VERBS (or is an ambiguous verb
-   *    in destructive shape). Read-only verbs throw — callers must use readSync.
-   * 4. Strip env denylist; inject GIT_CONFIG_GLOBAL/SYSTEM=/dev/null.
-   * 5. Spawn git via execFileSync; return stdout.
+   * 2. Refuse an unclassified verb, before anything else, on every surface.
+   * 3. Canonicalize each target and call assertNotInstarSourceTree on each.
+   * 4. Verify the invocation classifies as a write. Reads throw — callers must
+   *    use readSync.
+   * 5. Strip env denylist; inject GIT_CONFIG_GLOBAL/SYSTEM=/dev/null.
+   * 6. Spawn git via execFileSync; return stdout.
    *
-   * Throws SourceTreeGuardError if any target is the instar source tree.
+   * Throws SourceTreeGuardError if any target is the instar source tree and the
+   * verb is classified.
    * Throws SafeGitExecutorError on classification mismatch or arg errors.
    */
   static execSync(args: readonly string[], opts: SafeGitOptions): string {
-    const { verb, targets } = extractVerbAndTargets(args, opts.cwd);
+    const { verb, targets: rawTargets } = extractVerbAndTargets(args, opts.cwd);
+    const targets = withLocalVerifyTargets(rawTargets, opts);
     const verbArgs = sliceAfterVerb(args, verb);
+    const invocation = classifyGitInvocation(verb, verbArgs);
+    refuseUnclassified(invocation, verb, opts, targets);
 
     // Run source-tree assertion against every target — unless the caller
     // explicitly opted into the narrow data-pull allowlist (fetch / etc.)
     // for the documented LAYER B + LAYER C canonical-ref read path. See
     // SafeGitOptions.sourceTreeReadOk for the rationale.
-    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts)) {
+    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts, targets)) {
       runSourceTreeChecks(targets, opts.operation, 'git', verb);
     } else {
       audit('git', opts.operation, verb, targets[0], 'allowed', 'sourceTree-bypass');
     }
 
     // Verb classification.
-    const ambiguousReadOnly = isReadOnlyShape(verb, verbArgs);
-    if (ambiguousReadOnly === true) {
+    const shapeChecked = GIT_VERB_CLASSES.get(verb) === 'shape';
+    if (invocation === 'read' && shapeChecked) {
       // The verb is ambiguous and the shape is read-only — caller used the
       // wrong method. Fail loud rather than silently allow.
       audit('git', opts.operation, verb, targets[0], 'denied', 'read-only-shape-via-execSync');
@@ -1081,7 +1161,7 @@ export class SafeGitExecutor {
         `SafeGitExecutor.execSync called with read-only shape '${verb} ${verbArgs.join(' ')}' — use SafeGitExecutor.readSync instead.`,
       );
     }
-    if (ambiguousReadOnly === null && !DESTRUCTIVE_GIT_VERBS.has(verb)) {
+    if (invocation === 'read') {
       // Pure read-only verb routed through execSync.
       audit('git', opts.operation, verb, targets[0], 'denied', 'readonly-verb-via-execSync');
       throw new SafeGitExecutorError(
@@ -1089,7 +1169,7 @@ export class SafeGitExecutor {
       );
     }
 
-    const env = sanitizeEnv(opts.env, opts.cwd);
+    const env = gitChildEnv(opts);
 
     let stdout: string;
     try {
@@ -1114,29 +1194,32 @@ export class SafeGitExecutor {
    * Async/streaming variant. Same guard semantics as execSync.
    */
   static spawn(args: readonly string[], opts: SafeGitOptions): ChildProcess {
-    const { verb, targets } = extractVerbAndTargets(args, opts.cwd);
+    const { verb, targets: rawTargets } = extractVerbAndTargets(args, opts.cwd);
+    const targets = withLocalVerifyTargets(rawTargets, opts);
     const verbArgs = sliceAfterVerb(args, verb);
-    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts)) {
+    const invocation = classifyGitInvocation(verb, verbArgs);
+    refuseUnclassified(invocation, verb, opts, targets);
+    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts, targets)) {
       runSourceTreeChecks(targets, opts.operation, 'git', verb);
     } else {
       audit('git', opts.operation, verb, targets[0], 'allowed', 'sourceTree-bypass');
     }
 
-    const ambiguousReadOnly = isReadOnlyShape(verb, verbArgs);
-    if (ambiguousReadOnly === true) {
+    const shapeChecked = GIT_VERB_CLASSES.get(verb) === 'shape';
+    if (invocation === 'read' && shapeChecked) {
       audit('git', opts.operation, verb, targets[0], 'denied', 'read-only-shape-via-spawn');
       throw new SafeGitExecutorError(
         `SafeGitExecutor.spawn called with read-only shape '${verb}' — use SafeGitExecutor.readSync instead.`,
       );
     }
-    if (ambiguousReadOnly === null && !DESTRUCTIVE_GIT_VERBS.has(verb)) {
+    if (invocation === 'read') {
       audit('git', opts.operation, verb, targets[0], 'denied', 'readonly-verb-via-spawn');
       throw new SafeGitExecutorError(
         `SafeGitExecutor.spawn called with read-only verb '${verb}' — use SafeGitExecutor.readSync instead.`,
       );
     }
 
-    const env = sanitizeEnv(opts.env, opts.cwd);
+    const env = gitChildEnv(opts);
     const spawnOpts: SpawnOptions = {
       cwd: opts.cwd,
       stdio: opts.stdio ?? 'pipe',
@@ -1147,26 +1230,70 @@ export class SafeGitExecutor {
   }
 
   /**
+   * Streaming read-only variant. It preserves the same classification, source-
+   * tree guard, environment scrubbing, and audit funnel as `readSync`, while
+   * leaving stdout consumption and process completion checks to the caller.
+   */
+  static readStream(args: readonly string[], opts: SafeGitOptions): ChildProcess {
+    const { verb, targets: rawTargets } = extractVerbAndTargets(args, opts.cwd);
+    const targets = withLocalVerifyTargets(rawTargets, opts);
+    const verbArgs = sliceAfterVerb(args, verb);
+    const invocation = classifyGitInvocation(verb, verbArgs);
+    refuseUnclassified(invocation, verb, opts, targets);
+    const shapeChecked = GIT_VERB_CLASSES.get(verb) === 'shape';
+    if (invocation === 'write' && shapeChecked) {
+      audit('git', opts.operation, verb, targets[0], 'denied', 'destructive-shape-via-readStream');
+      throw new SafeGitExecutorError(
+        `SafeGitExecutor.readStream called with destructive shape '${verb} ${verbArgs.join(' ')}' — use SafeGitExecutor.spawn instead.`,
+      );
+    }
+    if (invocation === 'write') {
+      audit('git', opts.operation, verb, targets[0], 'denied', 'destructive-verb-via-readStream');
+      throw new SafeGitExecutorError(
+        `SafeGitExecutor.readStream called with destructive verb '${verb}' — use SafeGitExecutor.spawn instead.`,
+      );
+    }
+    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts, targets)) {
+      runSourceTreeChecks(targets, opts.operation, 'git', verb);
+    } else {
+      audit('git', opts.operation, verb, targets[0], 'allowed', 'sourceTree-bypass');
+    }
+
+    const env = gitChildEnv(opts);
+    audit('git', opts.operation, verb, targets[0], 'allowed');
+    return nodeSpawn('git', args as string[], {
+      cwd: opts.cwd,
+      stdio: opts.stdio ?? 'pipe',
+      env,
+      timeout: opts.timeout ?? 30000,
+      killSignal: 'SIGKILL',
+    });
+  }
+
+  /**
    * Read-only escape valve. Runs `git <args>` after verifying:
    *   - Verb is in READONLY_GIT_VERBS (or is an ambiguous verb in read-only shape).
    *   - assertNotInstarSourceTree passes against every target (defense-in-depth
    *     against repo-local aliases that could rebind a "read-only" verb).
    */
   static readSync(args: readonly string[], opts: SafeGitOptions): string {
-    const { verb, targets } = extractVerbAndTargets(args, opts.cwd);
+    const { verb, targets: rawTargets } = extractVerbAndTargets(args, opts.cwd);
+    const targets = withLocalVerifyTargets(rawTargets, opts);
 
     // Verb classification first, BEFORE source-tree check, so callers
     // misusing this method get a clear "use execSync" error rather than
     // a guard error first.
     const verbArgs = sliceAfterVerb(args, verb);
-    const ambiguousReadOnly = isReadOnlyShape(verb, verbArgs);
-    if (ambiguousReadOnly === false) {
+    const invocation = classifyGitInvocation(verb, verbArgs);
+    refuseUnclassified(invocation, verb, opts, targets);
+    const shapeChecked = GIT_VERB_CLASSES.get(verb) === 'shape';
+    if (invocation === 'write' && shapeChecked) {
       audit('git', opts.operation, verb, targets[0], 'denied', 'destructive-shape-via-readSync');
       throw new SafeGitExecutorError(
         `SafeGitExecutor.readSync called with destructive shape '${verb} ${verbArgs.join(' ')}' — use SafeGitExecutor.execSync instead.`,
       );
     }
-    if (ambiguousReadOnly === null && !READONLY_GIT_VERBS.has(verb)) {
+    if (invocation === 'write') {
       audit('git', opts.operation, verb, targets[0], 'denied', 'destructive-verb-via-readSync');
       throw new SafeGitExecutorError(
         `SafeGitExecutor.readSync called with destructive verb '${verb}' — use SafeGitExecutor.execSync instead.`,
@@ -1177,13 +1304,13 @@ export class SafeGitExecutor {
     // caller opted into the narrow read-tier allowlist (the LAYER B/C
     // canonical-ref read path that legitimately operates against the agent's
     // own instar checkout). See SafeGitOptions.sourceTreeReadOk.
-    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts)) {
+    if (!isSourceTreeCheckBypassed(verb, verbArgs, opts, targets)) {
       runSourceTreeChecks(targets, opts.operation, 'git', verb);
     } else {
       audit('git', opts.operation, verb, targets[0], 'allowed', 'sourceTree-bypass');
     }
 
-    const env = sanitizeEnv(opts.env, opts.cwd);
+    const env = gitChildEnv(opts);
     let stdout: string;
     try {
       stdout = execFileSync('git', args as string[], {
@@ -1204,39 +1331,200 @@ export class SafeGitExecutor {
   }
 
   /**
-   * Verb-aware dispatcher. Routes to readSync for known read-only verbs and to
-   * execSync otherwise. Use this from generic git() helpers that take dynamic
-   * args and don't know at the call site whether the verb is destructive.
+   * Verb-aware dispatcher. A write goes to execSync and everything else to
+   * readSync, which extracts the verb itself and makes the real decision. Use
+   * this from generic git() helpers that take dynamic args and don't know at the
+   * call site whether the verb is destructive.
+   *
+   * It reads args[0] as the verb, so a pre-verb flag such as `-c` classifies as
+   * unclassified here and lands on readSync (EVO-029 item 1).
    */
   static run(args: readonly string[], opts: SafeGitOptions): string {
     const verb = args[0];
-    if (verb && READONLY_GIT_VERBS.has(verb)) {
-      const verbArgs = args.slice(1);
-      const shape = isReadOnlyShape(verb, verbArgs);
-      if (shape !== false) return SafeGitExecutor.readSync(args, opts);
+    if (verb && classifyGitInvocation(verb, args.slice(1)) === 'write') {
+      return SafeGitExecutor.execSync(args, opts);
     }
-    if (verb && !DESTRUCTIVE_GIT_VERBS.has(verb)) {
-      return SafeGitExecutor.readSync(args, opts);
-    }
-    if (verb) {
-      const verbArgs = args.slice(1);
-      const shape = isReadOnlyShape(verb, verbArgs);
-      if (shape === true) return SafeGitExecutor.readSync(args, opts);
-    }
-    return SafeGitExecutor.execSync(args, opts);
+    return SafeGitExecutor.readSync(args, opts);
   }
+}
+
+/** The one refusal for a verb outside GIT_VERB_CLASSES. Every surface calls it first. */
+function refuseUnclassified(
+  invocation: GitInvocationClass,
+  verb: string,
+  opts: SafeGitOptions,
+  targets: readonly string[],
+): void {
+  if (invocation !== 'unclassified') return;
+  audit('git', opts.operation, verb, targets[0], 'denied', 'unclassified-verb');
+  throw new SafeGitExecutorError(
+    `SafeGitExecutor: git verb '${verb}' is not classified. It is not in GIT_VERB_CLASSES, so no surface will run it. Adding a verb is a reviewed change to that table.`,
+  );
 }
 
 function isSourceTreeCheckBypassed(
   verb: string,
   verbArgs: readonly string[],
   opts: SafeGitOptions,
+  targets: readonly string[] = [],
 ): boolean {
   if (opts.sourceTreeReadOk && SOURCE_TREE_READ_TIER_VERBS.has(verb)) return true;
+  if (opts.feedbackAttemptCloneOk && isFeedbackAttemptCloneInvocation(verb, verbArgs, targets)) return true;
+  if (opts.localVerifyCloneOk && isLocalVerifyCloneInvocation(verb, verbArgs, targets, opts)) return true;
   if (opts.sourceTreeWorktreeManagerOk && isSourceTreeWorktreeManagerInvocation(verb, verbArgs)) {
     return true;
   }
   return false;
+}
+
+const FEEDBACK_ATTEMPT_CLONE_DIR = /^feedback-[a-z0-9-]+-a\d+(-publish|-base)?$/;
+const FEEDBACK_ATTEMPT_CLONE_VERBS: ReadonlySet<string> = new Set([
+  'checkout', 'add', 'commit', 'push', 'status', 'diff', 'rev-parse', 'ls-files', 'log', 'show', 'cat-file',
+]);
+
+/** True when `target` is an executor attempt clone (or inside one): `<…>/.worktrees/feedback-<slug>-a<n>[-publish|-base]/…`. */
+export function isFeedbackAttemptClonePath(target: string): boolean {
+  const parts = path.resolve(target).split(path.sep);
+  for (let i = parts.length - 1; i > 0; i--) {
+    if (FEEDBACK_ATTEMPT_CLONE_DIR.test(parts[i]) && parts[i - 1] === '.worktrees') return true;
+  }
+  return false;
+}
+
+function isFeedbackAttemptCloneInvocation(verb: string, verbArgs: readonly string[], targets: readonly string[]): boolean {
+  if (targets.length === 0 || !targets.every((t) => isFeedbackAttemptClonePath(t))) return false;
+  if (verb === 'config') return isWorktreeIdentityConfigWrite(verbArgs);
+  if (verb === 'checkout') return verbArgs.includes('--detach') && !verbArgs.some((a) => a === '--' || a.startsWith('-b') || a === '-B' || a === '--orphan');
+  return FEEDBACK_ATTEMPT_CLONE_VERBS.has(verb);
+}
+
+const LOCAL_VERIFY_CLONE_VERBS: ReadonlySet<string> = new Set([
+  'fetch', 'merge-tree', 'commit-tree', 'update-ref', 'checkout', 'diff', 'merge-base', 'status',
+  // Reads the orchestrator needs over the merge tree (file text, object checks).
+  'show', 'rev-parse', 'cat-file', 'ls-tree',
+  // The independent-review head binding (spec §2, amended 2026-10-22) reads
+  // `git log <base>..<head> -- <paths>` in the bare clone. Missing here, every
+  // flagged PR was refused `trace-commit-unreadable` (found 2026-10-23, PR #2326).
+  'log',
+]);
+
+/** Realpath of `p`, or of its nearest existing ancestor joined with the rest (for paths not yet created). */
+function realpathOrAncestor(p: string): string {
+  let cur = path.resolve(p);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return path.join(fs.realpathSync(cur), ...rest);
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.resolve(p);
+      rest.unshift(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** True when `target`'s realpath is `verifyRoot`'s realpath or below it. */
+/**
+ * A verify root is admitted only in its expected shape: an absolute path ending in
+ * `.worktrees/.verify` whose `.verify` entry is a real directory, not a symlink. A root
+ * that is (or resolves to) anything else — the agent home itself, a symlink into the
+ * source tree — would exempt that whole tree from SourceTreeGuard. Missing is fine
+ * (the orchestrator creates it).
+ */
+export function isWellFormedLocalVerifyRoot(verifyRoot: string): boolean {
+  if (!verifyRoot || !path.isAbsolute(verifyRoot)) return false;
+  const norm = path.resolve(verifyRoot);
+  if (path.basename(norm) !== '.verify' || path.basename(path.dirname(norm)) !== '.worktrees') return false;
+  try {
+    if (fs.lstatSync(norm).isSymbolicLink()) return false;
+  } catch {
+    return true; // @silent-fallback-ok — absent root: nothing to escape through; the orchestrator creates it as a real directory
+  }
+  const real = realpathOrAncestor(norm);
+  return path.basename(real) === '.verify' && path.basename(path.dirname(real)) === '.worktrees';
+}
+
+export function isLocalVerifyClonePath(target: string, verifyRoot: string): boolean {
+  if (!isWellFormedLocalVerifyRoot(verifyRoot)) return false;
+  const root = realpathOrAncestor(verifyRoot);
+  const t = realpathOrAncestor(target);
+  return t === root || t.startsWith(root + path.sep);
+}
+
+/** The three env keys the carve-out sets itself (overriding the denylist for them only). */
+function localVerifyEnv(scope: LocalVerifyCloneScope): Record<string, string> {
+  const env: Record<string, string> = {
+    GIT_DIR: path.resolve(scope.gitDir),
+    GIT_CEILING_DIRECTORIES: path.dirname(realpathOrAncestor(scope.verifyRoot)),
+  };
+  if (scope.workTree) env.GIT_WORK_TREE = path.resolve(scope.workTree);
+  return env;
+}
+
+/** The env a git child runs with: sanitized, plus the carve-out's discovery pins when opted in. */
+function gitChildEnv(opts: SafeGitOptions): NodeJS.ProcessEnv {
+  const env = sanitizeEnv(opts.env, opts.cwd);
+  if (opts.localVerifyCloneOk) Object.assign(env, localVerifyEnv(opts.localVerifyCloneOk));
+  return env;
+}
+
+/** The explicit git dir and work tree are targets too (checked by the guard when not bypassed). */
+function withLocalVerifyTargets(targets: string[], opts: SafeGitOptions): string[] {
+  const scope = opts.localVerifyCloneOk;
+  if (!scope) return targets;
+  const extra = [scope.gitDir, ...(scope.workTree ? [scope.workTree] : [])].map((t) => canonicalize(t));
+  return dedupeTargets([...targets, ...extra]);
+}
+
+function isLocalVerifyCloneInvocation(
+  verb: string, verbArgs: readonly string[], targets: readonly string[], opts: SafeGitOptions,
+): boolean {
+  const scope = opts.localVerifyCloneOk;
+  if (!scope) return false;
+  const root = scope.verifyRoot;
+  const inRoot = (t: string) => isLocalVerifyClonePath(t, root);
+  if (targets.length === 0 || !targets.every(inRoot)) return false;
+  if (!inRoot(scope.gitDir) || (scope.workTree !== undefined && !inRoot(scope.workTree))) return false;
+  const cwd = opts.cwd ?? process.cwd();
+  const positional = (from: number) => verbArgs.slice(from).filter((a) => !a.startsWith('-'));
+
+  let allowed: boolean;
+  if (verb === 'worktree') {
+    const sub = verbArgs.find((a) => !a.startsWith('-'));
+    if (sub !== 'add' && sub !== 'remove' && sub !== 'prune') return false;
+    // `remove --force` is denied: the verifier falls back to a scoped directory delete +
+    // `worktree prune` instead, so there is no case that needs git to discard a dirty tree.
+    if (sub === 'remove' && verbArgs.some((a) => /^--force(=|$)/.test(a) || /^-f/.test(a))) return false;
+    const rest = positional(verbArgs.indexOf(sub) + 1);
+    // Path args resolve against the invocation cwd, then realpath, before the scope check.
+    if ((sub === 'add' || sub === 'remove') && (rest.length === 0 || !inRoot(path.resolve(cwd, rest[0])))) return false;
+    allowed = true;
+  } else if (verb === 'init') {
+    // Init creates the repo, so there is nothing to probe yet; the dir must be the pinned GIT_DIR.
+    const dirs = positional(0);
+    return verbArgs.includes('--bare') && dirs.every((a) => path.resolve(cwd, a) === path.resolve(scope.gitDir));
+  } else if (verb === 'config') {
+    allowed = isReadOnlyConfigInvocation(verbArgs) || isWorktreeIdentityConfigWrite(verbArgs);
+  } else {
+    allowed = LOCAL_VERIFY_CLONE_VERBS.has(verb);
+  }
+  if (!allowed) return false;
+  return localVerifyGitDirResolvesInside(opts, scope);
+}
+
+/** Probe: with the same cwd and env, does git resolve its repository inside verifyRoot? */
+function localVerifyGitDirResolvesInside(opts: SafeGitOptions, scope: LocalVerifyCloneScope): boolean {
+  try {
+    const out = withSyncOp(() => execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
+      cwd: opts.cwd, env: gitChildEnv(opts), encoding: 'utf-8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'],
+    }) as string);
+    const resolved = out.trim();
+    return resolved !== '' && isLocalVerifyClonePath(resolved, scope.verifyRoot);
+  } catch {
+    // @silent-fallback-ok: an unresolvable repository is refused by the normal guard.
+    return false;
+  }
 }
 
 function isSourceTreeWorktreeManagerInvocation(verb: string, verbArgs: readonly string[]): boolean {
@@ -1330,6 +1618,7 @@ function audit(
 export const _internal = {
   extractVerbAndTargets,
   isReadOnlyShape,
+  GIT_VERB_CLASS_ENTRIES,
   sanitizeEnv,
   GIT_ENV_DENYLIST,
   repoHasLocalIdentity,

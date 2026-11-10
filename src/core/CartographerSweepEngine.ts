@@ -24,22 +24,21 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { Worker } from 'node:worker_threads';
 import type { CartographerTree, CartographerNode, CartographerConfidence } from './CartographerTree.js';
 import type { PressureReading } from '../monitoring/SessionReaper.js';
 import { SafeFsExecutor } from './SafeFsExecutor.js';
 import {
   runDetect,
   applyIndexDeltas,
-  writeSnapshot,
-  readSnapshot,
+  detectStatus as statusFromDetect,
+  persistDetectSnapshot,
   type DetectInput,
   type DetectResult,
   type ApplyDeltasInput,
   type IndexDelta,
   type LastDetectStatus,
-  type CartographerSnapshot,
 } from './cartographerDetect.js';
+import { runCartographerWorker } from './cartographerDetectWorker.js';
 import {
   isSecretBearingPath,
   contentHasCredentialMaterial,
@@ -49,8 +48,41 @@ import {
   childDigestHash,
   delimitUntrusted,
 } from './cartographerSummary.js';
+import { buildBoundedContext, buildStructuredSha256Identity } from './JudgmentProvenanceLog.js';
+import type { DecisionProvenanceBlock } from './decisionQualityTypes.js';
+import { DP_CARTOGRAPHER_SUMMARY_AUTHOR } from '../data/provenanceCoverage.js';
 
 export const CARTOGRAPHER_SWEEP_COMPONENT = 'CartographerSweep';
+export const CARTOGRAPHER_LEAF_SUMMARY_PROMPT_ID = 'cartographer-leaf-summary-v1';
+export const CARTOGRAPHER_DIRECTORY_SUMMARY_PROMPT_ID = 'cartographer-directory-summary-v1';
+
+/**
+ * Identity-only decision context for Cartographer summary authoring. The source
+ * body and child-summary text are intentionally not accepted by this builder:
+ * provenance identifies the exact model-visible input and its shape without
+ * becoming a second code or summary archive.
+ */
+export function buildCartographerSummaryDecisionContext(input: {
+  nodePath: string;
+  nodeKind: 'file' | 'dir';
+  inputIdentitySha256: string;
+  visibleSourceBytes?: number;
+  inputTruncated?: boolean;
+  coveredSymbolCount: number;
+  childCount?: number;
+  childSummaryCount?: number;
+}): Record<string, unknown> {
+  return buildBoundedContext({
+    nodePath: input.nodePath || '(repo root)',
+    nodeKind: input.nodeKind,
+    inputIdentitySha256: input.inputIdentitySha256,
+    visibleSourceBytes: input.visibleSourceBytes,
+    inputTruncated: input.inputTruncated,
+    coveredSymbolCount: input.coveredSymbolCount,
+    childCount: input.childCount,
+    childSummaryCount: input.childSummaryCount,
+  });
+}
 
 /**
  * Slice 3 (fix instar#1069): resolve the sweep's effective routing framework +
@@ -93,7 +125,7 @@ export interface SweepEngineConfig {
   /** Curtailed node ceiling while CPU pressure is moderate. */
   minNodesUnderPressure: number;
   // ── fix instar#1069: off-event-loop detect knobs (all optional w/ defaults) ──
-  /** Run detect + index writes in a worker thread (default true). false = the SAME bounded pure module synchronously (operator escape hatch — never tree.staleNodes()). */
+  /** Run detect + index writes in a worker thread (default true). false = the SAME bounded pure module in-process (operator escape hatch — never tree.staleNodes()). */
   detectInWorker?: boolean;
   /** Bound on the detect worker await; on timeout the worker is terminated + the pass refuses (default 120000). */
   detectTimeoutMs?: number;
@@ -103,7 +135,7 @@ export interface SweepEngineConfig {
   maxIndexBytes?: number;
   /** Cap on the published stale sample in the snapshot (default 500). */
   snapshotSampleMax?: number;
-  /** Explicit git ls-tree maxBuffer (default 64MB) so a big tree never throws ENOBUFS. */
+  /** @deprecated Accepted for config compatibility; streaming ls-tree ignores it. */
   gitMaxBuffer?: number;
   /** Ordered-candidate headroom: maxCandidates = maxNodesPerPass × this (default 4). */
   detectCandidateHeadroom?: number;
@@ -116,7 +148,11 @@ export interface SweepRouterLike {
   for(component: string): { component: string; category: string; framework: string; available: boolean };
   evaluate(
     prompt: string,
-    opts: { attribution: { component: string; category: string }; model?: string },
+    opts: {
+      attribution: { component: string; category: string };
+      model?: string;
+      provenance?: DecisionProvenanceBlock;
+    },
   ): Promise<string>;
 }
 
@@ -124,6 +160,15 @@ export class SweepAbortedError extends Error {
   constructor() {
     super('cartographer author aborted by higher-priority lane');
     this.name = 'SweepAbortedError';
+  }
+}
+
+class SweepAuthorityRefusedError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`cartographer root authority refused (${reason})`);
+    this.name = 'SweepAuthorityRefusedError';
+    this.reason = reason;
   }
 }
 
@@ -143,6 +188,13 @@ export interface SweepEngineDeps {
   pressure: () => PressureReading;
   /** Author ONLY when this returns true (lease holder). Single-machine ⇒ () => true. */
   holdsLease: () => boolean;
+  /**
+   * Revalidate the authority-pinned root before any paid/background path begins.
+   * Omitted only by isolated legacy tests; production wiring supplies it.
+   */
+  authorizePaidAuthoring: () =>
+    | { ok: true }
+    | { ok: false; reason: string };
   config: SweepEngineConfig;
   stateDir: string;
   now?: () => number;
@@ -246,6 +298,19 @@ export class CartographerSweepEngine {
       return { ...base, reason: 'not-lease-holder' };
     }
 
+    // Root authority precedes both routing and detect. A stale/mismatched root
+    // must spend nothing and must not inspect one tree while reporting another.
+    const authority = this.d.authorizePaidAuthoring();
+    if (!authority.ok) {
+      this.log(`[cartographer-sweep] refusing to author: root authority ${authority.reason}`);
+      return {
+        ...base,
+        refused: true,
+        refusalReason: authority.reason,
+        reason: 'authority-refused',
+      };
+    }
+
     // Routing probe — the L5 canary. Refuse rather than silently burn Claude.
     const probe = this.probeRouting();
     if (!probe.ok) {
@@ -266,6 +331,22 @@ export class CartographerSweepEngine {
       return {
         ...base, refused: true, refusalReason: detect.refusalReason, reason,
         candidateCount: detect.staleTotal, detectStatus: this.detectStatus(detect),
+        detectDurationMs: detect.durationMs,
+      };
+    }
+
+    // Detect may run for minutes in a worker. Revalidate again after that await,
+    // before the first paid call, so a HEAD move during detect cannot inherit the
+    // authority result sampled at pass admission.
+    const postDetectAuthority = this.d.authorizePaidAuthoring();
+    if (!postDetectAuthority.ok) {
+      return {
+        ...base,
+        refused: true,
+        refusalReason: postDetectAuthority.reason,
+        reason: 'authority-refused',
+        candidateCount: detect.staleTotal,
+        detectStatus: this.detectStatus(detect),
         detectDurationMs: detect.durationMs,
       };
     }
@@ -332,6 +413,17 @@ export class CartographerSweepEngine {
         continue;
       }
 
+      // Each LLM call yields the event loop and may overlap an external checkout
+      // update. Revalidate the pinned revision immediately before every paid or
+      // fingerprint-authoring operation, not merely once per pass.
+      const nodeAuthority = this.d.authorizePaidAuthoring();
+      if (!nodeAuthority.ok) {
+        result.refused = true;
+        result.refusalReason = nodeAuthority.reason;
+        result.reason = 'authority-refused';
+        break;
+      }
+
       try {
         const outcome = await this.authorNode(node, framework, deltas);
         switch (outcome.kind) {
@@ -359,6 +451,12 @@ export class CartographerSweepEngine {
             break;
         }
       } catch (err) {
+        if (err instanceof SweepAuthorityRefusedError) {
+          result.refused = true;
+          result.refusalReason = err.reason;
+          result.reason = 'authority-refused';
+          break;
+        }
         if (this.isAbort(err)) {
           // Backpressure, NOT failure: leave status, don't count the breaker, retry next quiet tick.
           result.abortedBackpressure = true;
@@ -379,7 +477,14 @@ export class CartographerSweepEngine {
     if (!curtail && !result.abortedBackpressure &&
         result.centsSpent + cfg.estCentsPerAuthor <= cfg.maxCentsPerPass &&
         result.authored + result.fingerprintRefreshed < cfg.maxNodesPerPass) {
-      result.revalidated = await this.revalidateSample(detect.revalidationSample, framework, result, deltas);
+      const sampleAuthority = this.d.authorizePaidAuthoring();
+      if (sampleAuthority.ok) {
+        result.revalidated = await this.revalidateSample(detect.revalidationSample, framework, result, deltas);
+      } else {
+        result.refused = true;
+        result.refusalReason = sampleAuthority.reason;
+        result.reason = 'authority-refused';
+      }
     }
 
     // Author-phase index write (b): ONE off-thread re-read+apply+write of the
@@ -414,14 +519,18 @@ export class CartographerSweepEngine {
     };
   }
 
-  /** Run detect off-thread (worker) or synchronously (rollback) — SAME bounded module. */
+  /** Run detect off-thread (worker) or in-process (rollback) — SAME bounded module. */
   private async detect(): Promise<DetectResult> {
     const input = this.detectInput();
     if (this.d.config.detectInWorker === false) {
       // Operator escape hatch: bounded pure module on the main thread (NEVER staleNodes()).
-      return runDetect(input);
+      return await runDetect(input);
     }
-    const out = await this.runWorker<DetectResult>('detect', input);
+    const out = await runCartographerWorker<DetectResult>('detect', input, {
+      timeoutMs: this.d.config.detectTimeoutMs,
+      heapMb: this.d.config.detectWorkerHeapMb,
+      now: this.now,
+    });
     if (out.startFailed) {
       return this.refusedDetect('detect-worker-start-failure', out.durationMs);
     }
@@ -441,7 +550,7 @@ export class CartographerSweepEngine {
       counts: { nodeCount: 0, authoredCount: 0, neverAuthored: 0, stale: 0, pathGone: 0, generatedAt: null, headSha: null },
       freshness: {
         nodeCount: 0, authorableCount: 0, freshCount: 0, staleCount: 0, neverAuthoredCount: 0,
-        neverAuthoredWithinGrace: 0, neverAuthoredPastGrace: 0, authorFailedCount: 0, freshRatio: 1, generatedAt: null,
+        neverAuthoredWithinGrace: 0, neverAuthoredPastGrace: 0, authorFailedCount: 0, freshRatio: null, generatedAt: null,
       },
       revalidationSample: [], staleSample: [], staleTotal: 0, durationMs,
     };
@@ -457,7 +566,11 @@ export class CartographerSweepEngine {
     };
     try {
       if (this.d.config.detectInWorker === false) { applyIndexDeltas(input); return; }
-      await this.runWorker('apply-deltas', input);
+      await runCartographerWorker('apply-deltas', input, {
+        timeoutMs: this.d.config.detectTimeoutMs,
+        heapMb: this.d.config.detectWorkerHeapMb,
+        now: this.now,
+      });
     } catch {
       // @silent-fallback-ok — a failed index-delta write only means the node files
       // (already written) are ahead of the index for one tick; the next detect
@@ -466,104 +579,17 @@ export class CartographerSweepEngine {
   }
 
   private detectStatus(r: DetectResult): LastDetectStatus {
-    if (!r.refused) return 'ok';
-    switch (r.refusalReason) {
-      case 'detect-timeout': return 'timeout';
-      case 'detect-worker-start-failure': return 'worker-start-failed';
-      case 'detect-index-too-large': return 'index-too-large';
-      case 'detect-index-unreadable': return 'index-unreadable';
-      case 'detect-git-error': return 'git-error';
-      default: return 'ok';
-    }
+    return statusFromDetect(r);
   }
 
   /** Persist (or update) the per-host snapshot every /cartographer/* read route serves from. */
   private persistSnapshot(r: DetectResult): void {
     try {
-      const nowIso = new Date(this.now()).toISOString();
-      const status = this.detectStatus(r);
-      if (r.refused) {
-        // Keep the last-good sample/counts; only flip the detect-health fields so
-        // /stale serves snapshot:'detect-failing' with its prior sample (Slice 2).
-        const prior = readSnapshot(this.d.tree.snapshotPath());
-        const snap: CartographerSnapshot = prior
-          ? { ...prior, lastDetectStatus: status, lastDetectAt: nowIso, durationMs: r.durationMs }
-          : {
-              generatedAt: nowIso, headSha: null, counts: r.counts, freshness: r.freshness,
-              staleSample: [], staleTotal: 0, staleSampleTruncated: false,
-              lastDetectStatus: status, lastDetectAt: nowIso, durationMs: r.durationMs,
-            };
-        writeSnapshot(this.d.tree.snapshotPath(), snap);
-        return;
-      }
-      const snap: CartographerSnapshot = {
-        generatedAt: nowIso,
-        headSha: r.counts.headSha,
-        counts: r.counts,
-        freshness: r.freshness,
-        staleSample: r.staleSample,
-        staleTotal: r.staleTotal,
-        staleSampleTruncated: r.staleSample.length < r.staleTotal,
-        lastDetectStatus: 'ok',
-        lastDetectAt: nowIso,
-        durationMs: r.durationMs,
-      };
-      writeSnapshot(this.d.tree.snapshotPath(), snap);
+      persistDetectSnapshot(this.d.tree.snapshotPath(), r, this.now());
     } catch {
       // @silent-fallback-ok — the snapshot is an observability surface; a write
       // failure only costs route freshness for one tick, never correctness/safety.
     }
-  }
-
-  /** Minimal env allowlist for a spawned worker — NEVER the parent process.env. */
-  private workerEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = {};
-    for (const k of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TMPDIR', 'SystemRoot', 'TEMP', 'TMP']) {
-      if (process.env[k]) env[k] = process.env[k];
-    }
-    for (const k of Object.keys(process.env)) {
-      if (k.startsWith('GIT_')) env[k] = process.env[k];
-    }
-    return env;
-  }
-
-  /** Spawn the detect/write worker, await its single message, bound by detectTimeoutMs. */
-  private runWorker<T>(
-    mode: 'detect' | 'apply-deltas',
-    input: DetectInput | ApplyDeltasInput,
-  ): Promise<{ ok: boolean; result?: T; error?: string; timedOut?: boolean; startFailed?: boolean; durationMs: number }> {
-    const startedAt = this.now();
-    const timeoutMs = this.d.config.detectTimeoutMs ?? 120_000;
-    const heapMb = this.d.config.detectWorkerHeapMb ?? 1536;
-    return new Promise((resolve) => {
-      let worker: Worker;
-      try {
-        const workerUrl = new URL('./cartographerDetect.worker.js', import.meta.url);
-        worker = new Worker(workerUrl, {
-          workerData: { mode, input },
-          resourceLimits: { maxOldGenerationSizeMb: heapMb },
-          env: this.workerEnv(),
-        });
-      } catch (err) {
-        resolve({ ok: false, startFailed: true, error: err instanceof Error ? err.message : String(err), durationMs: this.now() - startedAt });
-        return;
-      }
-      let settled = false;
-      const done = (r: { ok: boolean; result?: T; error?: string; timedOut?: boolean; startFailed?: boolean }): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        worker.terminate().catch(() => { /* best-effort reap */ });
-        resolve({ ...r, durationMs: this.now() - startedAt });
-      };
-      const timer = setTimeout(() => {
-        // terminate() (awaited inside done→terminate) reaps the worker + its child git.
-        done({ ok: false, timedOut: true });
-      }, timeoutMs);
-      worker.once('message', (msg: { ok: boolean; result?: T; error?: string }) => done(msg));
-      worker.once('error', (err: Error) => done({ ok: false, error: err.message }));
-      worker.once('exit', (code: number) => { if (!settled) done({ ok: false, error: `worker exited (${code})` }); });
-    });
   }
 
   // ── authoring one node ──────────────────────────────────────────────────────
@@ -591,7 +617,20 @@ export class CartographerSweepEngine {
       }
       const coveredSymbols = extractCodeSymbols(read.content);
       const prompt = this.buildLeafPrompt(node.path, read.content, read.truncated);
-      const summary = await this.callAuthor(prompt);
+      const summary = await this.callAuthor(prompt, {
+        decisionPoint: DP_CARTOGRAPHER_SUMMARY_AUTHOR,
+        context: buildCartographerSummaryDecisionContext({
+          nodePath: node.path,
+          nodeKind: 'file',
+          inputIdentitySha256: buildStructuredSha256Identity(read.content),
+          visibleSourceBytes: Buffer.byteLength(read.content, 'utf8'),
+          inputTruncated: read.truncated,
+          coveredSymbolCount: coveredSymbols.size,
+        }),
+        optionsPresented: ['write-summary'],
+        promptId: CARTOGRAPHER_LEAF_SUMMARY_PROMPT_ID,
+      });
+      this.requirePaidAuthority();
       return this.persistAuthored(node, summary, coveredSymbols, framework, deltas, {
         modelTier: 'light', truncated: read.truncated,
       });
@@ -616,7 +655,20 @@ export class CartographerSweepEngine {
     const coveredText = childSummaries.join('\n') + '\n' + children.map((c) => basename(c.path)).join(' ');
     const coveredSymbols = extractCodeSymbols(coveredText);
     const prompt = this.buildDirPrompt(node.path, childSummaries, children.map((c) => basename(c.path)));
-    const summary = await this.callAuthor(prompt);
+    const summary = await this.callAuthor(prompt, {
+      decisionPoint: DP_CARTOGRAPHER_SUMMARY_AUTHOR,
+      context: buildCartographerSummaryDecisionContext({
+        nodePath: node.path,
+        nodeKind: 'dir',
+        inputIdentitySha256: buildStructuredSha256Identity(childSummaries.join('\n')),
+        coveredSymbolCount: coveredSymbols.size,
+        childCount: children.length,
+        childSummaryCount: childSummaries.length,
+      }),
+      optionsPresented: ['write-summary'],
+      promptId: CARTOGRAPHER_DIRECTORY_SUMMARY_PROMPT_ID,
+    });
+    this.requirePaidAuthority();
     return this.persistAuthored(node, summary, coveredSymbols, framework, deltas, {
       modelTier: 'light', childDigestHash: digest,
     });
@@ -663,16 +715,23 @@ export class CartographerSweepEngine {
     return { kind: 'authored' };
   }
 
-  private async callAuthor(prompt: string): Promise<string> {
+  private async callAuthor(prompt: string, provenance: DecisionProvenanceBlock): Promise<string> {
     return this.d.llmQueue.enqueue(
       'background',
       () =>
         this.d.router.evaluate(prompt, {
           attribution: { component: CARTOGRAPHER_SWEEP_COMPONENT, category: 'job' },
           model: 'fast', // framework-agnostic light tier — NEVER a vendor model name
+          provenance,
         }),
       this.d.config.estCentsPerAuthor,
     );
+  }
+
+  /** Close the LLM-await TOCTOU window immediately before a summary write. */
+  private requirePaidAuthority(): void {
+    const authority = this.d.authorizePaidAuthoring();
+    if (!authority.ok) throw new SweepAuthorityRefusedError(authority.reason);
   }
 
   // ── re-validation sample (fresh ≠ correct) ──────────────────────────────────
@@ -689,6 +748,13 @@ export class CartographerSweepEngine {
     let n = 0;
     for (const p of samplePaths) {
       if (result.centsSpent + this.d.config.estCentsPerAuthor > this.d.config.maxCentsPerPass) break;
+      const authority = this.d.authorizePaidAuthoring();
+      if (!authority.ok) {
+        result.refused = true;
+        result.refusalReason = authority.reason;
+        result.reason = 'authority-refused';
+        break;
+      }
       const node = this.d.tree.getNode(p);
       if (!node) continue;
       try {
@@ -698,6 +764,12 @@ export class CartographerSweepEngine {
           result.centsSpent += this.d.config.estCentsPerAuthor;
         }
       } catch (err) {
+        if (err instanceof SweepAuthorityRefusedError) {
+          result.refused = true;
+          result.refusalReason = err.reason;
+          result.reason = 'authority-refused';
+          break;
+        }
         if (this.isAbort(err)) break;
         // a failed re-validation is non-fatal; leave the node as-is.
       }

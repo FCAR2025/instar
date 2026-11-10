@@ -31,6 +31,7 @@
  */
 
 import crypto from 'node:crypto';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -42,9 +43,25 @@ import {
 } from './ReplicatedRecordEnvelope.js';
 import { SafeFsExecutor } from './SafeFsExecutor.js';
 
-export type JournalKind = 'topic-placement' | 'session-lifecycle' | 'autonomous-run' | 'threadline-conversation' | 'guard-latch' | 'pref-record' | 'relationship-record' | 'learning-record' | 'knowledge-record' | 'evolution-action-record' | 'user-record' | 'topic-operator-record' | 'threadline-pairing-record' | 'subscription-account-meta';
+export type JournalKind = 'topic-placement' | 'session-lifecycle' | 'autonomous-run' | 'threadline-conversation' | 'guard-latch' | 'ssh-direction-proof' | 'pref-record' | 'relationship-record' | 'learning-record' | 'knowledge-record' | 'evolution-action-record' | 'user-record' | 'topic-operator-record' | 'threadline-pairing-record' | 'subscription-account-meta' | 'topic-pin-record' | 'topic-claim-annotation' | 'working-set-artifact' | 'class-review-record' | 'failure-callout-chunk' | 'app-conversation-event' | 'mobile-device-key-ledger-row' | 'ecosystem-idea-event' | 'recommended-service-record';
 
-export const JOURNAL_KINDS: JournalKind[] = ['topic-placement', 'session-lifecycle', 'autonomous-run', 'threadline-conversation', 'guard-latch', 'pref-record', 'relationship-record', 'learning-record', 'knowledge-record', 'evolution-action-record', 'user-record', 'topic-operator-record', 'threadline-pairing-record', 'subscription-account-meta'];
+/**
+ * What happened to one `emit` call. Every branch of the private `emit` already
+ * existed and dropped silently; it now says which one ran so a caller that must
+ * know whether a record was accepted (the replicated-store reconciler) can tell.
+ * `accepted` means ENQUEUED for the flusher, not yet fsynced.
+ */
+export type JournalEmitOutcome =
+  | 'accepted'
+  | 'locked-out'
+  | 'rate-limited'
+  | 'schema-rejected'
+  | 'deduped'
+  | 'oversize'
+  | 'not-replicated-kind'
+  | 'error';
+
+export const JOURNAL_KINDS: JournalKind[] = ['topic-placement', 'session-lifecycle', 'autonomous-run', 'threadline-conversation', 'guard-latch', 'ssh-direction-proof', 'pref-record', 'relationship-record', 'learning-record', 'knowledge-record', 'evolution-action-record', 'user-record', 'topic-operator-record', 'threadline-pairing-record', 'subscription-account-meta', 'topic-pin-record', 'topic-claim-annotation', 'working-set-artifact', 'class-review-record', 'failure-callout-chunk', 'app-conversation-event', 'mobile-device-key-ledger-row', 'ecosystem-idea-event', 'recommended-service-record'];
 // 'subscription-account-meta' added for WS5.2 Account Follow-Me §6.1a (registry follow-me =
 // METADATA ONLY): a redacted, credential-free projection of a SubscriptionAccount (id, nickname,
 // email, provider, framework, status, quota) replicates so a peer KNOWS an account's depth/quota
@@ -77,7 +94,7 @@ export const JOURNAL_KINDS: JournalKind[] = ['topic-placement', 'session-lifecyc
 // topic-operator-record's live in TopicOperatorReplicatedStore.ts (recordKey = sha256(topicId + ":" +
 // verified-uid), NEVER a content-name). THE LOAD-BEARING SAFETY INVARIANT (topic-operator): a
 // replicated topic-operator record is UNTRUSTED peer data — NEVER this machine's authoritative answer
-// to "who is my verified operator?" (only the local authenticated setOperator binds the principal).
+// to "who is my verified operator?" (only the local authenticated setAuthenticatedOperator binds the principal).
 // Additive — readers ignore unknown kinds.
 // 'evolution-action-record' added for WS2.5 (multi-machine-replicated-store-foundation): the
 // FIFTH replicated-store consumer and the FOURTH memory-family kind, riding the same HLC
@@ -157,6 +174,20 @@ export interface PlacementData {
   prevOwner?: string;
   epoch: number;
   reason: PlacementReason;
+  // Cross-machine ownership-reconciler convergence (Fix #3): the cooperative-handoff
+  // INTERMEDIATE state, so a `transferring(owner=S → transferTo=T)` replicates and the
+  // target's applier materializes it (today only `active` crosses, so T never learns to
+  // claim → the stuck-move bug). All OPTIONAL + back-compat: an absent `status` is `active`
+  // (today's behavior), so an older peer that omits them is unaffected.
+  status?: 'active' | 'transferring' | 'released';
+  /** During `transferring`: the target machine the session is moving to. */
+  transferTo?: string;
+  /** The PRODUCER record's `timestamp` (the field the drain-grace + convergence deadline
+   *  key on — OwnershipReconciler.ts). Carried so the target derives output-exclusion +
+   *  recovery timing from the origin, never re-stamped to local now. Clamped on receive. */
+  timestamp?: number;
+  /** Whether a SessionDrainRunner is still draining the source (drain-grace input). */
+  drainInFlight?: boolean;
 }
 
 export interface SessionLifecycleData {
@@ -196,6 +227,22 @@ export interface GuardLatchData {
   reason?: string;
 }
 
+/** Ephemeral signed observation replicated for pool convergence, never restart authority. */
+export interface SshDirectionProofData {
+  sourceMachineId: string;
+  targetMachineId: string;
+  pairingEpoch: number;
+  observerBootId: string;
+  endpointId: string;
+  sourceClientKeyGeneration: number;
+  targetHostKeyGeneration: number;
+  targetHostKeyFingerprint: string;
+  verifiedAt: string;
+  expiresAt: string;
+  challengeDigest: string;
+  machineSignature: string;
+}
+
 /** One line in a stream file. */
 export interface JournalEntry {
   seq: number;
@@ -227,6 +274,7 @@ export const DEFAULT_RETENTION: Record<JournalKind, KindRetention> = {
   'threadline-conversation': { maxFileBytes: 8 * 1024 * 1024, rotateKeep: 8 },
   // guard-latch: rare operator-initiated transitions; keep full history bounded.
   'guard-latch': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 4 },
+  'ssh-direction-proof': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 2 },
   // pref-record (WS2.1): preferences are FEW (a tight per-store cap — the
   // PreferencesSync precedent's DEFAULT_MAX_REPLICATED_PREFERENCES=500). A small
   // window with a few archives bounds a runaway edit-churn stream. The store's own
@@ -257,6 +305,24 @@ export const DEFAULT_RETENTION: Record<JournalKind, KindRetention> = {
   // path (KNOWLEDGE_MAX_ENTRY_BYTES) so a fat summary replicates (the file BODY is never
   // replicated — only the catalog metadata).
   'knowledge-record': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 4 },
+  // working-set-artifact (intelligent-working-set-lazy-sync): FEW + bounded per-topic
+  // interactive-write index rows; a small window mirrors the knowledge-record sibling.
+  'working-set-artifact': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 4 },
+  // Terminal-retained class-review lifecycle stream; journal archives are
+  // bounded while the folded store retains every resolvable row.
+  'class-review-record': { maxFileBytes: 8 * 1024 * 1024, rotateKeep: 8 },
+  'failure-callout-chunk': { maxFileBytes: 8 * 1024 * 1024, rotateKeep: 8 },
+  // app-conversation-event (mobile-native-conversations §4.8): one immutable record per
+  // conversation event. The conversation store's JSONL files are the source of truth (never
+  // rotated); the journal stream is only the transport, so a bounded rotating window suffices.
+  'app-conversation-event': { maxFileBytes: 16 * 1024 * 1024, rotateKeep: 8 },
+  // mobile-device-key-ledger-row (mobile-native-conversations §4.8): one immutable, machine-signed
+  // row per phone-key activation or revocation. The ledger file is the source of truth (never
+  // pruned); the journal stream is only the transport. Rows are few, so a small window suffices.
+  'mobile-device-key-ledger-row': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 8 },
+  'ecosystem-idea-event': { maxFileBytes: 4 * 1024 * 1024, rotateKeep: 8 },
+  // A person's yes and no: never pruned, so compaction can't drop a refusal.
+  'recommended-service-record': { maxFileBytes: 2 * 1024 * 1024, rotateKeep: 0 },
   // evolution-action-record (WS2.5): a memory-family store — NEVER rotateKeep:0 (rotate-but-
   // never-delete would be a compliance defect). Actions are FEW + bounded (the
   // EvolutionManager prunes to maxActions=300), so a small window with a few archives mirrors
@@ -291,6 +357,18 @@ export const DEFAULT_RETENTION: Record<JournalKind, KindRetention> = {
   // refresh loop is coalesced upstream. Carries NO credential and NO PII beyond email (the
   // configHome + every credential field are stripped at the projector).
   'subscription-account-meta': { maxFileBytes: 2 * 1024 * 1024, rotateKeep: 4 },
+  // topic-pin-record (U4.1 §2C, fixes defect 4): rotateKeep 0 = rotate but NEVER
+  // delete — the replication carrier must not drop pins by construction (the old
+  // keep-4 window could rotate a long-untouched topic's winning record away as
+  // other topics churned). Pin volume is tiny (operator actions, one compact
+  // record per pin EVENT); the answer-complete READ is the fold view's job
+  // (CoherenceJournalReader.foldPinRecords + TopicPinFoldView), bounded by the
+  // loud ws13FoldMaxBytes byte-guard. Per-key rewrite-compaction at rotation is
+  // the named tracked follow-up if volume ever grows toward the guard.
+  'topic-pin-record': { maxFileBytes: 2 * 1024 * 1024, rotateKeep: 0 },
+  // U4.2 (stale-owner-release §2.4): claim suspension + per-topic claim budget +
+  // declined-demote pins. Written only on claim/decline transitions — tiny volume.
+  'topic-claim-annotation': { maxFileBytes: 2 * 1024 * 1024, rotateKeep: 4 },
 };
 
 export const DEFAULT_FLUSH_INTERVAL_MS = 250;
@@ -345,6 +423,12 @@ export interface CoherenceJournalConfig {
   now?: () => Date;
   /** Optional logger; called once per failure class. */
   logger?: (msg: string) => void;
+  /**
+   * Optional derived-index observer for replicated records. Called only after a
+   * replicated-kind batch has been written and fdatasync has returned, so callers
+   * never witness data that is merely queued in memory.
+   */
+  onReplicatedRecordsCommitted?: (kind: JournalKind, entries: JournalEntry[]) => void;
   /**
    * Optional fs seam for fault-injection tests (wedge the flusher). Defaults to
    * node:fs primitives. Only the primitives the flusher uses are seamed.
@@ -469,6 +553,7 @@ export class CoherenceJournal {
   private readonly guardWrite?: (filePath: string) => void;
   private readonly now: () => Date;
   private readonly logger?: (msg: string) => void;
+  private replicatedCommitObserver?: (kind: JournalKind, entries: JournalEntry[]) => void;
   private readonly io: JournalFs;
   /**
    * The replicated-kind registry (WS2 send-side). Injected via
@@ -482,7 +567,7 @@ export class CoherenceJournal {
   private state: WriterState = 'closed';
   private incarnation = '';
   /** Next seq to assign at enqueue, per kind (in-memory counter seeded at open). */
-  private nextSeq: Record<JournalKind, number> = { 'topic-placement': 1, 'session-lifecycle': 1, 'autonomous-run': 1, 'threadline-conversation': 1, 'guard-latch': 1, 'pref-record': 1, 'relationship-record': 1, 'learning-record': 1, 'knowledge-record': 1, 'evolution-action-record': 1, 'user-record': 1, 'topic-operator-record': 1, 'threadline-pairing-record': 1, 'subscription-account-meta': 1 };
+  private nextSeq: Record<JournalKind, number> = { 'topic-placement': 1, 'session-lifecycle': 1, 'autonomous-run': 1, 'threadline-conversation': 1, 'guard-latch': 1, 'ssh-direction-proof': 1, 'pref-record': 1, 'relationship-record': 1, 'learning-record': 1, 'knowledge-record': 1, 'evolution-action-record': 1, 'user-record': 1, 'topic-operator-record': 1, 'threadline-pairing-record': 1, 'subscription-account-meta': 1, 'topic-pin-record': 1, 'topic-claim-annotation': 1, 'working-set-artifact': 1, 'class-review-record': 1, 'failure-callout-chunk': 1, 'app-conversation-event': 1, 'mobile-device-key-ledger-row': 1, 'ecosystem-idea-event': 1, 'recommended-service-record': 1 };
   /** Durable highWaterSeq per kind (advanced after data fdatasync). */
   private highWaterSeq: Record<JournalKind, number> = {
     'topic-placement': 0,
@@ -490,6 +575,7 @@ export class CoherenceJournal {
     'autonomous-run': 0,
     'threadline-conversation': 0,
     'guard-latch': 0,
+    'ssh-direction-proof': 0,
     'pref-record': 0,
     'relationship-record': 0,
     'learning-record': 0,
@@ -499,6 +585,15 @@ export class CoherenceJournal {
     'topic-operator-record': 0,
     'threadline-pairing-record': 0,
     'subscription-account-meta': 0,
+    'topic-pin-record': 0,
+    'topic-claim-annotation': 0,
+    'working-set-artifact': 0,
+    'class-review-record': 0,
+    'failure-callout-chunk': 0,
+    'app-conversation-event': 0,
+    'mobile-device-key-ledger-row': 0,
+    'ecosystem-idea-event': 0,
+    'recommended-service-record': 0,
   };
   /** In-memory enqueue order; drained by the flusher in seq order per kind. */
   private queue: QueuedEntry[] = [];
@@ -509,6 +604,7 @@ export class CoherenceJournal {
     'autonomous-run': new Set(),
     'threadline-conversation': new Set(),
     'guard-latch': new Set(),
+    'ssh-direction-proof': new Set(),
     'pref-record': new Set(),
     'relationship-record': new Set(),
     'learning-record': new Set(),
@@ -518,6 +614,15 @@ export class CoherenceJournal {
     'topic-operator-record': new Set(),
     'threadline-pairing-record': new Set(),
     'subscription-account-meta': new Set(),
+    'topic-pin-record': new Set(),
+    'topic-claim-annotation': new Set(),
+    'working-set-artifact': new Set(),
+    'class-review-record': new Set(),
+    'failure-callout-chunk': new Set(),
+    'app-conversation-event': new Set(),
+    'mobile-device-key-ledger-row': new Set(),
+    'ecosystem-idea-event': new Set(),
+    'recommended-service-record': new Set(),
   };
   private rateBuckets: Record<JournalKind, RateBucket>;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -558,6 +663,7 @@ export class CoherenceJournal {
       'autonomous-run': config.retention?.['autonomous-run'] ?? DEFAULT_RETENTION['autonomous-run'],
       'threadline-conversation': config.retention?.['threadline-conversation'] ?? DEFAULT_RETENTION['threadline-conversation'],
       'guard-latch': config.retention?.['guard-latch'] ?? DEFAULT_RETENTION['guard-latch'],
+      'ssh-direction-proof': config.retention?.['ssh-direction-proof'] ?? DEFAULT_RETENTION['ssh-direction-proof'],
       'pref-record': config.retention?.['pref-record'] ?? DEFAULT_RETENTION['pref-record'],
       'relationship-record': config.retention?.['relationship-record'] ?? DEFAULT_RETENTION['relationship-record'],
       'learning-record': config.retention?.['learning-record'] ?? DEFAULT_RETENTION['learning-record'],
@@ -567,6 +673,15 @@ export class CoherenceJournal {
       'topic-operator-record': config.retention?.['topic-operator-record'] ?? DEFAULT_RETENTION['topic-operator-record'],
       'threadline-pairing-record': config.retention?.['threadline-pairing-record'] ?? DEFAULT_RETENTION['threadline-pairing-record'],
       'subscription-account-meta': config.retention?.['subscription-account-meta'] ?? DEFAULT_RETENTION['subscription-account-meta'],
+      'topic-pin-record': config.retention?.['topic-pin-record'] ?? DEFAULT_RETENTION['topic-pin-record'],
+      'topic-claim-annotation': config.retention?.['topic-claim-annotation'] ?? DEFAULT_RETENTION['topic-claim-annotation'],
+      'working-set-artifact': config.retention?.['working-set-artifact'] ?? DEFAULT_RETENTION['working-set-artifact'],
+      'class-review-record': config.retention?.['class-review-record'] ?? DEFAULT_RETENTION['class-review-record'],
+      'failure-callout-chunk': config.retention?.['failure-callout-chunk'] ?? DEFAULT_RETENTION['failure-callout-chunk'],
+      'app-conversation-event': config.retention?.['app-conversation-event'] ?? DEFAULT_RETENTION['app-conversation-event'],
+      'mobile-device-key-ledger-row': config.retention?.['mobile-device-key-ledger-row'] ?? DEFAULT_RETENTION['mobile-device-key-ledger-row'],
+      'ecosystem-idea-event': config.retention?.['ecosystem-idea-event'] ?? DEFAULT_RETENTION['ecosystem-idea-event'],
+      'recommended-service-record': config.retention?.['recommended-service-record'] ?? DEFAULT_RETENTION['recommended-service-record'],
     };
     this.rateCapCfg = config.rateCap ?? DEFAULT_RATE_CAP;
     this.artifactRoots = (config.artifactRoots ?? [path.join(this.stateDir, 'autonomous'), this.stateDir]).map((r) => {
@@ -582,6 +697,7 @@ export class CoherenceJournal {
     this.guardWrite = config.guardWrite;
     this.now = config.now ?? (() => new Date());
     this.logger = config.logger;
+    this.replicatedCommitObserver = config.onReplicatedRecordsCommitted;
     this.io = config.fsImpl ?? realFs();
     const initMs = this.now().getTime();
     this.rateBuckets = {
@@ -590,6 +706,7 @@ export class CoherenceJournal {
       'autonomous-run': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'threadline-conversation': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'guard-latch': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'ssh-direction-proof': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'pref-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'relationship-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'learning-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
@@ -599,6 +716,15 @@ export class CoherenceJournal {
       'topic-operator-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'threadline-pairing-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
       'subscription-account-meta': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'topic-pin-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'topic-claim-annotation': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'working-set-artifact': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'class-review-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'failure-callout-chunk': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'app-conversation-event': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'mobile-device-key-ledger-row': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'ecosystem-idea-event': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
+      'recommended-service-record': { tokens: this.rateCapCfg.capacity, lastRefillMs: initMs },
     };
   }
 
@@ -766,6 +892,10 @@ export class CoherenceJournal {
     );
   }
 
+  emitSshDirectionProof(data: SshDirectionProofData): void {
+    this.emit('ssh-direction-proof', undefined, data as unknown as Record<string, unknown>, `${data.sourceMachineId}->${data.targetMachineId}:${data.pairingEpoch}:${data.observerBootId}:${data.challengeDigest}`);
+  }
+
   /**
    * Inject the replicated-kind registry (WS2 send-side). Idempotent + optional:
    * the journal validates a registered `*-record` kind's envelope via the store
@@ -774,6 +904,15 @@ export class CoherenceJournal {
    */
   setReplicatedKindRegistry(registry: ReplicatedKindRegistry | undefined): void {
     this.replicatedRegistry = registry;
+  }
+
+  /**
+   * Attach/replace the derived-index observer after boot wiring has constructed
+   * the reader. This observer is NOT authoritative: the journal remains the source
+   * of truth and the observer can always rebuild from disk.
+   */
+  setReplicatedRecordCommitObserver(observer: ((kind: JournalKind, entries: JournalEntry[]) => void) | undefined): void {
+    this.replicatedCommitObserver = observer;
   }
 
   /**
@@ -788,13 +927,14 @@ export class CoherenceJournal {
    * into the caller (the manager emit hooks are best-effort). A no-op when the
    * kind is not a registered replicated kind (the registry is the authority).
    */
-  emitReplicatedRecord(kind: JournalKind, data: Record<string, unknown>): void {
+  emitReplicatedRecord(kind: JournalKind, data: Record<string, unknown>): JournalEmitOutcome {
     try {
-      if (!this.replicatedRegistry?.isReplicatedKind(kind)) return; // not a registered replicated kind ⇒ no-op
+      if (!this.replicatedRegistry?.isReplicatedKind(kind)) return 'not-replicated-kind'; // not a registered replicated kind ⇒ no-op
       const opKey = this.replicatedOpKey(data);
-      this.emit(kind, undefined, data, opKey);
+      return this.emit(kind, undefined, data, opKey);
     } catch (e) { /* @silent-fallback-ok: journal observability must never endanger the observed operation (COHERENCE-JOURNAL-SPEC §3.1) */
       this.log('emit-record', `[coherence-journal] emitReplicatedRecord failed (swallowed): ${(e as Error)?.message}`);
+      return 'error';
     }
   }
 
@@ -825,14 +965,14 @@ export class CoherenceJournal {
    * assign a seq, enqueue, and RETURN. No synchronous file I/O on this stack —
    * the flusher does all of it. Never throws into the caller.
    */
-  private emit(kind: JournalKind, topic: number | undefined, rawData: Record<string, unknown>, opKey: string): void {
+  private emit(kind: JournalKind, topic: number | undefined, rawData: Record<string, unknown>, opKey: string): JournalEmitOutcome {
     try {
-      if (this.state !== 'active') return; // locked-out or closed: silent no-op (never block)
+      if (this.state !== 'active') return 'locked-out'; // locked-out or closed: silent no-op (never block)
 
       // Rate cap (token bucket) — over-cap emits drop + count.
       if (!this.takeToken(kind)) {
         this.degradation.rateLimited++;
-        return;
+        return 'rate-limited';
       }
 
       // Typed-schema validation: rejects free text, coerces enums, DROPS unknown
@@ -840,13 +980,13 @@ export class CoherenceJournal {
       const validated = this.validate(kind, rawData);
       if (!validated) {
         this.degradation.schemaRejects++;
-        return;
+        return 'schema-rejected';
       }
 
       // Op-key idempotency (restart-proof — the index is reconstructed on open).
       if (this.opKeys[kind].has(opKey)) {
         this.degradation.dedupeHits++;
-        return;
+        return 'deduped';
       }
 
       const seq = this.nextSeq[kind];
@@ -863,7 +1003,7 @@ export class CoherenceJournal {
       // Per-entry size cap (8KB lifecycle / 80KB replicated record) — over-cap drop + count.
       if (Buffer.byteLength(line, 'utf-8') > this.maxEntryBytesForKind(kind)) {
         this.degradation.oversize++;
-        return;
+        return 'oversize';
       }
 
       // Commit to in-memory state: bump the counter, mark the op key, enqueue.
@@ -871,9 +1011,11 @@ export class CoherenceJournal {
       this.opKeys[kind].add(opKey);
       this.trimOpKeys(kind);
       this.queue.push({ kind, line, seq });
+      return 'accepted';
     } catch (e) { /* @silent-fallback-ok: journal observability must never endanger the observed operation (COHERENCE-JOURNAL-SPEC §3.1) */
       // The journal never throws into its caller (§3.1).
       this.log('emit', `[coherence-journal] emit failed (swallowed): ${(e as Error)?.message}`);
+      return 'error';
     }
   }
 
@@ -923,10 +1065,29 @@ export class CoherenceJournal {
       const reasons: PlacementReason[] = ['user-move', 'placed', 'failover', 'released', 'quota-block-move', 'reconcile'];
       if (typeof reason !== 'string' || !reasons.includes(reason as PlacementReason)) return null;
       out = { owner, epoch, reason };
-      known = ['owner', 'epoch', 'reason', 'prevOwner'];
+      known = ['owner', 'epoch', 'reason', 'prevOwner', 'status', 'transferTo', 'timestamp', 'drainInFlight'];
       if (raw.prevOwner !== undefined) {
         if (typeof raw.prevOwner !== 'string') return null;
         out.prevOwner = raw.prevOwner;
+      }
+      // Cross-machine convergence (Fix #3) — OPTIONAL handoff fields. Back-compat:
+      // an absent `status` is `active` (today's behavior). A present-but-malformed
+      // field schema-rejects the whole record (never a silent partial accept).
+      if (raw.status !== undefined) {
+        if (raw.status !== 'active' && raw.status !== 'transferring' && raw.status !== 'released') return null;
+        out.status = raw.status;
+      }
+      if (raw.transferTo !== undefined) {
+        if (typeof raw.transferTo !== 'string') return null;
+        out.transferTo = raw.transferTo;
+      }
+      if (raw.timestamp !== undefined) {
+        if (typeof raw.timestamp !== 'number' || !Number.isFinite(raw.timestamp)) return null;
+        out.timestamp = raw.timestamp;
+      }
+      if (raw.drainInFlight !== undefined) {
+        if (typeof raw.drainInFlight !== 'boolean') return null;
+        out.drainInFlight = raw.drainInFlight;
       }
     } else if (kind === 'session-lifecycle') {
       const sessionId = raw.sessionId;
@@ -990,6 +1151,14 @@ export class CoherenceJournal {
         if (typeof raw.reason !== 'string') return null;
         out.reason = raw.reason.slice(0, 80);
       }
+    } else if (kind === 'ssh-direction-proof') {
+      const stringFields = ['sourceMachineId', 'targetMachineId', 'observerBootId', 'endpointId', 'targetHostKeyFingerprint', 'verifiedAt', 'expiresAt', 'challengeDigest', 'machineSignature'] as const;
+      for (const field of stringFields) if (typeof raw[field] !== 'string' || raw[field].length < 1 || raw[field].length > 512) return null;
+      const numberFields = ['pairingEpoch', 'sourceClientKeyGeneration', 'targetHostKeyGeneration'] as const;
+      for (const field of numberFields) if (!Number.isSafeInteger(raw[field]) || Number(raw[field]) < 1) return null;
+      if (Number.isNaN(Date.parse(String(raw.verifiedAt))) || Number.isNaN(Date.parse(String(raw.expiresAt)))) return null;
+      known = [...stringFields, ...numberFields];
+      out = Object.fromEntries(known.map(field => [field, raw[field]]));
     } else {
       return null;
     }
@@ -1144,6 +1313,7 @@ export class CoherenceJournal {
           this.io.fdatasyncSync(fd);
         } catch (e) {
           this.degradation.flushErrors++;
+          featureEvidence.recordAtMostEvery('multiMachine.coherenceJournal', `flush-append:${kind}`, 3_600_000, { kind: 'error', reason: 'flush-append-failed', context: { journalKind: kind, entries: items.length, partial: bytesWritten, flushErrors: this.degradation.flushErrors } });
           this.log('flush', `[coherence-journal] append/fsync failed for ${kind}: ${(e as Error)?.message}`);
           if (!bytesWritten) {
             // Open failed (or threw before any write): zero bytes hit the file,
@@ -1172,13 +1342,33 @@ export class CoherenceJournal {
           const top = appended[appended.length - 1].seq;
           this.highWaterSeq[kind] = Math.max(this.highWaterSeq[kind], top);
           this.persistMeta();
+          this.notifyReplicatedRecordsCommitted(kind, appended);
         }
       }
     } catch (e) { /* @silent-fallback-ok: journal observability must never endanger the observed operation (COHERENCE-JOURNAL-SPEC §3.1) */
       this.degradation.flushErrors++;
+      featureEvidence.recordAtMostEvery('multiMachine.coherenceJournal', 'flush', 3_600_000, { kind: 'error', reason: 'flush-failed', context: { flushErrors: this.degradation.flushErrors } });
       this.log('flush', `[coherence-journal] flush failed (swallowed): ${(e as Error)?.message}`);
     } finally {
       this.flushing = false;
+    }
+  }
+
+  private notifyReplicatedRecordsCommitted(kind: JournalKind, appended: QueuedEntry[]): void {
+    if (!this.replicatedRegistry?.isReplicatedKind(kind) || !this.replicatedCommitObserver) return;
+    const entries: JournalEntry[] = [];
+    for (const it of appended) {
+      try {
+        const entry = JSON.parse(it.line) as JournalEntry;
+        if (entry && entry.kind === kind && typeof entry.seq === 'number') entries.push(entry);
+      } catch { /* @silent-fallback-ok: observer notification is derived-index maintenance; the durable journal line remains authoritative and can be rebuilt from disk. */
+      }
+    }
+    if (entries.length === 0) return;
+    try {
+      this.replicatedCommitObserver(kind, entries);
+    } catch (e) { /* @silent-fallback-ok: derived-index observer failure must never endanger journal durability; reader parity/rebuild falls back to the authoritative stream. */
+      this.log('replicated-commit-observer', `[coherence-journal] replicated commit observer failed for ${kind}: ${(e as Error)?.message}`);
     }
   }
 
@@ -1353,6 +1543,10 @@ export class CoherenceJournal {
     if (kind === 'guard-latch') {
       if (typeof d.latchKind !== 'string' || typeof d.latchId !== 'string' || typeof d.seq !== 'number') return null;
       return `${d.latchKind}:${d.latchId}:${d.seq}`;
+    }
+    if (kind === 'ssh-direction-proof') {
+      if (typeof d.sourceMachineId !== 'string' || typeof d.targetMachineId !== 'string' || typeof d.pairingEpoch !== 'number' || typeof d.observerBootId !== 'string' || typeof d.challengeDigest !== 'string') return null;
+      return `${d.sourceMachineId}->${d.targetMachineId}:${d.pairingEpoch}:${d.observerBootId}:${d.challengeDigest}`;
     }
     return null;
   }

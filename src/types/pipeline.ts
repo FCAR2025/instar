@@ -29,6 +29,7 @@
  */
 
 import { sanitizeSenderName, sanitizeTopicName } from '../utils/sanitize.js';
+import { topicNameFor, TOPIC_NAME_UNRESOLVED } from '../messaging/shared/topicRef.js';
 
 // ── Stage 1: Telegram Inbound ─────────────────────────────────────
 
@@ -239,6 +240,22 @@ export function toInjection(
 }
 
 /**
+ * The visible re-delivery marker (W21).
+ *
+ * instar's own no-loss recovery re-injects an inbound message that was claimed
+ * but never reply-committed (`reinjectStuck`, mints `id: replay-<dedupeKey>`
+ * with `metadata.replay: true`). Before this marker existed the two injected
+ * payloads were BYTE-IDENTICAL, so a re-delivered message was indistinguishable
+ * from a fresh instruction — which is how a superseded 21-hour-old instruction
+ * read as current on 2026-08-20.
+ *
+ * The marker is emitted INSIDE the tag, AFTER the topic id, so every existing
+ * tag parser (all of which anchor on `^\[telegram:(\d+)`) is unaffected.
+ */
+export const RE_DELIVERY_MARKER =
+  'RE-DELIVERED — no reply was recorded for this message';
+
+/**
  * Build the injection tag string.
  *
  * Exported for use by SessionManager.injectTelegramMessage() to avoid
@@ -250,24 +267,44 @@ export function toInjection(
  *   [telegram:42 "Topic Name"]                       — when sender unknown
  *   [telegram:42 from Justin (uid:12345)]             — when no topic name
  *   [telegram:42]                                     — bare minimum
+ *
+ * `reDelivered` is an IN-PROCESS parameter, never content-derived — the same
+ * provenance discipline `SessionManager.injectMessage`'s first-party flag uses.
+ * A message whose BODY merely contains the marker text therefore cannot mint
+ * the marker: there is nothing to string-match and so nothing to forge.
+ * ADDITIVE ONLY — when `reDelivered` is falsy the returned bytes are identical
+ * to the pre-marker output.
  */
 export function buildInjectionTag(
   topicId: number,
   topicName?: string,
   senderName?: string,
   telegramUserId?: number,
+  reDelivered?: boolean,
+  signedByAgent?: string,
 ): string {
   const uidSuffix = telegramUserId ? ` (uid:${telegramUserId})` : '';
+  const reDeliverySuffix = reDelivered === true ? ` — ${RE_DELIVERY_MARKER}` : '';
+  // The name and the id are inseparable (operator rule 2026-11-02): the verified name from the
+  // topic registry when the caller has none, else an explicit "(name unresolved)" — never a
+  // bare id the session has to guess a name for. Parsers anchor on `^\[telegram:(\d+)`.
+  const verifiedName = topicNameFor(topicId, topicName);
+  const topicPart = verifiedName ? ` "${verifiedName}"` : ` (${TOPIC_NAME_UNRESOLVED})`;
 
-  if (topicName && senderName) {
-    return `[telegram:${topicId} "${topicName}" from ${senderName}${uidSuffix}]`;
-  } else if (topicName) {
-    return `[telegram:${topicId} "${topicName}"]`;
+  // Agent-signed provenance (ASP). `signedByAgent` is an IN-PROCESS parameter
+  // carried from the classifier's own verdict — never parsed from content, so a
+  // body that merely claims a signature cannot mint this label. The human whose
+  // account carried the message is still named: the session must know the
+  // channel, and must NOT read the message as that human speaking.
+  const safeAgent = signedByAgent && /^[A-Za-z0-9_-]{1,64}$/.test(signedByAgent) ? signedByAgent : undefined;
+  let fromPart = '';
+  if (safeAgent) {
+    fromPart = ` from agent ${safeAgent} (signed)` + (senderName ? ` via ${senderName}'s account${uidSuffix}` : '');
   } else if (senderName) {
-    return `[telegram:${topicId} from ${senderName}${uidSuffix}]`;
-  } else {
-    return `[telegram:${topicId}]`;
+    fromPart = ` from ${senderName}${uidSuffix}`;
   }
+
+  return `[telegram:${topicId}${topicPart}${fromPart}${reDeliverySuffix}]`;
 }
 
 /**

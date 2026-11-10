@@ -40,12 +40,33 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
-import { SafeFsExecutor } from './SafeFsExecutor.js';
+import {
+  atomicWriteFileSync,
+  classifyDfSourceLocal,
+  legacyPidDeathLockReclaim,
+  probeDfHostLocal,
+  pruneHolders,
+  releaseLock,
+  tryTakeLockOnce,
+  type ReclaimContext,
+} from './hostSemaphoreCore.js';
 import { isAlive } from './ProjectRoundLock.js';
 
+// Re-export: classifyDfSourceLocal moved to hostSemaphoreCore (the §2.1
+// extraction) but remains part of this module's public export surface.
+export { classifyDfSourceLocal };
+
 /** One live holder of a spawn slot. */
+/**
+ * The two reservation lanes (F5, docs/specs/spawn-cap-interactive-priority.md).
+ * `interactive` = a synchronous, user-blocking call (the operator-facing tone gate);
+ * `background` = everything else (sentinels/sweeps/reflectors). A holder with no
+ * lane, or an unrecognized value, is classified `background` (equality, never parse —
+ * a garbage value can never consume the protected interactive reserve).
+ */
+export type SpawnLane = 'interactive' | 'background';
+
 export interface SpawnHolder {
   /** Unique per-acquire id (NOT the pid — pid-reuse must not steal a slot). */
   id: string;
@@ -53,6 +74,45 @@ export interface SpawnHolder {
   hostname: string;
   /** ms epoch of the last heartbeat (acquire time, refreshed by long holders). */
   heartbeat: number;
+  /**
+   * F5 reservation lane (OPTIONAL — never part of isWellFormedHolder, so a record
+   * with a missing/garbage lane is NEVER dropped; it is counted as `background`).
+   * Written only when interactive-priority is enabled; absent otherwise (the
+   * disabled state writes a byte-identical holder file).
+   */
+  lane?: SpawnLane;
+}
+
+/**
+ * F5 symmetric reservation knobs. `Ri` slots are reserved for the interactive lane,
+ * `Rb` for background, both WITHIN the existing total cap `N` (never raising it).
+ * Clamped so `0 ≤ Ri`, `0 ≤ Rb`, `Ri + Rb ≤ N − 1` (≥1 always-contended slot).
+ */
+export interface InteractivePriorityConfig {
+  enabled: boolean;
+  /** interactive reserve (clamped to [0, N-1]). */
+  ri: number;
+  /** background reserve (clamped to [0, N-1-Ri]). */
+  rb: number;
+}
+
+/**
+ * Resolve+clamp `Ri`/`Rb` against the effective cap `N`. Uses `Number.isFinite` and
+ * `>= 0` (NOT the cap's `> 0`) so a legitimate 0 is preserved; NaN/negative fall to
+ * the default. Interactive reserve is honored first (documented priority), background
+ * takes the remainder — guaranteeing both bands and ≥1 contended slot for any N ≥ 1.
+ */
+export function clampInteractiveReserves(
+  cap: number,
+  ri: number | undefined,
+  rb: number | undefined,
+): { ri: number; rb: number } {
+  const n = Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : 8;
+  const riReq = Number.isFinite(ri) && (ri as number) >= 0 ? Math.floor(ri as number) : 2;
+  const rbReq = Number.isFinite(rb) && (rb as number) >= 0 ? Math.floor(rb as number) : 2;
+  const clampedRi = Math.max(0, Math.min(riReq, n - 1));
+  const clampedRb = Math.max(0, Math.min(rbReq, n - 1 - clampedRi));
+  return { ri: clampedRi, rb: clampedRb };
 }
 
 interface HoldersFile {
@@ -60,11 +120,12 @@ interface HoldersFile {
   holders: SpawnHolder[];
 }
 
-/** Heartbeat staleness window — a holder is reclaim-eligible (pid dead OR, on a
- * provably host-local disk, heartbeat older than this) only past it. Kept long
- * (a slow `claude -p` cold-start + run can legitimately exceed a minute), and
- * pid-liveness is the PRIMARY signal — heartbeat staleness is secondary and
- * only consulted when the pid is also gone. */
+/** Heartbeat staleness window. A holder is reclaimed only when its pid is dead
+ * (PRIMARY signal) AND its heartbeat is older than this (SECONDARY signal) AND
+ * the holders file is df-confirmed host-local — an AND conjunction (see the
+ * authoritative ReclaimPolicy contract in hostSemaphoreCore.ts). Kept long
+ * (a slow `claude -p` cold-start + run can legitimately exceed a minute); a
+ * live-pid holder is NEVER reclaimed regardless of heartbeat. */
 export const HOLDER_STALE_MS = 5 * 60_000;
 
 /**
@@ -76,32 +137,15 @@ export const HOLDER_STALE_MS = 5 * 60_000;
  * core/ never depends on monitoring/.
  */
 export function isPathHostLocalDefault(p: string): boolean {
-  let out: string;
-  try {
-    // lint-allow-sync-spawn: a bounded (3s) one-shot host-FS classification, run
-    // ONCE per process and then MEMOIZED (HostSpawnSemaphore._fsLocalCache) — it
-    // never runs on the hot acquire() fan-out path. Mirrors ResumeQueue's
-    // isStateDirHostLocalDefault host-lock contract; a path's FS type can't
-    // change at runtime, so there is nothing to re-probe.
-    out = execFileSync('df', ['-P', p], { timeout: 3000, encoding: 'utf-8' });
-  } catch {
-    // @silent-fallback-ok: df unavailable/failed ⇒ cannot confirm local ⇒
-    // fail-closed to NOT-local (the safe direction: never reclaim on doubt).
-    return false;
-  }
-  const lines = out.trim().split('\n');
-  if (lines.length < 2) return false; // unparseable → fail-closed
-  const source = lines[1]?.trim().split(/\s+/)[0] ?? '';
-  return classifyDfSourceLocal(source);
-}
-
-/** Pure FD1 classifier over the `df -P` device-source column. FAIL-CLOSED. */
-export function classifyDfSourceLocal(source: string): boolean {
-  if (!source) return false;
-  if (source.startsWith('//')) return false; // SMB/CIFS //host/share → network
-  if (/^[^/][^:]*:/.test(source)) return false; // NFS host:/path → network
-  if (source.startsWith('/dev/')) return true; // a real block device → local
-  return false; // map/tmpfs/anything unrecognized → fail-closed
+  // Delegates to the extracted core probe (lint-allow-sync-spawn there: a
+  // bounded 3s one-shot, run ONCE per process and then MEMOIZED by
+  // HostSpawnSemaphore._fsLocalCache — never on the hot acquire() fan-out
+  // path). FAIL-CLOSED: a failed probe reads as not-local (never reclaim on
+  // doubt). NOTE: the memoize-a-failed-probe behavior is a §1.2-identified
+  // defect (a df timeout under load disables reclaim for the process
+  // lifetime); fixing it is part of the tracked spawn-lane back-port — the
+  // extraction preserves behavior byte-for-byte.
+  return probeDfHostLocal(p);
 }
 
 export interface HostSpawnSemaphoreDeps {
@@ -117,6 +161,12 @@ export interface HostSpawnSemaphoreDeps {
   isPathHostLocal?: (p: string) => boolean;
   /** Unique-id generator (tests override for determinism). */
   genId?: () => string;
+  /**
+   * F5 interactive-priority reservation. When `enabled:false` (or absent), `acquire`
+   * ignores the lane and is byte-identical to the all-or-nothing cap (no `lane` is
+   * written to holders). When enabled, the symmetric reserve in §C applies.
+   */
+  interactivePriority?: InteractivePriorityConfig;
 }
 
 /**
@@ -180,6 +230,12 @@ export interface SpawnSemaphoreStatus {
   /** Holders whose hostname is a DIFFERENT host (never reclaimed). */
   foreignHolders: number;
   holdersPath: string;
+  /** F5: interactive-priority reservation state. `enabled:false` ⇒ ri/rb 0 and the
+   * lane counts are over whatever lanes the holders carry (all background when off). */
+  interactivePriority: { enabled: boolean; ri: number; rb: number };
+  /** Live holders classified `interactive` (equality; everything else is background). */
+  liveInteractive: number;
+  liveBackground: number;
 }
 
 /**
@@ -195,6 +251,8 @@ export class HostSpawnSemaphore {
   private readonly pidAlive: (pid: number) => boolean;
   private readonly isPathHostLocal: (p: string) => boolean;
   private readonly genId: () => string;
+  /** F5 reservation config (resolved+clamped once at construction). */
+  private readonly priority: { enabled: boolean; ri: number; rb: number };
   /** Memoized host-local determination (a fixed path's FS type can't change at
    * runtime; the `df -P` probe is expensive + synchronous, so it runs ONCE per
    * instance — never per acquire() on the hot fan-out path). */
@@ -210,10 +268,23 @@ export class HostSpawnSemaphore {
     this.genId =
       deps.genId ??
       (() => `${this.host}:${process.pid}:${this.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`);
+    const ip = deps.interactivePriority;
+    if (ip && ip.enabled === true) {
+      const { ri, rb } = clampInteractiveReserves(this.cap, ip.ri, ip.rb);
+      this.priority = { enabled: true, ri, rb };
+    } else {
+      this.priority = { enabled: false, ri: 0, rb: 0 };
+    }
   }
 
   getCap(): number {
     return this.cap;
+  }
+
+  /** F5: is interactive-priority reservation active on this instance? The wrapper
+   * reads this so its lane-aware ingress stays byte-identical when the feature is off. */
+  interactivePriorityEnabled(): boolean {
+    return this.priority.enabled;
   }
 
   /**
@@ -221,19 +292,40 @@ export class HostSpawnSemaphore {
    * (liveHolders < cap after pruning), false if the host is at the cap.
    * Holds the exclusive flock for the whole read-prune-decide-write window.
    */
-  acquire(id: string): boolean {
+  acquire(id: string, lane: SpawnLane = 'background'): boolean {
     return this.withLock(() => {
       const file = this.readHolders();
       const live = this.pruneDead(file.holders);
+      // The OOM floor — UNCONDITIONAL first predicate of every lane. Never raised by
+      // the reservation; the reserve only SUBDIVIDES within `cap`.
       if (live.length >= this.cap) {
-        // At the cap — write back the pruned set (cheap GC) but take no slot.
         this.writeHolders({ version: 1, holders: live });
         return false;
+      }
+      // F5 symmetric reservation (over the SAME pruned `live` set, this critical
+      // section). Counts are equality-based: a missing/garbage lane → background, so a
+      // malformed holder can never consume the protected interactive reserve.
+      if (this.priority.enabled) {
+        const liveInteractive = live.filter((h) => h.lane === 'interactive').length;
+        const liveBackground = live.length - liveInteractive;
+        if (lane === 'interactive') {
+          if (liveInteractive >= this.cap - this.priority.rb) {
+            this.writeHolders({ version: 1, holders: live });
+            return false;
+          }
+        } else if (liveBackground >= this.cap - this.priority.ri) {
+          this.writeHolders({ version: 1, holders: live });
+          return false;
+        }
       }
       // Crash-safe: an id already present (a retry that already landed) is a
       // no-op-append, not a duplicate slot.
       if (!live.some((h) => h.id === id)) {
-        live.push({ id, pid: process.pid, hostname: this.host, heartbeat: this.now() });
+        const holder: SpawnHolder = { id, pid: process.pid, hostname: this.host, heartbeat: this.now() };
+        // Write `lane` ONLY when the feature is on — disabled state keeps the holder
+        // file byte-identical to today (clean rollback / mixed-version safety).
+        if (this.priority.enabled) holder.lane = lane;
+        live.push(holder);
       }
       this.writeHolders({ version: 1, holders: live });
       return true;
@@ -268,6 +360,40 @@ export class HostSpawnSemaphore {
     }, /* fallbackOnLockFail */ undefined);
   }
 
+  /**
+   * LOCK-FREE peek: live-holder count after an in-memory prune, WITHOUT the
+   * file lock and WITHOUT writing the holders file. For periodic samplers
+   * (the 15 s machine load report) that must never spin on the lock or inflate
+   * event-loop lag under spawn contention — `status()` takes the lock and
+   * rewrites the file, which is right for the route but wrong on a timer.
+   * Best-effort: never throws (a read error reports zero holders).
+   */
+  peek(): { cap: number; liveHolders: number } {
+    let live: SpawnHolder[] = [];
+    try {
+      live = this.pruneDead(this.readHolders().holders);
+    } catch {
+      // @silent-fallback-ok: a peek is observability — a read error reports
+      // zero holders rather than throwing into a sampler tick.
+      live = [];
+    }
+    return { cap: this.cap, liveHolders: live.length };
+  }
+
+  /**
+   * LOCK-FREE list of live holders (same prune and best-effort contract as
+   * `peek()`). The recovery-slot owner uses it to release a holder whose
+   * session has already ended (trustworthy-machine-load C2).
+   */
+  listHolders(): SpawnHolder[] {
+    try {
+      return this.pruneDead(this.readHolders().holders);
+    } catch {
+      // @silent-fallback-ok: observability read — an error reports no holders.
+      return [];
+    }
+  }
+
   /** Read-only status (count of live holders after a prune). Best-effort: never throws. */
   status(): SpawnSemaphoreStatus {
     let live: SpawnHolder[] = [];
@@ -284,12 +410,16 @@ export class HostSpawnSemaphore {
       live = [];
     }
     const localHolders = live.filter((h) => h.hostname === this.host).length;
+    const liveInteractive = live.filter((h) => h.lane === 'interactive').length;
     return {
       cap: this.cap,
       liveHolders: live.length,
       localHolders,
       foreignHolders: live.length - localHolders,
       holdersPath: this.holdersPath,
+      interactivePriority: { ...this.priority },
+      liveInteractive,
+      liveBackground: live.length - liveInteractive,
     };
   }
 
@@ -310,22 +440,27 @@ export class HostSpawnSemaphore {
     if (this._fsLocalCache === undefined) {
       this._fsLocalCache = this.isPathHostLocal(path.dirname(this.holdersPath));
     }
-    const fsLocal = this._fsLocalCache;
-    if (!fsLocal) {
-      // Cannot confirm host-local → reclaim NOTHING (fail-closed). Still return
-      // the well-formed set so the file stays clean.
-      return holders.filter((h) => isWellFormedHolder(h));
-    }
-    const nowMs = this.now();
-    return holders.filter((h) => {
-      if (!isWellFormedHolder(h)) return false; // drop garbage rows
-      if (h.hostname !== this.host) return true; // foreign — NEVER reclaimed (keep)
-      const pidDead = !this.pidAlive(h.pid);
-      const heartbeatStale = nowMs - h.heartbeat >= HOLDER_STALE_MS;
-      // Reclaim only when BOTH dead AND stale (pid primary, heartbeat secondary).
-      const reclaim = pidDead && heartbeatStale;
-      return !reclaim;
-    });
+    const ctx: ReclaimContext = {
+      nowMs: this.now(),
+      hostname: this.host,
+      pidAlive: this.pidAlive,
+      dfLocal: this._fsLocalCache,
+    };
+    // The SPAWN-lane ReclaimPolicy (see the contract in hostSemaphoreCore.ts):
+    // reclaim only when df-confirmed local AND this host AND pid dead AND
+    // heartbeat stale — the AND conjunction; a foreign-hostname holder is
+    // NEVER reclaimed, and when df can't confirm local, NOTHING is reclaimed
+    // (fail-closed; over-counting is the safe direction for the OOM floor).
+    return pruneHolders<SpawnHolder>(
+      holders,
+      isWellFormedHolder,
+      (h, c) =>
+        c.dfLocal &&
+        h.hostname === c.hostname &&
+        !c.pidAlive(h.pid) &&
+        c.nowMs - h.heartbeat >= HOLDER_STALE_MS,
+      ctx,
+    );
   }
 
   private readHolders(): HoldersFile {
@@ -345,21 +480,12 @@ export class HostSpawnSemaphore {
 
   private writeHolders(file: HoldersFile): void {
     this.ensureDir();
-    const body = JSON.stringify(file);
-    const tmp = `${this.holdersPath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
-    try {
-      const fd = fs.openSync(tmp, 'wx', 0o600);
-      fs.writeSync(fd, body);
-      fs.closeSync(fd);
-      fs.renameSync(tmp, this.holdersPath); // atomic on the same filesystem
-    } catch (err) {
-      try {
-        SafeFsExecutor.safeUnlinkSync(tmp, { operation: 'HostSpawnSemaphore.writeHolders:cleanup-tmp' });
-      } catch {
-        /* ignore */
-      }
-      throw err;
-    }
+    // Extracted atomic temp+rename write (byte-identical body — the golden
+    // test pins the on-disk format).
+    atomicWriteFileSync(this.holdersPath, JSON.stringify(file), {
+      mode: 0o600,
+      operation: 'HostSpawnSemaphore.writeHolders',
+    });
   }
 
   /**
@@ -376,59 +502,24 @@ export class HostSpawnSemaphore {
     const deadline = this.now() + 2000; // bounded spin — never block the event loop forever
     // Spin-acquire the lock with a tiny busy-wait; the critical section is sub-ms.
     for (;;) {
-      let fd: number | null = null;
-      try {
-        fd = fs.openSync(lockPath, 'wx', 0o600); // O_CREAT|O_EXCL
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: this.now() }));
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === 'EEXIST') {
-          // Lock held. Reclaim it if its holder's pid is dead (crash-safe).
-          if (this.reclaimStaleLock(lockPath)) continue;
+      const res = tryTakeLockOnce(lockPath, JSON.stringify({ pid: process.pid, at: this.now() }));
+      if (!res.ok) {
+        if (res.reason === 'held') {
+          // Lock held. SPAWN-lane lock-reclaim policy: reclaim when the
+          // recorded holder pid is dead (legacy behavior, preserved verbatim —
+          // the test lane deliberately does NOT ride this, §2.1).
+          if (legacyPidDeathLockReclaim(lockPath, this.pidAlive)) continue;
           if (this.now() >= deadline) return fallbackOnLockFail; // give up safely
           busyWaitTiny();
           continue;
         }
         // Any other open error — fail to the safe fallback rather than throw.
-        if (fd !== null) {
-          try { fs.closeSync(fd); } catch { /* ignore */ }
-        }
         return fallbackOnLockFail;
       }
       try {
         return fn();
       } finally {
-        try { fs.closeSync(fd); } catch { /* @silent-fallback-ok: closing an already-closed/invalid fd on lock-release is benign */ }
-        try {
-          SafeFsExecutor.safeUnlinkSync(lockPath, { operation: 'HostSpawnSemaphore.withLock:release' });
-        } catch {
-          /* @silent-fallback-ok: a missing lock on release is fine — release is idempotent */
-        }
-      }
-    }
-  }
-
-  /** Remove the lock file if its recorded holder pid is dead (crash recovery). */
-  private reclaimStaleLock(lockPath: string): boolean {
-    try {
-      const raw = fs.readFileSync(lockPath, 'utf-8');
-      const obj = JSON.parse(raw);
-      const pid = typeof obj?.pid === 'number' ? obj.pid : null;
-      if (pid !== null && this.pidAlive(pid)) return false; // live holder — wait
-      // Dead (or unparseable) lock holder — reclaim.
-      SafeFsExecutor.safeUnlinkSync(lockPath, { operation: 'HostSpawnSemaphore.reclaimStaleLock' });
-      return true;
-    } catch {
-      // @silent-fallback-ok: a read/parse failure on the lock means we couldn't
-      // confirm a live holder; treat as reclaimable so a corrupt lock can't wedge
-      // the cap permanently. The O_EXCL re-create still races safely.
-      try {
-        SafeFsExecutor.safeUnlinkSync(lockPath, { operation: 'HostSpawnSemaphore.reclaimStaleLock:corrupt' });
-        return true;
-      } catch {
-        // @silent-fallback-ok: couldn't remove the corrupt lock (a race with
-        // another reclaimer) — report not-reclaimed; the caller waits + retries.
-        return false;
+        releaseLock(lockPath, res.fd, 'HostSpawnSemaphore.withLock:release');
       }
     }
   }
@@ -473,12 +564,17 @@ let _singleton: HostSpawnSemaphore | null = null;
 let _configuredCap: number | undefined;
 let _configuredAcquireMs: number | undefined;
 let _configuredWaitersMax: number | undefined;
+let _configuredPriority: InteractivePriorityConfig | undefined;
 
 /** Operator config for the spawn cap (intelligence.spawnCap.*). All optional. */
 export interface SpawnCapConfig {
   maxConcurrent?: number;
   acquireMs?: number;
   waitersMax?: number;
+  /** F5 interactive-priority reservation (`intelligence.spawnCap.interactivePriority`).
+   * `enabled` is resolved by the dev-agent gate at the caller (omitted from
+   * ConfigDefaults); when absent here the reservation is OFF (byte-identical). */
+  interactivePriority?: InteractivePriorityConfig;
 }
 
 /**
@@ -490,13 +586,20 @@ export function configureHostSpawnSemaphore(cfg?: SpawnCapConfig): void {
   _configuredCap = cfg?.maxConcurrent;
   _configuredAcquireMs = cfg?.acquireMs;
   _configuredWaitersMax = cfg?.waitersMax;
-  _singleton = new HostSpawnSemaphore({ cap: resolveSpawnCap(_configuredCap) });
+  _configuredPriority = cfg?.interactivePriority;
+  _singleton = new HostSpawnSemaphore({
+    cap: resolveSpawnCap(_configuredCap),
+    interactivePriority: _configuredPriority,
+  });
 }
 
 /** The process-wide semaphore. Lazily constructed with env/config/8 cap. */
 export function getHostSpawnSemaphore(): HostSpawnSemaphore {
   if (!_singleton) {
-    _singleton = new HostSpawnSemaphore({ cap: resolveSpawnCap(_configuredCap) });
+    _singleton = new HostSpawnSemaphore({
+      cap: resolveSpawnCap(_configuredCap),
+      interactivePriority: _configuredPriority,
+    });
   }
   return _singleton;
 }

@@ -6,11 +6,14 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   changedFilesSince,
+  classifyVitestListRun,
+  evaluateAffectedSmokeSelection,
   evaluateSmokeBreadth,
   failedTestFilesFromVitestJson,
   readSmokeLimits,
   resolvePrePushBase,
-  summarizeVitestList,
+  summarizeVitestFilesOnlyJson,
+  summarizeVitestListJson,
 } from './lib/pre-push-scope.mjs';
 
 function run(command, args, opts = {}) {
@@ -28,12 +31,74 @@ function printSkip(reason) {
   console.log('   The PR test matrix still runs the full suite before merge.');
 }
 
+function printIndeterminateSkip(reason) {
+  console.warn(`⏭️  LOCAL SMOKE SKIPPED — affected set indeterminate; tests run: 0. ${reason}.`);
+  console.warn('   PRE_PUSH_SMOKE_RESULT=SKIPPED reason=affected-set-indeterminate tests_run=0');
+  console.warn('   The local tier did not pass; CI remains the authority and runs the full suite before merge.');
+}
+
 function readFailedFiles(reportFile) {
   try {
     return failedTestFilesFromVitestJson(fs.readFileSync(reportFile, 'utf-8'), { cwd: process.cwd() });
   } catch (err) {
     console.warn(`pre-push smoke: could not read failed test files from Vitest JSON (${err instanceof Error ? err.message : err}).`);
     return [];
+  }
+}
+
+function listAffectedTests(baseRef, { filesOnly = false } = {}) {
+  const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'instar-pre-push-list-'));
+  const reportFile = path.join(reportDir, 'vitest-list.json');
+  try {
+    const result = run('npx', [
+      'vitest',
+      'list',
+      ...(filesOnly ? ['--filesOnly'] : []),
+      '--config',
+      'vitest.push.config.ts',
+      '--changed',
+      baseRef,
+      `--json=${reportFile}`,
+    ], {
+      timeout: Number.parseInt(process.env.INSTAR_PRE_PUSH_SMOKE_LIST_TIMEOUT_MS ?? '', 10) || 120_000,
+    });
+
+    if (result.status !== 0) return { result };
+
+    try {
+      const text = fs.readFileSync(reportFile, 'utf-8');
+      const selected = filesOnly ? summarizeVitestFilesOnlyJson(text) : summarizeVitestListJson(text);
+      return { result, selected };
+    } catch (err) {
+      return { result, selectionError: err };
+    }
+  } finally {
+    fs.rmSync(reportDir, { recursive: true, force: true });
+  }
+}
+
+/** Shared handling of a listing run that did not produce a usable selection. */
+function exitOnUnusableListing(listed) {
+  const list = listed.result;
+  const listDisposition = classifyVitestListRun(list);
+  if (listDisposition.action === 'skip-indeterminate') {
+    process.stdout.write(list.stdout ?? '');
+    process.stderr.write(list.stderr ?? '');
+    printIndeterminateSkip(listDisposition.reason);
+    process.exit(0);
+  }
+  if (listDisposition.action === 'fail') {
+    process.stdout.write(list.stdout ?? '');
+    process.stderr.write(list.stderr ?? '');
+    process.exit(listDisposition.exitCode);
+  }
+  if (listed.selectionError || !listed.selected) {
+    process.stdout.write(list.stdout ?? '');
+    process.stderr.write(list.stderr ?? '');
+    console.error(
+      `pre-push smoke: could not determine the affected test set from Vitest JSON (${listed.selectionError instanceof Error ? listed.selectionError.message : listed.selectionError ?? 'missing structured result'}) — refusing a reassuring local pass.`,
+    );
+    process.exit(1);
   }
 }
 
@@ -101,33 +166,41 @@ if (breadth.skip) {
   process.exit(0);
 }
 
-const list = run('npx', ['vitest', 'list', '--config', 'vitest.push.config.ts', '--changed', base.ref], {
-  timeout: Number.parseInt(process.env.INSTAR_PRE_PUSH_SMOKE_LIST_TIMEOUT_MS ?? '', 10) || 120_000,
-});
-
-if (list.status !== 0) {
-  process.stdout.write(list.stdout ?? '');
-  process.stderr.write(list.stderr ?? '');
-  if (list.signal === 'SIGTERM') {
-    console.warn('pre-push smoke: affected-test listing timed out — skipping local smoke; CI is the authority.');
-    process.exit(0);
-  }
-  process.exit(list.status ?? 1);
-}
-
-const selected = summarizeVitestList(list.stdout);
-console.log(`🧪 Smoke affected set: ${selected.testFileCount} test files / ${selected.testCaseCount} test cases.`);
-
+// Stage 1: file names only. It imports no test file, so a change that reaches
+// hundreds of tests is found too broad in seconds instead of timing out the
+// full listing (which then skipped the smoke tier with tests_run=0).
+const filesListed = listAffectedTests(base.ref, { filesOnly: true });
+exitOnUnusableListing(filesListed);
 breadth = evaluateSmokeBreadth(
-  { changedFileCount: changed.length, testFileCount: selected.testFileCount, testCaseCount: selected.testCaseCount },
+  { changedFileCount: changed.length, testFileCount: filesListed.selected.testFileCount, testCaseCount: 0 },
   limits,
 );
 if (breadth.skip) {
   printSkip(breadth.reason);
   process.exit(0);
 }
+if (filesListed.selected.testFileCount === 0) {
+  console.log('✅ No affected tests selected by Vitest.');
+  process.exit(0);
+}
 
-if (selected.testCaseCount === 0) {
+// Stage 2: collect test cases, now bounded by the file cap.
+const listed = listAffectedTests(base.ref);
+exitOnUnusableListing(listed);
+
+const selected = listed.selected;
+console.log(`🧪 Smoke affected set: ${selected.testFileCount} test files / ${selected.testCaseCount} test cases.`);
+
+const selection = evaluateAffectedSmokeSelection(
+  { changedFileCount: changed.length, testFileCount: selected.testFileCount, testCaseCount: selected.testCaseCount },
+  limits,
+);
+if (selection.action === 'skip') {
+  printSkip(selection.reason);
+  process.exit(0);
+}
+
+if (selection.action === 'no-tests') {
   console.log('✅ No affected tests selected by Vitest.');
   process.exit(0);
 }

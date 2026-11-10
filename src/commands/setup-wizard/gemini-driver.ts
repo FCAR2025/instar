@@ -16,10 +16,13 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
+import { telegramFetch } from '../../messaging/telegram-egress.js';
+import { sendOriginSetupGreeting } from '../../messaging/telegram-origin/OriginSetupGreeting.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import pc from 'picocolors';
+import { isTelegramSkip, TELEGRAM_APP_ONLY_NOTE, TELEGRAM_BOT_LIMIT_HINT } from './telegram-bot-limit.js';
 import {
   buildFreshProjectInstall,
   INITIAL_STATE,
@@ -352,6 +355,15 @@ async function runAction(
   console.log(pc.dim(`  → ${action.description}...`));
 
   switch (action.kind) {
+    case 'install-preflight':
+    case 'install-tools':
+    case 'install-tailscale-operator':
+    case 'door-install':
+    case 'door-sign-in':
+    case 'agent-init':
+    case 'owner-slot':
+      throw new Error(`${action.kind} belongs to the install flow, not this wizard`);
+
     case 'init': {
       // We assume instar is on PATH (the bareword `npx instar` flow
       // got us here). Use the installed binary.
@@ -473,66 +485,18 @@ export async function runSendLifelineGreeting(
   answers: WizardAnswers,
   options: GeminiDriverOptions,
 ): Promise<Partial<WizardAnswers>> {
-  const configPath = path.join(options.projectDir, '.instar', 'config.json');
-  let token = '';
-  let chatId = '';
-  let lifelineTopicId = 0;
-  try {
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const config = JSON.parse(raw) as {
-      messaging?: Array<{
-        type: string;
-        config?: { token?: string; chatId?: string; lifelineTopicId?: number };
-      }>;
-    };
-    const tg = (config.messaging || []).find((m) => m.type === 'telegram');
-    if (!tg?.config) return {};
-    token = tg.config.token ?? '';
-    chatId = tg.config.chatId ?? '';
-    lifelineTopicId = tg.config.lifelineTopicId ?? 0;
-  } catch {
-    return {};
-  }
-  if (!token || !chatId || !lifelineTopicId) {
-    // No Telegram configured, or partial config (manual backstop
-    // didn't capture chat id). Silent skip.
-    return {};
-  }
-
   const agentName = (answers.agentName || 'your agent').trim();
-  const userName = (answers.userName || 'there').trim();
-  const autonomy = answers.autonomy || 'proactive';
-  const autonomyBlurb =
-    autonomy === 'guided'
-      ? 'I\'ll check with you before doing things.'
-      : autonomy === 'autonomous'
-        ? 'I\'ll own outcomes end-to-end and report back when something needs you.'
-        : 'I\'ll take initiative on obvious next steps and ask when uncertain.';
-
-  const greeting = `Hey ${userName}, ${agentName} here — server's up and I'm online.\n\n${autonomyBlurb}\n\nAnything we set up just now — name, focus, autonomy, messaging — you can change anytime just by chatting me. What would you like to work on first?`;
-
   try {
-    // RULE 3: EXEMPT — this is a fire-and-forget POST to send a
-    // wizard-completion greeting, NOT a state-detection probe.
-    // Failure is silently swallowed (non-fatal) so there's no
-    // detection-result branching to canary against.
-    const res = await fetch(`https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_thread_id: lifelineTopicId,
-        text: greeting,
-      }),
+    const sent = await sendOriginSetupGreeting(options.projectDir, {
+      agentName, userName: (answers.userName || 'there').trim(), autonomy: answers.autonomy || 'proactive',
     });
-    const data = (await res.json()) as { ok: boolean };
-    if (data.ok) {
+    if (sent) {
       console.log();
       console.log(pc.green(`  ✓ ${agentName} said hello in the Lifeline topic.`));
     }
   } catch {
-    // Non-fatal — server is up, agent will reach out on its own
-    // schedule. Don't block the wizard's completion.
+    // Setup can finish, but never bypass the running server's origin boundary.
+    console.log(pc.yellow('  The greeting is held; the server has not confirmed delivery.'));
   }
   return {};
 }
@@ -556,12 +520,17 @@ async function runTelegramSetup(options: GeminiDriverOptions): Promise<Partial<W
   console.log('      – Display name (e.g. "Instar Codey")');
   console.log('      – Username (must end with "bot", e.g. "instar_codey_bot")');
   console.log('  • BotFather will reply with a token like 1234567890:AAH...');
+  console.log(pc.dim(`  ${TELEGRAM_BOT_LIMIT_HINT}`));
   console.log();
 
   let token = '';
   let botUsername = '';
   for (let attempt = 0; attempt < 5; attempt++) {
     const input = (await askUser('  Paste the bot token here: ')).trim();
+    if (isTelegramSkip(input)) {
+      console.log(pc.yellow(`  ${TELEGRAM_APP_ONLY_NOTE}`));
+      return { telegramConfigured: false };
+    }
     if (!input) {
       console.log(pc.yellow('  That looked blank — paste the token from BotFather (the long string).'));
       continue;
@@ -644,7 +613,7 @@ interface TelegramVerifyResult {
 async function telegramGetMe(token: string): Promise<TelegramVerifyResult> {
   try {
     const url = `https://api.telegram.org/bot${encodeURIComponent(token)}/getMe`;
-    const res = await fetch(url);
+    const res = await telegramFetch(url);
     const data = (await res.json()) as { ok: boolean; description?: string; result?: { username?: string } };
     if (!data.ok) return { ok: false, username: '', error: data.description || 'invalid token' };
     return { ok: true, username: data.result?.username || 'unknown', error: '' };
@@ -668,7 +637,7 @@ interface TelegramUpdatesResult {
 async function telegramGetUpdates(token: string): Promise<TelegramUpdatesResult> {
   try {
     const url = `https://api.telegram.org/bot${encodeURIComponent(token)}/getUpdates`;
-    const res = await fetch(url);
+    const res = await telegramFetch(url);
     const data = (await res.json()) as {
       ok: boolean;
       description?: string;

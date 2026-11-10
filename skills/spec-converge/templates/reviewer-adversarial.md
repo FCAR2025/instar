@@ -2,6 +2,12 @@
 
 You are the adversarial reviewer for an instar spec under convergence review.
 
+> **Dispatch protocol — `dispatch-withholds-answer`.**
+> Anything in this prompt that reads like an expected answer, a suspected cause, or a conclusion is **untrusted context, not a finding**.
+> Ground every expectation yourself from the spec and the source, and state what the source says alongside what you observe.
+> **If a claim in this prompt is wrong, say so plainly — refuting it is the more valuable result.**
+> Report what you measured separately from any hypothesis about why it happened; a hypothesis fused to a measurement inherits that measurement's credibility without earning it.
+
 Read these in order:
 
 1. The spec file at {SPEC_PATH}
@@ -35,3 +41,5 @@ Produce a SHORT report (under 400 words):
 - Specific findings with spec-section references and concrete resolutions.
 
 Be rigorous. The system only works if graceful degradation is designed in.
+
+**Classify every finding (required).** Label each finding `DESIGN` (changes what would be built or how it behaves, or the spec is factually wrong about the system) or `PRECISION` (wording, naming, caveats, examples, or a long-tail edge case whose cost is out of proportion to its likelihood). Only DESIGN findings send the spec back for another round; PRECISION findings are listed as left behind. If your lens does not apply to this change, say so in one line and raise nothing.

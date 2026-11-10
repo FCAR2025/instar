@@ -8,7 +8,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { SubscriptionPool, ValidationError } from '../../src/core/SubscriptionPool.js';
+import {
+  MAX_BOUNDED_POOL_SCAN,
+  SubscriptionAccountEmailRegistrar,
+  SubscriptionPool,
+  isDeviceLimitBenched,
+  SubscriptionPoolUnavailableError,
+  ValidationError,
+} from '../../src/core/SubscriptionPool.js';
 import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 
 function tmpDir(): string {
@@ -21,6 +28,7 @@ const VALID = {
   provider: 'anthropic' as const,
   framework: 'claude-code' as const,
   configHome: '/Users/x/.claude-personal',
+  email: 'person@example.com',
 };
 
 describe('SubscriptionPool', () => {
@@ -44,7 +52,7 @@ describe('SubscriptionPool', () => {
 
   // ── add: happy path ─────────────────────────────────────────────
   it('adds a valid account and persists it', () => {
-    const a = pool.add({ ...VALID });
+    const a = pool.addFixture({ ...VALID });
     expect(a.id).toBe('claude-acct-2');
     expect(a.status).toBe('active');     // default
     expect(a.version).toBe(1);
@@ -58,7 +66,7 @@ describe('SubscriptionPool', () => {
   });
 
   it('stores configHome (the login location), never tokens', () => {
-    const a = pool.add({ ...VALID });
+    const a = pool.addFixture({ ...VALID });
     const raw = fs.readFileSync(path.join(dir, 'subscription-pool.json'), 'utf-8');
     expect(a.configHome).toBe('/Users/x/.claude-personal');
     // No credential-ish keys ever land in the persisted file.
@@ -67,49 +75,53 @@ describe('SubscriptionPool', () => {
   });
 
   // ── add: validation — both sides of each boundary ───────────────
+  it('refuses to create an account without a provider identity email', () => {
+    expect(() => pool.addFixture({ ...VALID, email: undefined as unknown as string })).toThrow(/email is required/);
+    expect(() => pool.addFixture({ ...VALID, email: 'not-an-email' })).toThrow(/valid non-blank/);
+  });
   it('rejects a missing id', () => {
-    expect(() => pool.add({ ...VALID, id: '' })).toThrow(ValidationError);
+    expect(() => pool.addFixture({ ...VALID, id: '' })).toThrow(ValidationError);
   });
 
   it('rejects an id with illegal charset, accepts a clean one', () => {
-    expect(() => pool.add({ ...VALID, id: 'Has Space' })).toThrow(/\^\[a-z0-9-\]/);
-    expect(() => pool.add({ ...VALID, id: 'UPPER' })).toThrow(ValidationError);
-    expect(pool.add({ ...VALID, id: 'ok-123' }).id).toBe('ok-123');
+    expect(() => pool.addFixture({ ...VALID, id: 'Has Space' })).toThrow(/\^\[a-z0-9-\]/);
+    expect(() => pool.addFixture({ ...VALID, id: 'UPPER' })).toThrow(ValidationError);
+    expect(pool.addFixture({ ...VALID, id: 'ok-123' }).id).toBe('ok-123');
   });
 
   it('rejects a duplicate id', () => {
-    pool.add({ ...VALID });
-    expect(() => pool.add({ ...VALID })).toThrow(/already exists/);
+    pool.addFixture({ ...VALID });
+    expect(() => pool.addFixture({ ...VALID })).toThrow(/already exists/);
   });
 
   it('rejects a missing nickname', () => {
-    expect(() => pool.add({ ...VALID, nickname: '   ' })).toThrow(/nickname is required/);
+    expect(() => pool.addFixture({ ...VALID, nickname: '   ' })).toThrow(/nickname is required/);
   });
 
   it('rejects an unknown provider, accepts a known one', () => {
-    expect(() => pool.add({ ...VALID, provider: 'bogus' as any })).toThrow(/provider must be/);
-    expect(pool.add({ ...VALID, id: 'p1', provider: 'openai' }).provider).toBe('openai');
+    expect(() => pool.addFixture({ ...VALID, provider: 'bogus' as any })).toThrow(/provider must be/);
+    expect(pool.addFixture({ ...VALID, id: 'p1', provider: 'openai' }).provider).toBe('openai');
   });
 
   it('rejects an unknown framework, accepts a known one', () => {
-    expect(() => pool.add({ ...VALID, framework: 'bogus' as any })).toThrow(/framework must be/);
-    expect(pool.add({ ...VALID, id: 'f1', framework: 'pi-cli' }).framework).toBe('pi-cli');
+    expect(() => pool.addFixture({ ...VALID, framework: 'bogus' as any })).toThrow(/framework must be/);
+    expect(pool.addFixture({ ...VALID, id: 'f1', framework: 'pi-cli' }).framework).toBe('pi-cli');
   });
 
   it('rejects a missing configHome', () => {
-    expect(() => pool.add({ ...VALID, configHome: '' })).toThrow(/configHome is required/);
+    expect(() => pool.addFixture({ ...VALID, configHome: '' })).toThrow(/configHome is required/);
   });
 
   it('rejects an unknown status, accepts a known one', () => {
-    expect(() => pool.add({ ...VALID, status: 'bogus' as any })).toThrow(/status must be/);
-    expect(pool.add({ ...VALID, id: 's1', status: 'disabled' }).status).toBe('disabled');
+    expect(() => pool.addFixture({ ...VALID, status: 'bogus' as any })).toThrow(/status must be/);
+    expect(pool.addFixture({ ...VALID, id: 's1', status: 'disabled' }).status).toBe('disabled');
   });
 
   // ── the never-store-credentials structural guard ────────────────
   it('rejects any credential-bearing field (accessToken/refreshToken/token/secret/...)', () => {
     for (const bad of ['accessToken', 'refreshToken', 'token', 'apiKey', 'secret', 'password', 'oauth', 'credentials']) {
       expect(() =>
-        pool.add({ ...VALID, id: 'cred' }, { ...VALID, [bad]: 'sk-leak' }),
+        pool.addFixture({ ...VALID, id: 'cred' }, { ...VALID, [bad]: 'sk-leak' }),
       ).toThrow(/never credentials/);
     }
     // None of the rejected attempts persisted anything.
@@ -118,33 +130,51 @@ describe('SubscriptionPool', () => {
 
   // ── update: happy + CAS + immutability + validation ─────────────
   it('updates mutable fields and bumps version (CAS)', () => {
-    pool.add({ ...VALID });
+    pool.addFixture({ ...VALID });
     const u = pool.update('claude-acct-2', { nickname: 'renamed', status: 'rate-limited' });
     expect(u?.nickname).toBe('renamed');
     expect(u?.status).toBe('rate-limited');
     expect(u?.version).toBe(2);   // bumped from 1
   });
 
-  it('update returns null for an unknown id', () => {
+  it('excludes identity-drifted accounts from local execution until self-closed', () => {
+    pool.addFixture({ ...VALID });
+    pool.update(VALID.id, {
+      identityDrifted: true,
+      identityDrift: {
+        expectedAccountId: VALID.id, actualAccountId: 'other', slot: VALID.configHome,
+        detectedAt: '2026-01-01T00:00:00.000Z', lastConfirmedAt: '2026-01-01T00:00:00.000Z',
+        repairState: 'planned',
+      },
+    });
+    expect(pool.locallyExecutable()).toEqual([]);
+    pool.update(VALID.id, { identityDrifted: false, identityDrift: null });
+    expect(pool.locallyExecutable().map((a) => a.id)).toEqual([VALID.id]);
+  });
+
+  it('unconfigured authority permits safe reads and first-create, but no other mutation', () => {
+    expect(pool.get('nope')).toBeNull();
+    expect(() => pool.update('nope', { nickname: 'x' })).toThrow(SubscriptionPoolUnavailableError);
+    pool.addFixture({ ...VALID });
     expect(pool.update('nope', { nickname: 'x' })).toBeNull();
   });
 
   it('update rejects an empty nickname and bad enum values', () => {
-    pool.add({ ...VALID });
+    pool.addFixture({ ...VALID });
     expect(() => pool.update('claude-acct-2', { nickname: '  ' })).toThrow(/cannot be empty/);
     expect(() => pool.update('claude-acct-2', { status: 'bogus' as any })).toThrow(/status must be/);
     expect(() => pool.update('claude-acct-2', { configHome: '' })).toThrow(/cannot be empty/);
   });
 
   it('update rejects credential-bearing input', () => {
-    pool.add({ ...VALID });
+    pool.addFixture({ ...VALID });
     expect(() =>
       pool.update('claude-acct-2', { nickname: 'x' }, { nickname: 'x', token: 'sk-leak' }),
     ).toThrow(/never credentials/);
   });
 
   it('update can carry a lastQuota snapshot (P1.2 forward-compat)', () => {
-    pool.add({ ...VALID });
+    pool.addFixture({ ...VALID });
     const u = pool.update('claude-acct-2', {
       lastQuota: {
         fiveHour: { utilizationPct: 10, resetsAt: '2026-06-07T00:20:00Z' },
@@ -157,7 +187,7 @@ describe('SubscriptionPool', () => {
 
   // ── remove ──────────────────────────────────────────────────────
   it('removes an account; returns false for an unknown id', () => {
-    pool.add({ ...VALID });
+    pool.addFixture({ ...VALID });
     expect(pool.remove('claude-acct-2')).toBe(true);
     expect(pool.size()).toBe(0);
     expect(pool.remove('claude-acct-2')).toBe(false);
@@ -165,20 +195,182 @@ describe('SubscriptionPool', () => {
 
   // ── health ──────────────────────────────────────────────────────
   it('reports health with usable counts', () => {
-    pool.add({ ...VALID, id: 'a', status: 'active' });
-    pool.add({ ...VALID, id: 'b', status: 'disabled' });
+    pool.addFixture({ ...VALID, id: 'a', status: 'active' });
+    pool.addFixture({ ...VALID, id: 'b', status: 'disabled' });
     const h = pool.getHealth();
     expect(h.status).toBe('healthy');
     expect(h.message).toContain('2 account(s)');
     expect(h.message).toContain('1 usable');
   });
 
-  // ── corruption resilience ───────────────────────────────────────
-  it('starts fresh on a corrupt store file (loses no credentials — there are none)', () => {
+  // ── authority foundation ────────────────────────────────────────
+  it('advertises static v1 compatibility independently from live authority state', () => {
+    expect(SubscriptionPool.getContractCapability()).toEqual({ version: 1 });
+    expect(pool.getContractCapability()).toEqual({ version: 1 });
+    expect(pool.getAvailability()).toEqual({
+      state: 'unconfigured', reason: 'not-initialized', maintenance: null,
+    });
+  });
+
+  it('fails closed on corrupt authority instead of silently publishing an empty pool', () => {
     fs.writeFileSync(path.join(dir, 'subscription-pool.json'), '{ not valid json');
-    const fresh = new SubscriptionPool({ stateDir: dir });
-    expect(fresh.size()).toBe(0);
-    // And is writable again afterwards.
-    expect(fresh.add({ ...VALID }).id).toBe('claude-acct-2');
+    const invalid = new SubscriptionPool({ stateDir: dir });
+    expect(invalid.getAvailability()).toEqual({ state: 'invalid', reason: 'parse', maintenance: null });
+    expect(() => invalid.size()).toThrow(SubscriptionPoolUnavailableError);
+    expect(() => invalid.list()).toThrow(SubscriptionPoolUnavailableError);
+    expect(() => invalid.addFixture({ ...VALID })).toThrow(SubscriptionPoolUnavailableError);
+  });
+
+  it('rejects duplicate ids during load before publishing array or index', () => {
+    const account = pool.addFixture({ ...VALID });
+    const file = path.join(dir, 'subscription-pool.json');
+    const store = JSON.parse(fs.readFileSync(file, 'utf8'));
+    store.accounts.push({ ...account });
+    fs.writeFileSync(file, JSON.stringify(store));
+    const invalid = new SubscriptionPool({ stateDir: dir });
+    expect(invalid.getAvailability().reason).toBe('duplicate-id');
+    expect(() => invalid.get(VALID.id)).toThrow(SubscriptionPoolUnavailableError);
+  });
+
+  it('uses indexed get and a backing-prefix bounded scan with an honest examined count', () => {
+    for (let i = 0; i < 6; i += 1) {
+      pool.addFixture({ ...VALID, id: `acct-${i}`, email: `p${i}@example.com` });
+    }
+    const file = path.join(dir, 'subscription-pool.json');
+    const store = JSON.parse(fs.readFileSync(file, 'utf8'));
+    store.accounts[0].email = '';
+    store.accounts[1].email = '   ';
+    fs.writeFileSync(file, JSON.stringify(store));
+    pool = new SubscriptionPool({ stateDir: dir });
+    // Repair-only rows consume the prefix even though they are not publicly visible.
+    const scan = pool.scanAccountsBounded(4);
+    expect(scan.examined).toBe(4);
+    expect(scan.truncated).toBe(true);
+    expect(scan.accounts.map((account) => account.id)).toEqual(['acct-2', 'acct-3']);
+    expect(pool.get('acct-5')?.id).toBe('acct-5');
+    expect(pool.scanAccountsBounded(MAX_BOUNDED_POOL_SCAN + 1).examined).toBe(6);
+  });
+
+  it('uses the machine-bound authority directory for fresh production-style callers', () => {
+    pool = new SubscriptionPool({ stateDir: dir, machineId: 'm_local' });
+    pool.addFixture({ ...VALID });
+    expect(fs.existsSync(path.join(dir, 'subscription-pool.json'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'state', 'subscription-pool', 'accounts.json'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'state', 'subscription-pool.initialized.json'))).toBe(true);
+    const restarted = new SubscriptionPool({ stateDir: dir, machineId: 'm_local' });
+    expect(restarted.getAvailability()).toEqual({ state: 'ready', reason: null, maintenance: null });
+    expect(restarted.get(VALID.id)?.email).toBe(VALID.email);
+    restarted.update(VALID.id, { nickname: 'after-restart' });
+    const twiceRestarted = new SubscriptionPool({ stateDir: dir, machineId: 'm_local' });
+    expect(twiceRestarted.get(VALID.id)?.nickname).toBe('after-restart');
+  });
+
+  it('reports missing machine identity as unavailable without weakening static compatibility', () => {
+    pool = new SubscriptionPool({ stateDir: dir, machineId: null });
+    expect(pool.getContractCapability()).toEqual({ version: 1 });
+    expect(pool.getAvailability()).toEqual({
+      state: 'unavailable', reason: 'machine-identity-unavailable', maintenance: null,
+    });
+    expect(() => pool.list()).toThrow(SubscriptionPoolUnavailableError);
+  });
+});
+
+describe('SubscriptionPool device-limit fields (codex-device-limit-tripwire §4/§6)', () => {
+  let dir: string;
+  let pool: SubscriptionPool;
+  const CODEX = {
+    id: 'codex-acct-1', nickname: 'codex one', provider: 'openai' as const, framework: 'codex-cli' as const,
+    configHome: '/Users/x/.codex-one', email: 'codex@example.com',
+  };
+  const BENCH = {
+    status: 'needs-reauth' as const,
+    statusCause: 'codex-device-limit' as const,
+    deviceLimitSince: '2026-10-31T20:06:00.000Z',
+    deviceLimitSuspectedAt: '2026-10-31T20:00:00.000Z',
+    deviceLimitNextReadAt: '2026-10-31T21:06:00.000Z',
+    deviceLimitRefusedReads: 2,
+    deviceLimitReadsStopped: false,
+  };
+  const FIELDS = ['statusCause', 'deviceLimitSince', 'deviceLimitSuspectedAt', 'deviceLimitNextReadAt',
+    'deviceLimitRefusedReads', 'deviceLimitReadsStopped'] as const;
+
+  beforeEach(() => {
+    dir = tmpDir();
+    pool = new SubscriptionPool({ stateDir: dir });
+    pool.addFixture({ ...CODEX });
+  });
+  afterEach(() => {
+    try { SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'tests/unit/subscription-pool.test.ts:device-limit-cleanup' }); } catch { /* @silent-fallback-ok: best-effort temp-dir cleanup */ }
+  });
+
+  it('accepts the six fields through update() and persists them across a reload', () => {
+    const benched = pool.update(CODEX.id, { ...BENCH })!;
+    expect(benched).toMatchObject(BENCH);
+    expect(isDeviceLimitBenched(benched)).toBe(true);
+    const reloaded = new SubscriptionPool({ stateDir: dir }).get(CODEX.id)!;
+    expect(reloaded).toMatchObject(BENCH);
+    expect(isDeviceLimitBenched(reloaded)).toBe(true);
+  });
+
+  it('validates each field and refuses bad values', () => {
+    expect(() => pool.update(CODEX.id, { statusCause: 'something-else' as never })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitSince: 'yesterday' })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitSuspectedAt: '2026-13-45T99:00:00Z' })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitNextReadAt: 12 as never })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitRefusedReads: -1 })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitRefusedReads: 1.5 })).toThrow(ValidationError);
+    expect(() => pool.update(CODEX.id, { deviceLimitReadsStopped: 'yes' as never })).toThrow(ValidationError);
+    // Nothing partially applied.
+    expect(pool.get(CODEX.id)!.version).toBe(1);
+    expect(pool.update(CODEX.id, { deviceLimitRefusedReads: 0, deviceLimitReadsStopped: true })).toMatchObject({
+      deviceLimitRefusedReads: 0, deviceLimitReadsStopped: true,
+    });
+  });
+
+  it('null removes a field', () => {
+    pool.update(CODEX.id, { deviceLimitSuspectedAt: '2026-10-31T20:00:00.000Z' });
+    const cleared = pool.update(CODEX.id, { deviceLimitSuspectedAt: null })!;
+    expect(cleared).not.toHaveProperty('deviceLimitSuspectedAt');
+  });
+
+  it('clears all six when update() moves status off needs-reauth', () => {
+    pool.update(CODEX.id, { ...BENCH });
+    const released = pool.update(CODEX.id, { status: 'active' })!;
+    for (const field of FIELDS) expect(released).not.toHaveProperty(field);
+    expect(isDeviceLimitBenched(released)).toBe(false);
+    const reloaded = new SubscriptionPool({ stateDir: dir }).get(CODEX.id)!;
+    for (const field of FIELDS) expect(reloaded).not.toHaveProperty(field);
+  });
+
+  it('does NOT clear the fields the same patch sets itself', () => {
+    pool.update(CODEX.id, { ...BENCH });
+    const moved = pool.update(CODEX.id, { status: 'active', deviceLimitSuspectedAt: '2026-10-31T22:00:00.000Z' })!;
+    expect(moved.deviceLimitSuspectedAt).toBe('2026-10-31T22:00:00.000Z');
+    for (const field of FIELDS.filter((f) => f !== 'deviceLimitSuspectedAt')) expect(moved).not.toHaveProperty(field);
+  });
+
+  it('keeps the fields on a write that leaves status needs-reauth, or does not move status', () => {
+    pool.update(CODEX.id, { ...BENCH });
+    expect(pool.update(CODEX.id, { status: 'needs-reauth' })).toMatchObject(BENCH);
+    expect(pool.update(CODEX.id, { nickname: 'renamed' })).toMatchObject(BENCH);
+    // A suspicion on an active account survives an active→active write.
+    pool.update(CODEX.id, { status: 'active' });
+    pool.update(CODEX.id, { deviceLimitSuspectedAt: '2026-10-31T23:00:00.000Z' });
+    expect(pool.update(CODEX.id, { status: 'active' })!.deviceLimitSuspectedAt).toBe('2026-10-31T23:00:00.000Z');
+  });
+
+  it('clears all six through the enrollment commit (completeValidated)', () => {
+    pool.update(CODEX.id, { ...BENCH });
+    const registrar = new SubscriptionAccountEmailRegistrar(pool, {} as never);
+    const enrolled = registrar.completeValidated(CODEX.id, CODEX.email, { status: 'active' })!;
+    expect(enrolled.status).toBe('active');
+    for (const field of FIELDS) expect(enrolled).not.toHaveProperty(field);
+    for (const field of FIELDS) expect(pool.get(CODEX.id)!).not.toHaveProperty(field);
+  });
+
+  it('isDeviceLimitBenched needs BOTH needs-reauth and the cause', () => {
+    expect(isDeviceLimitBenched({ status: 'needs-reauth', statusCause: 'codex-device-limit' })).toBe(true);
+    expect(isDeviceLimitBenched({ status: 'needs-reauth' })).toBe(false);
+    expect(isDeviceLimitBenched({ status: 'active', statusCause: 'codex-device-limit' })).toBe(false);
   });
 });

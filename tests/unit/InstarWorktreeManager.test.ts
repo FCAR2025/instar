@@ -19,6 +19,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_INSTAR_REPO_URL_ALLOWLIST,
+  assertWorktreeCapacity,
+  acquireWorktreeCreateLock,
   appendLedgerEntry,
   defaultSlugFor,
   ensureHuskyHooksActive,
@@ -31,6 +33,63 @@ import {
   worktreeDedupeKey,
   type LedgerEntry,
 } from '../../src/core/InstarWorktreeManager.js';
+
+describe('worktree capacity', () => {
+  let root: string;
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'worktree-capacity-')); });
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('counts checkout directories while ignoring marker files and links', () => {
+    fs.mkdirSync(path.join(root, 'one'));
+    fs.writeFileSync(path.join(root, '.metadata_never_index'), '');
+    fs.symlinkSync(path.join(root, 'one'), path.join(root, 'shared-deps'));
+    expect(() => assertWorktreeCapacity(root, 2)).not.toThrow();
+    fs.mkdirSync(path.join(root, 'two'));
+    expect(() => assertWorktreeCapacity(root, 2)).toThrow(/worktree-capacity: 2 directories/);
+  });
+
+  it('keeps the bound on every directory and says plainly what is filling the folder', () => {
+    fs.mkdirSync(path.join(root, 'real-checkout'));
+    fs.writeFileSync(path.join(root, 'real-checkout', '.git'), 'gitdir: elsewhere');
+    for (const name of ['gate-train-1', 'gate-train-2', 'runner-frozen-a', '.verify']) fs.mkdirSync(path.join(root, name));
+    // Non-checkouts count: five directories refuse at a limit of five, not one.
+    expect(() => assertWorktreeCapacity(root, 6)).not.toThrow();
+    let message = '';
+    try { assertWorktreeCapacity(root, 5); } catch (err) { message = (err as Error).message; }
+    expect(message).toContain('worktree-capacity: 5 directories');
+    expect(message).toContain('(limit 5)');
+    expect(message).toContain('1 git checkouts and 4 other folders');
+    expect(message).toContain('gate-* 2');
+    expect(message).toContain('runner-* 1');
+    expect(message).toContain('.verify 1');
+    expect(message).toContain('counts toward the limit');
+  });
+});
+
+describe('worktree creation lock', () => {
+  it('refuses a second creator and releases only its own lock', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'iwm-lock-'));
+    try {
+      const first = acquireWorktreeCreateLock(home);
+      expect(() => acquireWorktreeCreateLock(home)).toThrow(/worktree-create-busy/);
+      first.release();
+      first.release();
+      const next = acquireWorktreeCreateLock(home);
+      next.release();
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('leaves a crash-stale lock in place for inspection', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'iwm-stale-lock-'));
+    try {
+      const local = path.join(home, '.instar', 'local');
+      fs.mkdirSync(local, { recursive: true });
+      fs.writeFileSync(path.join(local, 'worktree-create.lock'), '{"pid":999999}');
+      expect(() => acquireWorktreeCreateLock(home)).toThrow(/worktree-create-busy/);
+      expect(fs.readFileSync(path.join(local, 'worktree-create.lock'), 'utf8')).toBe('{"pid":999999}');
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+});
 
 // ── Setup helpers ────────────────────────────────────────────────────────
 
@@ -327,6 +386,55 @@ describe('resolveInstarRepo', () => {
     ).toThrow(/no candidate passed integrity validation/);
   });
 
+  // ── The failure must name its remedy, not only its diagnosis ──────────
+  // Earned 2026-08-14: an agent whose checkout lives outside the default
+  // locations ran this from its agent home, got an honest but remedyless
+  // error, and went around the command to a raw `git worktree add` — skipping
+  // every safety property the worktree convention exists to provide.
+
+  it('THE DEFECT: the failure names INSTAR_REPO, the escape hatch it already consults', () => {
+    const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
+    let msg = '';
+    try {
+      resolveInstarRepo({
+        env: {},
+        cwd: elsewhere,
+        fallbackChain: [],
+        urlAllowlist: DEFAULT_INSTAR_REPO_URL_ALLOWLIST,
+      });
+    } catch (err) {
+      msg = (err as Error).message;
+    }
+    // INSTAR_REPO is the FIRST candidate resolveInstarRepo consults, yet the
+    // operator blocked by this error could not learn that from the error.
+    expect(msg).toMatch(/INSTAR_REPO/);
+    // And the remedy must be actionable, not merely a variable name.
+    expect(msg).toMatch(/run this command from inside your instar checkout/i);
+  });
+
+  it('CONTROL: the remedy is APPENDED — every candidate and its reason survive', () => {
+    const notRepo = fs.mkdtempSync(path.join(tmp, 'notrepo-'));
+    const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
+    let msg = '';
+    try {
+      resolveInstarRepo({
+        env: { INSTAR_REPO: notRepo },
+        cwd: elsewhere,
+        fallbackChain: [],
+        urlAllowlist: DEFAULT_INSTAR_REPO_URL_ALLOWLIST,
+      });
+    } catch (err) {
+      msg = (err as Error).message;
+    }
+    // This half passes BOTH before and after the change. It is the guard against
+    // "improving" an error by replacing its diagnostics with advice: the reader
+    // still needs to see which paths were tried and why each one failed.
+    expect(msg).toContain('no candidate passed integrity validation');
+    expect(msg).toContain(notRepo);
+    expect(msg).toContain(elsewhere);
+    expect(msg).toMatch(/not a git repo/);
+  });
+
   it('rejects when remote.origin.url is unset', () => {
     const repo = makeRepo();
     const elsewhere = fs.mkdtempSync(path.join(tmp, 'elsewhere-'));
@@ -367,6 +475,14 @@ describe('resolveInstarRepo', () => {
         urlAllowlist: DEFAULT_INSTAR_REPO_URL_ALLOWLIST,
       }),
     ).toThrow(/core.hooksPath .* resolves outside the repo/);
+  });
+
+  it('accepts a checkout of the canonical JKHeadley/instar repo by default (https and ssh)', () => {
+    for (const remote of ['https://github.com/JKHeadley/instar.git', 'git@github.com:JKHeadley/instar.git']) {
+      const repo = makeRepo({ remote });
+      const result = resolveInstarRepo({ env: { INSTAR_REPO: repo }, fallbackChain: [], urlAllowlist: DEFAULT_INSTAR_REPO_URL_ALLOWLIST });
+      expect(result.remoteUrl).toBe(remote);
+    }
   });
 
   it('accepts a repo with allowlisted origin and sane hooksPath', () => {

@@ -108,18 +108,18 @@ const CODEX_CLI_SIGNAL: FrameworkActivitySignal = {
   // that streamed events THEN froze is silence-eligible (the OutputActivity-
   // Tracker's observed-change requirement still gates "frozen before we watched").
   // These are structured JSON markers, not idle status text.
-  toolCallOrSpinner: /Working\s*\(\d+\s*s|•\s*Ran\b|exec\(|shell\(|apply_patch\(|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\bgenerating\b|"type":\s*"(thread|turn|item)\./i,
+  toolCallOrSpinner: /Working\s*\((?:\d+\s*h\s*)?(?:\d+\s*m\s*)?\d+\s*s|•\s*Ran\b|exec\(|shell\(|apply_patch\(|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\bgenerating\b|"type":\s*"(thread|turn|item)\./i,
   // Live-only: the working status line + spinner + "generating". Excludes "• Ran"
   // and exec(/shell(/apply_patch( + the event-stream markers, which persist in
   // scrollback / the JSONL after a turn ends.
-  liveActivity: /Working\s*\(\d+\s*s|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\bgenerating\b/i,
+  liveActivity: /Working\s*\((?:\d+\s*h\s*)?(?:\d+\s*m\s*)?\d+\s*s|⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\bgenerating\b/i,
   // Codex shows a BARE "esc to interrupt" (no "press"/"hit" prefix) inside
   // its working status line, so the Claude-style prefixed pattern never
   // matched a real Codex pane. Match the bare form.
   escapeToInterrupt: /esc to interrupt/i,
   runningIndicator: /\((running|executing|streaming)\)|background terminal running/i,
   promptSignaturesLine:
-    'the working status line "Working (Ns • esc to interrupt)", action bullets ("• Ran ..."), spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), "generating". IDLE (NOT work): the model-name status line "gpt-5.3-codex medium · <dir>" and the placeholder prompt "Find and fix a bug in @filename".',
+    'the working status line "Working (Ns / Nm Ns / Nh Nm Ns • esc to interrupt)", action bullets ("• Ran ..."), spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏), "generating". IDLE (NOT work): the model-name status line "gpt-5.3-codex medium · <dir>" and the placeholder prompt "Find and fix a bug in @filename".',
 };
 
 const GEMINI_CLI_SIGNAL: FrameworkActivitySignal = {
@@ -168,11 +168,33 @@ const PI_CLI_SIGNAL: FrameworkActivitySignal = {
     'executed-command lines ("$ <cmd>") with "Took N.Ns" completion stamps, spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏). IDLE (NOT work): the status line "<cwd> … <model>" and the static banner "escape interrupt · ctrl+c/ctrl+d clear/exit".',
 };
 
+
+/**
+ * grok-build (probed grok 1.0.4): the fullscreen TUI shows a spinner and an
+ * "esc to interrupt" hint while a turn runs; idle shows the input box with
+ * the model tag (e.g. "grok-4.6"). CONSERVATIVE like pi's entry: does NOT
+ * match the bare word "grok" or the static model tag — both linger in idle
+ * scrollback and would recreate the codex idle-status false positive.
+ */
+const GROK_BUILD_SIGNAL: FrameworkActivitySignal = {
+  displayName: 'Grok Build',
+  toolCallOrSpinner: /⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\b(thinking|working|generating|streaming)\b/i,
+  // Live-only: spinner + working words; excludes scrollback-persistent lines.
+  liveActivity: /⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|\b(thinking|working|generating|streaming)\b/i,
+  // grok's "esc to interrupt" hint is turn-scoped (probed 1.0.4) — it appears
+  // while a turn runs and clears at idle, unlike pi's always-visible banner.
+  escapeToInterrupt: /esc to interrupt/i,
+  runningIndicator: /\((running|executing|streaming)\)/i,
+  promptSignaturesLine:
+    'spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) and the turn-scoped "esc to interrupt" hint. IDLE (NOT work): the input box with the static model tag (e.g. "grok-4.6").',
+};
+
 const ACTIVITY_SIGNALS: Record<IntelligenceFramework, FrameworkActivitySignal> = {
   'claude-code': CLAUDE_CODE_SIGNAL,
   'codex-cli': CODEX_CLI_SIGNAL,
   'gemini-cli': GEMINI_CLI_SIGNAL,
   'pi-cli': PI_CLI_SIGNAL,
+  'grok-build': GROK_BUILD_SIGNAL,
 };
 
 /**

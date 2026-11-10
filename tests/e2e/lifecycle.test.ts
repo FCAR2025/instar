@@ -82,13 +82,28 @@ describeMaybe('E2E: Instar lifecycle', () => {
       {
         slug: 'e2e-health',
         name: 'E2E Health Check',
-        description: 'Fast health check for E2E testing',
-        schedule: '* * * * * *', // Every second
+        description: 'Manually-triggered health check for E2E testing',
+        // Keep the manual-trigger subject distinct from the every-second cron
+        // subject below. Sharing one slug made a correctly running cron session
+        // race the manual API request and trip the per-slug double-run guard.
+        schedule: '0 0 0 1 1 *',
         priority: 'high',
         expectedDurationMinutes: 1,
         model: 'haiku',
         enabled: true,
         execute: { type: 'prompt', value: 'Quick health check' },
+        tags: ['monitoring'],
+      },
+      {
+        slug: 'e2e-cron',
+        name: 'E2E Cron Check',
+        description: 'Fast cron check for E2E testing',
+        schedule: '* * * * * *', // Every second
+        priority: 'high',
+        expectedDurationMinutes: 1,
+        model: 'haiku',
+        enabled: true,
+        execute: { type: 'prompt', value: 'Quick cron check' },
         tags: ['monitoring'],
       },
     ];
@@ -189,8 +204,13 @@ describeMaybe('E2E: Instar lifecycle', () => {
       const sessions = execSync(`${tmuxPath} list-sessions -F "#{session_name}" 2>/dev/null || true`, {
         encoding: 'utf-8',
       }).trim();
+      const ownedPrefix = `${path.basename(projectDir)}-`;
       for (const session of sessions.split('\n').filter(Boolean)) {
-        if (session.includes('e2e-') || session.includes('job-e2e-')) {
+        // This suite runs concurrently with other real-tmux E2E files. Scope
+        // teardown to this fixture's project prefix; matching generic "e2e-"
+        // kills unrelated live sessions and makes their readiness assertions
+        // fail nondeterministically under the full repository gate.
+        if (session.startsWith(ownedPrefix)) {
           try { execSync(`${tmuxPath} kill-session -t '=${session}'`); } catch {}
         }
       }
@@ -248,21 +268,40 @@ describeMaybe('E2E: Instar lifecycle', () => {
     expect(statusRes.body.sessions.running).toBeGreaterThanOrEqual(1);
   });
 
+  it('delivers the ultracode keyword through the real API → tmux → Claude argv path', async () => {
+    const res = await request(app)
+      .post('/sessions/spawn')
+      .set('Authorization', `Bearer ${AUTH_TOKEN}`)
+      .send({ name: 'e2e-ultracode', prompt: 'Inspect this deeply', ultracode: true });
+
+    expect(res.status).toBe(201);
+    const argvLog = path.join(projectDir, 'mock-claude-argv.log');
+    await waitFor(() => {
+      const output = fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8') : '';
+      return output.includes('ultracode') && output.includes('Inspect this deeply');
+    }, 5000, 'ultracode-prefixed prompt to reach mock Claude');
+  });
+
   // ── Phase 6: Job trigger via API ─────────────────────────
 
   it('triggers a job via API and verifies event log', async () => {
     // Pause the scheduler so cron-spawned sessions don't fill all job slots
     scheduler.pause();
 
-    // Wait for any running job sessions to complete (mock-claude sleeps 2s)
-    await waitFor(
-      () => {
-        const running = sessionManager.listRunningSessions().filter(s => s.jobSlug);
-        return running.length === 0;
-      },
-      5000,
-      'running job sessions to drain',
-    );
+    // End every session this fixture still has running: Phase 5's two API
+    // sessions and any every-second cron session. They all share the 3-session
+    // budget with the manual trigger below. Waiting for them to finish on their
+    // own was a race: when the mock's "Session ended" line is missed under
+    // load, a session counts as running until the 15s startup grace. The drain
+    // then timed out (CI), or the manual spawn was refused at the session cap
+    // and re-queued after the API had already said "triggered", so e2e-health
+    // never got a lastRun (Mini). A cron spawn already in flight may still land
+    // after this, but one cron session plus the manual run fits both the job
+    // slots (2) and the session cap (3).
+    for (const session of sessionManager.listRunningSessions()) {
+      sessionManager.killSession(session.id);
+    }
+    expect(sessionManager.listRunningSessions()).toEqual([]);
 
     // Clear any queued jobs that accumulated while paused, then resume.
     // Without clearing, resume() calls processQueue() which may immediately
@@ -278,8 +317,17 @@ describeMaybe('E2E: Instar lifecycle', () => {
     expect(triggerRes.status).toBe(200);
     expect(triggerRes.body.result).toBe('triggered');
 
-    // Wait for spawn to complete
-    await new Promise(r => setTimeout(r, 200));
+    // "triggered" is returned before the session spawn settles. Prove the
+    // manual run really started: the scheduler writes lastRun and a
+    // job_triggered event for e2e-health only once its session is up.
+    await waitFor(
+      () => Boolean(state.getJobState('e2e-health')?.lastRun),
+      5000,
+    );
+    expect(
+      state.queryEvents({ type: 'job_triggered' })
+        .some(e => e.summary?.includes('"e2e-health"') && e.summary.includes('e2e-test')),
+    ).toBe(true);
 
     // Verify event was logged
     const eventsRes = await request(app)
@@ -293,7 +341,7 @@ describeMaybe('E2E: Instar lifecycle', () => {
   // ── Phase 7: Cron-triggered job ──────────────────────────
 
   it('cron triggers jobs automatically', async () => {
-    // The e2e-health job fires every second — wait for it
+    // The e2e-cron job fires every second — wait for it
     await waitFor(
       () => {
         const events = state.queryEvents({ type: 'job_triggered' });

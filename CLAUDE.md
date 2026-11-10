@@ -72,6 +72,11 @@ src/
                   # 'markdown' — flip to 'legacy-passthrough' in .instar/config.json
                   # for byte-for-byte rollback; per-call `_formatMode: 'html'` opt-out
                   # for callers already producing Telegram HTML),
+                  # slack/SlackMrkdwnFormatter (GFM→mrkdwn for Slack; default
+                  # 'mrkdwn' — flip to 'legacy-passthrough' in the slack messaging
+                  # config block for byte-for-byte rollback; per-call
+                  # `formatMode: 'legacy-passthrough'` opt-out for callers already
+                  # producing mrkdwn),
                   # MessageRouter (topic → adapter routing),
                   # DeliveryRetryManager (retry on failed delivery),
                   # PendingRelayStore (durable SQLite queue for Telegram relay;
@@ -152,7 +157,7 @@ This toolkit is meant to be tested against real Claude Code projects. The flow:
   - **Every session** must leave the test suite with zero failures, regardless of what was broken when you started
   - **"Pre-existing failure"** is not a valid label — all failures are current failures, and fixing them is your responsibility
   - **Before pushing**: Run `npm test` and verify zero failures. The Husky pre-push hook enforces this automatically.
-  - **Before concluding work**: If you modified code, run the full suite (`npm run test:all`) and fix any failures
+  - **Before concluding work**: If you modified code, run the full suite (`npm run test:all`: the unit lane in parallel, then integration, then e2e, each file once) and fix any failures
   - **The principle**: This is a classic responsibility gap where no one claims failures because "someone else caused them." The standard eliminates this gap — if you see a failure, you own it
   - **Enforcement**: Husky pre-push hook (local), GitHub Actions CI with branch protection (remote), Claude Code test-health-gate hook (session-level)
 

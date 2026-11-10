@@ -21,11 +21,43 @@
  * EscalationGovernor.ts / ModelSwapService.ts.
  */
 
-/** The frameworks the escalation policy knows. Closed enum — anything else
- *  resolves to null (spec §5.1 line 1). Kept as a literal union to avoid an
- *  import cycle with core/types.ts (matches the inline pattern used there). */
-export type EscalationFramework = 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
+/**
+ * The frameworks the escalation policy knows. Closed enum — anything else
+ * resolves to null (spec §5.1 line 1).
+ *
+ * ROUND-22: this was a SECOND literal union spelling out the same five members,
+ * kept separate "to avoid an import cycle". It is now an alias of the canonical
+ * union, because the duplicate silently re-armed the exact defect round-21 fixed.
+ *
+ * How the drift stayed invisible: three call sites reach this union through an
+ * `as EscalationFramework` cast (routes.ts spawn validation, ModelSwapService,
+ * and resolveEscalatedModelId below), so a sixth framework added to
+ * `IntelligenceFramework` and forgotten here compiled clean and then, at the
+ * spawn route, hit `KNOWN_MODEL_IDS[fw] ?? KNOWN_CLAUDE_MODEL_IDS` and validated
+ * the new framework's model against CLAUDE's list — round-21's defect, restored
+ * by the copy. The comment above `KNOWN_MODEL_IDS` claimed exhaustiveness "over
+ * the union"; that was true of THIS union, which was not the one the callers were
+ * using. An `as` cast is what let two unions look like one.
+ *
+ * Scoped honestly: `resolveTierModel` was NOT exposed to that, because it gates on
+ * `ESCALATION_FRAMEWORKS` membership first and fails closed to null on a name it
+ * does not know. The reachable consequence was the spawn-route fallback.
+ *
+ * The cycle concern does not apply to a TYPE-only import: `import type` is erased
+ * at compile time and adds no runtime edge. With the alias, `KNOWN_MODEL_IDS`
+ * becomes exhaustive over the REAL union, so the next framework cannot be added
+ * without giving it model ids — a compile error instead of a silent Claude
+ * fallback.
+ */
+export type EscalationFramework = IntelligenceFramework;
 
+/**
+ * framework-list-subset-ok: grok-build is EXCLUDED deliberately. It has no
+ * escalated model and its billing sink is unknown (grok-build spec §0.0/§4.4), so
+ * `resolveTierModel` must answer `unknown-framework` → null → the session stays on
+ * its default rather than resolve a tier for it. Verified round-22 as intent, not
+ * drift: this list is the fail-closed gate that runs BEFORE the model-id lookup.
+ */
 export const ESCALATION_FRAMEWORKS: readonly EscalationFramework[] = [
   'claude-code',
   'codex-cli',
@@ -89,6 +121,16 @@ export interface TierEscalationConfig {
    * is a strict no-op. Default false ⇒ ships dark independently of the rest
    * of the escalation feature. */
   ridesTopic: boolean;
+  /**
+   * swap-continuity-antithrash §4.2/Q5 — the model-swap SUBAGENT idle leg.
+   * A session at an idle prompt CAN have live background subagents; the
+   * pane-only check would swap under them (the F3 footer blind spot). Ships
+   * behind its OWN micro-flag with a CONCRETE default `false` (dark)
+   * everywhere — never stage-following (model-swap is already live, so
+   * stage-following would silently change a live refusal surface on deploy).
+   * Graduates on its own rollout rung (spec §10 rung 3a).
+   */
+  subagentIdleLeg: boolean;
   triggers: TierEscalationTriggers;
   frameworks: Partial<Record<EscalationFramework, TierEscalationFrameworkEntry>>;
   costGuards: TierEscalationCostGuards;
@@ -101,6 +143,9 @@ export const DEFAULT_TIER_ESCALATION_CONFIG: TierEscalationConfig = {
   // WS5.3 escalation-rides-topic sub-flag — ships dark (default false). Rides
   // under `enabled`: a no-op while escalation itself is off.
   ridesTopic: false,
+  // swap-continuity-antithrash Q5 — concrete default FALSE (dark) everywhere;
+  // flips only on its own rollout rung (§10 rung 3a), never on deploy.
+  subagentIdleLeg: false,
   triggers: {
     skills: ['build', 'autonomous', 'instar-dev', 'spec-converge'],
     projectDesign: true,
@@ -132,7 +177,9 @@ export const DEFAULT_TIER_ESCALATION_CONFIG: TierEscalationConfig = {
  * claude-code: concrete ids the Claude CLI accepts via `--model`, plus the
  * CLI tier aliases it documents (haiku/sonnet/opus). Includes the ultra
  * model `claude-fable-5` — the first populated escalation target.
- * codex-cli: mirror of CODEX_MODELS_SUBSCRIPTION (routes.ts spawn allowlist).
+ * codex-cli: THE codex list. The spawn route reads it through
+ * spawnModelAllowlist() (routes.ts) rather than restating it — it used to
+ * carry a hand-typed duplicate, and nothing enforced the agreement.
  * gemini-cli: re-exported from the adapter's own closed list.
  * pi-cli: CLOSED-EMPTY by design — pi model ids are `provider/id` patterns
  * whose provider half is per-agent config; there is no universal closed
@@ -141,8 +188,22 @@ export const DEFAULT_TIER_ESCALATION_CONFIG: TierEscalationConfig = {
  * regex — two independent fail-closed layers.
  */
 import { KNOWN_GEMINI_MODELS } from '../providers/adapters/gemini-cli/models.js';
+import type { IntelligenceFramework } from './intelligenceProviderFactory.js';
 
 export const KNOWN_CLAUDE_MODEL_IDS = [
+  // Claude 5 family — live on the claude-code subscription CLI (verified
+  // against `claude --model <id> -p` on CLI 2.1.263, 2026-09-06). Their
+  // absence was not a policy choice: the enum simply lagged a generation, so
+  // `frameworkDefaultModels['claude-code'] = 'claude-opus-5'` was silently
+  // dropped at the resolution clamp and a topic pin to Fable 5.1 was refused
+  // `off-enum` — a stale allowlist reads exactly like a deliberate refusal.
+  'claude-fable-5-1',
+  // Opus 5.5 — live-verified against `claude --model claude-opus-5-5 -p` on
+  // CLI 2.1.281, 2026-09-24. Added so a topic can be pinned to it by exact id
+  // (the operator moved every Fable 5.1 pin to Opus 5.5 that day).
+  'claude-opus-5-5',
+  'claude-opus-5',
+  'claude-sonnet-5',
   'claude-fable-5',
   'claude-opus-4-8',
   'claude-opus-4-7',
@@ -150,6 +211,9 @@ export const KNOWN_CLAUDE_MODEL_IDS = [
   'claude-sonnet-4-6',
   'claude-haiku-4-5',
   'claude-haiku-4-5-20251001',
+  // CLI tier aliases. 'fable' was missing while its three siblings were
+  // present — the same lag, one layer down.
+  'fable',
   'opus',
   'sonnet',
   'haiku',
@@ -161,6 +225,25 @@ export const KNOWN_CODEX_MODEL_IDS = [
   'gpt-5.4',
   'gpt-5.4-mini',
   'gpt-5.5',
+  // GPT-5.6 family — GA on the codex subscription 2026-07-09, live-verified on
+  // codex CLI >= 0.144.0 (older CLIs 400 with "requires a newer version"). The
+  // -pro variants are deliberately EXCLUDED (plan-gated + pricier — future
+  // follow-up).
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+  // GPT-6 family — live-verified 2026-09-05 on codex CLI 0.153.4; CLI 0.149.0
+  // 400s with "The 'gpt-6-astra' model requires a newer version of Codex."
+  // Only ids OBSERVED working are listed — sibling gpt-6 names are added when
+  // each is live-verified, never guessed. This is the SINGLE codex list:
+  // adding an id here reaches the spawn route and the pin validator both.
+  'gpt-6-astra',
+  // Live-verified 2026-09-23 on codex CLI 0.156.1 (0.153.4 refuses both).
+  'gpt-6-sol',
+  'gpt-6-luna',
+  // Live subscription probe on Codex CLI 0.166.0 (2026-11-04); 0.156.1
+  // refuses this id. Launchers check local CLI capability before using it.
+  'gpt-6.1-sol',
 ] as const;
 
 export const KNOWN_MODEL_IDS: Record<EscalationFramework, readonly string[]> = {
@@ -168,6 +251,8 @@ export const KNOWN_MODEL_IDS: Record<EscalationFramework, readonly string[]> = {
   'codex-cli': KNOWN_CODEX_MODEL_IDS,
   'gemini-cli': KNOWN_GEMINI_MODELS,
   'pi-cli': [],
+  // Probed grok 1.0.4 `grok models`: grok-4.6 (default) + grok-4.5.
+  'grok-build': ['grok-4.6', 'grok-4.5'],
 };
 
 /**
@@ -183,6 +268,7 @@ export const SWAP_CAPABILITY: Record<EscalationFramework, SwapCapability> = {
   'codex-cli': 'launch-time-only',
   'gemini-cli': 'launch-time-only',
   'pi-cli': 'launch-time-only',
+  'grok-build': 'launch-time-only',
 };
 
 /** §5.1 injection-safe id shape. Anything else is audit+reject. */
@@ -321,6 +407,7 @@ export function normalizeTierEscalationConfig(
     enabled: typeof r.enabled === 'boolean' ? r.enabled : d.enabled,
     dryRun: typeof r.dryRun === 'boolean' ? r.dryRun : d.dryRun,
     ridesTopic: typeof r.ridesTopic === 'boolean' ? r.ridesTopic : d.ridesTopic,
+    subagentIdleLeg: typeof r.subagentIdleLeg === 'boolean' ? r.subagentIdleLeg : d.subagentIdleLeg,
     triggers: {
       skills: Array.isArray(r.triggers?.skills)
         ? r.triggers.skills.filter((s): s is string => typeof s === 'string')

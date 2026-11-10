@@ -1,6 +1,6 @@
 /**
  * Tests for Telegram injection reliability improvements (PR #32):
- * - rawInject retry logic (≤2 attempts before giving up)
+ * - rawInject crash-safe effect journaling (no blind retry after mutation starts)
  * - Failed message persistence to stateDir (not world-readable /tmp)
  * - cleanupStaleSessions hard cap prunes oldest completed sessions first
  */
@@ -11,27 +11,42 @@ import path from 'node:path';
 
 const SESSION_MANAGER_SRC = path.join(process.cwd(), 'src/core/SessionManager.ts');
 const ROUTES_SRC = path.join(process.cwd(), 'src/server/routes.ts');
+const DISPATCHER_SRC = path.join(process.cwd(), 'src/core/TrackedPhysicalEffectDispatcher.ts');
 
-describe('SessionManager — rawInject retry logic', () => {
-  it('retries at most once (maxAttempts = 2)', () => {
+describe('SessionManager — rawInject effect safety', () => {
+  it('persists armed and started phases before the physical send', () => {
     const source = fs.readFileSync(SESSION_MANAGER_SRC, 'utf-8');
     const methodStart = source.indexOf('private rawInject(');
     const methodEnd = source.indexOf('\n  /**', methodStart + 1);
     const method = source.slice(methodStart, methodEnd > -1 ? methodEnd : undefined);
 
-    expect(method).toContain('maxAttempts = 2');
-    expect(method).toContain('attempt <= maxAttempts');
+    const dispatcher = fs.readFileSync(DISPATCHER_SRC, 'utf-8');
+    expect(method).toContain('trackedPhysicalEffects!.dispatchSync');
+    expect(dispatcher).toContain("'prepared', 'dispatch-armed'");
+    expect(dispatcher).toContain("'dispatch-armed', 'dispatch-started'");
+    expect(method).toContain('effect: () => this.performTmuxInjectionEffect');
   });
 
-  it('pauses between retry attempts', () => {
+  it('does not blindly retry after an ambiguous physical mutation', () => {
     const source = fs.readFileSync(SESSION_MANAGER_SRC, 'utf-8');
     const methodStart = source.indexOf('private rawInject(');
     const methodEnd = source.indexOf('\n  /**', methodStart + 1);
     const method = source.slice(methodStart, methodEnd > -1 ? methodEnd : undefined);
 
-    // Should sleep between attempts, not immediately retry
-    expect(method).toContain('sleep');
-    expect(method).toContain('attempt < maxAttempts');
+    const dispatcher = fs.readFileSync(DISPATCHER_SRC, 'utf-8');
+    expect(dispatcher).toContain("'dispatch-started', 'effect-unknown'");
+    expect(method).not.toContain('maxAttempts');
+  });
+
+  it('journals only sessions with the Codex acceptance observer', () => {
+    const source = fs.readFileSync(SESSION_MANAGER_SRC, 'utf-8');
+    const methodStart = source.indexOf('private rawInject(');
+    const methodEnd = source.indexOf('\n  /**', methodStart + 1);
+    const method = source.slice(methodStart, methodEnd > -1 ? methodEnd : undefined);
+
+    expect(method).toContain("this.stageBActivation.active && framework === 'codex-cli'");
+    expect(method).toContain('Refusing unverifiable Codex injection');
+    expect(method).not.toContain("framework: framework ?? 'unknown'");
   });
 
   it('returns false and reports degradation after all attempts fail', () => {
@@ -68,20 +83,22 @@ describe('routes.ts — failed message persistence', () => {
 });
 
 describe('SessionManager — cleanupStaleSessions hard cap', () => {
-  it('prunes oldest completed sessions first when over the 50-session cap', () => {
+  it('prunes oldest terminal sessions first when over the maxFinished cap (default 50)', () => {
     const source = fs.readFileSync(SESSION_MANAGER_SRC, 'utf-8');
     const methodStart = source.indexOf('cleanupStaleSessions(): string[]');
     const methodEnd = source.indexOf('\n  /**', methodStart + 1);
     const method = source.slice(methodStart, methodEnd > -1 ? methodEnd : undefined);
 
-    // Hard cap constant
-    expect(method).toContain('MAX_COMPLETED');
-    expect(method).toContain('50');
+    // Hard cap (config-tunable via sessions.retention.maxFinished, default 50 —
+    // session-listing hygiene, CMT-1936; behavioral coverage lives in
+    // tests/unit/SessionManager-retention.test.ts)
+    expect(method).toContain('MAX_FINISHED');
+    expect(method).toContain("posNum(retention?.maxFinished, 50)");
 
     // Sort ascending by endedAt so oldest come first
     expect(method).toContain('a.endedAt - b.endedAt');
 
     // Slice the excess (oldest end of the sorted array)
-    expect(method).toContain('slice(0, completed.length - MAX_COMPLETED)');
+    expect(method).toContain('slice(0, retained.length - MAX_FINISHED)');
   });
 });

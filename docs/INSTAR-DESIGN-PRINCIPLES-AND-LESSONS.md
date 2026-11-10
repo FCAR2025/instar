@@ -692,6 +692,8 @@ These are patterns Instar has *already built infrastructure for*. Any new spec t
 
 **Backtrack-tell:** new "the agent can do X" surface without policy evaluation step.
 
+**A Telegram tap is not proof of who pressed it** (`docs/specs/telegram-button-approval.md` §1 is the binding definition, 2026-10-19). A callback's sender arrives in a request body a local session can forge, and a genuine press proves only that something logged into the operator's account pressed. A tap may therefore authorise only: **S** — acts that move toward less agent action and can be undone with an audit record (stop, hold, cancel, decline-as-reopenable, freeze, disarm a merge), never turning off a guard, monitor, alarm or armed safety kill, never suppressing or snoozing a notice, never reducing logging; and **R** — a re-grant a spec defines explicitly: byte-identical to a dashboard-approved envelope, within its caps, after a system-raised brake on an allow-list, never after the operator's own revoke. Everything else is **P** and stays on the dashboard gate; unclassified means P. The rung-1 "yes/no tap" in the Self-Unblock ladder describes how small the request is, not where the approval happens. Enforced by `src/data/telegramCallbackClasses.json` and its unit test once built. **Backtrack-tell:** a new `callback_data` prefix whose handler grants, widens, arms, publishes, restores, turns off a control or mutes a notice.
+
 ---
 
 ### L16. Project Scope (multi-spec plan persistence)
@@ -934,19 +936,95 @@ Before any high-risk action (deploying, pushing to git, modifying files outside 
 - For every detector/gate/verifier in a spec, ask the three questions: **(A)** does it fire on a *corroborated* signal causally tied to the real state (a second signal an impostor state can't fake), or on a bare symbol's presence? **(B)** can the detector's input channel be written into incidentally by its own subject (the agent's own work / the thing it monitors)? If so, read a channel the subject can't pollute (a structured exit state, not free terminal text). **(C)** does it name which fail-direction is least-harmful, fail that way on *unknown*, and resolve its evidence by the real (often plural) location — so a genuine not-found is *unknown*, never the alarming state?
 - A brittle signal is still required to be a *correct* signal — this is orthogonal to *Signal vs Authority* (P2), which only governs who may BLOCK.
 - "Fail closed" is not universal — derive the least-harmful direction per detector and state it.
+- A cadence/liveness watermark has three states: `uninitialized`, `healthy`, and `stale`. Zero/absent/invalid means no first observation exists and therefore cannot authorize recovery or notification; only the measured age of a real prior observation may do that.
 
 **Enforcement (structural):**
 - ENFORCEMENT FIRST: the crystallizing instance is fixed in `docs/specs/ratelimit-sentinel-false-positive-hardening.md` (corroborated idle-error fire + account-home, fail-safe-by-direction verifier).
 - This catalog entry, so the `/spec-converge` lessons-aware reviewer asks the three questions of every spec's detectors.
+- `src/core/cadenceLiveness.ts#classifyCadenceLiveness` makes the cadence monitor's unknown state explicit in a discriminated union; unit, integration, and boot-timer lifecycle tests refuse an `uninitialized → stale` collapse.
 - Next surface (tracked): a `no-uncorroborated-symbol-fire`-style CI ratchet for detector callsites that fire on a bare substring with no second-signal corroboration, mirroring `no-silent-llm-fallback.test.ts`.
 
 **Earned from:** The crystallizing instance, not the first — 2026-06-24 (topic 16566): the RateLimitSentinel fired "this turn died on an API error" because the words `API Error:` were on the pane (put there by the session *investigating* API errors), then cried wolf for 11 min because its verifier looked in one Claude home while the session ran under another account home (absence-of-file read as never-recovered). The detector that diagnosed the bug was tripped by the bug, live. The class had recurred under disguises — the 2026-06-06 stale-pointer crying-wolf (mode C), the AUP-rejection wedge (mode B, a CLAUDE.md note only), and L5's origin (mode C for parsers). Per *Distrust Temporary Success*: four-plus recurrences is one missing standard, not four bugs.
+
+### P21. An Instar Agent Is Always a Multi-Machine Entity (unified is the default; machine-local must justify itself)
+
+**Statement:** Every feature, state surface, and design decision treats the agent as a SINGLE entity spread across many machines, BY DEFAULT. "Unified across my machines" is the default posture; "machine-local" is an EXCEPTION that must name a concrete reason it *cannot* be unified (a credential physically bound to one disk's keychain; a hardware-bound resource; an operator-ratified exception) — never a default chosen for expedience. A design that silently assumes one machine, or declares "machine-local BY DESIGN" with no justification, is a violation, not a valid posture.
+
+**Source:** constitution article "An Instar Agent Is Always a Multi-Machine Entity" (Building — sibling of Cross-Machine Coherence); operator-ratified by Justin 2026-07-03 (topic 29723). Distinct from Cross-Machine Coherence (which governs lease/seamlessness robustness under degraded conditions) — this governs the default posture of every NEW feature: the machinery only makes the agent whole if features actually ride it.
+
+**Translation:**
+- For every state surface, notice, or generated URL in a spec, ask: "what is its cross-machine posture — `unified`, `proxied-on-read`, or `machine-local + justification`?" Absence defaults to `unified`-required.
+- "machine-local BY DESIGN" is NOT a valid answer on its own — it must name the concrete reason it cannot be unified, jailed to the closed taxonomy (physical-credential-locality, hardware-bound-resource, operator-ratified exception).
+- The existing per-feature posture check tests for a *declaration*; this principle tests for the unified *default* — a wrong posture that is merely declared still fails.
+
+**Enforcement (structural):**
+- The enforcement build (tracked, post-ratification): the `/spec-converge` cross-machine check is STRENGTHENED to reject undefended "machine-local"; the side-effects review §7 posture field gains the justification requirement; the Standards-Conformance Gate gets a guard marker for a machine-local surface shipped without justification.
+- Existing features swept for undefended machine-local surfaces (folds into the feature-maturation audit, topic 30668).
+- This catalog entry, so the `/spec-converge` lessons-aware reviewer asks the posture question of every spec while that build lands.
+
+**Earned from:** 2026-07-03 (topic 29723): the tiered-intelligence-delegation spec defaulted its consult memory to machine-local and survived SEVEN convergence rounds before the operator caught it on read. That the review machinery passed it and only the operator's read caught it is the tell — the always-multi-machine expectation lived in prose and reviewer habit, not in structure. Justin: "it should be fundamental in our constitution that an Instar agent is always supported as a multi-machine entity."
+
+### P22. Self-Heal Before Notify (the operator hears only when self-healing fails)
+
+**Statement:** An internal issue is routed to the parts of the system that pick it up and self-heal — the watchers, and the watchers of the watchers. The operator is notified ONLY when the self-healing measures THEMSELVES have failed (exhausted, crashed, unable to recover). A watcher that detects a gap must attempt a bounded, audited self-heal FIRST and escalate to the operator as a LAST resort, never as its first move. Composes with No Silent Degradation (nothing is swallowed — every detection + heal attempt + outcome is audited) by refining *to whom* the report goes: into the self-heal machinery, not the user; the audit trail IS the report, the operator is the last resort.
+
+**Source:** constitution article "Self-Heal Before Notify — The Operator Hears Only When Self-Healing Fails" (Interaction); operator-ratified by Justin 2026-07-03 (topic 29723). General rule beneath Near-Silent Notifications (self-lifecycle narration is default-silent housekeeping).
+
+**Translation:**
+- For every watcher/monitor in a spec that can raise an operator-facing notice, ask: "what bounded self-heal does it attempt, and is the operator-raise gated on that heal's EXHAUSTION (attempted, bounded retries per P19, still failing) rather than on the raw detection?"
+- A watcher that escalates on first detection with no heal attempt is the anti-pattern — the escalation must be structurally downstream of a failed heal.
+- Nothing goes silent: every detection + heal attempt + outcome is audited; only the exhausted-heal path reaches the operator, deduped, one item.
+
+**Enforcement (structural):**
+- The enforcement build (tracked, post-ratification, newly required): self-heal-before-notify becomes a spec-review question for every escalating watcher, checked at spec-converge and in the side-effects review; existing first-notify watchers that skip a heal are swept in the same audit.
+- This catalog entry, so the `/spec-converge` lessons-aware reviewer asks the self-heal question of every watcher spec while that build lands.
+
+**Earned from:** 2026-07-03 (topic 29723): hardening the tiered-intelligence spec's "watcher for the watcher," the operator named the general rule — "the user almost never gets notified of internal issues; those get routed to aspects of the system that pick them up and self-heal (the watchers, and the watchers of the watchers); the only time the user should be notified is if these self-healing measures themselves fail."
+
+### P23. Notices Route to the Alerts Topic, Never a New One (an ownerless notice has ONE destination)
+
+**Statement:** A user-facing message that belongs to an existing conversation goes THERE; one that belongs to NO existing conversation topic (an alert, system notice, housekeeping escalation) routes to the ONE dedicated alerts/hub topic. Creating a NEW Telegram topic per alert/event/item is forbidden — the only topics created are user-initiated ones and a small fixed set of bounded, create-once system topics. The routing corollary of P17 (Bounded Notification Surface): P17 caps how MANY topics may be born; this names WHERE an ownerless notice goes instead.
+
+**Source:** constitution article "Notices Route to the Alerts Topic, Never a New One" (Building — extends Bounded Notification Surface); a standing operator rule since 2026-07-01, operator-ratified to constitutional status by Justin 2026-07-03 (topic 29723).
+
+**Translation:**
+- The alerts/hub topic is the DEFAULT destination for an ownerless notice — routing there is the rule, not a fallback the code stumbles into.
+- A feature notifying per-element over a collection must AGGREGATE (one summary item with the count + list), never one item per element.
+- Much of the machinery already ships (P17's `createForumTopic` budget, `AttentionTopicGuard` coalescing, the burst-invariant test) — this principle makes it the rule and closes the unique-source dodge.
+
+**Enforcement (structural):**
+- `topicCreationBudget` inside `TelegramAdapter.createForumTopic` (origin-typed, auto-by-default) + `AttentionTopicGuard` at `createAttentionItem` + `tests/integration/notification-flood-burst-invariant.test.ts` (existing, made load-bearing for routing).
+- The enforcement build (tracked): the ownerless-notice → alerts-topic default asserted at the routing chokepoint and checked at spec-review.
+- This catalog entry, so the `/spec-converge` lessons-aware reviewer flags a feature that would create a topic per alert.
+
+**Earned from:** The recurring topic-spam floods, all the same shape — a housekeeping feature spawning one topic per event: 2026-05-22 (sentinel), 2026-05-28 (collaboration-redrive), 2026-06-05 (worktree-detector, which dodged the per-source budget with unique sources — the reason the ceiling moved to the create primitive itself). Standing operator rule since 2026-07-01; directed to constitutional status 2026-07-03 (topic 29723): "any message sent to the user that didn't belong to a topic needs to go to the dedicated alerts topic; this needs to be a standard."
+
+### P24. Never Silently Cut the Data a Decision Depends On (a bound on judgment input is derived, disclosed in-band, and refuses when load-bearing)
+
+**Statement:** Any bound applied to data that becomes the **input to a judgment** — a prompt, a gate, a comparison, a review — carries three obligations the bound's mere existence does not discharge: **(1) DERIVED** in both dimensions (*how much* from what the consumer accepts and the producer emits, recorded beside the constant; *which part* from where the evidence lives — the END for anything chronological, because `slice(0, N)` keeps the preamble and discards the evidence while the remainder still reads like ordinary content); **(2) DISCLOSED IN-BAND** to the consumer, inside the data, naming the direction of the loss — a log line is not disclosure to a model that is about to answer; **(3) REFUSED when load-bearing** — if the cut removes the input the operation's correctness depends on, return a refusal or a degraded outcome, never a verdict. The tell that outranks all three: a bound that can structurally never admit a required input is a mis-specification, and its own "truncated" notice conceals it, because "truncated" describes partial loss and reads as reassurance while describing total loss.
+
+**Source:** constitution article "Never Silently Cut the Data a Decision Depends On" (Building; child of *Verify the State, Not Its Symbol*); proposed 2026-08-22 (topic 52224), **pending operator ratification** — the PARTIAL enforcement scope is itself the operator's ruling of that date. Boundary with *Expected Capacity Enforcement Is an Outcome, Not a Degradation* (storage side vs. input side). Converged audit: `docs/audits/truncated-judgment-input.md`.
+
+**Translation:**
+- For every size limit in a spec that sits in front of a decision, ask: **(A)** where does the number come from, and is that written next to it? **(B)** which END does it keep, and is that the end the decision reads? **(C)** when it cuts, does the *consumer* learn that inside what it reads? **(D)** if the cut removes the thing the check compares against, does the operation refuse — or answer anyway?
+- Disclosure is necessary and NOT sufficient. The crystallizing case disclosed correctly, in full, naming every dropped doc, and six rounds of review ran on top of it. A control that informs depends on someone reading; a control that refuses does not.
+- A partial load-bearing doc counts as OMITTED. Half a constitution cannot certify a spec against the constitution.
+- This is P20 one layer earlier: P20 stops a detector accepting a symbol for the state; this stops a working judge being handed a fabricated view of the state and asked to certify it.
+
+**Enforcement (structural):**
+- `src/core/boundedInput.ts` (`boundedTail` / `boundedHead`): keeps the correct end, writes the disclosure into the value at the cut, REFUSES a bound too small to hold its own disclosure.
+- `src/core/crossModelReviewer.ts`: `CONTEXT_BUDGET_BYTES` with its derivation recorded in place; `LOAD_BEARING_CONTEXT_SUBSTRINGS`; `runCrossModelReview` returns `degraded / context-incomplete` naming the lost docs, before the model is spent.
+- `scripts/lint-bounded-judgment-input.mjs` in the blocking `npm run lint` chain — a shrink-only ratchet over bare truncations feeding a prompt; `tests/unit/bounded-judgment-input-lint.test.ts` proves it bites.
+- This catalog entry, so the lessons-aware reviewer asks (A)–(D) of every bound in every spec.
+- **Honest state: PARTIAL.** 7 sites converted, 1 accepted with a written reason, 26 baselined shrink-only under `STD-SUBCOUNTDOWN-bounded-input-derivation-review` (2026-11-22). What is enforced today is *no new instance*, not *no instance*.
+
+**Earned from:** 2026-08-22 (topic 52224). The cross-model reviewer's context budget was 60 KB — smaller than an ordinary spec — so every referenced document was dropped in FULL on every review the machinery had ever run. Six rounds on `placement-real-capacity-scoring` were conducted with no reviewer ever seeing the parent design, the standards registry, or the lessons doc, and were reported as review. The operator named the general pattern before the cause was found: *"you tend to default to truncating data in an effort to be more data efficient — however, often it just cuts off very critical information."* The converging audit then found the same defect in its purest form in two more places only a second search angle could see: a summarizer that selected the newest 20 messages then kept the oldest of them, and a stuck-prompt detector that took the terminal's last 20 lines then cut from the top — able to discard the very prompt it exists to find and report nothing was wrong.
 
 ## Part 4 — How the lessons-aware reviewer uses this index
 
 The 8th `/spec-converge` reviewer (see `skills/spec-converge/SKILL.md`) loads this document plus the linked `feedback_*.md` files and the principles in `CLAUDE.md`, then asks for each spec under review:
 
-For each Part 1 principle (P1-P20):
+For each Part 1 principle (P1-P23):
 - Does the spec engage with this principle?
 - Does it contradict it?
 - If contradicting, is there an explicit, defended rationale in the spec?
@@ -965,6 +1043,8 @@ Output: structured findings per category, with citations to this index. Findings
 ---
 
 ## Maintenance log
+
+- 2026-08-22 — Added P24 (*Never Silently Cut the Data a Decision Depends On*), pending operator ratification; source article + converged audit `docs/audits/truncated-judgment-input.md`.
 
 | Date | Change |
 |---|---|

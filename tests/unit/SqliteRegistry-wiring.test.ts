@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { fileURLToPath } from 'node:url';
 import {
   sqliteRegistrySize,
@@ -25,6 +26,7 @@ import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 import { StopGateDb } from '../../src/core/StopGateDb.js';
 import { PreferenceStore } from '../../src/providers/uxConfirm/PreferenceStore.js';
 import { SpawnLedger } from '../../src/threadline/SpawnLedger.js';
+import { JobSupervisionStore } from '../../src/scheduler/JobSupervisionStore.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const SRC = path.join(REPO_ROOT, 'src');
@@ -49,11 +51,44 @@ const LONG_LIVED_STORES = [
   'src/messaging/MessageProcessingLedger.ts',
   'src/messaging/OutboundDedupStore.ts',
   'src/messaging/pending-relay-store.ts',
+  // Native app conversation index (mobile-native-conversations §4.5): registers its handle in
+  // the constructor (registerSqliteHandle), process-lifetime; derived from the JSONL files.
+  'src/core/AppConversationStore.ts',
+  // App media upload index (mobile-native-chat-media §4.2): registers its handle in the
+  // constructor (registerSqliteHandle), process-lifetime.
+  'src/core/AppMediaStore.ts',
   'src/messaging/imessage/NativeBackend.ts',
   'src/threadline/A2ADeliveryTracker.ts',
+  // A2A inbound message-id ledger: registers its handle in the constructor and
+  // unregisters in close() (docs/specs/a2a-inbound-id-ledger.md §1).
+  'src/threadline/InboundIdLedger.ts',
   // Durable Inbound Message Queue (CMT-1118): the custody store registers its
   // handle in the constructor (registerSqliteHandle), process-lifetime.
   'src/core/PendingInboundStore.ts',
+  // routing-control-room-spend Layer 1c (CMT-1929): the provider-report store
+  // registers its handle in the constructor (registerSqliteHandle), process-
+  // lifetime, closed once at shutdown like FeatureMetricsLedger beside it.
+  'src/monitoring/ProviderCostReportStore.ts',
+  // Correction-class review is durable process-lifetime state and registers
+  // its handle in the constructor like the other monitoring stores above.
+  'src/monitoring/ClassReviewStore.ts',
+  'src/monitoring/BlockerLifecycleLedger.ts',
+  // Feedback Factory's operated drain is process-lifetime durable state and
+  // participates in the same close-on-exit registry as the other stores.
+  'src/feedback-factory/drain/FeedbackDrainStore.ts',
+  // Self-heal episode state may remain open for governor queue continuation.
+  'src/core/SelfHealGate.ts',
+  // Passive subscription sign-in history is process-lifetime durable state.
+  'src/core/SubscriptionLoginLedger.ts',
+  // Assisted relogin episodes, audit events, and notification outbox are
+  // process-lifetime durable state and participate in close-on-exit cleanup.
+  'src/core/SubscriptionReloginStore.ts',
+  // Codex lifecycle delivery/effect evidence are process-lifetime stores.
+  'src/core/InboundDeliveryStore.ts',
+  'src/core/RecoveryActuationAuthority.ts',
+  // Script-result supervision keeps its WAL journal open for the scheduler's
+  // lifetime and must close before process exit.
+  'src/scheduler/JobSupervisionStore.ts',
 ];
 
 /**
@@ -61,9 +96,12 @@ const LONG_LIVED_STORES = [
  * each documented as a transient (closes itself) or a non-owning helper.
  */
 const TRANSIENT_SKIP: Record<string, string> = {
+  'src/messaging/telegram-origin/OriginStoreBackend.ts': 'worker-owned outbox handle is owned and registered by PendingRelayStore; archive handles close in finally',
+  'src/messaging/telegram-origin/OriginEvidenceSpool.ts': 'worker opens one evidence transaction and closes its handle in finally',
   'src/commands/server.ts': ':memory: probe testDb — closes itself immediately',
   'src/server/routes.ts': 'readonly per-request open — closed per request, not process-lifetime',
   'src/memory/NativeModuleHealer.ts': 'generic ABI-heal helper — owns no handle (a comment mentions new Database)',
+  'src/core/UpdateChecker.ts': 'candidate startup probe opens an in-memory database in a child process and closes it in finally',
 };
 
 function walkTs(dir: string, acc: string[] = []): string[] {
@@ -142,5 +180,23 @@ describe('SqliteRegistry wiring — registration fires (functional)', () => {
     expect(sqliteRegistrySize()).toBe(0);
     new SpawnLedger(path.join(tmp, 'spawn.db'));
     expect(sqliteRegistrySize()).toBe(1);
+  });
+
+  it('JobSupervisionStore registers and unregisters its live journal', () => {
+    const store = new JobSupervisionStore(tmp);
+    expect(sqliteRegistrySize()).toBe(1);
+    store.close();
+    expect(sqliteRegistrySize()).toBe(0);
+  });
+
+  it('JobSupervisionStore closes an opened journal when schema setup fails', () => {
+    const ledger = path.join(tmp, 'ledger');
+    fs.mkdirSync(ledger);
+    const db = new Database(path.join(ledger, 'job-supervision.db'));
+    db.exec('CREATE TABLE attempts (id TEXT)');
+    db.close();
+    fs.writeFileSync(path.join(ledger, 'job-supervision-baseline.json'), JSON.stringify({ at: new Date().toISOString() }));
+    expect(() => new JobSupervisionStore(tmp)).toThrow();
+    expect(sqliteRegistrySize()).toBe(0);
   });
 });

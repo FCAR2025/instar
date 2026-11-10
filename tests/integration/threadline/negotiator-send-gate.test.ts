@@ -61,7 +61,7 @@ describe('Threadline negotiator send-gate (integration)', () => {
       threadlineRelayClient: {
         connectionState: 'connected',
         resolveAgent: async () => 'targetfp00112233445566778899aabbcc',
-        sendAuto: (rid: string, text: string, threadId?: string) => { sentAuto.push({ rid, text, threadId }); return `msg-${sentAuto.length}`; },
+        sendAutoWithThread(r: string, m: string, t?: string) { return { messageId: (this as any).sendAuto(r, m, t), threadId: t ?? 'thread-stub' }; }, awaitRelayAck: async (_id: string, _ms: number) => null, banSuspected: false, noteUnconfirmedSettled() {}, sendAuto: (rid: string, text: string, threadId?: string) => { sentAuto.push({ rid, text, threadId }); return `msg-${sentAuto.length}`; },
       },
       startTime: new Date(),
     };
@@ -117,6 +117,7 @@ describe('Threadline negotiator send-gate (integration)', () => {
     // Content was WITHHELD.
     expect(json.success).toBe(true);
     expect(json.held).toBe(true);
+    expect(json.accepted).toBe(false);
     expect(json.delivered).toBe(false);
     expect(json.deliveryOutcome).toBe('holding');
     // Only the fixed holding notice reached the peer — NOT the warm session's content.
@@ -127,7 +128,7 @@ describe('Threadline negotiator send-gate (integration)', () => {
     expect(a2aDeliveryTracker.pending().length).toBe(0);
   });
 
-  it('OWNER: the lease-holding session is the voice — content is delivered', async () => {
+  it('OWNER: the lease-holding session is the voice — content is submitted to the relay', async () => {
     await listen(buildApp({ enabled: true, dryRun: false }));
     await conversationStore.acquireOrRenewLease('thread-1', { ownerSessionName: OWNER_SESSION, ownerMachineId: 'machine-a' }, { ttlMs: 90000 });
 
@@ -137,9 +138,13 @@ describe('Threadline negotiator send-gate (integration)', () => {
     });
 
     expect(json.success).toBe(true);
+    expect(json.accepted).toBe(false);
+    expect(json.delivered).toBe(false);
     expect(json.deliveryPath).toBe('relay');
+    expect(json.deliveryOutcome).toBe('submitted to relay; no relay acknowledgement within 3s');
+    expect(json.relayStatus).toBe('unconfirmed');
     expect(sentAuto.length).toBe(1);
-    expect(sentAuto[0].text).toBe('real owner content'); // the real content, not a notice
+    expect(sentAuto[0].text).toBe('real owner content'); // real content was submitted, not a notice
   });
 
   it('DRY-RUN: a foreign lease is observed but the content still sends', async () => {

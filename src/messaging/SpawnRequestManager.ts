@@ -107,7 +107,22 @@ export interface SpawnRequest {
    * on every existing spawn path → headless behavior is byte-for-byte unchanged.
    */
   interactive?: boolean;
+  /**
+   * a2a-required-acknowledgment D3/D5: who to tell about this payload's fate. Carried
+   * on the queue entry and on the in-flight reservation. No message content.
+   */
+  receipt?: SpawnQueueReceipt;
 }
+
+/** Opaque to this manager: handed back through the delivered and dropped callbacks. */
+export interface SpawnQueueReceipt {
+  watchId: number;
+  peerFp: string;
+  messageId: string;
+  threadId: string | null;
+}
+
+export type SpawnQueueDropCause = 'expired' | 'evicted';
 
 export interface SpawnResult {
   approved: boolean;
@@ -115,6 +130,12 @@ export interface SpawnResult {
   tmuxSession?: string;
   reason?: string;
   retryAfterMs?: number;
+  /**
+   * For a refused spawn, whether the current payload was admitted to the
+   * bounded retry queue. False means the caller must not describe the payload
+   * as accepted merely because the refusal is retryable.
+   */
+  queued?: boolean;
 }
 
 /**
@@ -148,7 +169,56 @@ export type SpawnFailureCause =
  */
 export type SpawnDegradationEvent =
   | { kind: 'spawn-penalty-tripped'; agent: string; consecutiveFailures: number; penaltyMs: number; at: number }
-  | { kind: 'spawn-infra-degraded'; agent: string; failureCount: number; degradationMs: number; at: number };
+  | { kind: 'spawn-infra-degraded'; agent: string; failureCount: number; degradationMs: number; at: number }
+  | {
+      kind: 'spawn-drain-attention-failed';
+      agent: string;
+      attentionId: string;
+      attempt: number;
+      error: string;
+      at: number;
+    };
+
+export interface SpawnDrainGiveUpEvent {
+  agent: string;
+  targetKey: string;
+  refusalSignature: string;
+  reason: string;
+  refusalCount: number;
+  queuedMessagesHeld: number;
+  firstRefusedAt: number;
+  lastRefusedAt: number;
+  at: number;
+  attentionId: string;
+}
+
+export interface SpawnDrainRearmEvent {
+  agent: string;
+  targetKey: string;
+  refusalSignature: string;
+  attentionId: string;
+  latchedAt: number;
+  lastRefusedAt: number;
+  rearmedAt: number;
+  rearmCooldownMs: number;
+}
+
+export interface SpawnDrainRefusalSnapshot {
+  agent: string;
+  targetKey: string;
+  refusalSignature: string;
+  count: number;
+  firstRefusedAt: number;
+  lastRefusedAt: number;
+  latchedAt: number;
+  attentionId: string;
+  attentionDelivered: boolean;
+  attentionAttempts: number;
+  lastAttentionAttemptAt: number;
+  attentionError?: string;
+}
+
+export type SpawnDrainReadyResult = void | Pick<SpawnResult, 'approved' | 'reason' | 'retryAfterMs'>;
 
 /** Error class callers throw from inside `spawnSession` to tag attributable failures. */
 export class SpawnFailureError extends Error {
@@ -218,6 +288,8 @@ export interface SpawnRequestManagerConfig {
    * absent (the default), admission behavior is byte-for-byte unchanged.
    */
   shouldSpawnSession?: (priority?: string) => { allowed: boolean; reason: string };
+  /** A standing refusal, with its reason, or null to continue. */
+  refuseSpawn?: () => string | null;
   /** Cooldown between spawn requests per agent (ms). Default: 30s */
   cooldownMs?: number;
   /** Max spawn retries before giving up. Default: 3 */
@@ -242,9 +314,52 @@ export interface SpawnRequestManagerConfig {
    * `evaluate`. Optional: if unset, the drain loop is a no-op and queued
    * messages only drain on the next inline `evaluate` call (legacy behavior).
    */
-  onDrainReady?: (agent: string) => Promise<void>;
+  onDrainReady?: (agent: string) => Promise<SpawnDrainReadyResult>;
   /** §4.2: max drains per tick. Default 8. */
   maxDrainsPerTick?: number;
+  /**
+   * Max denied drain re-attempts for one agent before the manager holds that
+   * agent's queued payloads and emits one give-up event. Default: maxRetries
+   * (or 3). This bounds a correct-but-persistent refusal such as memory
+   * pressure so the drain loop cannot spin silently forever.
+   */
+  drainRefusalGiveUpThreshold?: number;
+  /**
+   * Called once when one drain target crosses the bounded-refusal threshold.
+   * Server wiring maps this to a stable Attention id; manager-level tracking
+   * still dedupes the event so a repeating tick cannot flood callers.
+   */
+  onDrainGiveUp?: (event: SpawnDrainGiveUpEvent) => void | Promise<void>;
+  /**
+   * Minimum quiet-clear interval before a give-up latch can re-arm. The timer
+   * is measured from the last denied drain result, not just from the first
+   * attention item, so near-threshold memory pressure cannot flap the latch.
+   * Default: 8 minutes, below queued-message TTL.
+   */
+  drainGiveUpRearmCooldownMs?: number;
+  /**
+   * Optional clear predicate for a latched refusal target. Re-arm requires the
+   * cooldown above AND this predicate returning true. Server wiring uses this
+   * for memory-pressure denials so a near-threshold host does not flap.
+   */
+  isDrainRefusalCleared?: (marker: SpawnDrainRefusalSnapshot) => boolean;
+  /** Called when a previously latched drain target has genuinely re-armed. */
+  onDrainRearm?: (event: SpawnDrainRearmEvent) => void | Promise<void>;
+  /**
+   * a2a-required-acknowledgment D7: an early, live clear for a latched refusal. When
+   * it answers true (a session limit with a slot now free) the latch may re-arm before
+   * the cooldown, under brakes: at most one early re-arm a minute and three per
+   * episode. Admission itself is unchanged: the drain still goes through `evaluate`.
+   */
+  isDrainRefusalLiveCleared?: (marker: SpawnDrainRefusalSnapshot) => boolean;
+  /** a2a-required-acknowledgment D3: a queued payload with a receipt died. Called at all four drop sites. */
+  onQueuedMessageDropped?: (receipt: SpawnQueueReceipt, cause: SpawnQueueDropCause) => void;
+  /**
+   * a2a-required-acknowledgment D5: a payload with a receipt reached a live session.
+   * Fired from `#commitQueueSnapshot`, the one place every delivering path goes
+   * through, including an inline spawn that takes the backlog.
+   */
+  onQueuedMessageDelivered?: (receipt: SpawnQueueReceipt, session: { sessionName: string | null; interactive: boolean }) => void;
   /** §4.2: max queued messages per agent while in degraded admission. Default 1. */
   degradedMaxQueuedPerAgent?: number;
   /**
@@ -262,6 +377,36 @@ export interface SpawnRequestManagerConfig {
    */
   maxGlobalQueued?: number;
 }
+
+interface QueuedSpawnMessage {
+  context: string;
+  threadId?: string;
+  receivedAt: number;
+  envelopeHash: string;
+  drainAttempts: number;
+  /** Monotonic arrival order, including payloads reserved during an in-flight spawn. */
+  sequence: number;
+  /** a2a-required-acknowledgment: who to tell about this entry's fate. */
+  receipt?: SpawnQueueReceipt;
+}
+
+declare const TRANSIENT_REFUSAL_PRESERVED: unique symbol;
+
+/**
+ * A retryable refusal that can only be constructed by the preservation
+ * funnel. The private brand makes a new retryable return branch fail
+ * type-checking unless it first passes through `#refuseTransiently`.
+ */
+type PreservedTransientRefusal = SpawnResult & {
+  approved: false;
+  retryAfterMs: number;
+  readonly [TRANSIENT_REFUSAL_PRESERVED]: true;
+};
+
+type GuardedSpawnResult =
+  | (SpawnResult & { approved: true })
+  | (SpawnResult & { approved: false; retryAfterMs?: undefined })
+  | PreservedTransientRefusal;
 
 // ── Constants ───────────────────────────────────────────────────
 
@@ -310,6 +455,11 @@ const DRAIN_MAX_PER_TICK_DEFAULT = 8;
 const DRR_QUANTUM = 1;
 const DRR_COST = 1;
 const DRR_AGE_BOOST_MULTIPLIER = 1.5;
+const DEFAULT_DRAIN_GIVE_UP_REARM_COOLDOWN_MS = 8 * 60_000;
+const DRAIN_GIVE_UP_ATTENTION_RETRY_MS = 30_000;
+/** a2a-required-acknowledgment D7: brakes on the early re-arm. */
+const EARLY_REARM_MIN_INTERVAL_MS = 60_000;
+const EARLY_REARMS_PER_EPISODE = 3;
 
 const SPAWN_PROMPT_TEMPLATE = `You were spawned by an inter-agent message request.
 
@@ -359,13 +509,13 @@ export class SpawnRequestManager {
    *   process this entry. Bumped before each drain; reset on success.
    *   Used by DRR's age-boost.
    */
-  readonly #pendingMessages = new Map<string, {
-    context: string;
-    threadId?: string;
-    receivedAt: number;
-    envelopeHash: string;
-    drainAttempts: number;
-  }[]>();
+  readonly #pendingMessages = new Map<string, QueuedSpawnMessage[]>();
+
+  /** Serialize launch attempts per agent so one backlog cannot be delivered twice. */
+  readonly #spawnInflightByAgent = new Set<string>();
+
+  /** Arrival order shared by queued and in-flight-reserved payloads. */
+  #nextQueueSequence = 0;
 
   /** Max queued messages per agent before oldest are dropped */
   static readonly MAX_QUEUED_PER_AGENT = 10;
@@ -378,6 +528,38 @@ export class SpawnRequestManager {
 
   /** §4.2: drain-attempt counter per agent. Reset on successful drain. */
   readonly #drainAttempts = new Map<string, number>();
+
+  /** Count denied drain re-attempts per agent so one target cannot spin forever. */
+  readonly #drainRefusals = new Map<string, {
+    count: number;
+    firstRefusedAt: number;
+    lastReason: string;
+  }>();
+
+  /** Stable per-target give-up latch. Re-armed only after hysteresis clears. */
+  readonly #drainGiveUpLatches = new Map<string, {
+    attentionId: string;
+    refusalSignature: string;
+    latchedAt: number;
+    lastRefusedAt: number;
+    attentionEvent: SpawnDrainGiveUpEvent;
+    attentionDelivered: boolean;
+    attentionAttempts: number;
+    lastAttentionAttemptAt: number;
+    attentionError?: string;
+  }>();
+
+  /**
+   * a2a-required-acknowledgment D7: re-arming deletes the latch, so the brake counts
+   * and the episode's Attention state live here, per target. Cleared on a successful drain.
+   */
+  readonly #earlyRearmEpisodes = new Map<string, {
+    count: number;
+    lastEarlyAt: number;
+    /** The last re-arm was early: a re-latch in this episode must not reopen Attention. */
+    lastWasEarly: boolean;
+    attentionDelivered: boolean;
+  }>();
 
   /** §4.2: shared drain-tick timer. null when not started. */
   #drainTimer: ReturnType<typeof setInterval> | null = null;
@@ -525,7 +707,13 @@ export class SpawnRequestManager {
   /** Effective per-agent queue cap, accounting for soft-limiter degradation. */
   effectiveMaxQueuedPerAgent(agent: string): number {
     if (this.isInfraDegraded(agent)) {
-      return this.#config.degradedMaxQueuedPerAgent ?? DEGRADED_MAX_QUEUED_PER_AGENT_DEFAULT;
+      // A zero cap makes `while (queue.length >= cap)` non-terminating. Keep
+      // degraded admission bounded but live, even for a stale constructor
+      // config written before updateConfig began rejecting zero.
+      return Math.max(
+        1,
+        this.#config.degradedMaxQueuedPerAgent ?? DEGRADED_MAX_QUEUED_PER_AGENT_DEFAULT,
+      );
     }
     return SpawnRequestManager.MAX_QUEUED_PER_AGENT;
   }
@@ -536,6 +724,326 @@ export class SpawnRequestManager {
     this.#penaltyUntil.delete(agent);
   }
 
+  /**
+   * The single construction path for a retryable refusal.
+   *
+   * `retryAfterMs` means "not now", so returning it without first preserving
+   * the refused payload is a data-loss bug. Keeping construction here makes
+   * that postcondition class-wide: the structural guard test rejects any
+   * retryable-result object created elsewhere in this class.
+   *
+   * Queued backlog is not handled here: evaluate snapshots it without removal
+   * and commits that exact snapshot only after spawnSession reports delivery.
+   * A rejection therefore leaves the backlog's age and ordering untouched.
+   */
+  #refuseTransiently(
+    request: SpawnRequest,
+    reason: string,
+    retryAfterMs: number,
+    reservedPayload?: QueuedSpawnMessage,
+  ): PreservedTransientRefusal {
+    const agent = request.requester.agent;
+    let queued = false;
+    if (reservedPayload) {
+      queued = this.#admitQueuedMessage(agent, reservedPayload);
+    } else if (request.context) {
+      queued = this.#queueMessage(agent, request.context, request.pendingMessages?.[0], request.receipt);
+    }
+    return {
+      approved: false,
+      reason,
+      retryAfterMs,
+      queued,
+    } as PreservedTransientRefusal;
+  }
+
+  #drainGiveUpThreshold(): number {
+    const configured = this.#config.drainRefusalGiveUpThreshold ?? this.#config.maxRetries ?? DEFAULT_MAX_RETRIES;
+    if (!Number.isFinite(configured)) return DEFAULT_MAX_RETRIES;
+    return Math.max(1, Math.floor(configured));
+  }
+
+  #drainGiveUpRearmCooldownMs(): number {
+    const configured = this.#config.drainGiveUpRearmCooldownMs ?? DEFAULT_DRAIN_GIVE_UP_REARM_COOLDOWN_MS;
+    if (!Number.isFinite(configured)) return DEFAULT_DRAIN_GIVE_UP_REARM_COOLDOWN_MS;
+    return Math.max(0, Math.floor(configured));
+  }
+
+  #drainTargetKey(agent: string): string {
+    return agent.replace(/[^a-zA-Z0-9._:-]/g, '_').slice(0, 80) || 'unknown';
+  }
+
+  #drainGiveUpAttentionId(targetKey: string): string {
+    // One durable item per target. Server wiring explicitly refreshes/reopens
+    // this item for later episodes, avoiding both silent recurrence and a
+    // permanent pile of date/episode-keyed health items.
+    return `spawn-drain-refusal-giveup:${targetKey}`;
+  }
+
+  #drainRefusalSignature(reason: string | undefined): string {
+    const raw = (reason ?? 'unknown').trim().replace(/\s+/g, ' ');
+    return raw.slice(0, 240) || 'unknown';
+  }
+
+  #refreshHeldQueueForRearm(agent: string, now: number): void {
+    const queue = this.#pendingMessages.get(agent);
+    if (!queue) return;
+    for (const entry of queue) {
+      entry.receivedAt = now;
+    }
+  }
+
+  async #maybeRearmDrainGiveUp(agent: string): Promise<void> {
+    const targetKey = this.#drainTargetKey(agent);
+    const latch = this.#drainGiveUpLatches.get(targetKey);
+    if (!latch) return;
+
+    const now = this.#nowFn();
+    const rearmCooldownMs = this.#drainGiveUpRearmCooldownMs();
+
+    const refusal = this.#drainRefusals.get(agent);
+    const snapshot: SpawnDrainRefusalSnapshot = {
+      agent,
+      targetKey,
+      refusalSignature: latch.refusalSignature,
+      count: refusal?.count ?? 0,
+      firstRefusedAt: refusal?.firstRefusedAt ?? latch.latchedAt,
+      lastRefusedAt: latch.lastRefusedAt,
+      latchedAt: latch.latchedAt,
+      attentionId: latch.attentionId,
+      attentionDelivered: latch.attentionDelivered,
+      attentionAttempts: latch.attentionAttempts,
+      lastAttentionAttemptAt: latch.lastAttentionAttemptAt,
+      attentionError: latch.attentionError,
+    };
+    // D7: the live check moves ahead of the cooldown test. Admission still decides.
+    if (this.#maybeEarlyRearm(agent, targetKey, latch.attentionDelivered, snapshot, now)) {
+      try {
+        await this.#config.onDrainRearm?.({
+          agent,
+          targetKey,
+          refusalSignature: latch.refusalSignature,
+          attentionId: latch.attentionId,
+          latchedAt: latch.latchedAt,
+          lastRefusedAt: latch.lastRefusedAt,
+          rearmedAt: now,
+          rearmCooldownMs: 0,
+        });
+      } catch {
+        // Observability failure must never keep the target latched forever.
+      }
+      return;
+    }
+    if (now - latch.lastRefusedAt < rearmCooldownMs) return;
+    if (this.#config.isDrainRefusalCleared && !this.#config.isDrainRefusalCleared(snapshot)) return;
+
+    const episode = this.#earlyRearmEpisodes.get(targetKey);
+    if (episode) episode.lastWasEarly = false;
+    this.#refreshHeldQueueForRearm(agent, now);
+    this.#drainGiveUpLatches.delete(targetKey);
+    this.#clearDrainRefusal(agent);
+    try {
+      await this.#config.onDrainRearm?.({
+        agent,
+        targetKey,
+        refusalSignature: latch.refusalSignature,
+        attentionId: latch.attentionId,
+        latchedAt: latch.latchedAt,
+        lastRefusedAt: latch.lastRefusedAt,
+        rearmedAt: now,
+        rearmCooldownMs,
+      });
+    } catch {
+      // Observability failure must never keep the target latched forever.
+    }
+  }
+
+  /**
+   * D7: re-arm before the cooldown when the refusal has live-cleared, under the
+   * brakes. Does not refresh queue ages, except entries already past the maximum age,
+   * which would otherwise expire at the next free slot. Does not reopen Attention.
+   */
+  #maybeEarlyRearm(
+    agent: string,
+    targetKey: string,
+    attentionDelivered: boolean,
+    snapshot: SpawnDrainRefusalSnapshot,
+    now: number,
+  ): boolean {
+    const check = this.#config.isDrainRefusalLiveCleared;
+    if (!check) return false;
+    const episode = this.#earlyRearmEpisodes.get(targetKey);
+    if (episode) {
+      if (episode.count >= EARLY_REARMS_PER_EPISODE) return false;
+      if (now - episode.lastEarlyAt < EARLY_REARM_MIN_INTERVAL_MS) return false;
+    }
+    let cleared = false;
+    try { cleared = check(snapshot); } catch { cleared = false; /* @silent-fallback-ok — the normal cooldown applies */ }
+    if (!cleared) return false;
+
+    const queue = this.#pendingMessages.get(agent);
+    for (const entry of queue ?? []) {
+      if (now - entry.receivedAt >= SpawnRequestManager.QUEUE_MAX_AGE_MS) entry.receivedAt = now;
+    }
+    this.#earlyRearmEpisodes.set(targetKey, {
+      count: (episode?.count ?? 0) + 1,
+      lastEarlyAt: now,
+      lastWasEarly: true,
+      attentionDelivered: attentionDelivered || episode?.attentionDelivered === true,
+    });
+    this.#drainGiveUpLatches.delete(targetKey);
+    this.#clearDrainRefusal(agent);
+    return true;
+  }
+
+  #clearEarlyRearmEpisode(agent: string): void {
+    this.#earlyRearmEpisodes.delete(this.#drainTargetKey(agent));
+  }
+
+  async #forceRearmDrainGiveUp(agent: string): Promise<void> {
+    const targetKey = this.#drainTargetKey(agent);
+    const latch = this.#drainGiveUpLatches.get(targetKey);
+    if (!latch) return;
+
+    const now = this.#nowFn();
+    this.#refreshHeldQueueForRearm(agent, now);
+    this.#drainGiveUpLatches.delete(targetKey);
+    this.#clearDrainRefusal(agent);
+    try {
+      await this.#config.onDrainRearm?.({
+        agent,
+        targetKey,
+        refusalSignature: latch.refusalSignature,
+        attentionId: latch.attentionId,
+        latchedAt: latch.latchedAt,
+        lastRefusedAt: latch.lastRefusedAt,
+        rearmedAt: now,
+        rearmCooldownMs: 0,
+      });
+    } catch {
+      // Observability failure must never keep a proven-successful target latched.
+    }
+  }
+
+  #isDrainGiveUpLatched(agent: string): boolean {
+    return this.#drainGiveUpLatches.has(this.#drainTargetKey(agent));
+  }
+
+  async #deliverDrainGiveUpAttention(
+    latch: {
+      attentionId: string;
+      attentionEvent: SpawnDrainGiveUpEvent;
+      attentionDelivered: boolean;
+      attentionAttempts: number;
+      lastAttentionAttemptAt: number;
+      attentionError?: string;
+    },
+  ): Promise<void> {
+    if (latch.attentionDelivered) return;
+    const onDrainGiveUp = this.#config.onDrainGiveUp;
+    if (!onDrainGiveUp) {
+      latch.attentionDelivered = true;
+      return;
+    }
+
+    const at = this.#nowFn();
+    latch.attentionAttempts++;
+    latch.lastAttentionAttemptAt = at;
+    try {
+      await onDrainGiveUp(latch.attentionEvent);
+      latch.attentionDelivered = true;
+      latch.attentionError = undefined;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      latch.attentionError = error;
+      try {
+        this.#config.onDegradation?.({
+          kind: 'spawn-drain-attention-failed',
+          agent: latch.attentionEvent.agent,
+          attentionId: latch.attentionId,
+          attempt: latch.attentionAttempts,
+          error,
+          at,
+        });
+      } catch {
+        // A secondary observability-sink failure cannot make queue admission
+        // or the bounded retry state depend on the reporter itself.
+      }
+    }
+  }
+
+  async #maybeRetryDrainGiveUpAttention(agent: string): Promise<void> {
+    const latch = this.#drainGiveUpLatches.get(this.#drainTargetKey(agent));
+    if (!latch || latch.attentionDelivered) return;
+    if (this.#nowFn() - latch.lastAttentionAttemptAt < DRAIN_GIVE_UP_ATTENTION_RETRY_MS) return;
+    await this.#deliverDrainGiveUpAttention(latch);
+  }
+
+  #isDeniedDrainResult(result: SpawnDrainReadyResult): result is Pick<SpawnResult, 'approved' | 'reason' | 'retryAfterMs'> {
+    return typeof result === 'object' && result !== null && result.approved === false;
+  }
+
+  async #recordDrainRefusal(agent: string, reason: string | undefined): Promise<void> {
+    const now = this.#nowFn();
+    const targetKey = this.#drainTargetKey(agent);
+    const refusalSignature = this.#drainRefusalSignature(reason);
+    const attentionId = this.#drainGiveUpAttentionId(targetKey);
+    const prior = this.#drainRefusals.get(agent);
+    const firstRefusedAt = prior?.firstRefusedAt ?? now;
+    const next = {
+      count: (prior?.count ?? 0) + 1,
+      firstRefusedAt,
+      lastReason: refusalSignature,
+    };
+    this.#drainRefusals.set(agent, next);
+
+    if (next.count < this.#drainGiveUpThreshold()) return;
+
+    this.#drrDeficit.delete(agent);
+    this.#drainAttempts.delete(agent);
+
+    const existingLatch = this.#drainGiveUpLatches.get(targetKey);
+    if (existingLatch) {
+      existingLatch.refusalSignature = refusalSignature;
+      existingLatch.lastRefusedAt = now;
+      return;
+    }
+
+    const attentionEvent: SpawnDrainGiveUpEvent = {
+      agent,
+      targetKey,
+      refusalSignature,
+      reason: next.lastReason,
+      refusalCount: next.count,
+      queuedMessagesHeld: this.getQueuedCount(agent),
+      firstRefusedAt: next.firstRefusedAt,
+      lastRefusedAt: now,
+      at: now,
+      attentionId,
+    };
+    const latch = {
+      attentionId,
+      refusalSignature,
+      latchedAt: now,
+      lastRefusedAt: now,
+      attentionEvent,
+      attentionDelivered: false,
+      attentionAttempts: 0,
+      lastAttentionAttemptAt: 0,
+      attentionError: undefined,
+    };
+    // D7: a re-latch after an early re-arm is the same episode, so it does not
+    // reopen the Attention item the operator already has.
+    const episode = this.#earlyRearmEpisodes.get(targetKey);
+    if (episode?.lastWasEarly && episode.attentionDelivered) latch.attentionDelivered = true;
+    this.#drainGiveUpLatches.set(targetKey, latch);
+    await this.#deliverDrainGiveUpAttention(latch);
+  }
+
+  #clearDrainRefusal(agent: string): void {
+    this.#drainRefusals.delete(agent);
+  }
+
   // ── Public API ──────────────────────────────────────────────
 
   /**
@@ -543,7 +1051,21 @@ export class SpawnRequestManager {
    * Returns the result with approval status and session info if spawned.
    */
   async evaluate(request: SpawnRequest): Promise<SpawnResult> {
+    return this.#evaluateGuarded(request);
+  }
+
+  /**
+   * Typed implementation boundary for the class-level preservation invariant.
+   *
+   * A retryable result cannot satisfy this return type unless it came from
+   * `#refuseTransiently`, whose private brand certifies use of the preservation
+   * funnel.
+   */
+  async #evaluateGuarded(request: SpawnRequest): Promise<GuardedSpawnResult> {
     const agent = request.requester.agent;
+
+    const standingRefusal = this.#config.refuseSpawn?.();
+    if (standingRefusal) return { approved: false, reason: standingRefusal };
 
     // §4.3: payload byte-size cap. Refuse oversized envelopes at admission so
     // bulk content can't hog drain-tick budget. Measured on the UTF-8 byte
@@ -562,14 +1084,11 @@ export class SpawnRequestManager {
     // §4.2: single-source cooldown check (covers cooldown AND penalty).
     const remainingMs = this.cooldownRemainingMs(agent);
     if (remainingMs > 0) {
-      if (request.context) {
-        this.#queueMessage(agent, request.context, request.pendingMessages?.[0]);
-      }
-      return {
-        approved: false,
-        reason: `Cooldown: ${Math.ceil(remainingMs / 1000)}s remaining before next spawn for ${agent}`,
-        retryAfterMs: remainingMs,
-      };
+      return this.#refuseTransiently(
+        request,
+        `Cooldown: ${Math.ceil(remainingMs / 1000)}s remaining before next spawn for ${agent}`,
+        remainingMs,
+      );
     }
 
     // Check session limits — prefer the live accessor over the constructor
@@ -582,21 +1101,22 @@ export class SpawnRequestManager {
       : this.#config.maxSessions;
     if (activeSessions.length >= liveMaxSessions) {
       if (request.priority !== 'critical' && request.priority !== 'high') {
-        return {
-          approved: false,
-          reason: `Session limit reached (${activeSessions.length}/${liveMaxSessions}). Priority ${request.priority} insufficient to override.`,
-          retryAfterMs: 60_000,
-        };
+        return this.#refuseTransiently(
+          request,
+          `Session limit reached (${activeSessions.length}/${liveMaxSessions}). Priority ${request.priority} insufficient to override.`,
+          60_000,
+        );
       }
     }
 
-    // Check memory pressure
+    // Check memory pressure. The refusal funnel preserves the payload while
+    // the transient pressure condition clears.
     if (this.#config.isMemoryPressureHigh?.()) {
-      return {
-        approved: false,
-        reason: 'Memory pressure too high for new session',
-        retryAfterMs: 120_000,
-      };
+      return this.#refuseTransiently(
+        request,
+        'Memory pressure too high for new session',
+        120_000,
+      );
     }
 
     // Subscription-quota gate (S1) — only wired when the subscription-path
@@ -606,25 +1126,46 @@ export class SpawnRequestManager {
     if (this.#config.shouldSpawnSession) {
       const quota = this.#config.shouldSpawnSession(request.priority);
       if (!quota.allowed) {
-        if (request.context) {
-          this.#queueMessage(agent, request.context, request.pendingMessages?.[0]);
-        }
-        return {
-          approved: false,
-          reason: `Subscription quota gate: ${quota.reason}`,
-          retryAfterMs: 120_000,
-        };
+        return this.#refuseTransiently(
+          request,
+          `Subscription quota gate: ${quota.reason}`,
+          120_000,
+        );
       }
     }
+
+    // Cooldown can legitimately be configured to zero, so it cannot serve as
+    // the concurrency lock. Serialize per agent explicitly: otherwise two
+    // overlapping launches can snapshot and deliver the same backlog.
+    if (this.#spawnInflightByAgent.has(agent)) {
+      return this.#refuseTransiently(
+        request,
+        `Spawn already in flight for ${agent}`,
+        1_000,
+      );
+    }
+
+    // Stamp the current payload before the first await, but do not enqueue it
+    // yet: it is already present in the launch prompt. If launch fails, the
+    // exact reserved object is inserted by sequence, preserving both its
+    // original TTL and its position ahead of later concurrent arrivals.
+    const currentReservation = request.context
+      ? this.#makeQueuedMessage(request.context, request.pendingMessages?.[0], request.receipt)
+      : undefined;
+    this.#spawnInflightByAgent.add(agent);
 
     // §4.2: failure-suppressive reservation. Stamp `lastSpawnByAgent` BEFORE
     // the async spawn, and do NOT roll back on failure. A peer that triggers
     // fast-failing spawns still pays the cooldown.
     this.#lastSpawnByAgent.set(agent, this.#nowFn());
 
+    let queuedSnapshot: QueuedSpawnMessage[] = [];
     try {
-      const queuedMessages = this.#drainQueue(agent);
-      const prompt = this.#buildSpawnPrompt(request, queuedMessages);
+      // A latched target may still prove healthy through a new inline spawn.
+      // Keep the held backlog out of that probe; on success, force-rearm refreshes
+      // it and a later drain delivers it through the preservation funnel.
+      queuedSnapshot = this.#isDrainGiveUpLatched(agent) ? [] : this.#snapshotQueue(agent);
+      const prompt = this.#buildSpawnPrompt(request, queuedSnapshot);
       const spawned = await this.#config.spawnSession(prompt, {
         model: request.suggestedModel,
         maxDurationMinutes: request.suggestedMaxDuration,
@@ -639,15 +1180,27 @@ export class SpawnRequestManager {
         // Undefined on every non-warm spawn → headless behavior unchanged.
         interactive: request.interactive,
       });
+      // spawnSession's contract is now delivery-truthful: resolution means the
+      // prompt reached a live session. Remove only the entries in this prompt;
+      // messages arriving while spawnSession was in flight remain queued.
       // Accept both the legacy bare-id return and the {sessionId, tmuxSession}
       // object form. The tmuxSession (when provided) is forwarded so callers
       // (spawnNewThread) persist the REAL tmux name as the resume entry's
       // sessionName — load-bearing for Threadline continuity.
       const sessionId = typeof spawned === 'string' ? spawned : spawned.sessionId;
       const tmuxSession = typeof spawned === 'string' ? undefined : spawned.tmuxSession;
+      // The current payload's reservation went out in this prompt too: it is not in
+      // the queue, but its receipt still has to hear about the hand-off.
+      this.#commitQueueSnapshot(
+        agent,
+        currentReservation ? [...queuedSnapshot, currentReservation] : queuedSnapshot,
+        { sessionName: tmuxSession ?? null, interactive: request.interactive === true },
+      );
 
       // Success — clear penalty state and pending retries.
       this.#clearFailureAttribution(agent);
+      await this.#forceRearmDrainGiveUp(agent);
+      this.#clearEarlyRearmEpisode(agent);
       const retryKey = this.#getRetryKey(request);
       this.#pendingRetries.delete(retryKey);
 
@@ -660,11 +1213,14 @@ export class SpawnRequestManager {
     } catch (err) {
       const cause = this.#classifyFailure(err);
       this.#applyFailureAttribution(agent, cause);
-      return {
-        approved: false,
-        reason: `Spawn failed (${cause}): ${err instanceof Error ? err.message : 'unknown error'}`,
-        retryAfterMs: 30_000,
-      };
+      return this.#refuseTransiently(
+        request,
+        `Spawn failed (${cause}): ${err instanceof Error ? err.message : 'unknown error'}`,
+        30_000,
+        currentReservation,
+      );
+    } finally {
+      this.#spawnInflightByAgent.delete(agent);
     }
   }
 
@@ -734,13 +1290,104 @@ export class SpawnRequestManager {
    * Returns true if the message was queued; false if rejected by the
    * global cap. (Per-agent truncation still queues the new entry.)
    */
-  #queueMessage(agent: string, context: string, threadId?: string): boolean {
+  #queueMessage(agent: string, context: string, threadId?: string, receipt?: SpawnQueueReceipt): boolean {
+    return this.#admitQueuedMessage(agent, this.#makeQueuedMessage(context, threadId, receipt));
+  }
+
+  /** D3: report one dead entry. A sink failure never affects the queue. */
+  #reportDropped(entry: QueuedSpawnMessage, cause: SpawnQueueDropCause): void {
+    if (!entry.receipt) return;
+    try { this.#config.onQueuedMessageDropped?.(entry.receipt, cause); } catch { /* @silent-fallback-ok — observability only */ }
+  }
+
+  /**
+   * D3: drop expired entries on a quiet queue, so expiry fires without a later
+   * arrival. Skips a latched queue, which keeps its existing hold, and a queue whose
+   * entries are reserved by an in-flight launch.
+   */
+  #pruneExpiredQueues(): void {
+    const now = this.#nowFn();
+    const maxAge = SpawnRequestManager.QUEUE_MAX_AGE_MS;
+    for (const [agent, queue] of [...this.#pendingMessages]) {
+      if (this.#isDrainGiveUpLatched(agent) || this.#spawnInflightByAgent.has(agent)) continue;
+      const valid = queue.filter((m) => now - m.receivedAt < maxAge);
+      if (valid.length === queue.length) continue;
+      for (const m of queue) {
+        if (now - m.receivedAt >= maxAge) this.#reportDropped(m, 'expired');
+      }
+      if (valid.length === 0) {
+        this.#pendingMessages.delete(agent);
+        this.#truncated.delete(agent);
+      } else {
+        this.#pendingMessages.set(agent, valid);
+      }
+    }
+  }
+
+  /**
+   * Construct queue metadata at message arrival rather than eventual
+   * admission. In-flight payloads use this to retain their original TTL and
+   * order if the launch fails after later messages have arrived.
+   */
+  #makeQueuedMessage(context: string, threadId?: string, receipt?: SpawnQueueReceipt): QueuedSpawnMessage {
+    return {
+      ...(receipt ? { receipt } : {}),
+      context,
+      threadId,
+      receivedAt: this.#nowFn(),
+      envelopeHash: computeEnvelopeHash({ context, threadId }),
+      drainAttempts: 0,
+      sequence: this.#nextQueueSequence++,
+    };
+  }
+
+  /** Admit a fully stamped payload while preserving monotonic arrival order. */
+  #admitQueuedMessage(agent: string, message: QueuedSpawnMessage): boolean {
     // §4.3 global cap: refuse new enqueues when total queued is at the
     // global limit. Computed before any local mutation.
     const maxGlobal = this.#config.maxGlobalQueued ?? DEFAULT_MAX_GLOBAL_QUEUED;
     let totalQueued = 0;
     for (const q of this.#pendingMessages.values()) totalQueued += q.length;
-    if (totalQueued >= maxGlobal) return false;
+    if (totalQueued >= maxGlobal) {
+      // A launch payload is stamped before its await and may be admitted only
+      // after a later in-flight refusal has filled the final slot. Preserve the
+      // bounded queue's chronological policy: an earlier reserved payload
+      // displaces the globally newest later arrival; an actually newer payload
+      // remains refused as before.
+      let newest: { agent: string; entry: QueuedSpawnMessage } | undefined;
+      for (const [queuedAgent, queued] of this.#pendingMessages) {
+        // A give-up latch explicitly promises to hold its backlog until
+        // re-arm. Global chronological displacement may only consider work
+        // that is not protected by that promise.
+        if (this.#isDrainGiveUpLatched(queuedAgent)) continue;
+        for (const entry of queued) {
+          if (!newest || entry.sequence > newest.entry.sequence) {
+            newest = { agent: queuedAgent, entry };
+          }
+        }
+      }
+      if (newest && message.sequence < newest.entry.sequence) {
+        const newestQueue = this.#pendingMessages.get(newest.agent);
+        const newestIndex = newestQueue?.indexOf(newest.entry) ?? -1;
+        if (newestQueue && newestIndex >= 0) {
+          newestQueue.splice(newestIndex, 1);
+          if (newestQueue.length === 0) {
+            this.#pendingMessages.delete(newest.agent);
+          }
+          this.#truncated.add(newest.agent);
+          totalQueued--;
+          this.#reportDropped(newest.entry, 'evicted');
+        }
+      }
+    }
+    if (totalQueued >= maxGlobal) {
+      // Mark the agent truncated before refusing. The preservation funnel does
+      // not surface this internal boolean, so without the marker a global-cap
+      // refusal would leave no trace. The per-agent cap below already sets it;
+      // this makes the global cap match.
+      this.#truncated.add(agent);
+      return false;
+    }
 
     let queue = this.#pendingMessages.get(agent);
     if (!queue) {
@@ -750,27 +1397,40 @@ export class SpawnRequestManager {
 
     const now = this.#nowFn();
     const maxAge = SpawnRequestManager.QUEUE_MAX_AGE_MS;
-    while (queue.length > 0 && now - queue[0].receivedAt > maxAge) {
-      queue.shift();
+    const heldByGiveUpLatch = this.#isDrainGiveUpLatched(agent);
+    queue.sort((a, b) => a.sequence - b.sequence);
+    if (!heldByGiveUpLatch) {
+      while (queue.length > 0 && now - queue[0].receivedAt > maxAge) {
+        const dead = queue.shift() as QueuedSpawnMessage;
+        this.#reportDropped(dead, 'expired');
+      }
     }
 
     // §4.2 infra soft limiter + §4.3 truncation marker.
     // Per-agent cap (degraded if soft-limited). Drop oldest on overflow.
     const cap = this.effectiveMaxQueuedPerAgent(agent);
+    if (cap <= 0) {
+      // Defensive backstop for future cap sources; effective config currently
+      // floors degraded admission at one.
+      this.#truncated.add(agent);
+      return false;
+    }
+    if (heldByGiveUpLatch && queue.length >= cap) {
+      // Existing latched work is protected. Reject the new arrival instead
+      // of silently evicting a payload the give-up marker says is held.
+      this.#truncated.add(agent);
+      return false;
+    }
     let truncatedAny = false;
     while (queue.length >= cap) {
-      queue.shift();
+      const dead = queue.shift() as QueuedSpawnMessage;
+      this.#reportDropped(dead, 'evicted');
       truncatedAny = true;
     }
     if (truncatedAny) this.#truncated.add(agent);
 
-    queue.push({
-      context,
-      threadId,
-      receivedAt: now,
-      envelopeHash: computeEnvelopeHash({ context, threadId }),
-      drainAttempts: 0,
-    });
+    queue.push(message);
+    queue.sort((a, b) => a.sequence - b.sequence);
     return true;
   }
 
@@ -779,8 +1439,14 @@ export class SpawnRequestManager {
     return this.#truncated.has(agent);
   }
 
-  /** Drain all queued messages for an agent */
-  #drainQueue(agent: string): { context: string; threadId?: string }[] {
+  /**
+   * Snapshot the currently valid queue without removing it.
+   *
+   * The snapshot stays reserved while spawnSession is in flight. This prevents
+   * another sender from consuming the temporarily freed global capacity and
+   * preserves each entry's original TTL/order if launch fails.
+   */
+  #snapshotQueue(agent: string): QueuedSpawnMessage[] {
     const queue = this.#pendingMessages.get(agent);
     if (!queue || queue.length === 0) {
       this.#truncated.delete(agent); // empty queue can't claim "truncated"
@@ -790,9 +1456,48 @@ export class SpawnRequestManager {
     const now = this.#nowFn();
     const maxAge = SpawnRequestManager.QUEUE_MAX_AGE_MS;
     const valid = queue.filter(m => now - m.receivedAt < maxAge);
-    this.#pendingMessages.delete(agent);
-    this.#truncated.delete(agent); // §4.3: drain clears the marker
-    return valid;
+    for (const m of queue) {
+      if (now - m.receivedAt >= maxAge) this.#reportDropped(m, 'expired');
+    }
+    if (valid.length === 0) {
+      this.#pendingMessages.delete(agent);
+      this.#truncated.delete(agent);
+      return [];
+    }
+    if (valid.length !== queue.length) {
+      this.#pendingMessages.set(agent, valid);
+    }
+    return [...valid];
+  }
+
+  /**
+   * Commit exactly the queue entries included in a delivered prompt.
+   *
+   * Object identity is deliberate: entries appended while spawnSession awaited
+   * may carry identical content/hash but represent separate inbound messages.
+   */
+  #commitQueueSnapshot(
+    agent: string,
+    delivered: QueuedSpawnMessage[],
+    session: { sessionName: string | null; interactive: boolean },
+  ): void {
+    if (delivered.length === 0) return;
+    // D5: every path that delivers queued messages comes through here. The watch
+    // opens and the D2 journal row moves on, before anything else can observe it.
+    for (const entry of delivered) {
+      if (!entry.receipt) continue;
+      try { this.#config.onQueuedMessageDelivered?.(entry.receipt, session); } catch { /* @silent-fallback-ok — observability only */ }
+    }
+    const queue = this.#pendingMessages.get(agent);
+    if (!queue || queue.length === 0) return;
+    const deliveredEntries = new Set(delivered);
+    const remaining = queue.filter((entry) => !deliveredEntries.has(entry));
+    if (remaining.length === 0) {
+      this.#pendingMessages.delete(agent);
+      this.#truncated.delete(agent);
+      return;
+    }
+    this.#pendingMessages.set(agent, remaining);
   }
 
   /** Get count of queued messages for an agent (for monitoring) */
@@ -811,6 +1516,7 @@ export class SpawnRequestManager {
     pendingRetries: number;
     queuedMessages: Array<{ agent: string; count: number }>;
     penalties: Array<{ agent: string; untilMs: number; consecutiveFailures: number }>;
+    drainGiveUps: Array<SpawnDrainRefusalSnapshot & { rearmRemainingMs: number }>;
   } {
     const cooldowns: Array<{ agent: string; remainingMs: number }> = [];
     for (const agent of this.#lastSpawnByAgent.keys()) {
@@ -839,11 +1545,33 @@ export class SpawnRequestManager {
       }
     }
 
+    const drainGiveUps: Array<SpawnDrainRefusalSnapshot & { rearmRemainingMs: number }> = [];
+    for (const [targetKey, latch] of this.#drainGiveUpLatches) {
+      const agent = [...this.#pendingMessages.keys()].find(a => this.#drainTargetKey(a) === targetKey) ?? targetKey;
+      const refusal = this.#drainRefusals.get(agent);
+      drainGiveUps.push({
+        agent,
+        targetKey,
+        refusalSignature: latch.refusalSignature,
+        count: refusal?.count ?? 0,
+        firstRefusedAt: refusal?.firstRefusedAt ?? latch.latchedAt,
+        lastRefusedAt: latch.lastRefusedAt,
+        latchedAt: latch.latchedAt,
+        attentionId: latch.attentionId,
+        attentionDelivered: latch.attentionDelivered,
+        attentionAttempts: latch.attentionAttempts,
+        lastAttentionAttemptAt: latch.lastAttentionAttemptAt,
+        attentionError: latch.attentionError,
+        rearmRemainingMs: Math.max(this.#drainGiveUpRearmCooldownMs() - (now - latch.lastRefusedAt), 0),
+      });
+    }
+
     return {
       cooldowns,
       pendingRetries: this.#pendingRetries.size,
       queuedMessages,
       penalties,
+      drainGiveUps,
     };
   }
 
@@ -915,6 +1643,7 @@ export class SpawnRequestManager {
   async runTick(): Promise<number> {
     if (this.#tickInflight) return 0;
     if (this.#pendingMessages.size === 0) return 0;
+    this.#pruneExpiredQueues();
     const onDrainReady = this.#config.onDrainReady;
     if (!onDrainReady) return 0;
 
@@ -924,6 +1653,11 @@ export class SpawnRequestManager {
       const readyAgents: string[] = [];
       for (const [agent, queue] of this.#pendingMessages) {
         if (queue.length === 0) continue;
+        if (this.#isDrainGiveUpLatched(agent)) {
+          await this.#maybeRetryDrainGiveUpAttention(agent);
+          await this.#maybeRearmDrainGiveUp(agent);
+          if (this.#isDrainGiveUpLatched(agent)) continue;
+        }
         if (this.cooldownRemainingMs(agent) <= tickGraceMs) {
           readyAgents.push(agent);
         }
@@ -960,10 +1694,19 @@ export class SpawnRequestManager {
 
       // Fire callbacks concurrently; one callback failure does not abort the batch.
       const results = await Promise.allSettled(
-        selected.map(agent => onDrainReady(agent).then(() => {
-          // Successful drain → reset attempt counter so next tick doesn't apply age-boost.
+        selected.map(async agent => {
+          const result = await onDrainReady(agent);
+          if (this.#isDeniedDrainResult(result)) {
+            await this.#recordDrainRefusal(agent, result.reason);
+            return;
+          }
+          // Successful drain → reset attempt/refusal counters so next tick
+          // doesn't apply age-boost or inherit a stale denial streak.
           this.#drainAttempts.delete(agent);
-        })),
+          this.#clearDrainRefusal(agent);
+          this.#clearEarlyRearmEpisode(agent);
+          await this.#maybeRearmDrainGiveUp(agent);
+        }),
       );
       // Log but don't throw on individual callback failures.
       for (let i = 0; i < results.length; i++) {
@@ -994,6 +1737,8 @@ export class SpawnRequestManager {
     maxEnvelopeBytes: number;
     maxGlobalQueued: number;
     degradedMaxQueuedPerAgent: number;
+    drainRefusalGiveUpThreshold: number;
+    drainGiveUpRearmCooldownMs: number;
     drainTickMs: number;
   } {
     return {
@@ -1001,7 +1746,12 @@ export class SpawnRequestManager {
       maxDrainsPerTick: this.#config.maxDrainsPerTick ?? DRAIN_MAX_PER_TICK_DEFAULT,
       maxEnvelopeBytes: this.#config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
       maxGlobalQueued: this.#config.maxGlobalQueued ?? DEFAULT_MAX_GLOBAL_QUEUED,
-      degradedMaxQueuedPerAgent: this.#config.degradedMaxQueuedPerAgent ?? DEGRADED_MAX_QUEUED_PER_AGENT_DEFAULT,
+      degradedMaxQueuedPerAgent: Math.max(
+        1,
+        this.#config.degradedMaxQueuedPerAgent ?? DEGRADED_MAX_QUEUED_PER_AGENT_DEFAULT,
+      ),
+      drainRefusalGiveUpThreshold: this.#drainGiveUpThreshold(),
+      drainGiveUpRearmCooldownMs: this.#drainGiveUpRearmCooldownMs(),
       drainTickMs: this.getDrainTickMs(),
     };
   }
@@ -1024,13 +1774,17 @@ export class SpawnRequestManager {
     maxEnvelopeBytes?: number;
     maxGlobalQueued?: number;
     degradedMaxQueuedPerAgent?: number;
+    drainRefusalGiveUpThreshold?: number;
+    drainGiveUpRearmCooldownMs?: number;
   }): { applied: true; tickIntervalChanged: boolean } | { applied: false; reason: string } {
     const validators: Array<[keyof typeof patch, (v: number) => boolean]> = [
       ['cooldownMs', v => v >= 0 && Number.isFinite(v)],
       ['maxDrainsPerTick', v => v >= 1 && Number.isFinite(v) && Number.isInteger(v)],
       ['maxEnvelopeBytes', v => v >= 1 && Number.isFinite(v) && Number.isInteger(v)],
       ['maxGlobalQueued', v => v >= 0 && Number.isFinite(v) && Number.isInteger(v)],
-      ['degradedMaxQueuedPerAgent', v => v >= 0 && Number.isFinite(v) && Number.isInteger(v)],
+      ['degradedMaxQueuedPerAgent', v => v >= 1 && Number.isFinite(v) && Number.isInteger(v)],
+      ['drainRefusalGiveUpThreshold', v => v >= 1 && Number.isFinite(v) && Number.isInteger(v)],
+      ['drainGiveUpRearmCooldownMs', v => v >= 0 && Number.isFinite(v) && Number.isInteger(v)],
     ];
     for (const [k, ok] of validators) {
       const v = patch[k];
@@ -1048,6 +1802,12 @@ export class SpawnRequestManager {
     if (patch.degradedMaxQueuedPerAgent !== undefined) {
       this.#config.degradedMaxQueuedPerAgent = patch.degradedMaxQueuedPerAgent;
     }
+    if (patch.drainRefusalGiveUpThreshold !== undefined) {
+      this.#config.drainRefusalGiveUpThreshold = patch.drainRefusalGiveUpThreshold;
+    }
+    if (patch.drainGiveUpRearmCooldownMs !== undefined) {
+      this.#config.drainGiveUpRearmCooldownMs = patch.drainGiveUpRearmCooldownMs;
+    }
     const newTickMs = this.getDrainTickMs();
     return { applied: true, tickIntervalChanged: oldTickMs !== newTickMs };
   }
@@ -1061,7 +1821,12 @@ export class SpawnRequestManager {
     this.#consecutiveSpawnFailures.clear();
     this.#drrDeficit.clear();
     this.#drainAttempts.clear();
+    this.#drainRefusals.clear();
+    this.#drainGiveUpLatches.clear();
+    this.#earlyRearmEpisodes.clear();
     this.#infraFailureWindow.clear();
     this.#truncated.clear();
+    this.#spawnInflightByAgent.clear();
+    this.#nextQueueSequence = 0;
   }
 }

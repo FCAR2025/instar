@@ -34,6 +34,49 @@ describe('ConfigDefaults', () => {
       expect((defaults.monitoring as any).quotaTracking).toBe(true);
     });
 
+    it('starts the script rollout with deterministic grading and preserves operator overrides', () => {
+      const initial = (getInitDefaults('managed-project').jobs as any).scriptRunners.disabledSlugs as string[];
+      expect(initial).not.toContain('llm-decision-grading');
+      expect(initial).toContain('correction-class-review-backstop');
+      expect(initial).toContain('health-check');
+      expect(initial).toContain('feedback-factory-process');
+      const existing: any = { jobs: { scriptRunners: { disabledSlugs: ['custom-job'] } } };
+      applyDefaults(existing, getMigrationDefaults('managed-project'));
+      expect(existing.jobs.scriptRunners.disabledSlugs).toEqual(['custom-job']);
+    });
+
+    it('ships the pre-admission carrier dark and backfills it without clobbering overrides', () => {
+      for (const t of ['managed-project', 'standalone'] as const) {
+        const continuation = (getInitDefaults(t).autonomousSessions as any).codexTaskContinuation;
+        expect(continuation.enabled).toBe(false);
+        expect(continuation.preparationCarrierEnabled).toBe(false);
+      }
+      const existing: any = {
+        autonomousSessions: { codexTaskContinuation: { enabled: true, preparationCarrierEnabled: true } },
+      };
+      applyDefaults(existing, getMigrationDefaults('managed-project'));
+      expect(existing.autonomousSessions.codexTaskContinuation.enabled).toBe(true);
+      expect(existing.autonomousSessions.codexTaskContinuation.preparationCarrierEnabled).toBe(true);
+      expect(existing.autonomousSessions.codexTaskContinuation.maxDurationSeconds).toBe(14400);
+    });
+
+    it('seeds the non-gating swap timeout default on init and migration without overwriting overrides', () => {
+      for (const t of ['managed-project', 'standalone'] as const) {
+        expect((getInitDefaults(t).intelligence as any).nonGatingSwapTimeoutMs).toBe(15000);
+        expect((getMigrationDefaults(t).intelligence as any).nonGatingSwapTimeoutMs).toBe(15000);
+      }
+
+      const missing: any = { intelligence: {} };
+      const { patched, changes } = applyDefaults(missing, getMigrationDefaults('managed-project'));
+      expect(patched).toBe(true);
+      expect(missing.intelligence.nonGatingSwapTimeoutMs).toBe(15000);
+      expect(changes.some((c: string) => c.includes('intelligence.nonGatingSwapTimeoutMs'))).toBe(true);
+
+      const tuned: any = { intelligence: { nonGatingSwapTimeoutMs: 22000 } };
+      applyDefaults(tuned, getMigrationDefaults('managed-project'));
+      expect(tuned.intelligence.nonGatingSwapTimeoutMs).toBe(22000);
+    });
+
     it('ships SessionReaper OFF + dry-run by default (the only kill-on-heuristic monitor)', () => {
       for (const t of ['managed-project', 'standalone'] as const) {
         const sr = (getInitDefaults(t).monitoring as any).sessionReaper;
@@ -152,6 +195,9 @@ describe('ConfigDefaults', () => {
         expect(sp.enabled).toBe(false);
         expect(sp.stage).toBe('dark');
         expect(sp.dryRun).toBe(true);
+        expect(sp.promotionModel).toBe('off');
+        expect(sp.promotionCeiling).toBe('dark');
+        expect(sp.promotionTickMs).toBe(60000);
         // Clock-skew knobs present + honor the §L2 startup invariant.
         expect(sp.clockSkewToleranceMs).toBe(300000);
         expect(sp.maxExpectedNtpDriftMs).toBe(250);
@@ -160,6 +206,8 @@ describe('ConfigDefaults', () => {
       const mig = (getMigrationDefaults('managed-project').multiMachine as any).sessionPool;
       expect(mig.enabled).toBe(false);
       expect(mig.stage).toBe('dark');
+      expect(mig.promotionModel).toBe('off');
+      expect(mig.promotionCeiling).toBe('dark');
     });
 
     it('ships threadline.a2aCheckIn (A2A Coherence Layer 4) DARK by default + migrates it', () => {

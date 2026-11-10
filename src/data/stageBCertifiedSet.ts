@@ -1,0 +1,511 @@
+/**
+ * Stage-B certified-set manifest (spec: stage-b-evidence-code-binding).
+ * Maintained ONLY by scripts/stage-b-certified-fingerprint.mjs --write, which
+ * refuses to rebind old evidence onto changed code. Every closure member is
+ * either certified (fingerprinted) or excluded with a written reason; the
+ * --check partition is fail-closed for anything new.
+ */
+export const STAGE_B_CERTIFIED_SET = {
+  "roots": [
+    "src/core/InboundDeliveryStore.ts",
+    "src/core/CodexDeliveryObserver.ts",
+    "src/core/CodexComposerAdapter.ts",
+    "src/core/CodexLifecycleProductionComposition.ts",
+    "src/core/StageBStartupReadiness.ts"
+  ],
+  "certified": [
+    "src/core/CodexComposerAdapter.ts",
+    "src/core/CodexDeliveryObserver.ts",
+    "src/core/CodexLifecycleProductionComposition.ts",
+    "src/core/InboundDeliveryStore.ts",
+    "src/core/SessionRecoveryChannel.ts",
+    "src/core/SessionRecoveryConsumer.ts",
+    "src/core/StageBStartupReadiness.ts"
+  ],
+  "excluded": [
+    {
+      "file": "src/core/AppRecordSignatures.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/IdentityStore.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/MachineIdentity.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/MobileDeviceKeys.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/NicknameAssigner.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/TeamAccessEvents.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/TeamAccessLog.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/appConversationText.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/appMediaTypes.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/keyMaterialPaths.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/pairingWords.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/messaging/outbound-credential-guard.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/permissions/TeamAccess.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/users/TeamConfinement.ts",
+      "reason": "Reached through team access on the mobile pairing service (team-roles-and-access step 2a). It is identity, phone or access-record code that runs only when a phone connects, not code the Stage-B canary exercises."
+    },
+    {
+      "file": "src/core/pipeErrorGuard.ts",
+      "reason": "Stream error listener reached through the excluded ClaudeCliIntelligenceProvider; it only stops a closed pipe becoming an uncaught exception, and has no part in the certified Codex Stage-B delivery path."
+    },
+    {
+      "file": "src/core/claudeChildAuth.ts",
+      "reason": "Claude-only helper that passes the sign-in key to claude children; a Codex launch never reads it, so it cannot change the behaviour the Stage-B evidence certifies."
+    },
+    {
+      "file": "src/monitoring/healthChoices.ts",
+      "reason": "The person's hide and ignore choices on a health problem, reached through DegradationReporter; it decides only whether a degradation is recorded or shown, and has no part in the certified Codex Stage-B delivery path."
+    },
+    {
+      "file": "src/monitoring/scrubSecrets.ts",
+      "reason": "Text scrubber reached through healthChoices for a saved problem title; pure, and no part of the certified Codex Stage-B delivery path."
+    },
+    {
+      "file": "src/monitoring/FeatureEvidenceLog.ts",
+      "reason": "Write-only evidence log reached through DegradationReporter; its calls never throw, return nothing the caller reads, and do not alter the certified Codex Stage-B delivery path."
+    },
+    {
+      "file": "src/utils/jsonl-rotation.ts",
+      "reason": "Size-based log rotation used only by the evidence log in this closure; it never throws and does not alter the certified Codex Stage-B delivery path."
+    },
+    {
+      "file": "src/permissions/SlackPrincipalResolver.ts",
+      "reason": "Slack identity lookup reached only through memory privacy from the excluded SessionManager; no delivery logic, outside the Stage-B canaried path."
+    },
+    {
+      "file": "src/permissions/types.ts",
+      "reason": "Role type declarations reached through SlackPrincipalResolver; types and constants only, outside the Stage-B canaried path."
+    },
+    {
+      "file": "src/users/MemoryAudience.ts",
+      "reason": "Pure audience rules reached through the excluded SessionManager; no delivery logic, outside the Stage-B canaried path."
+    },
+    {
+      "file": "src/users/MemoryPrivacy.ts",
+      "reason": "Memory audience state reached through the excluded SessionManager; decides a session's memory folder, not message delivery, outside the Stage-B canaried path."
+    },
+    {
+      "file": "src/scheduler/jobScriptProtocol.ts",
+      "reason": "Shared deterministic script-job output parser reached through scheduler imports; it does not alter the certified Codex Stage-B delivery path and has separate script protocol unit and lifecycle coverage"
+    },
+    {
+      "file": "src/core/machineLiveness.ts",
+      "reason": "Display-only machine-evidence derivation (trustworthy-machine-load P1) reached through MachinePoolRegistry; it gates nothing in Stage-B canaried delivery and is certified by its own suites (tests/unit/machine-liveness*.test.ts, tests/integration/machine-liveness-pool.test.ts)"
+    },
+    {
+      "file": "src/core/machineLoadReport.ts",
+      "reason": "Reporting-only load sampler + verdict table (trustworthy-machine-load P1) reached through MachinePoolRegistry; it gates nothing in Stage-B canaried delivery and is certified by its own suites (tests/unit/machine-load-report.test.ts, tests/e2e/machine-load-report-lifecycle.test.ts)"
+    },
+    {
+      "file": "src/monitoring/hostMemoryPressure.ts",
+      "reason": "cross-cutting host-memory reader shared far beyond Codex delivery (reaper, revival, load report), certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/mergeDefaults.ts",
+      "reason": "Pure shallow defaults-merge helper (no I/O, no state, no delivery logic) reached only through the excluded SessionLivenessOracle.ts; outside Stage-B canaried delivery behavior and covered by its own unit tests (tests/unit/core/mergeDefaults.test.ts)"
+    },
+    {
+      "file": "src/core/AgentRegistryPaths.ts",
+      "reason": "Shared agent registry path/test-isolation utility reached through excluded Config.ts; outside Stage-B canaried delivery behavior, with unchanged default registry location and separate registry-path tests"
+    },
+    {
+      "file": "src/core/AccountFollowMeGrants.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/AccountFollowMeSpendSlice.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/AnthropicSubscriptionRouter.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/CircuitBreakingIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/ClaudeCliIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/CodexCliIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/Config.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/CredentialAuditEmit.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/CredentialWriteFunnel.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/GateSignalDetectors.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/GeminiCliIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/InFlightSyncOpMarker.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/InstrumentAssessment.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/InteractivePoolIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/JargonDetector.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/JudgmentProvenanceLog.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/LlmCircuitBreaker.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/MessagingToneGate.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/ModelTierEscalation.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/OAuthRefresher.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/PhysicalEffectLock.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/PiCliIntelligenceProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/ProjectRoundLock.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SafeFsExecutor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SafeGitExecutor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SecretMigrator.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/SecretStore.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SessionLivenessOracle.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/SourceTreeGuard.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SpawnCapIntelligenceProvider.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/SqliteRegistry.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/StageBActivationGate.ts",
+      "reason": "release policy, not canaried delivery behavior; binding it would force irrelevant two-hour canaries for gate-policy fixes (incl. the code-binding fix itself), and it adds no adversarial protection since the manifest is equally PR-editable"
+    },
+    {
+      "file": "src/core/canonicalFeedback.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/claudeForbiddenGuard.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/decisionQualityTypes.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/deferral-floor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/devAgentGate.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/durableSecretScrub.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/dynamicMcpConfig.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/frameworkFacts.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/hostSemaphoreCore.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/hostSpawnSemaphore.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/inboundQueueConfig.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/intelligenceProviderFactory.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/internal-id-leak.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/machineCoherenceAdvert.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/machineCoherenceManifest.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/machineServesChannel.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/models.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/seamlessnessConfig.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/core/self-stop-floor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/core/types.ts",
+      "reason": "universal shared type module; changes routinely for every subsystem"
+    },
+    {
+      "file": "src/data/codexStageBReleaseEvidence.ts",
+      "reason": "the evidence itself; bound by artifactDigest, fingerprinting it would be circular"
+    },
+    {
+      "file": "src/data/provenanceCoverage.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/data/stageBCertifiedSet.ts",
+      "reason": "this manifest; self-reference would be circular"
+    },
+    {
+      "file": "src/monitoring/CredentialProvider.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/monitoring/DegradationReporter.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/monitoring/ErrorCodeExtractor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/monitoring/Redactor.ts",
+      "reason": "cross-cutting utility shared far beyond Codex delivery, certified by its own suite; binding it would re-freeze releases on unrelated churn"
+    },
+    {
+      "file": "src/providers/adapters/gemini-cli/models.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/gemini-cli/observability/geminiCapacityPolicy.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/gemini-cli/transport/geminiSpawn.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/openai-codex/errors.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/openai-codex/models.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/openai-codex/observability/eventNormalizer.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/openai-codex/transport/codexSpawn.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/openai-codex/transport/codexUsageParser.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/pi-cli/config.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/pi-cli/errors.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/pi-cli/policy.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/pi-cli/transport/oneShotCompletion.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/adapters/pi-cli/transport/piSpawn.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/capabilities.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/costAwareRouting.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/errors.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/events.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/primitives/observability/usageMeterProvider.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/primitives/transport/oneShotCompletion.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/registry.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/routing.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/providers/types.ts",
+      "reason": "LLM-provider plumbing reached through a dynamic import in a certified module; shared across every internal LLM feature and certified by its own suites — binding it would re-freeze releases on unrelated provider churn"
+    },
+    {
+      "file": "src/messaging/NotificationPreferences.ts",
+      "reason": "Confirmed Telegram notification preference replication, reached through the notification gate; it cannot change Codex composer admission, inbound delivery observation, or recovery acknowledgment certified by Stage-B."
+    },
+    {
+      "file": "src/messaging/NotificationSelectivityGate.ts",
+      "reason": "Outbound Telegram notification routing only, reached through excluded TelegramAdapter; it does not admit, observe, or acknowledge inbound Codex composer deliveries covered by the Stage-B canary."
+    },
+    {
+      "file": "src/messaging/QuietNotificationStore.ts",
+      "reason": "Local outbound Telegram quiet-feed persistence only, reached through the notification gate; it has no effect on the certified inbound Codex delivery state machine."
+    },
+    {
+      "file": "src/messaging/notificationCategories.ts",
+      "reason": "Closed outbound Telegram notification category declarations only, reached through the notification gate; no Codex composer or inbound delivery behavior."
+    },
+    {
+      "file": "src/core/upgradeAnnouncement.ts",
+      "reason": "Existing outbound release announcement front-matter parser, reached through notification category promotion; does not admit or observe inbound Codex composer deliveries certified by Stage-B."
+    },
+    {
+      "file": "src/core/SigninProfileGuard.ts",
+      "reason": "Stateless Google browser-profile ownership validation and generated native hook text, reached through the shared MCP/registry dependency graph; it does not implement the certified Codex delivery observer, composer, ledger, or recovery protocol. Its browser capability boundary is verified by dedicated unit, HTTP, and installed-hook lifecycle tests."
+    }
+  ],
+  "fingerprint": "f1aacb47b41db1f9385f30b67cd53dfe1febac2ea1e555dbd61f5002ac55512f",
+  "artifactDigest": "a2db23a95530681953ffa3002ab14e349ebf53d19be2a54c1f4afacc3aead997",
+  "fileHashes": {
+    "src/core/CodexComposerAdapter.ts": "8d4753c45f317092f3d1e8d6e5a73a875dbf046cbac20066220fa036b4f0e065",
+    "src/core/CodexDeliveryObserver.ts": "0d70e29ef427af8ceda05a2434858639b48f120edc3490a439c90c26ab450fe3",
+    "src/core/CodexLifecycleProductionComposition.ts": "a94897fbd317af61c5ea8d09da7484b2799b985ef44af2e2cc304f769fff62a4",
+    "src/core/InboundDeliveryStore.ts": "9a20293ef6cf10938718e64cae357d51c14605b17631d13c0001cb4710c1c9b2",
+    "src/core/SessionRecoveryChannel.ts": "d38b8ebc6d073008ae2d9f9109a254019813499d5d327a3ff00e4b2a72272b65",
+    "src/core/SessionRecoveryConsumer.ts": "6a00ca4993d188f1c95eaa7d156795804f00f7e10e600ea12fa2e8cd40423268",
+    "src/core/StageBStartupReadiness.ts": "92275608368d44abc98802f9a445acc6419fd57bddb8c2e4935f32961d401183"
+  },
+  "boundAt": "2026-11-05",
+  "boundBy": "echo (fresh exact-candidate certification, topic 59199, 2026-09-04)",
+  "note": "Fresh binding after the first candidate correctly failed closed on three busy-session false-unknown outcomes. Candidate cfe468dc5 then passed 50/50 deliveries over 7,213,141 ms, the full required case matrix, 30/30 responsiveness samples, and zero forbidden outcomes; its signed evidence digest is bound here. On 2026-10-27 the unrelated shared script protocol was classified as excluded; certified hashes and signed evidence are unchanged."
+} as const;
+
+export type StageBCertifiedSet = typeof STAGE_B_CERTIFIED_SET;

@@ -38,7 +38,9 @@ const LLM_CALL_RE = /\.evaluate\(\s*(prompt|systemPrompt|simplePrompt|classifier
 
 // Infrastructure that IMPLEMENTS evaluate() (the router + provider adapters) — not a
 // gate that could "fall back to a heuristic". They ARE the swap/circuit machinery.
-const EXCLUDE_RE = /IntelligenceRouter|providers[\\/]adapters[\\/]|anthropic-interactive-pool/;
+// SingleFlightProvider is also provider plumbing: it implements evaluate(),
+// refuses busy/open-breaker calls, and propagates the inner provider's errors.
+const EXCLUDE_RE = /IntelligenceRouter|SingleFlightProvider|providers[\\/]adapters[\\/]|anthropic-interactive-pool/;
 
 // Any one of these in a callsite file satisfies the standard:
 //  - DegradationReporter — the degradation is reported (not silent)
@@ -56,18 +58,25 @@ const REVIEWED_ADVISORY: Record<string, string> = {
   'threadline/WarrantsReplyGate.ts': 'fail-open returns REPLY — gates whether an A2A msg warrants a reply; benign direction (an extra reply, never a harmful action)',
   'threadline/A2ACheckInProxy.ts': 'no catch — advisory A2A check-in proxy; failure propagates to the router',
   'core/TopicIntentArcCheck.ts': 'returns {actsOn:[],contradicts:[]} — advisory intent-arc analysis, no gated action',
-  'core/UnjustifiedStopGate.ts': 'fail-open allows the stop AND emits a degradation report; gates an agent self-stop in the benign direction (let it stop)',
   'core/JobReflector.ts': 'returns null/defaults — advisory post-job reflection',
   'core/TopicIntentCapture.ts': 'returns {status:"degraded"} — explicitly marks degraded; advisory intent capture',
   'core/ProjectDriftChecker.ts': 'returns empty drift — advisory project-drift signal, no gated action',
-  'core/CompletionEvaluator.ts': 'fail-open returns met:false ("keep working") / stopAllowed:true — conservative; gates autonomous completion in the benign direction',
+  // core/CompletionEvaluator.ts REMOVED from REVIEWED_ADVISORY (llm-decision-quality-meter
+  // P7 correlation-persistence wiring): it now carries a @silent-fallback-ok marker
+  // (the persistCorrelation sink-write catch — a sink failure degrades later outcome
+  // annotation to age-out-unknown, honest; the verdict path is untouched). The
+  // "no stale entries" check below enforces this removal (it now hasMarker).
   'core/ContextualEvaluator.ts': 'routes failure through handleEvaluationError — advisory contextual evaluation',
   // core/CoherenceReviewer.ts REMOVED from REVIEWED_ADVISORY (reviewer-fail-closed-on-abstain,
   // CMT-1794): it no longer silently degrades — it now carries gating:true (the router
   // swaps before abstaining) AND tags abstains so CoherenceGate fails CLOSED on a
   // high-criticality abstain external. The "no stale entries" check below enforces this
   // removal (it now hasMarker).
-  'core/TopicIntentExtractor.ts': 'returns [] — advisory topic-intent extraction',
+  // core/TopicIntentExtractor.ts REMOVED from REVIEWED_ADVISORY
+  // (topic-awareness-three-levels CI follow-through): the provider-failure
+  // boundary now carries an @llm-fallback-ok marker beside its onDegrade metric;
+  // extraction remains advisory and cannot authorize or block an action. The
+  // "no stale entries" check below enforces this removal (it now hasMarker).
   'memory/TopicSummarizer.ts': 'returns partial results — advisory topic summary',
   'security/LLMSanitizer.ts': 'fails SAFE — default catch returns sanitized:"" (empty, the safest result); only returns original when the caller explicitly opts in',
   'providers/uxConfirm/TaskClassifier.ts': 'returns UNCLASSIFIED_PATTERN source:"fallback" — advisory task classification, explicitly fallback-marked',
@@ -76,8 +85,6 @@ const REVIEWED_ADVISORY: Record<string, string> = {
   'knowledge/TreeSynthesis.ts': 'returns {synthesis:null} — advisory knowledge synthesis',
   'monitoring/PromptGate.ts': 'returns/skips on malformed output — advisory prompt observation, no gated action',
   'monitoring/InputClassifier.ts': 'conservative default is "relay" (route to human) with a deterministic destructive-op floor BEFORE the LLM — never auto-approves on failure',
-  'monitoring/PresenceProxy.ts': 'returns early on cancelled/started — advisory presence heartbeat',
-  'messaging/slack/SlackAdapter.ts': 'fail-open returns true/[] on advisory Slack paths — no gated action',
 };
 
 function walk(dir: string): string[] {
@@ -102,6 +109,28 @@ function hasMarker(rel: string): boolean {
   const content = readFileSync(path.join(SRC, rel), 'utf8');
   return MARKERS.some((m) => content.includes(m));
 }
+
+/**
+ * Stated exceptions: a `gating: true` call that, with no model after failover, passes instead of failing
+ * closed. Not "reviewed advisory": the call does gate, so it swaps providers first. Each one must report the
+ * degradation, and is listed here with its reason so the exception stays visible.
+ */
+const STATED_FAIL_OPEN_EXCEPTIONS: Record<string, { reportedFrom: string; reason: string }> = {
+  'core/attribution/AttributionJudge.ts': {
+    reportedFrom: 'core/attribution/attributionRuntime.ts',
+    reason: 'docs/specs/attribution-paper-trail.md section 4: with no model after failover the write passes as `unchecked`, exact facts recorded, reported and counted on /attribution/status, because failing closed would block every memory write during an outage, a far worse harm than a claim the daily audit re-checks',
+  },
+};
+
+describe('stated fail-open exceptions', () => {
+  for (const [file, exception] of Object.entries(STATED_FAIL_OPEN_EXCEPTIONS)) {
+    it(`${file} swaps providers first and reports what it lets through`, () => {
+      expect(readFileSync(path.join(SRC, file), 'utf8')).toContain('gating: true');
+      expect(readFileSync(path.join(SRC, exception.reportedFrom), 'utf8')).toContain('DegradationReporter');
+      expect(exception.reason.length).toBeGreaterThan(40);
+    });
+  }
+});
 
 describe('no-silent-llm-fallback — every LLM-gating callsite is swap/fail-closed/reported or reviewed-advisory', () => {
   it('every LLM callsite carries a safety marker OR is reviewed-advisory (no new silent fallback)', () => {

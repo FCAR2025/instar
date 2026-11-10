@@ -26,6 +26,7 @@ import {
 
 let dir: string;
 let store: PendingInboundStore;
+let shadowStore: PendingInboundStore | null;
 let clock: { wall: number; mono: number };
 let deps: QueueDrainLoopDeps & {
   lossReports: Array<{ items: LossItem[]; reason: string }>;
@@ -35,7 +36,7 @@ let deps: QueueDrainLoopDeps & {
   pisCleared: string[];
   dispatchResults: Map<string, DrainDispatchResult | ((h: DrainHandover) => Promise<DrainDispatchResult>)>;
   dispatchCalls: DrainMessage[];
-  forceReplaceResult: boolean;
+  forceReplaceResult: boolean | 'rejected' | 'local';
   forceReplaceCalls: DrainMessage[];
   verdicts: Map<string, 'hold' | 'failover' | 'deliver'>;
   stopped: Set<string>;
@@ -100,6 +101,7 @@ function enqueue(sessionKey: string, messageId: string, payloadOrOpts: string | 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qdl-test-'));
   store = PendingInboundStore.open('echo', dir);
+  shadowStore = null;
   clock = { wall: Date.parse('2026-06-12T20:00:00Z'), mono: 1_000_000 };
   deps = makeDeps();
   loop = new QueueDrainLoop(deps);
@@ -107,6 +109,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  shadowStore?.close();
   store.close();
   SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'queue-drain-loop.test.ts' });
 });
@@ -123,14 +126,69 @@ describe('enqueueLive (§2.2)', () => {
     expect(out).toMatchObject({ result: 'refused', reason: 'not-lease-holder' });
   });
 
-  it('dry-run: counters only, never custody (§2.4)', () => {
+  it('dry-run: shadow custody commits and reads back without touching the live queue', () => {
     deps.qcfg.dryRun = true;
+    shadowStore = PendingInboundStore.openShadow('echo', dir);
+    deps.shadowStore = shadowStore;
     deps.verdicts.set('s', 'hold');
     const out = loop.enqueueLive({ sessionKey: 's', messageId: 'm', payload: 'x' }, 'r');
     expect(out).toMatchObject({ result: 'refused', reason: 'dry-run' });
     expect(store.getCounter('wouldEnqueue')).toBe(1);
     expect(store.getCounter('wouldHold')).toBe(1);
     expect(store.countAll()).toBe(0);
+    expect(shadowStore.countAll()).toBe(0); // proof row scrubbed after read-back
+    expect(store.dryRunShadowCustodyEvidence()).toEqual({
+      verified: 1,
+      refused: 0,
+      errors: 0,
+      recoveredAfterRestart: 0,
+      firstAttemptAt: '2026-06-12T20:00:00.000Z',
+      lastVerifiedAt: '2026-06-12T20:00:00.000Z',
+      lastErrorAt: null,
+    });
+  });
+
+  it('dry-run shadow applies the real store bounds and records a policy refusal', () => {
+    deps.qcfg = { ...deps.qcfg, dryRun: true, maxPayloadBytes: 1 };
+    shadowStore = PendingInboundStore.openShadow('echo', dir);
+    deps.shadowStore = shadowStore;
+    const out = loop.enqueueLive({ sessionKey: 's', messageId: 'm', payload: 'too-large' }, 'r');
+    expect(out).toMatchObject({ result: 'refused', reason: 'dry-run' });
+    expect(store.getCounter('wouldEnqueue')).toBe(1);
+    expect(store.getCounter('wouldRefuse')).toBe(1);
+    expect(store.dryRunShadowCustodyEvidence().refused).toBe(1);
+    expect(store.getCounter('dryRunErrors')).toBe(0);
+  });
+
+  it('dry-run remains fail-open and reports unavailable shadow custody', () => {
+    deps.qcfg.dryRun = true;
+    const out = loop.enqueueLive({ sessionKey: 's', messageId: 'm', payload: 'x' }, 'r');
+    expect(out).toMatchObject({ result: 'refused', reason: 'dry-run' });
+    expect(store.getCounter('dryRunErrors')).toBe(1);
+    expect(loop.snapshot().shadowCustody).toMatchObject({ available: false, errors: 1 });
+    expect(store.countAll()).toBe(0);
+  });
+
+  it('dry-run recovers a committed shadow row after restart as persistence evidence, never dispatching it', () => {
+    shadowStore = PendingInboundStore.openShadow('echo', dir);
+    const seeded = shadowStore.enqueue(
+      {
+        sessionKey: 's', messageId: 'crash-gap', payload: 'survived', reason: 'dry-run-shadow:r',
+        tenure: 'mac-a#1', nowIso: '2026-06-12T19:59:00.000Z', monoMs: 1,
+        bootSessionId: 'old-boot', senderEnvelope: null,
+      },
+      { maxPerSession: 50, maxTotal: 500, hardMaxTotal: 1000, maxPayloadBytes: 65536 },
+    );
+    expect(seeded.result).toBe('queued');
+    shadowStore.close();
+    shadowStore = PendingInboundStore.openShadow('echo', dir);
+    deps.qcfg.dryRun = true;
+    deps.shadowStore = shadowStore;
+
+    const recovered = new QueueDrainLoop(deps);
+    expect(recovered.snapshot().shadowCustody.recoveredAfterRestart).toBe(1);
+    expect(shadowStore.countAll()).toBe(0);
+    expect(deps.dispatchCalls).toHaveLength(0);
   });
 
   it('refusals hit the negative cache; ordering-affecting refusals counted', () => {
@@ -422,6 +480,45 @@ describe('maxAttempts → final forced re-place (§3.3)', () => {
       advance(deps.qcfg.maxBackoffMs + 1000);
       await loop.runDrainPass('test');
     }
+    expect(store.getRow(seq)?.state).toBe('expired');
+    expect(store.getRow(seq)?.terminal_reason).toBe('attempts-exhausted');
+    expect(deps.lossReports.some((r) => r.reason === 'attempts-exhausted')).toBe(true);
+  });
+});
+
+describe('maxAttempts → forced re-place lands on THIS machine (`local`)', () => {
+  function exhaust(seq: number): Promise<void> {
+    return (async () => {
+      for (let i = 0; i < deps.qcfg.maxAttempts; i++) {
+        advance(deps.qcfg.maxBackoffMs + 1000);
+        await loop.runDrainPass('test');
+      }
+      expect(store.getRow(seq)?.attempts).toBe(deps.qcfg.maxAttempts);
+    })();
+  }
+
+  it('runs ONE local dispatch under the held claim; delivered only when that dispatch delivers', async () => {
+    const seq = enqueue('s', 'm');
+    deps.dispatchResults.set('m', { kind: 'un-routable', reason: 'transferring' });
+    await exhaust(seq);
+    deps.forceReplaceResult = 'local';
+    deps.dispatchResults.set('m', { kind: 'local-delivered' });
+    const before = deps.dispatchCalls.length;
+    advance(deps.qcfg.maxBackoffMs + 1000);
+    await loop.runDrainPass('test');
+    expect(deps.forceReplaceCalls).toHaveLength(1);
+    expect(deps.dispatchCalls.length).toBe(before + 1);
+    expect(store.getRow(seq)?.state).toBe('delivered');
+  });
+
+  it('the local dispatch fails → terminal attempts-exhausted + loss notice (bounded, never silent)', async () => {
+    const seq = enqueue('s', 'm');
+    deps.dispatchResults.set('m', { kind: 'un-routable', reason: 'transferring' });
+    await exhaust(seq);
+    deps.forceReplaceResult = 'local';
+    deps.dispatchResults.set('m', { kind: 'failed', error: new Error('spawn failed') });
+    advance(deps.qcfg.maxBackoffMs + 1000);
+    await loop.runDrainPass('test');
     expect(store.getRow(seq)?.state).toBe('expired');
     expect(store.getRow(seq)?.terminal_reason).toBe('attempts-exhausted');
     expect(deps.lossReports.some((r) => r.reason === 'attempts-exhausted')).toBe(true);

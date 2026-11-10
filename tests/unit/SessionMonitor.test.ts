@@ -85,6 +85,16 @@ describe('SessionMonitor', () => {
   });
 
   describe('dead session detection', () => {
+    it('does not emit a user-notified event or delivered ledger for a quiet notice', async () => {
+      deps = createMockDeps({ getActiveTopicSessions: () => new Map([[100, 'session-a']]), isSessionAlive: () => false,
+        getTopicHistory: () => [{ text: 'hello', fromUser: true, timestamp: new Date(Date.now() - 300000).toISOString(), messageId: 7 }],
+        sendToTopic: vi.fn().mockResolvedValue({ delivered: false, recorded: true, quietId: 'monitor-q' }) });
+      monitor = new SessionMonitor(deps); const notices = vi.fn(); monitor.on('monitor:user-notified', notices);
+      await monitor.poll(); await monitor.poll();
+      expect(deps.sendToTopic).toHaveBeenCalledOnce(); expect(notices).not.toHaveBeenCalled();
+      expect((monitor as any).deadNotified.size).toBe(0);
+    });
+
     it('detects dead session when user is waiting and triggers triage + notification', async () => {
       const now = Date.now();
       deps = createMockDeps({
@@ -134,6 +144,61 @@ describe('SessionMonitor', () => {
 
       // Triage resolved it, so no user notification
       expect(events).not.toContain('notified');
+    });
+  });
+
+  describe('topic owned by another pool machine', () => {
+    function deadTopicDeps(isTopicOwnedByPeer?: (topicId: number) => boolean) {
+      const now = Date.now();
+      return createMockDeps({
+        getActiveTopicSessions: vi.fn(() => new Map([[128732, 'echo-feature-maturation']])),
+        isSessionAlive: vi.fn(() => false),
+        getTopicHistory: vi.fn(() => [
+          { text: 'Please give me the tldr', fromUser: true, timestamp: new Date(now - 11_000).toISOString() },
+        ]),
+        triggerTriage: vi.fn(async () => ({ resolved: false })),
+        ...(isTopicOwnedByPeer ? { isTopicOwnedByPeer } : {}),
+      });
+    }
+
+    it('posts no notice and runs no triage for a topic a peer owns (stale local mapping)', async () => {
+      const recovery = { checkAndRecover: vi.fn(async () => ({ recovered: false, failureType: null, message: '' })) };
+      deps = { ...deadTopicDeps(vi.fn(() => true)), sessionRecovery: recovery as any };
+      monitor = new SessionMonitor(deps);
+      await monitor.poll();
+      await monitor.poll();
+      expect(deps.sendToTopic).not.toHaveBeenCalled();
+      expect(deps.triggerTriage).not.toHaveBeenCalled();
+      expect(recovery.checkAndRecover).not.toHaveBeenCalled();
+      expect(monitor.getStatus().trackedSessions).toBe(0);
+    });
+
+    it('still notifies for a topic this machine owns', async () => {
+      deps = deadTopicDeps(vi.fn(() => false));
+      monitor = new SessionMonitor(deps);
+      await monitor.poll();
+      await monitor.poll();
+      expect(deps.sendToTopic).toHaveBeenCalledWith(128732, expect.stringContaining('session has stopped'));
+    });
+
+    it('treats an ownership lookup that throws as owned here (monitors as before)', async () => {
+      deps = deadTopicDeps(vi.fn(() => { throw new Error('registry unreadable'); }));
+      monitor = new SessionMonitor(deps);
+      await monitor.poll();
+      await monitor.poll();
+      expect(deps.triggerTriage).toHaveBeenCalled();
+    });
+
+    it('starts monitoring again once ownership returns to this machine', async () => {
+      let peerOwns = true;
+      deps = deadTopicDeps(vi.fn(() => peerOwns));
+      monitor = new SessionMonitor(deps);
+      await monitor.poll();
+      expect(deps.triggerTriage).not.toHaveBeenCalled();
+      peerOwns = false;
+      await monitor.poll();
+      await monitor.poll();
+      expect(deps.triggerTriage).toHaveBeenCalled();
     });
   });
 
@@ -409,6 +474,29 @@ describe('SessionMonitor', () => {
       vi.advanceTimersByTime(6 * 60_000);
       await monitor.poll(); // a NEW genuine death -> notify #2
       expect(deps.sendToTopic).toHaveBeenCalledTimes(2);
+    });
+
+    it('presents a previously seen boolean to the same recovery after the banner scrolls away', async () => {
+      const mockRecovery = {
+        markContextWedgedSeen: vi.fn(),
+        hasContextWedgedSeen: vi.fn(() => true),
+        checkAndRecover: vi.fn(async () => ({
+          recovered: false, deferred: true, failureType: 'context_exhaustion' as const,
+          message: 'existing recovery deferred',
+        })),
+      };
+      deps = createMockDeps({
+        getActiveTopicSessions: vi.fn(() => new Map([[203, 'session-latched']])),
+        captureSessionOutput: vi.fn(() => ''),
+        sessionRecovery: mockRecovery as any,
+      });
+      monitor = new SessionMonitor(deps, { pollIntervalSec: 60 });
+
+      await monitor.poll();
+
+      expect(mockRecovery.markContextWedgedSeen).not.toHaveBeenCalled();
+      expect(mockRecovery.hasContextWedgedSeen).toHaveBeenCalledWith(203);
+      expect(mockRecovery.checkAndRecover).toHaveBeenCalledWith(203, 'session-latched');
     });
   });
 

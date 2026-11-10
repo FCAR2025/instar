@@ -1,0 +1,26 @@
+{
+  "version": 2,
+  "slug": "memory-hygiene-store-skill",
+  "sessionId": "1d44ee68-3024-4af9-87a0-aa4ae4309356",
+  "timestamp": "2026-11-07T19:24:01.512Z",
+  "artifactPath": "upgrades/side-effects/memory-hygiene-store-skill.md",
+  "artifactSha256": "f703d4e828f54218ea6a9164c06313505417737f8b9f5102318ee2848a152cd4",
+  "coveredFiles": [
+    "docs/specs/memory-hygiene-store-skill.eli16.md",
+    "src/commands/init.ts",
+    "src/core/PostUpdateMigrator.ts",
+    "src/data/builtinSkillContent.ts",
+    "tests/fixtures/skills/memory-hygiene-pre-store.md",
+    "tests/fixtures/skills/memory-hygiene-store.md",
+    "tests/unit/memory-hygiene-store-skill.test.ts",
+    "upgrades/next/memory-hygiene-store-skill.md",
+    "upgrades/side-effects/memory-hygiene-store-skill.md"
+  ],
+  "phase": "complete",
+  "tier": 1,
+  "tierReasoning": "Skill wording change plus an idempotent content migration that only rewrites the stock old skill; a revert leaves agents on a skill that uses only existing routes. Risk floor 2 is from touching PostUpdateMigrator; declared below floor with this reason.",
+  "eli16Path": "docs/specs/memory-hygiene-store-skill.eli16.md",
+  "sideEffectsPath": "upgrades/side-effects/memory-hygiene-store-skill.md",
+  "secondPass": "not-required",
+  "reviewerConcurred": null
+}

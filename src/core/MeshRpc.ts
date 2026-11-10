@@ -26,11 +26,78 @@
 export type MachineId = string;
 
 export type MeshCommand =
+  | { type: 'notification-preference'; intent: import('../messaging/NotificationPreferences.js').NotificationPreferenceIntent }
+  | import('../messaging/telegram-origin/OriginMesh.js').OriginMeshCommand
   | { type: 'place'; session: string; machine: MachineId }
   | { type: 'claim'; session: string; epoch: number; failover?: boolean }
   | { type: 'release'; session: string; epoch: number; failover?: boolean }
   | { type: 'transfer'; session: string; target: MachineId }
+  | {
+      /** Recipient-encrypted live delivery-ledger custody carried source→target during drain. */
+      type: 'inbound-delivery-transfer';
+      session: string;
+      sourceEpoch: number;
+      transferEpoch: number;
+      transfer: import('./InboundDeliveryStore.js').EncryptedDeliveryTransfer;
+    }
   | { type: 'deliverMessage'; session: string; messageId: string; payload: unknown; ownershipEpoch: number }
+  | {
+      /** Signed cross-machine carrier into the existing A2A inbox accept boundary. */
+      type: 'a2a-inbox-deliver';
+      targetAgent: string;
+      text: string;
+      topicId: number;
+      senderAgent: string;
+      senderBotId: string;
+    }
+  | {
+      // A2A cross-machine route (docs/specs/a2a-cross-machine-route.md §2): a
+      // relay STANDBY of mine hands one send to my machine that holds the relay
+      // connection. Registered-peer class — the envelope proves a machine of
+      // mine sent it, which can already speak as the agent, so the verb adds no
+      // authority. The HANDLER is the gate: it refuses when the feature is off
+      // or when this machine is itself a standby, and otherwise runs the
+      // complete ordinary relay-send route. `inReplyTo` / `originSessionName`
+      // are deliberately NOT fields: checks keyed on the sending session ran on
+      // the sender. An older peer answers `claim-unauthorized` (today's 503).
+      type: 'a2a-relay-forward';
+      targetAgent: string;
+      /** The sender's own nickname resolution; the holder cannot re-resolve the name. */
+      resolvedFp?: string;
+      body: string;
+      messageId: string;
+      threadId?: string;
+      resend: boolean;
+      originTopicId?: number;
+      purpose?: string;
+    }
+  | {
+      // a2a-required-acknowledgment D4: a relay STANDBY hands one kinded ack to my
+      // machine holding the relay. A verb of its own, because the chat forward carries
+      // only a chat body: a mixed-version holder would send a summary as a real
+      // message. Registered-peer class; the HANDLER is the gate (feature on, holder
+      // not a standby, capability). A holder without the verb refuses it, and the
+      // standby's pending row stays pending until it expires.
+      type: 'a2a-relay-forward-ack';
+      peerFp: string;
+      ack: { kind: string; state?: string; reason?: string; refMessageIds: string[]; summary?: string };
+      text: string;
+      threadId?: string | null;
+      triggerEncrypted: boolean;
+      ackKinds?: number | null;
+    }
+  | {
+      // A2A cross-machine route §5: the relay holder asks the machine that has a
+      // topic's live session to type a reply into it. Registered-peer class —
+      // the RECEIVER decides from its own live session for the topic, injects
+      // with the confirmed paste, and never spawns or moves the topic. Replay
+      // is refused by the envelope nonce guard; each ask is one attempt.
+      type: 'a2a-topic-reply-inject';
+      topicId: number;
+      text: string;
+      messageId: string;
+      threadId: string;
+    }
   | {
       // WS1.2 drain signal (MULTI-MACHINE-SEAMLESSNESS-SPEC): the transfer
       // planner (router authority) tells the CURRENT owner of `session` to
@@ -47,9 +114,37 @@ export type MeshCommand =
       target: MachineId;
       ownershipEpoch: number;
     }
+  | {
+      // U4.4 lease hand-back offer (docs/specs/u4-4-lease-handback.md, R-r2-2):
+      // the CURRENT lease holder offers the serving lease BACK to the F4
+      // preferred captain, carrying the SIGNED, epoch-bound, TTL-bounded,
+      // SINGLE-USE consent token the target presents at acquire time (the
+      // `handbackOpts` branch of FencedLease.canAcquire). RBAC: its OWN case,
+      // default-deny — ONLY the machine currently holding the serving lease may
+      // send it (verified against the live lease, mirroring the drain verb's
+      // role-checked posture). Typed handler responses: `accept` /
+      // `declined:churn-latched` / `declined:quota` / `declined:legacy-peer`;
+      // on timeout/silence the holder KEEPS HOLDING (claim-before-release — a
+      // failed hand-back can never leave zero holders). Replay: rides the
+      // standard envelope nonce guard AND the single-use consent token — a
+      // replayed offer never re-authorizes a second claim. Version skew: an old
+      // peer without the verb fails closed (403/`no-handler`); the sender
+      // classifies that as peer-cannot-hand-back and STOPS re-offering for the
+      // episode (degrade to today's sticky behavior, never hammer an old peer).
+      type: 'handback-offer';
+      proposedEpoch: number;
+      consentToken: import('./FencedLease.js').HandbackConsentToken;
+      expiresAt: string;
+    }
   | { type: 'capacity-report' }
   | { type: 'session-status'; session?: string }
   | { type: 'secret-share'; encrypted: string }
+  // a2a-single-agent-identity §1.2 — the two AGENT-identity verbs. Structurally separate from
+  // `secret-share` (credential-class payload, signed responses, own serving refusals).
+  | { type: 'agent-identity-observe'; agentName: string; requesterNonce: string }
+  | { type: 'agent-identity-request'; agentName: string; expectedFingerprint: string; requesterNonce: string }
+  | { type: 'ssh-bootstrap-advert'; advert: import('./SshBootstrapAdvert.js').SshBootstrapAdvert }
+  | { type: 'ssh-proof-publish'; proof: import('./MutualSshVerifier.js').DirectionalSshProof }
   | {
       // WS5.2 R7a/R7(c) — per-account SPEND-SLICE renewal (account follow-me).
       // OPERATOR-MANDATE-GATED with its OWN `checkCommandRBAC` case — deliberately
@@ -178,6 +273,29 @@ export type MeshCommand =
       topics: string[];
     }
   | {
+      // Moved-conversation history (session-pool-signed-history). Read/observe class:
+      // the lease holder serves its OWN recent messages for one topic to a registered
+      // same-operator peer. Exists so a move needs no shared bearer token.
+      type: 'topic-history-pull';
+      topic: number;
+      limit?: number;
+    }
+  | {
+      // session-pool-move-nudge. Registered-peer class: "pull placements from me now". Names the
+      // claim to look for and grants nothing; ownership crosses only as signed journal entries.
+      type: 'ownership-nudge';
+      sessionKey: string;
+      epoch: number;
+      landedAt: number;
+    }
+  | {
+      // Duplicate check (session-pool-activation-at-pairing, Change 8). Read/observe class:
+      // says only whether this machine holds a live session for one conversation.
+      type: 'session-live-probe';
+      platform: string;
+      platformId: string;
+    }
+  | {
       // Working-set handoff transport (WORKING-SET-HANDOFF-SPEC §3.2).
       // Read/observe class — the FRESH manifest computed per request is the
       // allowlist (own jailed working files only; no generic file-read
@@ -189,6 +307,11 @@ export type MeshCommand =
       manifestOnly?: boolean;
       want?: { relPath: string; offset: number }[];
     }
+  // App media copying (mobile-native-chat-media §4.12). Read/observe class: serves OWN blobs that
+  // an unpurged local event references (≤ 1 MiB slices), this machine's held-hash inventory, or a
+  // nudge asking it to pull hashes a peer holds alone. The receiver verifies length and SHA-256
+  // before keeping a byte, so the verb carries reach, never authority.
+  | import('./AppMediaReplicator.js').AppMediaPullCommand
   | {
       // WS4.4 "links that survive machine boundaries"
       // (MULTI-MACHINE-SEAMLESSNESS-SPEC §WS4.4). The tunnel-fronting machine
@@ -289,7 +412,8 @@ export type RbacReason =
   | 'release-unauthorized'
   | 'drain-unauthorized'
   | 'slice-renew-unauthorized'
-  | 'mandate-deliver-unauthorized';
+  | 'mandate-deliver-unauthorized'
+  | 'handback-offer-unauthorized';
 
 export interface RbacDeps {
   /** The machine currently holding the router lease (verify-on-read, §L1), or null. */
@@ -342,6 +466,20 @@ export function checkCommandRBAC(command: MeshCommand, sender: MachineId, deps: 
       // lease-holder — may order an owner to drain; a peer (even the transfer
       // TARGET) may not.
       return isRouter ? { ok: true, reason: 'ok' } : { ok: false, reason: 'drain-unauthorized' };
+    case 'inbound-delivery-transfer':
+      // Only the live owner may hand off ledger custody. The handler additionally
+      // checks the transfer epoch and recipient-bound encrypted snapshot.
+      return deps.ownerOf(command.session) === sender
+        ? { ok: true, reason: 'ok' }
+        : { ok: false, reason: 'release-unauthorized' };
+    case 'handback-offer':
+      // U4.4 (R-r2-2): only the CURRENT lease holder may offer the lease back —
+      // verified against the live lease view, default-deny, its OWN refusal
+      // reason (mirrors the drain verb's posture). A non-holder — including the
+      // preferred captain itself — can never manufacture a hand-back offer;
+      // the LOAD-BEARING authority remains the holder-signed consent token the
+      // handler verifies at acquire time (this gate is the coarse pre-filter).
+      return isRouter ? { ok: true, reason: 'ok' } : { ok: false, reason: 'handback-offer-unauthorized' };
     case 'claim': {
       // The router's assigned target for this session, OR the router on a failover re-place.
       if (deps.placementTargetOf(command.session) === sender) return { ok: true, reason: 'ok' };
@@ -383,6 +521,7 @@ export function checkCommandRBAC(command: MeshCommand, sender: MachineId, deps: 
       return authd ? { ok: true, reason: 'ok' } : { ok: false, reason: 'mandate-deliver-unauthorized' };
     }
     case 'commitment-mutate':
+    case 'telegram-origin':
       // MUTATING verb, deliberately its OWN case (COMMITMENTS-COHERENCE-SPEC
       // §3.4/§5): any registered peer may issue it under the same-operator
       // posture — meaning RBAC adds NO authorization beyond verifyEnvelope,
@@ -396,12 +535,42 @@ export function checkCommandRBAC(command: MeshCommand, sender: MachineId, deps: 
     case 'pool-stream-ticket':
     case 'journal-sync':
     case 'working-set-pull':
+    case 'app-media-pull':
     case 'topic-profile-pull':
+    case 'topic-history-pull':
+    case 'session-live-probe':
+    case 'ownership-nudge':
     case 'commitments-sync':
+    case 'notification-preference':
     case 'preferences-sync':
     case 'state-snapshot':
     case 'pool-view-fetch':
     case 'secret-share':
+    case 'ssh-bootstrap-advert':
+    case 'ssh-proof-publish':
+    case 'a2a-inbox-deliver':
+    case 'a2a-relay-forward':
+    case 'a2a-relay-forward-ack':
+    case 'a2a-topic-reply-inject':
+    case 'agent-identity-observe':
+    case 'agent-identity-request':
+      // agent-identity-observe / agent-identity-request (a2a-single-agent-identity
+      // §1.2): registered-peer class — verifyEnvelope already proved a signed,
+      // recipient-bound, replay-safe ACTIVE sibling. The HANDLER is the real gate
+      // for `request` (typed serving refusals: not-registered, no-usable-identity,
+      // fingerprint-mismatch, requester-publishes-identity, rate-limited) and it
+      // seals the payload to the requester's REGISTRY encryption key — a key named
+      // in the body is never used.
+      // a2a-relay-forward / a2a-topic-reply-inject (a2a-cross-machine-route):
+      // registered-peer class. Both handlers are the real gate — the forward
+      // handler refuses when the feature is off or this machine is a relay
+      // standby; the inject handler acts only on its OWN live session for the
+      // topic and never spawns.
+      // Registered-peer class — any caller here has already passed signed,
+      // recipient-bound, replay-safe machine authentication. a2a-inbox-deliver
+      // gains NO content authority here: the recipient handler re-validates the
+      // target agent and dispatches through the existing A2A marker/role/bot-id
+      // allowlist boundary before accepting it.
       // Read/observe class (or e2e-encrypted) — any registered peer (already
       // proven a registered peer by verifyEnvelope). journal-sync joins this
       // class: it serves/applies own-stream coherence-journal deltas, which are
@@ -411,10 +580,16 @@ export function checkCommandRBAC(command: MeshCommand, sender: MachineId, deps: 
       // files behind a fresh-manifest allowlist (disclosure accepted for
       // registered same-operator peers, §3.1 note); the handler itself stays
       // dark unless replication is explicitly enabled (§3.7 gate).
+      // app-media-pull joins it (mobile-native-chat-media §4.12): it serves OWN
+      // blobs only while an unpurged local event references them; the puller
+      // keeps a copy only when its length and SHA-256 equal the reference.
       // topic-profile-pull joins it (TOPIC-PROFILE-SPEC §5.3): it serves OWN
       // per-topic profile entries — disclosure-only for registered
       // same-operator peers; the receiver revalidates every field (§10.2)
       // before anything persists, so the verb carries reach, not authority.
+      // topic-history-pull joins it (session-pool-signed-history): it serves OWN recent
+      // messages for one topic, the same disclosure the bearer history route makes to
+      // this agent's own machines, capped in count and size by its handler.
       // pool-view-fetch joins it (MULTI-MACHINE-SEAMLESSNESS-SPEC §WS4.4): the
       // verb is reachable by any registered peer, but its HANDLER is the real
       // gate — it serves a private view body ONLY when the carried user-auth
@@ -466,6 +641,9 @@ export interface MeshRpcDispatcherDeps {
   handlers: Partial<Record<MeshCommand['type'], MeshCommandHandler>>;
   /** Audit sink for rejections (SecurityLog). Optional. */
   onReject?: (env: MeshEnvelope, reason: string) => void;
+  /** Fires after sender-signature/freshness verification but before RBAC. Used
+   * for first-hand liveness/evidence only; it grants no command authority. */
+  onVerified?: (env: MeshEnvelope) => void;
   logger?: (msg: string) => void;
 }
 
@@ -486,6 +664,7 @@ function statusForReason(reason: string): number {
     case 'drain-unauthorized':
     case 'slice-renew-unauthorized':
     case 'mandate-deliver-unauthorized':
+    case 'handback-offer-unauthorized':
       return 403;
     case 'replayed-nonce':
     case 'stale-timestamp':
@@ -511,11 +690,18 @@ export class MeshRpcDispatcher {
   }
 
   async dispatch(env: MeshEnvelope): Promise<DispatchResult> {
-    const accept = acceptEnvelope(env, this.d.verify, this.d.rbac);
-    if (!accept.ok) {
-      this.d.onReject?.(env, accept.reason);
-      this.d.logger?.(`[mesh-rpc] rejected ${env.command?.type} from ${env.sender}: ${accept.reason}`);
-      return { ok: false, reason: accept.reason, status: statusForReason(accept.reason) };
+    const verified = verifyEnvelope(env, this.d.verify);
+    if (!verified.ok) {
+      this.d.onReject?.(env, verified.reason);
+      this.d.logger?.(`[mesh-rpc] rejected ${env.command?.type} from ${env.sender}: ${verified.reason}`);
+      return { ok: false, reason: verified.reason, status: statusForReason(verified.reason) };
+    }
+    this.d.onVerified?.(env);
+    const authorized = checkCommandRBAC(env.command, env.sender, this.d.rbac);
+    if (!authorized.ok) {
+      this.d.onReject?.(env, authorized.reason);
+      this.d.logger?.(`[mesh-rpc] rejected ${env.command?.type} from ${env.sender}: ${authorized.reason}`);
+      return { ok: false, reason: authorized.reason, status: statusForReason(authorized.reason) };
     }
     // Accepted — burn the nonce so an immediate replay is caught.
     this.d.recordNonce(env.sender, env.nonce);

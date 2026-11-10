@@ -24,6 +24,56 @@
  */
 import crypto from 'node:crypto';
 import { encryptForSync, decryptFromSync, type Secrets, type EncryptedSecretPayload } from './SecretStore.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
+
+/**
+ * Vault namespaces whose contents are deliberately machine-local.  In
+ * particular, recovery private keys are an escrow root: copying one through
+ * the ordinary peer secret-sync channel would collapse recovery continuity to
+ * the same credential/channel it is meant to survive.
+ */
+export const LOCAL_ONLY_SECRET_PREFIXES = ['machineIdentityRecovery'] as const;
+
+function isLocalOnlySecretPath(keyPath: string): boolean {
+  return LOCAL_ONLY_SECRET_PREFIXES.some((prefix) => (
+    keyPath === prefix
+    || keyPath.startsWith(`${prefix}.`)
+    || keyPath.endsWith(`.${prefix}`)
+    || keyPath.includes(`.${prefix}.`)
+  ));
+}
+
+/**
+ * Prototype agent-held Google passkeys (spec agent-held-google-passkey §6, Increment 1).
+ * These were minted on one machine and must never be copied to another, but they are a
+ * single top-level vault key (e.g. `google_passkey_echo_studio`), not a dotted namespace,
+ * so the dot-segment rule above cannot match them. A separate first-segment prefix
+ * matcher handles them.
+ */
+export const LEGACY_PASSKEY_KEY_PREFIX = 'google_passkey_';
+
+/** True when the key path's FIRST segment is a prototype passkey key. */
+export function isLegacyPasskeyPath(keyPath: string): boolean {
+  const first = keyPath.split('.')[0] ?? '';
+  return first.startsWith(LEGACY_PASSKEY_KEY_PREFIX);
+}
+
+/** Return a deep, non-mutating copy with every machine-local namespace removed. */
+export function filterSecretsForSync(secrets: Secrets, prefix = ''): Secrets {
+  const filtered: Secrets = {};
+  for (const [key, value] of Object.entries(secrets)) {
+    const keyPath = prefix ? `${prefix}.${key}` : key;
+    if (isLocalOnlySecretPath(keyPath)) continue;
+    if (isLegacyPasskeyPath(keyPath)) continue;
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const child = filterSecretsForSync(value as Secrets, keyPath);
+      if (Object.keys(child).length > 0) filtered[key] = child;
+    } else {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
 
 /** The `secret-share` mesh command payload (mirrors the MeshCommand variant). */
 export interface SecretShareCommand {
@@ -107,7 +157,7 @@ export class SecretProvisioner {
 
   /** Push the current secret set to every online peer. */
   async provisionAll(): Promise<{ machineId: string; ok: boolean; reason?: string }[]> {
-    const secrets = this.deps.secretsToSync();
+    const secrets = filterSecretsForSync(this.deps.secretsToSync());
     const peers = this.deps.listPeers();
     if (Object.keys(secrets).length === 0 || peers.length === 0) return [];
     const out: { machineId: string; ok: boolean; reason?: string }[] = [];
@@ -142,8 +192,26 @@ export class SecretShareHandler {
     },
   ) {}
 
-  /** Decrypt + store. Returns the keyPaths stored. Throws only on a malformed/foreign payload. */
-  handle(command: SecretShareCommand, sender: string): { stored: string[] } {
+  /**
+   * Decrypt + store. Returns the keyPaths stored and any prototype passkey keys dropped.
+   * Throws only on a malformed/foreign payload or a machine-local recovery namespace.
+   */
+  handle(command: SecretShareCommand, sender: string): { stored: string[]; dropped: string[] } {
+    try {
+      const result = this.handleInner(command, sender);
+      // Counts only: never a secret name or value.
+      featureEvidence.record('multiMachine.secretSync', { kind: 'fired', reason: 'secret sync received and applied', context: { sender, stored: result.stored.length, dropped: result.dropped.length } });
+      return result;
+    } catch (err) {
+      // A classified code, never err.message: the refusal message names a secret path.
+      const message = err instanceof Error ? err.message : '';
+      const code = message.includes('non-secret-share') ? 'wrong-command' : message.includes('machine-local') ? 'local-only-namespace' : 'open-or-apply-failed';
+      featureEvidence.record('multiMachine.secretSync', { kind: 'error', reason: `secret sync refused: ${code}`, context: { sender, code } });
+      throw err;
+    }
+  }
+
+  private handleInner(command: SecretShareCommand, sender: string): { stored: string[]; dropped: string[] } {
     // The legacy permissive path must be structurally unreachable for credential-class data
     // (WS5.2 R3a / §6.5): a credential rides the distinct `account-credential-share` verb +
     // `decryptAccountCredential`, never this one. Reject anything that is not a secret-share.
@@ -152,12 +220,28 @@ export class SecretShareHandler {
     }
     const payload = JSON.parse(command.encrypted) as EncryptedSecretPayload;
     const secrets = decryptFromSync(payload, this.deps.ownEncryptionPrivateKey());
+    const forbidden = secretKeyPaths(secrets).find(isLocalOnlySecretPath);
+    if (forbidden) {
+      throw new Error(`SecretShareHandler refuses machine-local secret namespace: ${forbidden}`);
+    }
     const stored: string[] = [];
+    // Prototype passkey keys from an older-build sender are dropped and audited, never
+    // stored — and the rest of the batch is still stored (spec §6 Increment 1: a
+    // mixed-version fleet must not halt ALL secret sync). A copy this machine already
+    // holds is left untouched: a receive refusal never deletes anything.
+    const dropped: string[] = [];
     for (const [keyPath, value] of Object.entries(secrets)) {
+      if (isLegacyPasskeyPath(keyPath)) {
+        dropped.push(keyPath);
+        continue;
+      }
       this.deps.store.set(keyPath, value);
       stored.push(keyPath);
     }
+    if (dropped.length > 0) {
+      this.deps.log?.(`[secret-sync] dropped ${dropped.length} prototype passkey key(s) from ${sender} (machine-local; names: ${dropped.join(', ')})`);
+    }
     this.deps.log?.(`[secret-sync] stored ${stored.length} secret(s) from ${sender}`);
-    return { stored };
+    return { stored, dropped };
   }
 }

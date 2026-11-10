@@ -27,6 +27,8 @@
  * always "speak" with zero behavior delta (spec invariant 6).
  */
 
+import { featureEvidence } from './FeatureEvidenceLog.js';
+
 export interface SpeakerElectionDeps {
   /** Dark flag: multiMachine.seamlessness.ws3OneVoice (read live per decision). */
   enabled: () => boolean;
@@ -47,6 +49,18 @@ export interface SpeakerElectionDeps {
   dwellMs?: number;
   /** Observability hook (P7): every verdict is reported, never silent. */
   onVerdict?: (topicId: number, verdict: SpeakerVerdict) => void;
+  /**
+   * Owner-liveness ENFORCE flag (speaker-election-owner-liveness Layer 1/2).
+   * Absent/false = OBSERVE-ONLY (default): a DARK placement/stamp owner still
+   * wins (today's verdict), the would-fall-through is only recorded via
+   * onOwnerLivenessObservation. True = ENFORCE: a dark owner falls THROUGH to
+   * rules 3+4 (deferred behind a soak + sustained-dark condition — ACT-1196).
+   */
+  ownerLivenessEnforce?: () => boolean;
+  /** Records a dark-owner observation (observe-only measurement surface). */
+  onOwnerLivenessObservation?: (obs: {
+    topicId: number; owner: string; self: string; rule: 1 | 2; onlinePool: string[];
+  }) => void;
   now?: () => number;
 }
 
@@ -96,6 +110,10 @@ export class SpeakerElection {
   decide(topicId: number, stampedOwner?: string | null): SpeakerVerdict {
     const v = this.decideInner(topicId, stampedOwner ?? null);
     try { this.deps.onVerdict?.(topicId, v); } catch { /* observability never gates */ }
+    if (!v.speak && !v.defer && v.reason !== 'dwell-hold') {
+      // decide() runs per emission: one row per topic and reason per hour.
+      featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws3OneVoice', `withheld|${topicId}|${v.reason}`, 60 * 60_000, { kind: 'fired', reason: `send withheld: ${v.reason}`, context: { topicId, verdict: v.reason, poolSize: this.deps.poolMachineIds().length } });
+    }
     return v;
   }
 
@@ -118,21 +136,48 @@ export class SpeakerElection {
       return { ...heldEntry.verdict, reason: 'dwell-hold' };
     }
 
-    // 1) Live placement owner wins.
+    // Owner-liveness guard (speaker-election-owner-liveness). Self is ALWAYS
+    // authoritative about its own liveness (F2: never dropped even if self's own
+    // row is momentarily stale in the local pool view).
+    const ownerLive = (owner: string): boolean => owner === self || pool.includes(owner);
+
+    // 1) Live placement owner wins — UNLESS it is dark (and enforcing).
     const liveOwner = this.deps.resolveTopicOwner(topicId);
     if (liveOwner) {
-      this.unstableSince.delete(topicId);
-      return this.hold(topicId, now, liveOwner === self
-        ? { speak: true, defer: false, reason: 'owner-self' }
-        : { speak: false, defer: false, reason: 'owner-other' });
+      if (!ownerLive(liveOwner)) {
+        // Dark owner. Record the observation regardless of mode.
+        this.deps.onOwnerLivenessObservation?.({ topicId, owner: liveOwner, self, rule: 1, onlinePool: pool });
+        // The elected speaker is offline, so this turn may go unanswered unless enforce falls through.
+        featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws3OneVoice', `dark-owner|${topicId}|${liveOwner}`, 60 * 60_000, { kind: 'error', reason: 'placement owner is offline: nobody may answer this turn', context: { topicId, owner: liveOwner, rule: 1, enforce: this.deps.ownerLivenessEnforce?.() ?? false, onlinePool: pool.length } });
+        // ENFORCE → fall THROUGH to rules 3+4 (do not return). OBSERVE (default)
+        // → verdict UNCHANGED (dark owner still wins), only measured.
+        if (!(this.deps.ownerLivenessEnforce?.() ?? false)) {
+          this.unstableSince.delete(topicId);
+          return this.hold(topicId, now, { speak: false, defer: false, reason: 'owner-other' });
+        }
+      } else {
+        this.unstableSince.delete(topicId);
+        return this.hold(topicId, now, liveOwner === self
+          ? { speak: true, defer: false, reason: 'owner-self' }
+          : { speak: false, defer: false, reason: 'owner-other' });
+      }
     }
 
-    // 2) Durable stamp fallback (a commitment's recorded owner).
+    // 2) Durable stamp fallback (a commitment's recorded owner) — same guard.
     if (stampedOwner) {
-      this.unstableSince.delete(topicId);
-      return this.hold(topicId, now, stampedOwner === self
-        ? { speak: true, defer: false, reason: 'owner-stamp-self' }
-        : { speak: false, defer: false, reason: 'owner-stamp-other' });
+      if (!ownerLive(stampedOwner)) {
+        this.deps.onOwnerLivenessObservation?.({ topicId, owner: stampedOwner, self, rule: 2, onlinePool: pool });
+        featureEvidence.recordAtMostEvery('multiMachine.seamlessness.ws3OneVoice', `dark-owner|${topicId}|${stampedOwner}`, 60 * 60_000, { kind: 'error', reason: 'stamped owner is offline: nobody may answer this turn', context: { topicId, owner: stampedOwner, rule: 2, enforce: this.deps.ownerLivenessEnforce?.() ?? false, onlinePool: pool.length } });
+        if (!(this.deps.ownerLivenessEnforce?.() ?? false)) {
+          this.unstableSince.delete(topicId);
+          return this.hold(topicId, now, { speak: false, defer: false, reason: 'owner-stamp-other' });
+        }
+      } else {
+        this.unstableSince.delete(topicId);
+        return this.hold(topicId, now, stampedOwner === self
+          ? { speak: true, defer: false, reason: 'owner-stamp-self' }
+          : { speak: false, defer: false, reason: 'owner-stamp-other' });
+      }
     }
 
     // 3) Owner unknown → fail toward speech-with-dedup. While the lease is

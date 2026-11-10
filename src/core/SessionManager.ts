@@ -1,3 +1,4 @@
+import { assertBrowserMcpProfilesSafe } from './BrowserMcpProfileGuard.js';
 /**
  * Session Manager — spawn and monitor Claude Code sessions via tmux.
  *
@@ -6,22 +7,48 @@
  * and can be monitored/reaped by the server.
  */
 
+import { isSafeSessionRef } from './claudeResumeTranscript.js';
+import { conversationRefOf, type TeamConfinement } from '../users/TeamConfinement.js';
+import type { MemoryPrivacyRecovery } from '../users/MemoryPrivacyRecovery.js';
+import { isCredentialEnvName, CLAUDE_CONFINED_PERMISSION_ARGS } from './credentialEnvNames.js';
+import { featureEvidence } from '../monitoring/FeatureEvidenceLog.js';
+import { applyMemorySessionLaunch, buildMemorySessionSettings, memorySessionInboundRoots, moveInboundFilesIntoScope, prepareSessionCurlHome } from './memorySessionPolicy.js';
+import { audienceKey, type MemoryPrivacy, type SessionPlaceInput } from '../users/MemoryPrivacy.js';
+import { isScopedAudience, memoryScopeEnvValue, type MemoryAudience, type MemoryPlace } from '../users/MemoryAudience.js';
 import { execFileSync, execFile } from 'node:child_process';
+import { isInstarSourceTree } from './SourceTreeGuard.js';
+import { AdmissionRefusedError, type AdmissionDecision, type AdmissionKind } from './workAdmission.js';
 import { promisify } from 'node:util';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID, type KeyObject } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SessionLivenessOracle, type SessionLivenessOracleConfig } from './SessionLivenessOracle.js';
+import { JOB_FAILURE_FILE_ENV, jobDeclaredFailureDir, jobDeclaredFailurePath } from '../scheduler/jobDeclaredFailure.js';
 import { resolveGhTokenFromVault } from './ghToken.js';
-import type { ReapGuard } from './ReapGuard.js';
+import type { ReapGuard, ReapKeepReason } from './ReapGuard.js';
+import { DRAINED_CLOSE_BYPASSED_REASONS, drainProcessShape, analyseTranscriptSinceBoundary } from './standDownDrain.js';
 import { clampWorkEvidence, isMidWork } from './WorkEvidence.js';
+import { confirmSessionUsageLimit } from '../monitoring/sessionUsageLimitEvidence.js';
 import { resolveFrameworkTranscriptPath } from './FrameworkSessionStore.js';
+import type { OriginSessionLaunch, OriginSessionLifecycle } from '../messaging/telegram-origin/OriginSessionRegistry.js';
+import { captureOriginHookSettings } from '../messaging/telegram-origin/OriginNativeHookProof.js';
 import { paneShowsClaudeWorking } from './claudeActivityIndicators.js';
-import { extractGeminiFinalAssistantBlock, meaningfulTail } from './paneText.js';
-import { ensureInteractiveReady } from './ensureInteractiveReady.js';
+// ONE definition, imported by both this probe and the stand-down drain predicate
+// (a leaf module, so no load-order cycle — see baselineProcessPatterns.ts).
+import { BASELINE_PROCESS_PATTERNS, CLAUDE_TOOL_SHELL_PATTERN, isMcpLauncherShell, isToolShellCommand } from './baselineProcessPatterns.js';
+import { chunkLiteralForTmux, buildLiteralSendArgs } from './tmuxLiteralSend.js';
+import { isReadyPromptTail, classifyPaneReadiness, type PaneReadiness } from './claudeReadinessProbe.js';
+import { RerouteRefusedError } from './rerouteRefusedError.js';
+import { SessionCapacityRefusedError } from './sessionCapacityRefusedError.js';
+export { RerouteRefusedError } from './rerouteRefusedError.js';
+import { initialConfinedStartupState, stepConfinedStartup, classifyConfinedStartupPane, confinedPromptLine, LOGIN_REQUIRED, showsOtherPermissionMode, CONFINED_STARTUP_BUDGET_MS, type ConfinedStartupState, type ConfinedStartupObservation } from './confinedStartupDialogs.js';
+
+const squash = (text: string): string => text.replace(/\s+/g, '');
+import { extractGeminiFinalAssistantBlock, meaningfulTail, meaningfulNonBlankTail } from './paneText.js';
+import { ensureClaudeFirstRunAnswered } from './ensureInteractiveReady.js';
 import { withSyncOp } from './InFlightSyncOpMarker.js';
 import type { DegradedTmuxGuard } from '../monitoring/DegradedTmuxGuard.js';
 
@@ -53,21 +80,43 @@ export interface SessionDiagnostics {
   suggestions: string[];
 }
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
+import { hostFreeMemPct, type MemReadDeps } from '../monitoring/hostMemoryPressure.js';
 import { detectRateLimited, nextIdleThrottleAction, RATE_LIMIT_SETTLED_CAPTURE_LINES, type ThrottleSettleState } from '../monitoring/rateLimitDetection.js';
+import { classifyIdleError } from './IdleErrorClassifier.js';
+import { classifyLoginExpired } from './LoginExpiredSignature.js';
+import { liveTail } from './paneTail.js';
+import { claudeAuthExecPrefix, removeClaudeAuthEnvFile, writeClaudeAuthEnvFile } from './claudeChildAuth.js';
+import type { InteractiveLoginExpiredSignal } from './InteractiveLoginExpiredRecovery.js';
 import { InputGuard, type TopicBinding } from './InputGuard.js';
+import { resolveIdleSinceSeed } from './idleSincePersistence.js';
 import type { InputDetector } from '../monitoring/PromptGate.js';
+import { toPaneTailLines, type PermissionPromptAutoResolver, RESOLVER_PREGATE_RE } from '../monitoring/PermissionPromptAutoResolver.js';
 
 const execFileAsync = promisify(execFile);
 import type { Session, SessionManagerConfig, SessionStatus, ModelTier } from './types.js';
 import type { IntelligenceFramework } from './intelligenceProviderFactory.js';
 import {
+  resolveBaselineServers,
+  resolveSessionMcpServers,
+  filterMcpConfig,
+  type McpJson,
+} from './dynamicMcpConfig.js';
+import {
   buildInteractiveLaunch,
   buildHeadlessLaunch,
+  withClaudeUltracodePrompt,
   claudeHeadlessExtraFlags,
   resolveInteractiveFramework,
+  resolveFrameworkBinaryPath,
+  frameworkBinaryExists,
+  headlessLaneIsClosed,
+  resolveHeadlessFallbackFramework,
+  resolveInteractiveLaunchModel,
   resolveModelForFramework,
+  computeGrokInteractiveOptIn,
 } from './frameworkSessionLaunch.js';
 import { frameworkFromEnv } from './intelligenceProviderFactory.js';
+import { codexSupportsGpt61Sol } from './codexCapabilities.js';
 import { decideSdkVsSubscription, DEFAULT_SAFETY_MARGIN_FRACTION } from '../providers/costAwareRouting.js';
 import {
   resolveCodexLaunchModelWithUsage,
@@ -79,9 +128,264 @@ import { sanitizeSenderName, sanitizeTopicName } from '../utils/sanitize.js';
 import { getTelegramInboundDir } from '../messaging/shared/telegramInboundFiles.js';
 import { SessionBuildContextStore } from './SessionBuildContextStore.js';
 import { PendingInjectStore, sweepPendingInjects } from './PendingInjectStore.js';
+import { SafeFsExecutor } from './SafeFsExecutor.js';
+import { ClaudeBinaryRetainer, resolveRetainerEnabled, type RetainerStatus } from './ClaudeBinaryRetainer.js';
+import { placeResumeTranscript } from './claudeResumeTranscript.js';
+import {
+  InboundDeliveryStore,
+  InboundDeliveryStoreUnavailableError,
+  loadOrCreateDeliveryHmacKey,
+  type EncryptedDeliveryTransfer,
+} from './InboundDeliveryStore.js';
+import type { StageBActivationStatus } from './StageBActivationGate.js';
+import { CodexDeliveryObserver, type ComposerObservation } from './CodexDeliveryObserver.js';
+import { observeCodexComposerFrame, type CodexComposerFrame } from './CodexComposerAdapter.js';
+import { createPhysicalEffectLock } from './PhysicalEffectLock.js';
+import { TrackedPhysicalEffectDispatcher } from './TrackedPhysicalEffectDispatcher.js';
 import { AgeKillBackoff } from './AgeKillBackoff.js';
+import { governor, consumeAdmissionToken } from '../monitoring/selfaction/governor.js';
+import type { DerivedTarget } from '../monitoring/selfaction/types.js';
+import { VetoedKillBackoff, normalizeReasonKey, IDLE_ZOMBIE_ESCALATION_REASONS } from './VetoedKillBackoff.js';
+import type { IncidentDedupe } from '../monitoring/IncidentDedupe.js';
+import { ensureAgentOwnedMemory, defaultClaudeConfigHome } from './AgentOwnedMemory.js';
+import { topicRef } from '../messaging/shared/topicRef.js';
+import { redactSpawnError } from './redactSpawnError.js';
+import {
+  CLAUDE_MCP_TOOL_TIMEOUT_ENV_FLAGS,
+  type ThreadlineMcpSpawnWiring,
+  type ThreadlineSpawnPlan,
+  type ThreadlineSpawnRequest,
+} from './threadlineMcpSpawn.js';
+
+/* @self-action-controller: age-kill-backoff */
+// Unified self-action backpressure (Increment B, OBSERVE-ONLY): the age-limit
+// kill request rides the SelfActionGovernor chokepoint. The handle is minted
+// ONCE at module scope (companion §2); in observe mode admit records the
+// would-verdict and always allows — behavior is unchanged until the operator
+// flips this class to enforce (FD8).
+const ageKillGov = governor.for('age-kill-backoff');
+
+/**
+ * Unforgeable, module-private authority for one machine-local cleanup path.
+ *
+ * The serving lease governs shared/cross-machine state; it cannot make a peer
+ * clean up a tmux process that physically exists only on this machine. The
+ * over-age monitor is the sole minter of this capability, and the termination
+ * authority accepts it only with the literal `age-limit` reason. It is omitted
+ * from the public terminateSession options so ordinary autonomous callers keep
+ * the lease-holder boundary unchanged.
+ */
+const LOCAL_AGE_LIMIT_REAP_CAPABILITY = Symbol('local-age-limit-reap-capability');
+const REROUTED_LIFETIME_REAP_CAPABILITY = Symbol('rerouted-lifetime-reap-capability');
+
+/**
+ * Closeout activeness bypass (docs/specs/closeout-activeness-bypass-confirmed-move.md).
+ *
+ * The SessionReaper's assertion that a liveness-CONFIRMED genuine move justified
+ * lifting the two positive-evidence activeness keep-reasons. It carries the
+ * evidence the decision rested on so the termination authority can validate the
+ * claim instead of trusting a bare boolean.
+ */
+export interface ConfirmedMoveAssertion {
+  /** The session this assertion authorizes — and ONLY this session. Without it
+   *  an assertion is a bearer token for ANY local session for its whole TTL: a
+   *  caller holding one built for topic A could pass it to terminate(sessionB),
+   *  lifting the activeness guards on a correctly-owned busy session while the
+   *  audit row named topic A's owner. Round-4 security finding. */
+  sessionId: string;
+  /** The bound topic, recorded so the audit row answers "which conversation
+   *  moved?" without a second lookup. Advisory in the decision; the sessionId
+   *  is what binds. */
+  topicId: number | null;
+  /** The remote owner the ownership record named. */
+  ownerMachineId: string;
+  /** This machine — the one holding the leftover session. */
+  selfMachineId: string;
+  /** Epoch ms of the liveness proof that backed the confirmed reading. */
+  reachableAt: number;
+  /** Epoch ms of the freshest local user message on the bound topic, or null. */
+  lastUserMessageAt: number | null;
+  /** Confirmations accumulated before the decision (the dwell). */
+  dwellTicks: number;
+  /** The dwell threshold in force when the decision was made. Carried so the
+   *  authority can check `dwellTicks >= requiredConfirmTicks` rather than merely
+   *  "some confirmation happened". The THRESHOLD ITSELF remains the reaper's
+   *  policy — this is an internal-consistency check, not an independent one. */
+  requiredConfirmTicks: number;
+  /** Epoch ms after which this assertion is stale and must be refused. */
+  expiresAt: number;
+}
+
+/**
+ * How long a confirmed-move assertion stays valid. A CODE CONSTANT, never config:
+ * a safety bound in config is a safety bound an emergency edit can silently remove
+ * (the 2026-06-05 load-shed lesson). The reaper builds and consumes the assertion
+ * in the same synchronous block, so this is generous by two orders of magnitude —
+ * it exists to refuse a delayed or replayed call, not to time normal operation.
+ */
+export const CONFIRMED_MOVE_ASSERTION_TTL_MS = 30_000;
+
+/**
+ * Slack allowed when checking the assertion's expiry against the authority's OWN
+ * ceiling. The reaper stamps `expiresAt` from its injected clock and the authority
+ * validates against `Date.now()`; in production these are the same clock, but a
+ * few milliseconds pass between the stamp and the check. Small by design: this is
+ * an allowance for the check-to-kill gap, NOT a second TTL.
+ */
+export const CONFIRMED_MOVE_CLOCK_SKEW_ALLOWANCE_MS = 2_000;
+
+/**
+ * Maximum age of the LIVENESS PROOF the assertion rests on, checked against the
+ * authority's own clock. The TTL above bounds only the reaper→authority hop; it
+ * says nothing about how old the evidence ITSELF is, and `lastUserMessageAt <=
+ * reachableAt` compares two caller-supplied values, so an arbitrarily old (or
+ * future) `reachableAt` would satisfy every other check — the same
+ * caller-vs-caller pattern already withdrawn for identity and for the expiry.
+ *
+ * Derived from the closeout liveness snapshot's own staleness bound (2x the
+ * refresh cadence, ~4 min at the default 120s tick) plus margin, and kept a CODE
+ * CONSTANT for the same reason as the TTL: loosening a safety bound must not be
+ * config-reachable. The failure it closes: the owner machine dies inside the
+ * staleness window, and the closeout kills the LAST live session for the topic
+ * on evidence that was already stale.
+ */
+export const MAX_LIVENESS_EVIDENCE_AGE_MS = 300_000;
+
+/** Machine ids are written verbatim into the world-readable reap-log and
+ *  rendered by GET /sessions/reap-log; `ownerMachineId` originates from the
+ *  peer-influenced mesh ownership registry. Clamp shape and length at the
+ *  authority rather than trusting the registry. */
+const MACHINE_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
+
+/** Why a confirmed-move assertion was refused — named, never a bare false. */
+export type ConfirmedMoveAssertionRefusal =
+  | 'malformed'
+  | 'local-identity-unknown'
+  | 'self-identity-mismatch'
+  | 'self-is-owner'
+  | 'user-message-newer-than-liveness'
+  | 'dwell-below-threshold'
+  | 'expired'
+  | 'ttl-exceeds-ceiling'
+  | 'session-mismatch'
+  | 'liveness-proof-in-future'
+  | 'liveness-proof-stale';
+
+/**
+ * Validate a confirmed-move assertion at the termination authority.
+ *
+ * This authority cannot query the ownership registry or topic-message state —
+ * importing those onto the kill path is coupling this deliberately avoids. What it
+ * CAN do is check the assertion against TRUSTED LOCAL IDENTITY, check that it is
+ * well-formed and internally consistent with the preconditions it claims, and check
+ * that it is fresh. Every failure returns a NAMED reason and denies the bypass
+ * (fail toward NOT killing).
+ *
+ * The identity checks are load-bearing, and they must compare against
+ * `actualLocalMachineId` rather than against the assertion's own fields. An earlier
+ * draft checked only `ownerMachineId !== selfMachineId` — both caller-supplied — and
+ * claimed that made a self-owned bypass "structurally impossible". It did not: a
+ * caller on the owner machine could pass `{ owner: 'other', self: 'not-this-machine' }`
+ * and satisfy it. Comparing both fields against the machine's own identity is what
+ * actually closes that hole; an unknown local identity fails CLOSED.
+ */
+export function validateConfirmedMoveAssertion(
+  assertion: unknown,
+  nowMs: number,
+  actualLocalMachineId: string | null,
+  /** The session this call is about to terminate. An assertion that does not
+   *  name THIS session is refused — it authorizes one kill, not any kill. */
+  targetSessionId?: string,
+): { ok: true; assertion: ConfirmedMoveAssertion } | { ok: false; refusal: ConfirmedMoveAssertionRefusal } {
+  if (typeof assertion !== 'object' || assertion === null) return { ok: false, refusal: 'malformed' };
+  const a = assertion as Partial<ConfirmedMoveAssertion>;
+  const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  if (typeof a.sessionId !== 'string' || a.sessionId.length === 0) return { ok: false, refusal: 'malformed' };
+  if (!(a.topicId === null || finite(a.topicId))) return { ok: false, refusal: 'malformed' };
+  // Shape-clamped, not merely non-empty: these strings land verbatim in a
+  // world-readable log and come from a peer-influenced registry.
+  if (typeof a.ownerMachineId !== 'string' || !MACHINE_ID_PATTERN.test(a.ownerMachineId)) return { ok: false, refusal: 'malformed' };
+  if (typeof a.selfMachineId !== 'string' || !MACHINE_ID_PATTERN.test(a.selfMachineId)) return { ok: false, refusal: 'malformed' };
+  if (!finite(a.reachableAt) || !finite(a.dwellTicks) || !finite(a.expiresAt)) return { ok: false, refusal: 'malformed' };
+  if (!finite(a.requiredConfirmTicks) || a.requiredConfirmTicks < 1) return { ok: false, refusal: 'malformed' };
+  if (!(a.lastUserMessageAt === null || finite(a.lastUserMessageAt))) return { ok: false, refusal: 'malformed' };
+  // Trusted-identity checks. Without a known local identity there is nothing to
+  // compare against, so the bypass is refused rather than granted on self-report.
+  if (typeof actualLocalMachineId !== 'string' || actualLocalMachineId.length === 0) {
+    return { ok: false, refusal: 'local-identity-unknown' };
+  }
+  if (a.selfMachineId !== actualLocalMachineId) return { ok: false, refusal: 'self-identity-mismatch' };
+  // A machine may never bypass on evidence naming IT as the owner.
+  if (a.ownerMachineId === actualLocalMachineId) return { ok: false, refusal: 'self-is-owner' };
+  // The freshest-interaction invariant, re-checked here rather than trusted.
+  if (a.lastUserMessageAt !== null && a.lastUserMessageAt > a.reachableAt) {
+    return { ok: false, refusal: 'user-message-newer-than-liveness' };
+  }
+  if (a.dwellTicks < a.requiredConfirmTicks) return { ok: false, refusal: 'dwell-below-threshold' };
+  if (nowMs > a.expiresAt) return { ok: false, refusal: 'expired' };
+  // The window must be bounded in BOTH directions (round-4 cross-model finding).
+  // Checking only `now <= expiresAt` enforces nothing: a caller that stamps an
+  // expiry a year out passes forever, so the TTL was a documented intention
+  // rather than an enforced bound. The authority owns the ceiling — the caller
+  // supplies the expiry, so the caller cannot be the one who bounds it. A small
+  // clock-skew allowance keeps an honest reaper from being refused when the two
+  // clocks disagree by milliseconds.
+  if (a.expiresAt > nowMs + CONFIRMED_MOVE_ASSERTION_TTL_MS + CONFIRMED_MOVE_CLOCK_SKEW_ALLOWANCE_MS) {
+    return { ok: false, refusal: 'ttl-exceeds-ceiling' };
+  }
+  // The EVIDENCE's own age, anchored to the authority's clock. Without this the
+  // freshest-interaction check is caller-field vs caller-field and an old or
+  // future `reachableAt` makes it vacuous.
+  if (a.reachableAt > nowMs + CONFIRMED_MOVE_CLOCK_SKEW_ALLOWANCE_MS) {
+    return { ok: false, refusal: 'liveness-proof-in-future' };
+  }
+  if (nowMs - a.reachableAt > MAX_LIVENESS_EVIDENCE_AGE_MS) {
+    return { ok: false, refusal: 'liveness-proof-stale' };
+  }
+  // The assertion authorizes ONE session. A caller that supplies no target gets
+  // no bypass — the binding is not optional in effect, only in signature.
+  if (typeof targetSessionId !== 'string' || a.sessionId !== targetSessionId) {
+    return { ok: false, refusal: 'session-mismatch' };
+  }
+  return { ok: true, assertion: a as ConfirmedMoveAssertion };
+}
+
+/** The canonical target derivation for the age-kill controller (companion §1):
+ *  instar session ids are stable per topic across respawns, so the session id
+ *  IS the recurrence identity — a stable key, never a per-incarnation pid. */
+export function deriveTargetKey(sessionId: string): DerivedTarget {
+  return { key: `session:${sessionId}`, classId: 'session', keyIsVolatile: false };
+}
 
 /** Absolute maximum session duration (4 hours) — safety net for sessions without explicit timeout */
+/** Sessions younger than this get their pane tail sampled each monitor tick
+ *  so a self-exit during startup leaves evidence (see `startupTails`). */
+const STARTUP_TAIL_WINDOW_MS = 120_000;
+/** How long a rerouted session must keep showing the expired-login frame before
+ *  the monitor ends it (one frame alone never ends a session). */
+const LOGIN_EXPIRED_DWELL_MS = 60_000;
+/** Interactive sessions: how often the live tail is checked for the expired-login frame
+ *  (cheaper than every 5 s tick; well inside the ~1 minute recovery budget). */
+const INTERACTIVE_LOGIN_CHECK_INTERVAL_MS = 20_000;
+/** Interactive sessions: a session still at the screen after a recovery attempt is offered
+ *  again only after this long (the recovery owns its own per-session cooldown too). */
+const INTERACTIVE_LOGIN_REPORT_RETRY_MS = 10 * 60_000;
+/** Codex sessions (codex-device-limit-tripwire §2 B): a sign-in-looking live tail held this long
+ *  asks the quota poller for ONE fresh read of the session's account. A trigger, never a verdict. */
+const CODEX_SIGNIN_TRIGGER_DWELL_MS = 60_000;
+/** At most one read request per Codex session per this window. */
+const CODEX_SIGNIN_TRIGGER_RETRY_MS = 10 * 60_000;
+/** After a request found the account working, the same tail text asks again only after this. */
+const CODEX_SIGNIN_TRIGGER_QUIET_MS = 60 * 60_000;
+/** Broad, recall-oriented: it only decides WHEN to look, never what is true. */
+const CODEX_SIGNIN_TRIGGER_RE = /device|limit|log ?in|sign ?in|signed out|logged out/i;
+/** Prepended to a topic bootstrap when its earlier conversation could not be reopened (spec §3.1, P24 in-band disclosure). */
+export const RESUME_REOPEN_FAILED_NOTE =
+  'Note: your earlier conversation in this topic could not be reopened, so you only have the recent topic messages below.';
+/** Lines captured per startup-tail sample — enough to show a menu/banner/error,
+ *  small enough to be a negligible per-tick cost. */
+const STARTUP_TAIL_LINES = 15;
+
 const DEFAULT_MAX_DURATION_MINUTES = 240;
 
 /** Age-gate transcript-activity window (ms). A session whose framework transcript
@@ -97,6 +401,19 @@ const DEFAULT_MAX_DURATION_MINUTES = 240;
  *  window is harmless (the idle-detection block below still reaps it later). */
 const AGE_GATE_TRANSCRIPT_ACTIVE_MS = 120_000;
 
+/** How long after the age gate last SAW an over-age session working it still
+ *  counts that session as working. Each age-gate verdict is one sample taken
+ *  every few seconds, and every probe has a blind moment: a coordinator that
+ *  waits on background watch loops is, for a few seconds after a watch ends,
+ *  mid-turn with no child process — and on 2026-09-29 its transcript probe was
+ *  keyed to a stale Claude session id and read nothing. One such sample
+ *  terminal-killed the Instar 2.0 coordinating session (920m, topic 52075)
+ *  two seconds after its last transcript write; its background watch (a live
+ *  child process) had ended about ten seconds earlier. The memory only renews
+ *  on a sample that reads working from the three existing probes, so a
+ *  session with no real work is age-killed this long after its last one. */
+const AGE_GATE_RECENT_WORK_MS = 10 * 60_000;
+
 /**
  * Pure age-gate idle decision — extracted so the exact 2026-06-13 incident can be
  * reproduced at the decision boundary (Bug-Fix Evidence Bar). A session past its
@@ -108,13 +425,16 @@ const AGE_GATE_TRANSCRIPT_ACTIVE_MS = 120_000;
  * OUT of the pane's process tree. The incident inputs
  * (idleAtPrompt=true, hasActiveProcs=false, transcriptActive=true) return
  * `false` ⇒ DEFERRED, not killed — which the pre-fix two-signal decision got wrong.
+ * `recentlySeenWorking` (the gate saw the session working within
+ * AGE_GATE_RECENT_WORK_MS) also defers, so one blind sample cannot kill it.
  */
 export function isAgeGateTrulyIdle(
   idleAtPrompt: boolean,
   hasActiveProcs: boolean,
   transcriptActive: boolean,
+  recentlySeenWorking = false,
 ): boolean {
-  return idleAtPrompt && !hasActiveProcs && !transcriptActive;
+  return idleAtPrompt && !hasActiveProcs && !transcriptActive && !recentlySeenWorking;
 }
 
 /** Minutes of idle-at-prompt before a non-protected session is killed */
@@ -150,7 +470,7 @@ export const IDLE_PROMPT_PATTERNS = [
  * Patterns in terminal output that indicate an API or tool error caused the session to stop.
  * When detected at the idle prompt, we nudge the session to continue instead of killing it.
  */
-const TERMINAL_ERROR_PATTERNS = [
+export const TERMINAL_ERROR_PATTERNS = [
   'API Error:',
   'invalid_request_error',
   'Could not process',
@@ -214,14 +534,6 @@ export function parseProcTimeToSeconds(raw: string): number {
  * Process names that are always running in a Claude Code session (MCP servers, etc.)
  * These do NOT indicate activity — they're background infrastructure.
  */
-const BASELINE_PROCESS_PATTERNS = [
-  /\bplaywright-mcp\b/,
-  /\bplaywright\/mcp\b/,
-  /\bmcp-stdio-entry\b/,
-  /\bmcp.*server\b/i,
-  /\bcaffeinate\b/,
-  /\bnpm exec\b.*mcp/,
-];
 
 /** Sanitize a string for use as part of a tmux session name. */
 function sanitizeSessionName(name: string): string {
@@ -238,7 +550,11 @@ export interface SessionManagerEvents {
    * immediate single-nudge is deliberately skipped for this case.
    */
   rateLimitedAtIdle: [sessionName: string];
+  inboundDeliveryNotice: [notice: import('./InboundDeliveryStore.js').InboundDeliveryNotice];
+  codexObserverSustainedFailure: [episode: { episodeId: string; nextAttemptAt: number }];
 }
+
+class StageBInactiveError extends Error {}
 
 /**
  * Tri-state outcome of a hot-path tmux call (tmux-event-loop-resilience §A).
@@ -258,6 +574,19 @@ type TmuxOutcome =
  *  off-path/test caller) keep today's behavior byte-for-byte: tmuxAsyncEnabled
  *  defaults false ⇒ the legacy sync hot path runs unchanged. */
 export interface SessionManagerOptions {
+  /** Resolved once at boot. Absence/inactive preserves the legacy injection path byte-for-byte. */
+  stageBActivation?: StageBActivationStatus;
+  localMachineId?: () => string;
+  ownerEpochForConversation?: (conversationId: string) => number;
+  /** Exact rollout resolver. Production derives it from the incarnation-bound
+   * session id; tests may supply an isolated captured rollout fixture. */
+  codexRolloutPathForSession?: (session: Session) => string | null;
+  /** Test seam proving the production writer's verified-open failure keeps
+   * Stage B typed-dark. Production always uses InboundDeliveryStore.open. */
+  openInboundDeliveryStoreForTesting?: (stateDir: string) => InboundDeliveryStore;
+  inboundDeliveryStoreOptions?: import('./InboundDeliveryStore.js').InboundDeliveryStoreOptions;
+  /** Independently dark recovery authority composition status. */
+  stageCRecoveryEnabled?: boolean;
   /** (A) — when true, monitorTick drives the bounded async tmux hot-path twins
    *  and isSessionAliveAsync returns tri-state. Resolved server-side via
    *  resolveDevAgentGate(monitoring.tmuxResilience.asyncHotPath.enabled). */
@@ -280,15 +609,171 @@ export interface SessionManagerOptions {
    *  resolveDevAgentGate(monitoring.idleThrottleSettleGate.enabled). Absent ⇒ legacy
    *  immediate emit, unchanged. */
   idleThrottleSettleGate?: boolean;
+  /** Idle-zombie veto-backoff ledger (session-respawn-thrash Fix A). Resolved
+   *  server-side via resolveDevAgentGate(monitoring.idleKillVetoBackoff.enabled).
+   *  DISABLED CONTRACT (C1): when `enabled !== true` the `idleKillBackoff` ledger
+   *  is never constructed and never consulted — the idle-zombie branch falls
+   *  through to its exact prior per-tick behavior. `cooldownMs: 0` is
+   *  enabled-but-no-cooldown (R4-5), NOT a disable. */
+  idleKillVetoBackoff?: { enabled: boolean; cooldownMs: number; escalateAfterEpisodes: number };
+  /** Coordinator/mesh identity machine id for the per-machine
+   *  SessionBuildContextStore re-key (standby-write-reconciliation §3.3).
+   *  A GETTER because the mesh identity resolves after SessionManager
+   *  construction at server boot. Absent/null ⇒ the literal 'local'. */
+  buildContextMachineId?: () => string | null;
+  /** Birth-time capability handoff. The trusted terminate closure is delivered
+   *  while this manager is constructed; no later public getter or binder exists. */
+  bindTerminateAuthority?: (authority: SessionTerminateAuthority) => void;
+  /** Test-only birth-time observation seam for the maintenance workflow. The
+   *  authority-bearing tick itself remains a JS-private method and never appears
+   *  on a live manager's runtime prototype. Production boot does not request it. */
+  bindMaintenanceTickForTesting?: (tick: () => Promise<void>) => void;
+}
+
+export interface SessionTerminateAuthorityOptions {
+  finalStatus?: 'completed' | 'killed';
+  disposition?: 'terminal' | 'recovery-bounce';
+  origin?: 'operator' | 'autonomous';
+  via?: string;
+  knownDead?: boolean;
+  bypassRecoveryFlag?: boolean;
+  bypassActiveProcessKeep?: boolean;
+  bypassRecentUserMessageForConfirmedMove?: boolean;
+  /**
+   * The DRAINED close of a duplicate-session stand-down
+   * (docs/specs/duplicate-session-standdown.md §Drained-close). A CLAIM, not an
+   * authorization: this authority independently confirms the session really is a
+   * DRAINED stand-down against its own registry probe, and then applies its OWN
+   * frozen bypass list. The caller never supplies a reason set — a caller-supplied
+   * bypass set would be exactly the blanket activeness bypass round-4 review
+   * rejected, wearing a different name.
+   */
+  standDownDrainedClose?: boolean;
+  /** Trusted SessionReaper assertion after ownership/liveness/dwell clears. */
+  localPostTransferCloseout?: boolean;
+  /**
+   * Trusted assertion from the topic-transfer drain (SessionDrainRunner): this
+   * close retires the local copy of a topic that is moving to another machine.
+   * Lifts the `standing-session` keep (a standing coordinator must not stay
+   * live on both machines), the `recent-user-message` keep (the conversation
+   * continues on the target, so the user's latest message is no reason to keep
+   * this copy), and the lease-holder gate (the owner closing its OWN copy on a
+   * fenced drain order — the old owner is usually not the lease holder). Every
+   * other keep-guard is still re-checked; a refusal aborts the transfer.
+   */
+  topicTransferClose?: boolean;
+  workEvidence?: string[];
+}
+
+export type SessionTerminateAuthority = (
+  sessionId: string,
+  reason: string,
+  opts?: SessionTerminateAuthorityOptions,
+) => Promise<{ terminated: boolean; skipped?: string }>;
+
+/** The late verdict of a `queued-busy` injection — see `watchQueuedInjection`. */
+export type InjectionSettlement = 'submitted' | 'stuck' | 'ceiling' | 'session-gone';
+
+/** The observed outcome of a confirmed paste — see `injectPasteNotificationObserved`. */
+export type InjectionConfirmation =
+  | { state: 'submitted' }
+  | { state: 'stuck' }
+  | { state: 'queued-busy'; settle: () => Promise<InjectionSettlement> };
+
+/**
+ * The claude-code confinement adapter's permission + environment half, shared by the headless and
+ * the rerouted-interactive lanes so the two can never drift (spec "Shared adapter"): drop
+ * `--dangerously-skip-permissions`, add the confined permission args (before `-p` when present),
+ * assert both, and start the CLI from an empty environment plus an allowlist (`env -i`).
+ * Returns the tmux `-e` flags for the attempt temp directory.
+ */
+export function applyClaudeConfinement(argv: string[], confinement: { tmpDir: string }, ids: { sessionId: string; tmuxSession: string }, configDir: string | undefined): string[] {
+  const envFlags = ['-e', `CLAUDE_CODE_TMPDIR=${confinement.tmpDir}`, '-e', `TMPDIR=${confinement.tmpDir}`];
+  const dangerous = argv.indexOf('--dangerously-skip-permissions');
+  if (dangerous >= 0) argv.splice(dangerous, 1);
+  const dashP = argv.indexOf('-p');
+  argv.splice(dashP > 0 ? dashP : argv.length, 0, ...CLAUDE_CONFINED_PERMISSION_ARGS);
+  if (argv.includes('--dangerously-skip-permissions') || !argv.includes('dontAsk')) {
+    throw new Error('confinement-adapter-missing: the confined permission mode was not applied');
+  }
+  // Start the confined CLI from an EMPTY environment plus an allowlist (`env -i`): nothing the
+  // tmux server or this process carries (credentials under any name) reaches the session.
+  const allow: Record<string, string | undefined> = {
+    PATH: process.env.PATH, HOME: process.env.HOME, USER: process.env.USER, LOGNAME: process.env.LOGNAME, SHELL: process.env.SHELL,
+    LANG: process.env.LANG, LC_ALL: process.env.LC_ALL, TERM: process.env.TERM ?? 'xterm-256color',
+    CLAUDE_CONFIG_DIR: configDir,
+    CLAUDE_CODE_TMPDIR: confinement.tmpDir, TMPDIR: confinement.tmpDir,
+    INSTAR_SESSION_ID: ids.sessionId, INSTAR_SESSION_NAME: ids.tmuxSession,
+  };
+  const pairs = Object.entries(allow).filter((e): e is [string, string] => typeof e[1] === 'string' && e[1] !== '' && !isCredentialEnvName(e[0])).map(([k, v]) => `${k}=${v}`);
+  argv.unshift('/usr/bin/env', '-i', ...pairs);
+  return envFlags;
+}
+
+/**
+ * Tool confinement without an OS sandbox (job-cost-reduction §5.6.2, triage sessions): drop
+ * `--dangerously-skip-permissions`, add the confined permission form with `--tools <list>` (before
+ * `-p` when present), and assert it. The caller also passes `--allowedTools <list>` (so `dontAsk`
+ * permits exactly those tools) and `--strict-mcp-config --mcp-config {}` (no MCP servers load).
+ * Throws when the mode was not applied, so a spawn can never silently run with full permissions.
+ */
+export function applyClaudeToolConfinement(argv: string[], tools: string[]): void {
+  if (tools.length === 0 || tools.some((t) => !/^[A-Za-z][A-Za-z0-9_]*$/.test(t))) {
+    throw new Error('confined-tools-invalid: tool names must be plain identifiers');
+  }
+  const form: string[] = [...CLAUDE_CONFINED_PERMISSION_ARGS];
+  const toolsAt = form.indexOf('--tools');
+  form[toolsAt + 1] = tools.join(',');
+  let dangerous = argv.indexOf('--dangerously-skip-permissions');
+  while (dangerous >= 0) { argv.splice(dangerous, 1); dangerous = argv.indexOf('--dangerously-skip-permissions'); }
+  const dashP = argv.indexOf('-p');
+  argv.splice(dashP > 0 ? dashP : argv.length, 0, ...form);
+  const at = argv.indexOf('--tools');
+  if (argv.includes('--dangerously-skip-permissions') || !argv.includes('dontAsk') || at < 0 || argv[at + 1] !== tools.join(',')
+    || !argv.includes('--strict-mcp-config')) {
+    throw new Error('confined-tools-adapter-missing: the confined permission mode was not applied');
+  }
+}
+
+interface MemorySessionPlan {
+  audience: MemoryAudience;
+  placeKey: string | null;
+  dropResume: boolean;
+  scopeDir: string | null;
+  settingsPath: string | null;
+}
+
+/** A session that must run inside the boundary cannot, here. Never run it unprotected. */
+export class MemoryPrivacyUnavailableError extends Error {
+  constructor(framework: string) {
+    super(`memory-privacy-unavailable: no working sandbox for ${framework}`);
+    this.name = 'MemoryPrivacyUnavailableError';
+  }
 }
 
 export class SessionManager extends EventEmitter {
+  private pendingHeadlessSpawns = 0;
+  private pendingScheduledSpawns = 0;
   private config: SessionManagerConfig;
   private state: StateManager;
   private monitorInterval: ReturnType<typeof setInterval> | null = null;
   private monitoringInProgress = false;
   private inputGuard: InputGuard | null = null;
   private registryPath: string | null = null;
+
+  /**
+   * Duplicate-session stand-down drain probe (docs/specs/duplicate-session-standdown.md).
+   * Wired at boot to the StandDownRegistry; ABSENT means the feature is dark, and
+   * an absent probe grants nothing — a `standDownDrainedClose` claim without a
+   * probe that answers `true` gets no bypass at all.
+   */
+  private standDownDrainProbe: ((tmuxSession: string) => boolean) | null = null;
+
+  /** Wire the stand-down drain probe. Called once at boot by the composition
+   *  root; there is deliberately no way to set it from a request path. */
+  setStandDownDrainProbe(probe: ((tmuxSession: string) => boolean) | null): void {
+    this.standDownDrainProbe = probe;
+  }
 
   /** Track when each session was first seen idle at the Claude prompt. Key = session ID */
   private idlePromptSince = new Map<string, number>();
@@ -317,13 +802,230 @@ export class SessionManager extends EventEmitter {
    * output, which for a busy codex session happens while the draft is still
    * stranded. This map clears only when the marker actually leaves the prompt,
    * so it survives a long busy turn. */
-  private strandedDraftMarkers = new Map<string, { marker: string; framework: string; injectedAt: number }>();
+  private strandedDraftMarkers = new Map<string, {
+    marker: string; framework: string; injectedAt: number; deliveryId?: string; conversationId?: string;
+  }>();
 
   /** Throttle stale session cleanup to every 5 minutes */
   private lastCleanupAt = 0;
 
   /** Optional callback to check if a session has active subagents (prevents false zombie kills) */
   private subagentChecker?: (session: Session) => boolean;
+  private originLifecycle?: OriginSessionLifecycle;
+
+  /** Production wires the preparation-only token authority before any new launch. */
+  setOriginLifecycle(lifecycle: OriginSessionLifecycle): void { this.originLifecycle = lifecycle; }
+
+  /**
+   * The persisted transport tag for a session (threadline-mcp-local-http D4). Only a
+   * plan the wiring actually made is recorded; a stripped spawn records nothing.
+   */
+  private threadlineTransportTag(plan: ThreadlineSpawnPlan): { threadlineMcpTransport?: 'http' | 'stdio' } {
+    if (plan.transport === 'http') return { threadlineMcpTransport: 'http' };
+    if (['not-wired', 'not-applicable', 'stripped', 'plan-failed', 'framework-unsupported'].includes(plan.reason)) return {};
+    return { threadlineMcpTransport: 'stdio' };
+  }
+
+  /**
+   * Headless lane plan (threadline-mcp-local-http D2/D3): a stripped spawn (no agent
+   * authority, confined, or an empty strict MCP config) is never offered the HTTP
+   * entry. Codex is only re-wired where today's per-spawn stdio override applies.
+   */
+  private planHeadlessThreadlineMcp(
+    framework: IntelligenceFramework,
+    binaryPath: string,
+    options: { omitAuthEnv?: boolean; confinement?: unknown; disableProjectMcp?: boolean; confinedTools?: string[]; accountPin?: { configHome: string } },
+  ): ThreadlineSpawnPlan {
+    if (!(framework === 'claude-code' || (framework === 'codex-cli' && !!this.config.codexThreadlineMcp))) {
+      return { transport: 'stdio', reason: 'not-applicable', secretEnvFlags: [] };
+    }
+    return this.planThreadlineMcp({
+      framework,
+      binaryPath,
+      knownVersion: this.claudeLaunchVersions.get(binaryPath) ?? null,
+      stripped: Boolean(options.omitAuthEnv) || Boolean(options.confinement)
+        || Boolean(options.disableProjectMcp) || Boolean(options.confinedTools),
+      codexHome: options.accountPin && framework === 'codex-cli' ? options.accountPin.configHome : process.env.CODEX_HOME,
+    });
+  }
+
+  /**
+   * Interactive lane plan (threadline-mcp-local-http D3). This lane has no stripped
+   * mode. Claude Code: dynamic MCP's per-topic strict config wins (its threadline
+   * entry is replaced by the HTTP one); otherwise the stable per-agent file,
+   * non-strict. Returns the plan, the claude MCP flags and the session tag.
+   */
+  private planInteractiveThreadlineMcp(
+    framework: IntelligenceFramework,
+    binaryPath: string,
+    options: { telegramTopicId?: number; configHome?: string } | undefined,
+  ): { plan: ThreadlineSpawnPlan; mcpFlags: string[]; tag: { threadlineMcpTransport?: 'http' | 'stdio' } } {
+    const plan: ThreadlineSpawnPlan =
+      framework === 'claude-code' || (framework === 'codex-cli' && !!this.config.codexThreadlineMcp)
+        ? this.planThreadlineMcp({
+            framework,
+            binaryPath,
+            knownVersion: this.claudeLaunchVersions.get(binaryPath) ?? null,
+            stripped: false,
+            codexHome: framework === 'codex-cli' ? (options?.configHome ?? process.env.CODEX_HOME) : undefined,
+          })
+        : { transport: 'stdio', reason: 'not-applicable', secretEnvFlags: [] };
+    const out: { threadline?: 'http' | 'stdio' | 'absent' } = {};
+    const dynamicFlags = this.buildSessionMcpFlags(options?.telegramTopicId, framework, {
+      ...(plan.transport === 'http' && plan.claudeEntry ? { httpEntry: plan.claudeEntry } : {}),
+      out,
+    });
+    let mcpFlags = dynamicFlags;
+    let tag = this.threadlineTransportTag(plan);
+    if (framework === 'claude-code') {
+      if (dynamicFlags.length > 0) {
+        // The resolved lean set decides: HTTP entry swapped in, stdio entry kept, or none.
+        tag = out.threadline === 'http' ? { threadlineMcpTransport: 'http' }
+          : out.threadline === 'stdio' ? this.threadlineTransportTag(plan)
+            : {};
+      } else if (plan.transport === 'http' && plan.claudeConfigPath) {
+        mcpFlags = ['--mcp-config', plan.claudeConfigPath];
+      }
+    }
+    return { plan, mcpFlags, tag };
+  }
+
+  /** Late-bind the Threadline MCP spawn wiring (server.ts, after Threadline boots). */
+  setThreadlineMcpWiring(wiring: ThreadlineMcpSpawnWiring | null): void { this.threadlineMcpWiring = wiring; }
+
+  /**
+   * The Threadline MCP plan for one spawn. Never throws and never waits: any
+   * failure (or no wiring) is today's stdio behaviour with no secret.
+   */
+  private planThreadlineMcp(req: ThreadlineSpawnRequest): ThreadlineSpawnPlan {
+    if (!this.threadlineMcpWiring) return { transport: 'stdio', reason: 'not-wired', secretEnvFlags: [] };
+    try {
+      return this.threadlineMcpWiring.planSpawn(req);
+    } catch (err) {
+      console.warn(`[SessionManager] Threadline MCP spawn plan failed (stdio): ${err instanceof Error ? err.message : String(err)}`);
+      return { transport: 'stdio', reason: 'plan-failed', secretEnvFlags: [] };
+    }
+  }
+
+  /** Existing processes survive a server update. Publish their new preparation
+   * credential into their own tmux environment, which the refreshed relay reads.
+   * Do not infer a legacy record's harness from the current topic defaults.
+   */
+  async enrollExistingOriginSessions(): Promise<{ enrolled: number; unavailable: string[] }> {
+    if (!this.originLifecycle) throw new Error('Origin lifecycle unavailable');
+    let enrolled = 0;
+    const unavailable: string[] = [];
+    for (const session of this.state.listSessions().filter(s => s.status === 'running')) {
+      if (!session.framework || !await this.isSessionAliveAsync(session.tmuxSession)) { unavailable.push(session.id); continue; }
+      try {
+        const token = await this.originLifecycle.issue({ sessionId: session.id, harnessId: session.framework,
+          projectDir: session.cwd ?? this.config.projectDir, configuredModel: session.model,
+          nativeSessionId: session.claudeSessionId,
+          configHome: await this.existingOriginConfigHome(session.tmuxSession, session.framework) });
+        await promisify(execFile)(this.config.tmuxPath,
+          ['set-environment', '-t', `=${session.tmuxSession}`, 'INSTAR_ORIGIN_TOKEN', token], { timeout: 5000 });
+        enrolled++;
+      } catch {
+        // @silent-fallback-ok — revoke preparation authority and return this
+        // session in unavailable; server startup logs the enrollment failures.
+        this.revokeOriginSession(session.id);
+        unavailable.push(session.id);
+      }
+    }
+    return { enrolled, unavailable };
+  }
+
+  /** Re-enrollment must retain the running process's account home, not the
+   * restarted server's current launch defaults. Read only the relevant tmux
+   * environment key; never expose the session's other environment values. */
+  private async existingOriginConfigHome(tmuxSession: string, harness: string): Promise<string | undefined> {
+    if (harness === 'pi-cli') return this.originConfigHome(harness, {});
+    const key = ({ 'claude-code': 'CLAUDE_CONFIG_DIR', 'codex-cli': 'CODEX_HOME',
+      'gemini-cli': 'GEMINI_CLI_HOME', 'grok-build': 'GROK_HOME' } as Record<string, string>)[harness];
+    if (!key) return undefined;
+    let output: string;
+    try {
+      const result = await promisify(execFile)(this.config.tmuxPath,
+        ['show-environment', '-t', `=${tmuxSession}`, key], { timeout: 5000, encoding: 'utf8', maxBuffer: 16 * 1024 });
+      output = result.stdout.trim();
+    } catch (error) {
+      // tmux uses exit 1 when an environment key is absent. Other errors are
+      // enrollment failures, not permission to guess another account's home.
+      if ((error as { code?: number }).code === 1) return undefined;
+      throw error;
+    }
+    if (output === `-${key}` || output === '') return undefined;
+    if (!output.startsWith(`${key}=`)) throw new Error('Unexpected runtime config home response');
+    const configHome = output.slice(key.length + 1);
+    if (!path.isAbsolute(configHome)) throw new Error('Invalid runtime config home');
+    return configHome;
+  }
+
+  private async originTokenEnvFlags(launch: OriginSessionLaunch): Promise<string[]> {
+    // Scrub a parent's session token even while this feature is not wired.
+    // Only this pre-spawn seam can certify which hook settings a NEW native
+    // incarnation starts with. Re-enrolling a surviving CLI must not mint it.
+    const token = this.originLifecycle ? await this.originLifecycle.issue({ ...launch,
+      launchHookSettingsDigest: await captureOriginHookSettings(launch.projectDir, launch.harnessId) }) : '';
+    if (this.originLifecycle && !/^ior1_[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('Invalid origin preparation credential');
+    return ['-e', `INSTAR_ORIGIN_TOKEN=${token}`];
+  }
+
+  private revokeOriginSession(sessionId: string): void {
+    const report = () => DegradationReporter.getInstance().report({
+      feature: 'SessionManager.originRevocation', primary: 'Persist revoked origin preparation credentials',
+      fallback: 'In-memory revocation remains enforced; persisted credentials still require live session validation',
+      reason: 'Origin credential revocation persistence unavailable',
+      impact: 'Disk repair is required before revocation survives restart; dead sessions remain unable to prepare messages',
+    });
+    try {
+      const result = this.originLifecycle?.revoke(sessionId);
+      if (result) void result.catch(() => report()); // DegradationReporter above receives the failure.
+    } catch { report(); } // DegradationReporter above receives the failure.
+  }
+
+  private originSpawnError(error: unknown): string {
+    // #2184: the raw error carries the full tmux argv, including `-e GH_TOKEN=…`.
+    return redactSpawnError(error);
+  }
+
+  private originConfirmsProcessGone(tmuxSession: string): boolean {
+    try {
+      withSyncOp(() => execFileSync(this.config.tmuxPath, ['has-session', '-t', `=${tmuxSession}`], { timeout: 5000 }));
+      return false;
+    } catch (error) {
+      // @silent-fallback-ok — only tmux's explicit absent-session exit status
+      // confirms termination. Other failures preserve the session credential.
+      return (error as { status?: number }).status === 1;
+    }
+  }
+
+  /**
+   * Agent-owned memory (operator rule 2026-09-25: logins are for tokens and
+   * quota only, never data). Before a claude-code session starts under a config
+   * home, make that home's `projects/<key>/memory` a link to the agent's own
+   * folder, merging any login-local memory first. Fail-open: a failure is
+   * logged and the spawn proceeds exactly as before.
+   */
+  private linkAgentOwnedMemory(harness: string, env: Record<string, string>, cwd: string): void {
+    if (harness !== 'claude-code') return;
+    try {
+      const configHome = this.originConfigHome(harness, env) || defaultClaudeConfigHome();
+      const result = ensureAgentOwnedMemory({ agentHome: this.config.projectDir, configHome, cwd });
+      if (result.action === 'linked' || result.action === 'migrated') {
+        console.log(`[SessionManager] agent-owned memory: ${result.action} ${result.linkPath} -> ${result.ownedDir}${result.setAsidePath ? ` (old folder kept at ${result.setAsidePath})` : ''}`);
+      }
+    } catch (err) {
+      // @silent-fallback-ok — logged; the spawn proceeds under the login exactly as before this feature.
+      console.warn(`[SessionManager] agent-owned memory: could not link for ${cwd} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private originConfigHome(harness: string, env: Record<string, string>): string | undefined {
+    if (harness === 'pi-cli') return path.join(this.config.projectDir, '.instar', 'state', 'pi-sessions');
+    const key = ({ 'claude-code': 'CLAUDE_CONFIG_DIR', 'codex-cli': 'CODEX_HOME', 'gemini-cli': 'GEMINI_CLI_HOME', 'grok-build': 'GROK_HOME' } as Record<string, string>)[harness];
+    return key ? env[key] || process.env[key] : undefined;
+  }
 
   /** Optional callback: is this session currently in active compaction recovery? If so, skip zombie kill. */
   private activeRecoveryChecker?: (session: Session) => boolean;
@@ -332,6 +1034,9 @@ export class SessionManager extends EventEmitter {
 
   /** Pressure-tier provider for the work-evidence fallback (reap-notify R2.1). */
   private pressureTier?: () => 'normal' | 'moderate' | 'critical';
+  /** Build-Session Yield Safety (ACT-839) dirty-worktree probe, shared with the
+   *  SessionReaper. Present only when the dev-gated feature is live. */
+  private worktreeDirtyCheck?: (worktreePath: string) => boolean;
   /** Sessions the §P5 backstop has flagged long-`indeterminate` — excluded from
    *  the ABSOLUTE spawn cap so unverifiable panes can't lock out spawning. */
   private longIndeterminateSessions = new Set<string>();
@@ -354,6 +1059,29 @@ export class SessionManager extends EventEmitter {
    * is enabled, so it is a strict no-op by default). Returns null per-call when
    * no eligible account exists. */
   private spawnAccountResolver?: () => { configHome: string; accountId: string } | null;
+  /** Memory privacy (docs/specs/memory-privacy.md). Unwired means today's behaviour. */
+  private memoryPrivacyWiring?: {
+    privacy: MemoryPrivacy;
+    /** The confined list (team-roles-and-access §3.5). */
+    confinement?: TeamConfinement;
+    /** The whole Telegram group's place key, or null when there is no group. */
+    telegramGroupKey: () => string | null;
+    /** True when the boot probe proved the OS sandbox starts here. */
+    sandboxReady: () => boolean;
+    /** Why scoped sessions cannot run, and the plain fix. Null when they can. */
+    blocker?: () => string | null;
+    fix?: () => string | null;
+    /** The owner's one-time repair link. */
+    recovery?: () => MemoryPrivacyRecovery;
+    /** Scripts a scoped session runs, as absolute paths. */
+    replyScripts: () => string[];
+    /** Finds the Slack channel of a session started before places were recorded. */
+    slackChannelForSession?: (sessionName: string) => string | null;
+  };
+  private readonly conversationLocks = new Map<string, Promise<void>>();
+  /** Forgets a conversation's resume binding. Wired at boot, where the binding store lives. */
+  conversationResumeDropper: ((ref: string) => void) | null = null;
+  private memoryInboundClaims = new Map<string, { place: string; dev: number; ino: number; size: number; mtimeMs: number; claimedAt: number }>();
 
   /**
    * Census #5/#6: live credential re-pointing gate. When set AND enabled, a pinned account's
@@ -366,6 +1094,7 @@ export class SessionManager extends EventEmitter {
 
   /** Prompt Gate InputDetector — monitors terminal output for interactive prompts */
   private promptDetector?: InputDetector;
+  private permissionPromptResolver?: PermissionPromptAutoResolver;
 
   /** Sessions with active relay leases (prompt relayed, waiting for response) — extends idle timeout */
   private relayLeases = new Map<string, number>(); // session ID → lease expiry timestamp
@@ -398,6 +1127,11 @@ export class SessionManager extends EventEmitter {
    *  autonomous run that hit a SECOND transient API error was never re-nudged and
    *  silently stranded at the prompt. The runaway cap lives in errorNudgeTotal.) */
   private errorNudgedSessions = new Set<string>();
+  /** Per-session once-per-idle-episode guard for the idle-error classify audit record
+   *  (CMT-1785). Armed on the first classify of an episode; cleared in BOTH the
+   *  active-session re-arm block AND sessionComplete (full errorNudgedSessions lifecycle
+   *  parity — clearing only at re-arm would leak entries for sessions reaped while idle). */
+  private idleErrorClassified = new Set<string>();
 
   /** Total error-nudges issued per session (never cleared until sessionComplete).
    *  Bounds runaway: even with per-episode re-arming, a session stuck in a tight
@@ -415,10 +1149,31 @@ export class SessionManager extends EventEmitter {
    * once per session, not every tick.
    */
   private overAgeButActiveLogged = new Set<string>();
+  /** When the age gate last saw each over-age session working (epoch ms) —
+   *  see AGE_GATE_RECENT_WORK_MS. */
+  private ageGateLastWorkingAt = new Map<string, number>();
+  /** Over-age sessions whose transcript the age gate saw being written: work
+   *  CONFIRMED past the age limit. Uncertain samples (empty pane capture, a
+   *  failed process probe, an idle MCP child) defer the kill but never enter
+   *  here. Feeds `seenWorkingPastAgeLimit` on the age kill. */
+  private ageGateConfirmedWorkPastLimit = new Set<string>();
   /** Per-session back-off so the age-gate respects the KEEP-guard's verdict: after a kill
    *  is vetoed (session kept), suppress re-requests for a window instead of re-asking every
    *  5s tick (the 2026-06-05 17,503-line flood). Constructed in the constructor. */
   private ageKillBackoff!: AgeKillBackoff;
+
+  /** Idle-zombie veto-backoff ledger (session-respawn-thrash Fix A). A SECOND,
+   *  independently-configured VetoedKillBackoff instance for the bound-idle zombie
+   *  killer (the age-gate keeps its own instance above). DISABLED CONTRACT (C1):
+   *  left `undefined` and never consulted when the feature resolves disabled — the
+   *  idle-zombie branch falls through to its exact prior per-tick behavior. */
+  private idleKillBackoff?: VetoedKillBackoff;
+  /** P19 breaker threshold (Fix A′): after this many consecutive veto episodes on
+   *  the SAME session with the keep-reason still active, raise ONE attention item. */
+  private idleKillEscalateAfter = 6;
+  /** Best-effort "one per incident" dedupe seam for the P19 breaker (Fix A′).
+   *  Injected at server boot; when unset the breaker escalation is a no-op. */
+  private incidentDedupe?: IncidentDedupe;
 
   /** Cached count of running sessions, updated asynchronously by the monitor tick.
    *  Used by the health endpoint to avoid synchronous tmux polling. */
@@ -452,6 +1207,55 @@ export class SessionManager extends EventEmitter {
   private worktreeManager: import('./WorktreeManager.js').WorktreeManager | null = null;
   private buildContextStore: SessionBuildContextStore | null = null;
   private pendingInjects!: PendingInjectStore;
+  private inboundDeliveries: InboundDeliveryStore | null = null;
+  private inboundDeliveryHmacKey: string | null = null;
+  private trackedPhysicalEffects: TrackedPhysicalEffectDispatcher | null = null;
+  private codexDeliveryObserver: CodexDeliveryObserver | null = null;
+  private stageBActivation: StageBActivationStatus;
+  private readonly localMachineId: () => string;
+  private readonly ownerEpochForConversation: (conversationId: string) => number;
+  private readonly codexRolloutPathForSession: (session: Session) => string | null;
+  private readonly stageCRecoveryEnabled: boolean;
+  /**
+   * Last pane tail the monitor saw for a session still in its STARTUP window.
+   *
+   * A session whose process ends on its own takes its terminal with it — by the
+   * time the monitor notices the pane is gone there is nothing left to capture.
+   * 2026-08-22: interactive codex sessions died ~18s after spawn and every death
+   * was a `completed`/reason-null record with no evidence; the cause had to be
+   * re-derived by hand-spawning one and watching. So the monitor samples a small
+   * tail for sessions younger than `STARTUP_TAIL_WINDOW_MS` (where silent deaths
+   * cluster — a session that survives startup is not the silent-death class),
+   * and the vanish path hands the last sample to the reap-log `exited` row.
+   * Bounded: the window caps how many sessions are sampled per tick, entries are
+   * evicted every tick for sessions no longer running, and the stored tail is a
+   * dozen lines. Memory-only; never written anywhere except the redacted row.
+   */
+  private readonly startupTails = new Map<string, { tail: string; at: number }>();
+  /**
+   * First time each rerouted (completionMode 'pattern') session's live tail
+   * showed Claude Code's "Login expired · Please run /login" frame. A session
+   * still showing it LOGIN_EXPIRED_DWELL_MS later is ended (see the rerouted
+   * branch of the monitor tick). Evicted with the startup tails for sessions no
+   * longer running, and whenever the frame is no longer the live tail.
+   */
+  private readonly loginExpiredFirstSeen = new Map<string, number>();
+  /** Interactive (non-job) sessions: last time the live tail was checked for the expired-login
+   *  frame, and when the current episode was last handed to the recovery sink (CMT-1008). */
+  private readonly interactiveLoginLastCheckAt = new Map<string, number>();
+  private readonly interactiveLoginReportedAt = new Map<string, number>();
+  /** Codex sessions: sign-in-trigger state per tmux session (codex-device-limit-tripwire §2 B). */
+  private readonly codexSigninTrigger = new Map<string, { firstSeen: number; requestedAt?: number; matched?: string; quietUntil?: number }>();
+  /** Signal sink for "this Codex session's live tail looked like a sign-in problem past the dwell".
+   *  Wired by server.ts to the quota poller's requestCodexCheck, which alone reads and decides;
+   *  the returned promise resolves `true` when that read found the account working. */
+  private codexSigninTriggerSink: ((input: { accountId: string; session: string }) => Promise<boolean | void> | void) | null = null;
+  /** Terminal child status sampled from a tmux pane retained by
+   * `remain-on-exit failed`; consumed by the self-exit transition. */
+  private readonly terminalExitCodes = new Map<string, number>();
+  /** Sessions whose `remain-on-exit failed` was set successfully. For these a FAILED exit keeps
+   * its pane (and its status), so a pane that vanished instead exited 0. */
+  private readonly failedExitRetained = new Set<string>();
 
   /** Per-session shim directory root (one subdir per session). Used for K9 mandatory shim. */
   private shimRoot: string | null = null;
@@ -476,10 +1280,53 @@ export class SessionManager extends EventEmitter {
    *  present, else `<projectDir>/.instar`). */
   private vaultStateDir: string;
 
+  /**
+   * Per-version retained copy of the Claude Code executable (CMT-798). Every
+   * claude-code session launches from `<state>/claude-bin/<version>/claude`
+   * instead of the mutable npm path, so a Claude Code update can no longer
+   * unlink a live session's executable (the macOS data.kalloc.1024 kernel
+   * leak — see ClaudeBinaryRetainer). Default ON; `sessions.retainedClaudeBinary`
+   * is the off switch. Construction is side-effect free; the first copy
+   * happens at the first claude-code spawn.
+   */
+  private readonly claudeBinaryRetainer: ClaudeBinaryRetainer;
+  private lastClaudeBinaryPruneAt = 0;
+  /** Version of the last claude-code binary resolveLaunchBinary chose, keyed by the path it returned. */
+  private readonly claudeLaunchVersions = new Map<string, string | null>();
+  /**
+   * Threadline MCP over local HTTP (docs/specs/threadline-mcp-local-http.md):
+   * the in-server wiring that decides, per spawn, whether a session gets the
+   * HTTP entry or today's stdio helper. Set late (Threadline boots after the
+   * SessionManager); unset ⇒ every spawn plans stdio with no secret.
+   */
+  private threadlineMcpWiring: ThreadlineMcpSpawnWiring | null = null;
+  private static readonly CLAUDE_BINARY_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
   constructor(config: SessionManagerConfig, state: StateManager, opts: SessionManagerOptions = {}) {
     super();
     this.config = config;
     this.state = state;
+    this.claudeBinaryRetainer = new ClaudeBinaryRetainer({
+      dir: config.retainedClaudeBinary?.dir || ClaudeBinaryRetainer.defaultDir(config.projectDir),
+      enabled: resolveRetainerEnabled(config.retainedClaudeBinary?.enabled),
+      ...(typeof config.retainedClaudeBinary?.pruneGraceMs === 'number'
+        ? { pruneGraceMs: config.retainedClaudeBinary.pruneGraceMs }
+        : {}),
+    });
+    this.stageBActivation = opts.stageBActivation ?? {
+      configured: null, pendingActivation: false, active: false,
+      reason: 'unconfigured-dark', artifactDigest: null,
+    };
+    this.localMachineId = opts.localMachineId ?? (() => 'local');
+    this.ownerEpochForConversation = opts.ownerEpochForConversation ?? (() => 0);
+    this.codexRolloutPathForSession = opts.codexRolloutPathForSession ?? ((session) => {
+      if (!session.claudeSessionId) return null;
+      return resolveFrameworkTranscriptPath({
+        framework: 'codex-cli', sessionId: session.claudeSessionId,
+        projectDir: session.cwd ?? this.config.projectDir,
+      });
+    });
+    this.stageCRecoveryEnabled = opts.stageCRecoveryEnabled === true;
     // (A)/(C) tmux-event-loop-resilience wiring — resolved server-side and threaded
     // in. Absent (every 2-arg/test caller) ⇒ the legacy sync hot path runs unchanged.
     this.tmuxAsyncEnabled = opts.tmuxAsyncEnabled === true;
@@ -505,17 +1352,145 @@ export class SessionManager extends EventEmitter {
     const stateBase = typeof (state as { baseDir?: unknown } | undefined)?.baseDir === 'string'
       ? (state as { baseDir: string }).baseDir
       : path.join(config.projectDir, '.instar');
-    this.pendingInjects = new PendingInjectStore(path.join(stateBase, 'state'));
     this.vaultStateDir = stateBase;
+    this.pendingInjects = new PendingInjectStore(path.join(stateBase, 'state'));
+    const projectCompatibility = (ledger: InboundDeliveryStore) => {
+      const rows = ledger.compatibilityTombstones();
+      for (const row of rows) this.pendingInjects.projectTombstone(row);
+      const floorPath = path.join(stateBase, 'state', 'codex-lifecycle-downgrade-floor.json');
+      if (rows.length > 0) fs.writeFileSync(floorPath, JSON.stringify({ schemaVersion: 1, liveEvidence: rows.length, projectedAt: Date.now() }));
+      else { try { SafeFsExecutor.safeUnlinkSync(floorPath, { operation: 'SessionManager.clearLifecycleDowngradeFloor' }); } catch { /* absent */ } }
+    };
+    // The projector is deliberately independent of Stage-B actuation. Turning
+    // the feature dark must not make a legacy injector blind to live evidence.
+    if (!this.stageBActivation.active && fs.existsSync(path.join(stateBase, 'state', 'inbound-delivery.sqlite'))) {
+      try {
+        const compatibilityLedger = InboundDeliveryStore.open(stateBase);
+        projectCompatibility(compatibilityLedger);
+        compatibilityLedger.close();
+      } catch (err) {
+        console.error(`[SessionManager] Downgrade compatibility projection failed; rollback remains fenced: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    try {
+      if (!this.stageBActivation.active) throw new StageBInactiveError();
+    this.inboundDeliveries = opts.openInboundDeliveryStoreForTesting
+      ? opts.openInboundDeliveryStoreForTesting(stateBase)
+      : InboundDeliveryStore.open(stateBase, opts.inboundDeliveryStoreOptions);
+    // Downgrade projector: old pending-inject readers see non-actionable empty
+    // tombstones instead of losing delivery IDs or replaying an uncertain body.
+    projectCompatibility(this.inboundDeliveries);
+      this.inboundDeliveryHmacKey = loadOrCreateDeliveryHmacKey(stateBase);
+      this.trackedPhysicalEffects = new TrackedPhysicalEffectDispatcher(
+        createPhysicalEffectLock(stateBase), this.inboundDeliveries,
+      );
+      this.codexDeliveryObserver = new CodexDeliveryObserver({
+        store: this.inboundDeliveries,
+        hmacKey: this.inboundDeliveryHmacKey,
+        resolveRolloutPath: (delivery) => {
+          const session = this.state.findSessionByTmux(delivery.incarnation);
+          return session ? this.codexRolloutPathForSession(session) : null;
+        },
+        resolveRolloutId: (delivery) => this.state.findSessionByTmux(delivery.incarnation)?.claudeSessionId ?? null,
+        bindImportedSuccessor: (delivery) => {
+          if (delivery.ownerMachineId !== this.localMachineId()) return false;
+          const topicId = Number(delivery.conversationId);
+          const expectedIncarnation = Number.isFinite(topicId) ? this.getSessionNameForTopic(topicId) : null;
+          if (!expectedIncarnation) return false;
+          const successorCandidates = this.state.listSessions({ status: 'running' }).filter((candidate) =>
+            candidate.tmuxSession === expectedIncarnation
+              && candidate.claudeSessionId === delivery.rolloutId,
+          );
+          if (successorCandidates.length !== 1) return false;
+          const successor = successorCandidates[0];
+          if (!successor?.claudeSessionId) return false;
+          const rolloutPath = this.codexRolloutPathForSession(successor);
+          if (!rolloutPath) return false;
+          let baselineOffset: number;
+          try { baselineOffset = fs.statSync(rolloutPath).size; } catch { // @silent-fallback-ok: successor is not ready until its pinned rollout exists
+            return false;
+          }
+          return this.inboundDeliveries!.bindImportedRolloutSuccessor({
+            conversationId: delivery.conversationId, deliveryId: delivery.deliveryId,
+            targetMachineId: delivery.ownerMachineId, ownerEpoch: delivery.ownerEpoch,
+            incarnation: successor.tmuxSession, rolloutPath, rolloutId: successor.claudeSessionId, baselineOffset,
+          });
+        },
+        bindLocalBootstrap: (delivery) => {
+          if (delivery.ownerMachineId !== this.localMachineId() || delivery.baselineOffset !== -1) return false;
+          const session = this.state.listSessions({ status: 'running' })
+            .find((candidate) => candidate.tmuxSession === delivery.incarnation);
+          if (!session?.claudeSessionId) return false;
+          const rolloutPath = this.codexRolloutPathForSession(session);
+          if (!rolloutPath) return false;
+          return this.inboundDeliveries!.bindBootstrapRollout(
+            delivery.conversationId, delivery.deliveryId, rolloutPath, session.claudeSessionId,
+          );
+        },
+        onSustainedFailure: (episode) => this.emit('codexObserverSustainedFailure', episode),
+        capturePane: (delivery) => {
+          const session = this.state.listSessions({ status: 'running' })
+            .find((candidate) => candidate.tmuxSession === delivery.incarnation);
+          return session ? this.captureCodexComposerFrame(delivery.incarnation) : null;
+        },
+        capturePaneAsync: async (delivery) => {
+          const session = this.state.listSessions({ status: 'running' })
+            .find((candidate) => candidate.tmuxSession === delivery.incarnation);
+          return session ? this.captureCodexComposerFrameAsync(delivery.incarnation) : null;
+        },
+      });
+      const interrupted = this.inboundDeliveries.reconcileInterruptedEffects();
+      if (interrupted.deliveries > 0 || interrupted.attempts > 0) {
+        console.warn(
+          `[SessionManager] Reconciled ambiguous tmux effects: ${interrupted.deliveries} deliveries, ${interrupted.attempts} key attempts; blind replay is disabled`,
+        );
+      }
+    } catch (err) { // @silent-fallback-ok: inactive is expected control flow; initialization faults are logged and fail closed below
+      if (err instanceof StageBInactiveError) {
+        this.inboundDeliveries = null;
+        this.inboundDeliveryHmacKey = null;
+        this.trackedPhysicalEffects = null;
+        this.codexDeliveryObserver = null;
+      } else {
+      // Keep the server reachable, but fail CLOSED before every pane mutation.
+      // The caller's existing failed-message/PendingInject path retains input.
+      console.error(`[SessionManager] Inbound delivery journal unavailable; tmux injection disabled: ${err instanceof Error ? err.message : String(err)}`);
+      this.inboundDeliveries = null;
+      this.inboundDeliveryHmacKey = null;
+      this.trackedPhysicalEffects = null;
+      this.codexDeliveryObserver = null;
+      if (err instanceof InboundDeliveryStoreUnavailableError) {
+        this.stageBActivation = { ...this.stageBActivation, active: false, reason: err.reason };
+      } else {
+        this.stageBActivation = { ...this.stageBActivation, active: false, reason: 'startup-schema-failed' };
+      }
+      }
+    }
     // Age-gate kill back-off: default 10 min between re-requests for a kept session
     // (config.ageKillBackoffMinutes; 0 disables → legacy every-tick behavior).
     const backoffMin = typeof config.ageKillBackoffMinutes === 'number' ? config.ageKillBackoffMinutes : 10;
     this.ageKillBackoff = new AgeKillBackoff({ backoffMs: Math.max(0, backoffMin) * 60_000 });
+    // Idle-zombie veto-backoff ledger (session-respawn-thrash Fix A). DISABLED
+    // CONTRACT (C1): only construct when explicitly enabled — otherwise the field
+    // stays undefined and the idle-zombie branch runs its exact prior per-tick
+    // behavior. `cooldownMs: 0` is enabled-but-no-cooldown (R4-5), never a disable.
+    if (opts.idleKillVetoBackoff?.enabled === true) {
+      this.idleKillBackoff = new VetoedKillBackoff({ backoffMs: opts.idleKillVetoBackoff.cooldownMs });
+      this.idleKillEscalateAfter = opts.idleKillVetoBackoff.escalateAfterEpisodes;
+    }
     if (config.respawnBuildContext?.enabled) {
       this.buildContextStore = new SessionBuildContextStore(state, {
         maxAgeMs: config.respawnBuildContext.maxAgeMs,
+        // Per-machine re-key (standby-write-reconciliation §3.3): the id comes
+        // from the coordinator/mesh identity via a late-resolving getter.
+        machineId: opts.buildContextMachineId ?? null,
       });
     }
+    // Minted only during construction and handed into the boot composition root's
+    // lexical scope. A caller holding this manager later cannot retrieve it.
+    opts.bindTerminateAuthority?.((sessionId, reason, authorityOpts) =>
+      this.#terminateSessionInternal(sessionId, reason, authorityOpts));
+    opts.bindMaintenanceTickForTesting?.(() => this.#monitorTick());
   }
 
   /** Per-agent GitHub token env flags for spawned sessions (Phase-3 increment
@@ -525,9 +1500,40 @@ export class SessionManager extends EventEmitter {
    *  exactly as before). Mirrors the existing credential-injection art
    *  (INSTAR_AUTH_TOKEN / ANTHROPIC_API_KEY via tmux -e). The hardened triage
    *  spawn deliberately does NOT call this — it scrubs credentials. */
+  /** Spec feedback-inbox-vault-token §B: the per-run file a job writes to
+   *  declare its run failed (`INSTAR_JOB_FAILURE_FILE`), read by
+   *  JobScheduler.notifyJobComplete. Named by the unique tmux session. */
+  private jobFailureFileEnvFlags(tmuxSession: string): string[] {
+    try {
+      fs.mkdirSync(jobDeclaredFailureDir(this.vaultStateDir), { recursive: true });
+    } catch {
+      // @silent-fallback-ok — the job's own write then fails visibly in its
+      // transcript; spawning must never depend on this directory.
+    }
+    return ['-e', `${JOB_FAILURE_FILE_ENV}=${jobDeclaredFailurePath(this.vaultStateDir, tmuxSession)}`];
+  }
+
   private ghTokenEnvFlags(): string[] {
     const token = resolveGhTokenFromVault(this.vaultStateDir);
     return token ? ['-e', `GH_TOKEN=${token}`] : [];
+  }
+
+  /** durable-conversation-identity §7 (R4-M3): the per-session bind-token env
+   *  flags (`INSTAR_BIND_TOKEN`). The token scopes durable-state opens
+   *  (`POST /commitments` on a minted id) to the session's OWN authenticated
+   *  bootstrap conversation set. Empty when no minter is wired or the spawn
+   *  carries no bootstrap conversation — a token-less spawn rides the gate's
+   *  legacy lane; a failed mint NEVER blocks a spawn. */
+  private bindTokenEnvFlags(tmuxSession: string, bootstrapConversationIds: number[]): string[] {
+    if (!this.config.mintBindToken || bootstrapConversationIds.length === 0) return [];
+    try {
+      const token = this.config.mintBindToken(tmuxSession, bootstrapConversationIds);
+      return token ? ['-e', `INSTAR_BIND_TOKEN=${token}`] : [];
+    } catch {
+      // @silent-fallback-ok — a failed token mint degrades to a token-less
+      // spawn (the §7 legacy lane, loud at bind time); never a blocked spawn.
+      return [];
+    }
   }
 
   /** Lazily-constructed tri-state liveness oracle (UNIFIED-SESSION-LIFECYCLE §P1).
@@ -592,6 +1598,13 @@ export class SessionManager extends EventEmitter {
       // guard counts the degraded-call signal distinctly from a generic error.
       const killed = e.killed === true || e.signal === 'SIGKILL' || /SIGKILL/.test(msg);
       this.degradedTmuxGuard?.observeTmuxCall(Date.now() - t0, killed ? 'killed-client' : 'indeterminate');
+      if (this.tmuxAsyncEnabled) {
+        featureEvidence.recordAtMostEvery('monitoring.tmuxResilience.asyncHotPath', killed ? 'timeout' : 'indeterminate', 300_000, {
+          kind: killed ? 'fired' : 'error',
+          reason: killed ? 'bounded-call-timed-out-and-killed' : 'tmux-call-failed-indeterminate',
+          context: { op: args[0] ?? 'unknown', elapsedMs: Date.now() - t0, timeoutMs: timeout, inFlight: this.tmuxInflightCount },
+        });
+      }
       return { state: 'indeterminate', reason: msg.slice(0, 120) };
     }
   }
@@ -750,6 +1763,222 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * The resolver picks the optimal pool account (the scheduler's reset-date /
    * headroom score) at spawn time and returns its configHome + id, or null.
    */
+  setMemoryPrivacy(wiring: NonNullable<SessionManager['memoryPrivacyWiring']>): void {
+    this.memoryPrivacyWiring = wiring;
+  }
+
+  /**
+   * The audience for a session about to start, and everything that follows from
+   * it. Computed here for every interactive spawn, so a caller that passes no
+   * place lands on `none` rather than on full reach. Null when unwired.
+   */
+  private planMemorySession(framework: string, tmuxSession: string, input: SessionPlaceInput): MemorySessionPlan | null {
+    const wiring = this.memoryPrivacyWiring;
+    // Before the off-switch check: with privacy off a confined conversation cannot be confined at all.
+    if (wiring?.confinement?.refuseSpawn(input, wiring.privacy.enabled)) throw new MemoryPrivacyUnavailableError(framework);
+    if (!wiring || !wiring.privacy.enabled) return null;
+    const place = wiring.privacy.placeFor(input, wiring.telegramGroupKey());
+    const audience = wiring.privacy.audienceFor(place);
+    const placeKey = 'placeKey' in place ? place.placeKey : null;
+    console.log(`[memory-privacy] session=${tmuxSession} place=${place.kind} audience=${audience.kind}`);
+    const dropResume = wiring.privacy.audienceChanged(placeKey, audience);
+    if (!isScopedAudience(audience)) return { audience, placeKey, dropResume, scopeDir: null, settingsPath: null };
+    if (framework !== 'claude-code' || !wiring.sandboxReady()) {
+      throw new MemoryPrivacyUnavailableError(framework);
+    }
+    const scopeDir = wiring.privacy.ensureScopeDir(audience, tmuxSession);
+    if (!scopeDir) throw new Error('memory-session-launch-missing: no scope folder for a scoped audience');
+    const settingsDir = path.join(path.dirname(scopeDir), '.settings');
+    fs.mkdirSync(settingsDir, { recursive: true, mode: 0o700 });
+    const settingsPath = path.join(settingsDir, `${tmuxSession}.json`);
+    const settings = buildMemorySessionSettings({
+      agentHome: this.config.projectDir,
+      scopeDir,
+      homeDir: os.homedir(),
+      agentHomeEntries: fs.readdirSync(this.config.projectDir),
+      replyScripts: wiring.replyScripts(),
+      tempRoots: ['/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders'],
+    });
+    fs.writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 });
+    return { audience, placeKey, dropResume, scopeDir, settingsPath };
+  }
+
+  /**
+   * With memory privacy off, end any session still inside the boundary. It would keep
+   * its sandbox and its limited token through a restart, so turning the setting off
+   * would not reach it. Runs at boot. The next message starts an ordinary session.
+   */
+  async retireBoundedSessionsWhenPrivacyOff(): Promise<string[]> {
+    const wiring = this.memoryPrivacyWiring;
+    if (!wiring || wiring.privacy.enabled) return [];
+    const retired: string[] = [];
+    for (const session of this.listRunningSessions()) {
+      if (!session.memoryScopeDir) continue;
+      if (await this.retireMemorySession(session)) retired.push(session.name);
+    }
+    return retired;
+  }
+
+  /**
+   * End every running session whose audience no longer matches, so a session that
+   * loaded wider memory cannot answer a new reader. Runs on a flip and at boot,
+   * before any waiting message is delivered.
+   */
+  async retireSessionsForAudienceChange(): Promise<string[]> {
+    const wiring = this.memoryPrivacyWiring;
+    if (!wiring?.privacy.enabled) return [];
+    const retired: string[] = [];
+    for (const session of this.listRunningSessions()) {
+      if (session.jobSlug || session.launchLane) continue;
+      const input: SessionPlaceInput = session.memoryPlaceInput ?? {
+        telegramTopicId: session.telegramTopicId,
+        slackChannelId: session.slackChannelId ?? wiring.slackChannelForSession?.(session.tmuxSession) ?? undefined,
+      };
+      const expected = audienceKey(wiring.privacy.audienceFor(wiring.privacy.placeFor(input, wiring.telegramGroupKey())));
+      if (expected === (session.memoryAudience ?? 'open')) continue;
+      if (await this.retireMemorySession(session)) retired.push(session.name);
+    }
+    return retired;
+  }
+
+  /**
+   * Headless lanes are reached only by jobs and agent-token callers, so they run as
+   * `system`. Hooks read this: on a multi-person agent, no scope means no injection.
+   */
+  private memorySystemEnvFlags(): string[] {
+    const privacy = this.memoryPrivacyWiring?.privacy;
+    return privacy?.enabled && privacy.isMultiPerson() ? ['-e', 'INSTAR_MEMORY_SCOPE=system'] : [];
+  }
+
+  private async retireMemorySession(session: Session): Promise<boolean> {
+    const result = await this.#terminateSessionInternal(session.id, 'memory-audience-changed', {
+      finalStatus: 'killed', disposition: 'terminal', workEvidence: [], memoryAudienceClose: true,
+    });
+    return result.terminated;
+  }
+
+  /**
+   * The per-message check: the live session for a place must match its audience.
+   * False means it could not be ended, and the message must not be delivered to it.
+   */
+  async retireSessionUnlessAudience(tmuxSession: string, audience: string): Promise<boolean> {
+    const session = this.listRunningSessions().find((s) => s.tmuxSession === tmuxSession || s.name === tmuxSession);
+    if (!session) return true;
+    if ((session.memoryAudience ?? 'open') === audience) return true;
+    // Job and headless work is left running, but it has owner reach, so it must not
+    // receive a message from a place that is scoped.
+    if (session.jobSlug || session.launchLane) return !/^(person:|place:|none$)/.test(audience);
+    return this.retireMemorySession(session);
+  }
+
+  /** Memory privacy: a scoped session reads its files from its own inbox. */
+  registerMemoryInboundFile(place: string, filePath: string): void {
+    if (!this.memoryPrivacyWiring?.privacy.enabled) return;
+    try {
+      const now = Date.now();
+      for (const [key, claim] of this.memoryInboundClaims) {
+        if (now - claim.claimedAt > 10 * 60_000) this.memoryInboundClaims.delete(key);
+      }
+      const real = fs.realpathSync(filePath);
+      const info = fs.lstatSync(filePath);
+      if (!info.isFile() || info.nlink !== 1) return;
+      this.memoryInboundClaims.set(real, { place, dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, claimedAt: now });
+    } catch { /* A missing attachment cannot be claimed. */ }
+  }
+
+  private withInboundFilesInScope(tmuxSession: string, text: string): string {
+    if (!this.memoryPrivacyWiring) return text;
+    const session = this.listRunningSessions().find((s) => s.tmuxSession === tmuxSession);
+    const scopeDir = session?.memoryScopeDir;
+    if (!scopeDir) return text;
+    const place = session.telegramTopicId !== undefined ? `telegram:${session.telegramTopicId}`
+      : session.slackChannelId ? `slack:${session.slackChannelId}` : null;
+    const projectState = path.join(this.config.projectDir, '.instar');
+    const roots = memorySessionInboundRoots(this.config.stateDir ?? projectState);
+    if (this.config.stateDir && this.config.stateDir !== projectState) roots.push(path.join(projectState, 'telegram-inbound'));
+    const staged = moveInboundFilesIntoScope(text, scopeDir, roots, Date.now(), (real, info) => {
+      const claim = this.memoryInboundClaims.get(real);
+      return !!place && claim?.place === place && Date.now() - claim.claimedAt <= 10 * 60_000 && claim.dev === info.dev && claim.ino === info.ino
+        && claim.size === info.size && claim.mtimeMs === info.mtimeMs;
+    });
+    if (staged === text && !/\b(?:file|document|photo|image|attachment)\b/i.test(text)) return staged;
+    return `${staged}\n[File access: If one referenced file fails to open, retry that file once. Then say which file failed and ask the sender to resend it. Do not conclude that other files cannot open in this session.]`;
+  }
+
+  /**
+   * The inbox of a confined conversation's scope folder, or null when it is not confined. `key` is an
+   * app conversation key or `telegram:<topic>`, the forms the conversation store uses.
+   */
+  confinedInboxFor(key: string): string | null {
+    const wiring = this.memoryPrivacyWiring;
+    if (!wiring?.confinement || !wiring.privacy.enabled) return null;
+    const input: SessionPlaceInput = key.startsWith('telegram:') ? { telegramTopicId: Number(key.slice(9)) } : { memoryPlaceKey: `app:${key}` };
+    const place = wiring.confinement.place(input);
+    if (!place) return null;
+    const scopeDir = wiring.privacy.ensureScopeDir(wiring.privacy.audienceFor(place), 'inbox');
+    return scopeDir ? path.join(scopeDir, 'inbox') : null;
+  }
+
+  /** The audience kind a place would get, for callers that shape what they send there. */
+  memoryAudienceKind(input: SessionPlaceInput): MemoryAudience['kind'] {
+    const wiring = this.memoryPrivacyWiring;
+    if (!wiring?.privacy.enabled) return 'open';
+    return wiring.privacy.audienceFor(wiring.privacy.placeFor(input, wiring.telegramGroupKey())).kind;
+  }
+
+  /** Sessions whose output may feed agent-wide digests: never one inside the boundary. */
+  sessionsForAgentDigests(): Session[] {
+    return this.listRunningSessions().filter((s) => this.feedsAgentDigests(s));
+  }
+
+  /** The same rule for one session, for callers holding a finished one. */
+  feedsAgentDigests(session: Pick<Session, 'memoryScopeDir'>): boolean {
+    return !session.memoryScopeDir;
+  }
+
+  /** What the status route reports. No people's names beyond the owner's id. */
+  memoryPrivacyStatus(): { enabled: boolean; multiPerson: boolean; ownerUserId: string | null; sandboxReady: boolean; blocker: string | null; fix: string | null } {
+    const wiring = this.memoryPrivacyWiring;
+    if (!wiring) return { enabled: false, multiPerson: false, ownerUserId: null, sandboxReady: false, blocker: null, fix: null };
+    return {
+      enabled: wiring.privacy.enabled,
+      multiPerson: wiring.privacy.isMultiPerson(),
+      ownerUserId: wiring.privacy.ownerUserId(),
+      sandboxReady: wiring.sandboxReady(),
+      blocker: wiring.blocker?.() ?? null,
+      fix: wiring.fix?.() ?? null,
+    };
+  }
+
+  memoryPrivacyRecovery(): MemoryPrivacyRecovery | null {
+    return this.memoryPrivacyWiring?.recovery?.() ?? null;
+  }
+
+  /** New sessions launch from this binary. Live sessions keep the one they started with. */
+  setClaudeBinary(binaryPath: string): void {
+    this.config.claudePath = binaryPath;
+    if (this.config.frameworkBinaryPaths?.['claude-code']) this.config.frameworkBinaryPaths['claude-code'] = binaryPath;
+  }
+
+  /** True when memory privacy is on and more than one person can reach this agent. */
+  isMultiPersonAgent(): boolean {
+    const privacy = this.memoryPrivacyWiring?.privacy;
+    return Boolean(privacy?.enabled && privacy.isMultiPerson());
+  }
+
+  /** Clean up after a session that ran inside the boundary. */
+  releaseMemorySession(session: Pick<Session, 'id' | 'memoryScopeDir' | 'memorySettingsPath' | 'memoryAudience'>): void {
+    if (!session.memoryScopeDir) return;
+    const privacy = this.memoryPrivacyWiring?.privacy;
+    if (privacy && !privacy.sessionReplied(session.id)) {
+      featureEvidence.record('memoryPrivacy', { kind: 'error', reason: 'session ended with no reply', context: { audience: session.memoryAudience ?? null } });
+    }
+    privacy?.revokeSessionTokens(session.id);
+    const op = 'SessionManager.releaseMemorySession';
+    if (session.memorySettingsPath) SafeFsExecutor.safeRmSync(session.memorySettingsPath, { force: true, operation: op });
+    if (session.memoryAudience === 'none') SafeFsExecutor.safeRmSync(session.memoryScopeDir, { recursive: true, force: true, operation: op });
+  }
+
   setSpawnAccountResolver(resolver: () => { configHome: string; accountId: string } | null): void {
     this.spawnAccountResolver = resolver;
   }
@@ -781,8 +2010,22 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * the util's contract); failures are logged, not fatal, because the worst
    * case is the pre-fix behavior, not a dead spawn path.
    */
-  private ensurePinnedHomeInteractiveReady(configHome: string, lane: string): void {
-    const ready = ensureInteractiveReady(configHome);
+  /** The agent directory sessions launch in. Exposed because the folder-trust
+   *  acknowledgement a config home needs is keyed on this exact path, and the
+   *  callers that seed a swap target's home (SessionRefresh) only hold a
+   *  SessionManager. */
+  agentProjectDir(): string {
+    return this.config.projectDir;
+  }
+
+  /** The default login's first-run answers are checked once per process. */
+  private defaultHomeFirstRunChecked = false;
+
+  private ensurePinnedHomeInteractiveReady(configHome: string | null, lane: string): void {
+    // projectDir is what makes the folder-trust acknowledgement specific to the
+    // directory this session will actually launch in — without it the home can
+    // read as ready and still die at "Do you trust the files in this folder?".
+    const ready = ensureClaudeFirstRunAnswered(configHome, this.config.projectDir);
     if (ready.patched) {
       console.log(`[SessionManager] ${lane}: made ${configHome} interactive-ready (${ready.reason})`);
     } else if (ready.reason !== 'already interactive-ready') {
@@ -810,6 +2053,154 @@ rm()  { "${shimRunner}" rm  "$@"; }
    */
   setReapGuard(guard: ReapGuard): void {
     this.reapGuard = guard;
+  }
+
+  /**
+   * Wire the best-effort "one per incident" dedupe seam for the idle-zombie veto
+   * P19 breaker (session-respawn-thrash Fix A′). Server boot injects the shared
+   * IncidentDedupe so the breaker escalation coalesces across ticks. Unset ⇒ the
+   * breaker never escalates (best-effort, signal-only).
+   */
+  setIncidentDedupe(seam: IncidentDedupe): void {
+    this.incidentDedupe = seam;
+  }
+
+  /**
+   * Evaluate the ReapGuard ONCE for the idle-zombie kill decision (C2/R4-2). Calls
+   * blockedReason with NO bypass flags (the idle-zombie branch never bypasses), and
+   * normalizes the vetoing reason to its STABLE ledger key. The verdict is threaded
+   * through both the backoff gate (shouldRequest) and the terminate call so the
+   * guard is never double-evaluated with a possibly-changed reason between them.
+   */
+  private computeIdleZombieReapVerdict(
+    session: Session,
+    _now: number,   // stays UNUSED — the reasonKey MUST be time-independent (same key every tick)
+  ): { blocked: ReapKeepReason | null; reasonKey: string | null } {
+    // KEY CONSISTENCY (idle-zombie-veto-key-consistency.md): the veto-backoff ledger keys
+    // its cooldown on this reasonKey, but recordVeto stores the reason terminateSessionInternal
+    // ACTUALLY returns. That method's skip precedence is `protected` → the lease gate
+    // (`not-lease-holder`) → the reapGuard cascade. On a STANDBY machine it short-circuits at
+    // the lease gate and stores `not-lease-holder` (NOT a reapGuard reason). If this pre-check
+    // key differs from the stored key, the reason-key stale-reprieve deletes the ledger entry
+    // every tick and the 30m cooldown never holds (the observed 5s spin). Mirror that precedence
+    // here so the pre-check key == the key recordVeto will store. `blocked` stays the RAW reapGuard
+    // verdict (only reasonKey is overridden) so the C2/R4-2 single-guard-eval threading to
+    // terminateSessionInternal is preserved. Equivalence with terminateSessionInternal is enforced
+    // by a CI property test, NOT by discipline (Structure > Willpower).
+    const blocked = this.reapGuard?.blockedReason(session) ?? null;
+    if (blocked?.reason === 'protected') return { blocked, reasonKey: 'protected' };
+    if (this.isAwakeMachine && !this.isAwakeMachine()) return { blocked, reasonKey: 'not-lease-holder' };
+    return { blocked, reasonKey: normalizeReasonKey(blocked) };
+  }
+
+  /**
+   * P19 breaker (Fix A′): after `idleKillEscalateAfter` consecutive veto episodes
+   * on a session whose keep-reason is still active, raise ONE attention item via
+   * the injected dedupe seam so it emits at most once per incident within the
+   * process window. Signal-only — best-effort; if no seam is injected nothing
+   * emits. Never spawns a topic or touches a transport directly.
+   */
+  private maybeEscalateIdleZombieVeto(session: Session, topicId: number | null, reasonKey: string): void {
+    const incidentKey = 'idle-zombie-veto:' + (topicId ?? 'none') + ':' + reasonKey;
+    if (this.incidentDedupe?.shouldEmit(incidentKey, 24 * 60 * 60 * 1000)) {
+      this.idleZombieVetoEscalated.set(session.id, topicId);
+      this.emit('idleZombieVetoEscalation', {
+        session,
+        topicId,
+        reasonKey,
+        message: `Session "${session.name}" on ${topicId != null ? topicRef(topicId) : 'no topic'} is permanently vetoed from idle-zombie cleanup (reason: ${reasonKey}) — likely a stuck open-commitment or a resume-loop; investigate.`,
+      });
+    }
+  }
+
+  /**
+   * Idle-zombie kill decision (session-respawn-thrash Fix A). Factored out of
+   * monitorTick so the enabled/disabled split is unit-testable in isolation.
+   *
+   * ENABLED (idleKillBackoff constructed) — veto-backoff path: evaluate the guard
+   * once, honor the reason-key-aware cooldown, attempt the kill through the SAME
+   * verdict, then either drop state on a real kill or record the veto (logging ONCE
+   * per episode + escalating after N episodes). DISABLED (field undefined) — the
+   * exact prior per-tick behavior: attempt terminateSession every tick.
+   *
+   * @returns whether a kill was actually performed (for the caller's WARN wording).
+   */
+  /**
+   * attention-lifecycle-close-on-cause §3.3 — sessions whose idle-zombie veto was
+   * escalated to the attention queue, by topic. When the veto ends (the session
+   * was finally killed, or its backoff state is dropped because it is gone) the
+   * server closes that row via `idleZombieVetoCleared`.
+   */
+  private readonly idleZombieVetoEscalated = new Map<string, number | null>();
+
+  private noteIdleZombieVetoEnded(sessionId: string): void {
+    if (!this.idleZombieVetoEscalated.has(sessionId)) return;
+    const topicId = this.idleZombieVetoEscalated.get(sessionId) ?? null;
+    this.idleZombieVetoEscalated.delete(sessionId);
+    this.emit('idleZombieVetoCleared', { sessionId, topicId });
+  }
+
+  private async handleIdleZombie(
+    session: Session,
+    idleMs: number,
+    binding: string | number | null,
+    now: number,
+    bindingNote: string,
+    killThresholdMinutes: number,
+  ): Promise<void> {
+    void killThresholdMinutes; // threshold already applied by the caller
+    if (this.idleKillBackoff) {
+      // ENABLED — veto-backoff path.
+      const verdict = this.computeIdleZombieReapVerdict(session, now);
+      // Unkeyable fail-open (R4-4): a truthy veto with no usable reason string →
+      // re-evaluate this tick rather than gate on a fabricated key.
+      const unkeyable = verdict.blocked != null && verdict.reasonKey == null;
+      if (!unkeyable && !this.idleKillBackoff.shouldRequest(session.id, now, verdict.reasonKey)) {
+        // Inside the cooldown, same reason → quiet skip: no terminate attempt,
+        // no reap-log write.
+        return;
+      }
+      const result = await this.#terminateSessionInternal(
+        session.id,
+        'idle-zombie',
+        { disposition: 'terminal' },
+        { blocked: verdict.blocked },
+      );
+      if (result.terminated) {
+        console.warn(`[SessionManager] Session "${session.name}" idle at prompt for ${Math.round(idleMs / 60_000)}m with no active processes${bindingNote}. Killing zombie.`);
+        this.idleKillBackoff.recordKilled(session.id);
+        this.noteIdleZombieVetoEnded(session.id);
+      } else {
+        const vetoKey = normalizeReasonKey(result.skipped ? { reason: result.skipped } : null)
+          ?? verdict.reasonKey ?? 'unknown';
+        // Cooldown applies to EVERY skip reason (the flood-stop benefit is
+        // universal — incl. a STANDBY machine's `not-lease-holder` every-tick skip,
+        // itself a documented reap-log flood source).
+        const firstOfEpisode = this.idleKillBackoff.recordVeto(session.id, now, vetoKey);
+        if (firstOfEpisode) {
+          console.warn(`[SessionManager] Session "${session.name}" idle-zombie cleanup vetoed (${vetoKey})${bindingNote} — backing off re-attempts.`);
+        }
+        // Breaker (Fix A′): escalate ONLY when the persisting reason is a genuine
+        // STUCK-session keep-reason (second-pass review point 9). Authority/CAS
+        // skips (`not-lease-holder` on a standby machine, `in-flight`, `protected`,
+        // `already-*`, …) back off above but must NEVER raise the "permanently
+        // vetoed from idle-zombie cleanup" attention item — that wording is false
+        // for them, and a standby machine would otherwise emit misleading HIGH items.
+        if (
+          IDLE_ZOMBIE_ESCALATION_REASONS.has(vetoKey)
+          && this.idleKillBackoff.episodeCount(session.id) >= this.idleKillEscalateAfter
+        ) {
+          const topicId = typeof binding === 'number'
+            ? binding
+            : (binding != null && /^-?\d+$/.test(String(binding)) ? Number(binding) : null);
+          this.maybeEscalateIdleZombieVeto(session, topicId, vetoKey);
+        }
+      }
+      return;
+    }
+    // DISABLED — prior per-tick behavior EXACTLY.
+    console.warn(`[SessionManager] Session "${session.name}" idle at prompt for ${Math.round(idleMs / 60_000)}m with no active processes${bindingNote}. Killing zombie.`);
+    await this.terminateSession(session.id, 'idle-zombie', { disposition: 'terminal' });
   }
 
   /**
@@ -851,7 +2242,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
     if (!newName || typeof newName !== 'string') return false;
     const trimmed = newName.trim();
     if (!trimmed) return false;
-    const session = this.state.listSessions().find((s) => s.tmuxSession === tmuxSession);
+    const session = this.state.findSessionByTmux(tmuxSession);
     if (!session) return false;
     if (session.name === trimmed) return false;
     session.name = trimmed;
@@ -883,8 +2274,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * Register the multi-machine lease/awake predicate. When set and it returns
    * false, an AUTONOMOUS terminate is a no-op `skipped:'not-lease-holder'` — only
    * the awake/lease-holding machine may autonomously reap; a standby may detect
-   * and signal but never kill another machine's sessions. Operator kills bypass.
-   * Unset → treated as awake (single-machine default).
+   * and signal but never kill another machine's sessions. Operator kills bypass,
+   * and so does the runtime-private topic-moved closeout authority (F8: closing
+   * THIS machine's own leftover session for a topic that moved away is not
+   * "killing another machine's session", and the old owner is by definition
+   * usually not the lease holder). Unset → treated as awake
+   * (single-machine default).
    */
   setAwakeChecker(fn: () => boolean): void {
     this.isAwakeMachine = fn;
@@ -901,9 +2296,20 @@ rm()  { "${shimRunner}" rm  "$@"; }
       detector.cleanup(session.tmuxSession);
       this.relayLeases.delete(session.id);
       this.errorNudgedSessions.delete(session.id);
+      this.idleErrorClassified.delete(session.id);
       this.errorNudgeTotal.delete(session.id);
       this.pasteRetried.delete(session.id);
     });
+  }
+
+  /**
+   * Set the always-on Permission-Prompt Auto-Resolver (the safety floor that
+   * auto-answers a framework approval prompt Instar cannot otherwise clear).
+   * When set, monitorTick() pre-gates each running session's tail and hands a
+   * candidate to it. Unconditional by design — there is no enable flag.
+   */
+  setPermissionPromptResolver(resolver: PermissionPromptAutoResolver): void {
+    this.permissionPromptResolver = resolver;
   }
 
   /**
@@ -939,6 +2345,105 @@ rm()  { "${shimRunner}" rm  "$@"; }
     return this.config.protectedSessions;
   }
 
+  /** Resolves a tmux session to its bound Telegram topic, for `topic:<id>`
+   *  entries in `standingSessions`. Wired by server.ts; null ⇒ name-only match. */
+  private standingTopicResolver: ((tmuxSession: string) => number | null) | null = null;
+
+  setStandingTopicResolver(fn: ((tmuxSession: string) => number | null) | null): void {
+    this.standingTopicResolver = fn;
+  }
+
+  /** Signal sink for "this session showed Claude Code's Login expired frame under this config
+   *  home". Wired by server.ts to the QuotaPoller, which alone decides pool status. */
+  private loginExpiredSink: ((input: { configHome: string; session: string; messageLed?: boolean }) => void) | null = null;
+
+  /** `messageLed` (CMT-1008): the frame was the CLI's own `⏺` message line, not a tool result —
+   *  only then may the sighting change pool state on its own. */
+  setLoginExpiredSink(fn: ((input: { configHome: string; session: string; messageLed?: boolean }) => void) | null): void {
+    this.loginExpiredSink = fn;
+  }
+
+  /** Signal sink for "this INTERACTIVE session has sat at Claude Code's expired-login screen past
+   *  the dwell" (CMT-1008). Wired by server.ts to InteractiveLoginExpiredRecovery, which owns the
+   *  pool marking and the swap; this class only detects. */
+  private interactiveLoginExpiredSink: ((input: InteractiveLoginExpiredSignal) => void | Promise<unknown>) | null = null;
+
+  setInteractiveLoginExpiredSink(fn: ((input: InteractiveLoginExpiredSignal) => void | Promise<unknown>) | null): void {
+    this.interactiveLoginExpiredSink = fn;
+  }
+
+  /** Put a handler ahead of the sink. When it returns true the signal is handled and goes no further. */
+  prependInteractiveLoginExpiredSink(first: (input: InteractiveLoginExpiredSignal) => Promise<boolean>): void {
+    const rest = this.interactiveLoginExpiredSink;
+    this.interactiveLoginExpiredSink = async (input) => {
+      if (await first(input)) return;
+      await rest?.(input);
+    };
+  }
+
+  /** A restored sign-in key for every later launch. `config` here is a copy, so server code can't reach it. */
+  setAnthropicKey(key: string | null): void {
+    this.config.anthropicApiKey = key ?? undefined;
+  }
+
+  /** Forget which sessions were already reported, so a stuck one is offered again on the next check. */
+  clearInteractiveLoginReports(): void {
+    this.interactiveLoginReportedAt.clear();
+  }
+
+  /** Unprotected topic sessions showing Claude Code's own login frame right now. */
+  async listSessionsAtLoginScreen(): Promise<string[]> {
+    const stuck: string[] = [];
+    for (const session of this.listRunningSessions()) {
+      if ((session.framework ?? 'claude-code') !== 'claude-code' || session.jobSlug) continue;
+      if (this.config.protectedSessions.includes(session.tmuxSession)) continue;
+      const pane = (await this.captureOutputMaybeAsync(session.tmuxSession, 40)) || '';
+      const verdict = classifyLoginExpired(pane);
+      if (verdict.loginExpired && verdict.messageLed) stuck.push(session.tmuxSession);
+    }
+    return stuck;
+  }
+
+  /** The key a session was launched with, as tmux holds it. Read for comparison only: never log it. */
+  sessionLaunchKey(tmuxSession: string): string | null {
+    try {
+      const line = withSyncOp(() => execFileSync(this.config.tmuxPath, ['show-environment', '-t', `=${tmuxSession}:`, 'CLAUDE_CODE_OAUTH_TOKEN'], {
+        encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+      })).trim();
+      const value = line.startsWith('CLAUDE_CODE_OAUTH_TOKEN=') ? line.slice('CLAUDE_CODE_OAUTH_TOKEN='.length) : '';
+      return value || null;
+    } catch { return null; } // @silent-fallback-ok: unset or unreadable means no launch key, and no key means no refresh
+  }
+
+  setCodexSigninTriggerSink(fn: ((input: { accountId: string; session: string }) => Promise<boolean | void> | void) | null): void {
+    this.codexSigninTriggerSink = fn;
+  }
+
+  /** The configured standing-session entries (tmux names and `topic:<id>`). */
+  getStandingSessions(): string[] {
+    return this.config.standingSessions ?? [];
+  }
+
+  /**
+   * Standing session (`sessions.standingSessions`): a long-lived coordinator no
+   * AUTONOMOUS lifecycle path may end (idle reap, age limit, completion
+   * detection), while it stays killable for a kill-to-respawn — `killSession`
+   * deliberately does NOT consult this (that is the difference from
+   * `protectedSessions`, which made the 2.0 desk unrestartable on 2026-10-05).
+   * Matches by tmux name or by bound topic (`topic:<id>`). Never throws: an
+   * unresolvable topic falls back to the name match only.
+   */
+  isStandingSession(tmuxSession: string): boolean {
+    const entries = this.config.standingSessions;
+    if (!entries || entries.length === 0) return false;
+    if (entries.includes(tmuxSession)) return true;
+    if (!entries.some(e => e.startsWith('topic:'))) return false;
+    let topicId: number | null = null;
+    try { topicId = this.standingTopicResolver?.(tmuxSession) ?? null; }
+    catch { topicId = null; /* @silent-fallback-ok: name match already checked above; an unresolvable binding cannot widen or narrow beyond it */ }
+    return topicId != null && entries.includes(`topic:${topicId}`);
+  }
+
   /** Mark a session as being reaped (two-phase reap window). The idle-kill path
    *  skips reaping sessions so the reaper is the single actor on them. */
   markReaping(sessionId: string): void {
@@ -965,14 +2470,15 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * The authority holds the safety checks so a killer can only *request* a kill:
    *  - CAS on live status + an in-flight guard (prevents the double-kill race).
    *  - `protectedSessions` (never kill).
-   *  - Lease-holder gate: an AUTONOMOUS reap on a standby machine is a no-op
-   *    `skipped:'not-lease-holder'` — only the awake machine reaps.
+   *  - Lease-holder gate: an ordinary AUTONOMOUS reap on a standby machine is a
+   *    no-op `skipped:'not-lease-holder'`. Two machine-local exceptions lift
+   *    ONLY this gate: the existing F8 topic-moved closeout, and the private
+   *    over-age monitor capability for this machine's own idle process.
    *  - ReapGuard (§P2): an AUTONOMOUS reap of a session the guard says to KEEP is
    *    a no-op `skipped:<keep-reason>` — even a buggy killer cannot end a guarded
    *    session.
-   * `origin:'operator'` bypasses the lease-gate and the guard (an explicit human
-   * kill must always happen). Default `origin` is `'autonomous'` so an in-process
-   * caller can never accidentally mint operator privilege.
+   * Operator authority exists only on runtime-private internal calls. The public
+   * method is structurally autonomous; caller labels and casts cannot mint it.
    *
    * Re-entrancy: the guard is consulted BEFORE this call acquires its own
    * in-flight lock, so the authority's lock for the kill it is performing is
@@ -985,7 +2491,217 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * @returns `{ terminated: true }` on a kill performed by THIS call, or
    *          `{ terminated: false, skipped }` describing why it was a no-op.
    */
+  /**
+   * Rerouted-branch helper: if the session's live tail has shown Claude Code's
+   * dead-login frame for at least LOGIN_EXPIRED_DWELL_MS, terminate it (recorded
+   * as killed, so its job reruns on its next trigger, where placement can pick a
+   * signed-in account) and report a degradation naming the login folder.
+   * Returns true when the session was ended. Never throws into the tick.
+   */
+  private async endIfLoginExpired(session: Session): Promise<boolean> {
+    let pane = '';
+    try {
+      pane = (await this.captureOutputMaybeAsync(session.tmuxSession, 40)) || '';
+    } catch { /* @silent-fallback-ok — an unreadable pane is re-checked next tick */
+      return false;
+    }
+    const verdict = classifyLoginExpired(pane);
+    if (!verdict.loginExpired) {
+      this.loginExpiredFirstSeen.delete(session.tmuxSession);
+      return false;
+    }
+    const now = Date.now();
+    const firstSeen = this.loginExpiredFirstSeen.get(session.tmuxSession);
+    if (firstSeen === undefined) {
+      this.loginExpiredFirstSeen.set(session.tmuxSession, now);
+      return false;
+    }
+    if (now - firstSeen < LOGIN_EXPIRED_DWELL_MS) return false;
+    // `defaultWhenUnset`: a session on the default login carries NO CLAUDE_CONFIG_DIR (the spawn
+    // falls back to the process env), so an explicitly-unset var resolves to the default home here;
+    // a tmux read FAILURE still yields undefined (never a guessed slot).
+    const liveConfigHome = this.configHomeForSession(session.tmuxSession, { defaultWhenUnset: true });
+    const configHome = liveConfigHome ?? 'the default login';
+    if (liveConfigHome && this.loginExpiredSink) {
+      try { this.loginExpiredSink({ configHome: liveConfigHome, session: session.tmuxSession, messageLed: verdict.messageLed === true }); }
+      catch { /* @silent-fallback-ok — a signal sink failure must never block ending the session */ }
+    }
+    console.warn(`[SessionManager] Rerouted session "${session.name}" is stuck at an expired login (${configHome}): "${verdict.matchedLine}". Ending it so its slot is freed.`);
+    // workEvidence: [] — the killer proved the session idle (a REPL at the login screen can do
+    // nothing), so a live MCP child must not stamp it mid-work and queue a revival back onto
+    // the same dead login.
+    const killed = await this.terminateSession(session.id, 'rerouted-login-expired', {
+      finalStatus: 'killed',
+      disposition: 'terminal',
+      workEvidence: [],
+    });
+    this.loginExpiredFirstSeen.delete(session.tmuxSession);
+    if (killed.terminated) {
+      DegradationReporter.getInstance().report({
+        feature: 'SessionManager.monitorTick.reroutedLoginExpired',
+        primary: 'rerouted-interactive session runs under a signed-in login and completes via its sentinel',
+        fallback: 'ended as soon as its live tail showed an expired login, instead of holding its slot to the lifetime cap',
+        reason: `Session "${session.name}" launched under ${configHome}, which reports "${verdict.matchedLine}"`,
+        impact: 'That run did no work; its job reruns on its next trigger. The login itself needs a fresh sign-in.',
+      });
+    }
+    return killed.terminated;
+  }
+
+  /**
+   * Codex-device-limit trigger (spec codex-device-limit-tripwire §2 B). A Codex session's live tail
+   * that keeps looking like a sign-in problem for CODEX_SIGNIN_TRIGGER_DWELL_MS asks the quota
+   * poller for ONE fresh read of the session's account. The screen text is never judged and never
+   * benches anything (a session can print anything, including a conversation about device limits);
+   * the read's own provider answer is what the tripwire judges. Brakes: one request per session per
+   * CODEX_SIGNIN_TRIGGER_RETRY_MS; after a read found the account working, the same tail asks again
+   * only once it changes or CODEX_SIGNIN_TRIGGER_QUIET_MS passes. Relogin helper sessions and
+   * sessions with no pool account are skipped. Never throws into the tick.
+   */
+  private async checkCodexSigninTrigger(session: Session): Promise<void> {
+    if (!this.codexSigninTriggerSink || !session.subscriptionAccountId) return;
+    const key = session.tmuxSession;
+    if (key.startsWith('relogin-') || session.name.startsWith('relogin-')) return;
+    const now = Date.now();
+    const lastCheck = this.interactiveLoginLastCheckAt.get(key);
+    if (lastCheck !== undefined && now - lastCheck < INTERACTIVE_LOGIN_CHECK_INTERVAL_MS) return;
+    this.interactiveLoginLastCheckAt.set(key, now);
+    let pane = '';
+    try {
+      pane = (await this.captureOutputMaybeAsync(key, 40)) || '';
+    } catch { /* @silent-fallback-ok — an unreadable pane is re-checked next interval */
+      return;
+    }
+    const tail = liveTail(pane, 12).join('\n');
+    const match = tail.match(CODEX_SIGNIN_TRIGGER_RE);
+    const state = this.codexSigninTrigger.get(key);
+    if (!match) {
+      if (state && !state.quietUntil) this.codexSigninTrigger.delete(key);
+      return;
+    }
+    const matched = createHash('sha256').update(tail).digest('hex').slice(0, 16);
+    if (!state) { this.codexSigninTrigger.set(key, { firstSeen: now, matched }); return; }
+    if (state.quietUntil && state.matched === matched && now < state.quietUntil) return;
+    if (now - state.firstSeen < CODEX_SIGNIN_TRIGGER_DWELL_MS) return;
+    if (state.requestedAt !== undefined && now - state.requestedAt < CODEX_SIGNIN_TRIGGER_RETRY_MS) return;
+    state.requestedAt = now;
+    state.matched = matched;
+    state.quietUntil = undefined;
+    // Fire-and-forget (like the Claude login-expired sink): the read can take seconds or wait in the
+    // read gate, and must never hold up the monitor tick.
+    const warn = (err: unknown) => console.warn(`[SessionManager] codex sign-in check for "${session.name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      const r = this.codexSigninTriggerSink({ accountId: session.subscriptionAccountId, session: key });
+      if (r && typeof (r as Promise<unknown>).then === 'function') {
+        (r as Promise<boolean | void>).then((working) => {
+          if (working === true && this.codexSigninTrigger.get(key) === state) state.quietUntil = Date.now() + CODEX_SIGNIN_TRIGGER_QUIET_MS;
+        }, warn);
+      }
+    } catch (err) { /* @silent-fallback-ok — a failed request is retried after the retry window */
+      warn(err);
+    }
+  }
+
+  /**
+   * Interactive-branch helper (CMT-1008): a topic-bound Claude Code session placed on a login whose
+   * CLI sign-in has expired shows "Login expired · Please run /login" (or "Not logged in · Run
+   * /login") on every turn and never recovers on its own. When the live tail has shown that frame
+   * for LOGIN_EXPIRED_DWELL_MS, hand it to the recovery sink once per episode (re-offered after
+   * INTERACTIVE_LOGIN_REPORT_RETRY_MS if the screen persists). Detection only: it never kills,
+   * swaps, or touches pool state itself. Never throws into the tick.
+   */
+  private async reportInteractiveLoginExpired(session: Session): Promise<void> {
+    if (!this.interactiveLoginExpiredSink) return;
+    const key = session.tmuxSession;
+    const now = Date.now();
+    const lastCheck = this.interactiveLoginLastCheckAt.get(key);
+    if (lastCheck !== undefined && now - lastCheck < INTERACTIVE_LOGIN_CHECK_INTERVAL_MS) return;
+    this.interactiveLoginLastCheckAt.set(key, now);
+    let pane = '';
+    try {
+      pane = (await this.captureOutputMaybeAsync(key, 40)) || '';
+    } catch { /* @silent-fallback-ok — an unreadable pane is re-checked next interval */
+      return;
+    }
+    const verdict = classifyLoginExpired(pane);
+    // Only the CLI's own message line counts here: a `⎿`-led tool result (e.g. the session ran
+    // `claude auth status` against some login) must never mark this session's account.
+    if (!verdict.loginExpired || !verdict.messageLed) {
+      this.loginExpiredFirstSeen.delete(key);
+      this.interactiveLoginReportedAt.delete(key);
+      return;
+    }
+    const firstSeen = this.loginExpiredFirstSeen.get(key);
+    if (firstSeen === undefined) {
+      this.loginExpiredFirstSeen.set(key, now);
+      return;
+    }
+    if (now - firstSeen < LOGIN_EXPIRED_DWELL_MS) return;
+    const reportedAt = this.interactiveLoginReportedAt.get(key);
+    if (reportedAt !== undefined && now - reportedAt < INTERACTIVE_LOGIN_REPORT_RETRY_MS) return;
+    this.interactiveLoginReportedAt.set(key, now);
+    const configHome = this.configHomeForSession(key, { defaultWhenUnset: true });
+    console.warn(`[SessionManager] Interactive session "${session.name}" is stuck at an expired login (${configHome ?? 'unknown login'}): "${verdict.matchedLine}". Handing it to login-expired recovery.`);
+    try {
+      const r = this.interactiveLoginExpiredSink({
+        session: key,
+        sessionName: session.name,
+        configHome: configHome ?? null,
+        accountId: session.subscriptionAccountId ?? null,
+        matchedLine: verdict.matchedLine ?? '',
+        protected: this.config.protectedSessions.includes(key),
+      });
+      if (r && typeof (r as Promise<unknown>).catch === 'function') {
+        (r as Promise<unknown>).catch((err) => console.warn(`[SessionManager] login-expired recovery for "${session.name}" failed: ${err instanceof Error ? err.message : String(err)}`));
+      }
+    } catch (err) { /* @silent-fallback-ok — a sink failure is logged and re-offered after the retry interval */
+      console.warn(`[SessionManager] login-expired recovery for "${session.name}" threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async terminateSession(
+    sessionId: string,
+    reason: string,
+    opts?: {
+      finalStatus?: 'completed' | 'killed';
+      disposition?: 'terminal' | 'recovery-bounce';
+      /** UNTRUSTED caller-supplied provenance claim (REMOTE-SESSION-CLOSE-SPEC
+       *  §2.3) — recorded in the reap-log as `viaClaim`, NEVER consulted in any
+       *  authority/bypass decision (signal-vs-authority). */
+      via?: string;
+      workEvidence?: string[];
+    },
+  ): Promise<{ terminated: boolean; skipped?: string }> {
+    // Public enforcement boundary — re-evaluates the guard itself (no precomputed
+    // verdict). The single-guard-eval precompute is a PRIVATE same-tick optimization
+    // used only by the idle-zombie branch (R3-1/R4-2); it is NEVER a public option.
+    // Copy only inert/public fields. Do not spread the caller object: JavaScript
+    // callers can force undeclared keys through a cast, and every guard bypass is
+    // authority. Trusted lifecycle components receive a birth-bound closure.
+    return this.#terminateSessionInternal(
+      sessionId,
+      reason,
+      {
+        finalStatus: opts?.finalStatus,
+        disposition: opts?.disposition,
+        via: opts?.via,
+        workEvidence: opts?.workEvidence,
+        // Public callers are always autonomous. Explicit operator authority is
+        // confined to runtime-private call sites inside this class; labels,
+        // unknown values, and caller casts cannot bypass any guard.
+        origin: 'autonomous',
+      },
+    );
+  }
+
+  /**
+   * The single-writer termination implementation. `precomputedGuardVerdict`, when
+   * provided (ONLY by the idle-zombie branch, which uses no bypass flags), threads
+   * the already-computed ReapGuard verdict through so the guard is not
+   * double-evaluated in the same tick (C2). Every OTHER caller passes it undefined
+   * and the guard is evaluated here exactly as before.
+   */
+  async #terminateSessionInternal(
     sessionId: string,
     reason: string,
     opts?: {
@@ -1010,6 +2726,31 @@ rm()  { "${shimRunner}" rm  "$@"; }
        * fresh and still vetoes. Spec: docs/specs/post-transfer-closeout-correctness.md.
        */
       bypassRecentUserMessageForConfirmedMove?: boolean;
+      /** See SessionTerminateAuthorityOptions.standDownDrainedClose — verified
+       *  here against `standDownDrainProbe`, never trusted. */
+      standDownDrainedClose?: boolean;
+      /** Module-private capability minted only by #terminateLocalAgeExpiredSession.
+       *  It proves the request originated in THIS SessionManager's monitor over
+       *  THIS machine's state tree and local tmux namespace. Never public. */
+      localAgeLimitReapCapability?: typeof LOCAL_AGE_LIMIT_REAP_CAPABILITY;
+      /** Module-private proof from the rerouted-session monitor. The termination
+       * guard rechecks the saved session's lane and elapsed hard lifetime. */
+      reroutedLifetimeReapCapability?: typeof REROUTED_LIFETIME_REAP_CAPABILITY;
+      /** Age-limit kill only: the age gate saw this session working after it
+       *  passed its age limit. Passed through on `sessionReaped` so the resume
+       *  queue does not count the revival as a kill-resume-kill loop. */
+      seenWorkingPastAgeLimit?: boolean;
+      /** Birth-bound SessionReaper assertion after ownership/liveness/dwell. */
+      localPostTransferCloseout?: boolean;
+      /** See SessionTerminateAuthorityOptions.topicTransferClose. */
+      topicTransferClose?: boolean;
+      /**
+       * Runtime-private: this session holds memory its place's readers must not see,
+       * and a message is about to reach it. The ordinary keeps protect a busy session,
+       * and a busy session is exactly the one that would answer, so they do not apply.
+       * Only `protected`, which is checked before this, still wins.
+       */
+      memoryAudienceClose?: boolean;
       /**
        * Killer-supplied work evidence (reap-notify spec R2.1): computed at the
        * KILLER's decision point — the only moment the work was observable (the
@@ -1020,6 +2761,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
        */
       workEvidence?: string[];
     },
+    /** Idle-zombie-only same-tick optimization (C2/R4-2): the ReapGuard verdict
+     *  already computed by computeIdleZombieReapVerdict, threaded here so the guard
+     *  is evaluated ONCE. Only the idle-zombie branch (which uses no bypass flags)
+     *  supplies it; every other caller leaves it undefined and the guard is
+     *  re-evaluated below. NEVER exposed on the public terminateSession() signature. */
+    precomputedGuardVerdict?: { blocked: ReapKeepReason | null },
   ): Promise<{ terminated: boolean; skipped?: string }> {
     const session = this.state.getSession(sessionId);
     if (!session) return { terminated: false, skipped: 'not-found' };
@@ -1030,16 +2777,48 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
     const origin = opts?.origin ?? 'autonomous';
     const disposition = opts?.disposition ?? 'terminal';
+    const holdsServingLease = origin === 'operator'
+      || !this.isAwakeMachine
+      || this.isAwakeMachine();
+    const requestedLocalAgeLimit = reason === 'age-limit'
+      && opts?.localAgeLimitReapCapability === LOCAL_AGE_LIMIT_REAP_CAPABILITY;
+    // The local-process capability is usable only after the full KEEP guard is
+    // installed and the exact durable session transition is currently admitted.
+    // This closes both startup windows: no guard means no local authority, and a
+    // pure read-only standby never kills tmux before discovering saveSession will
+    // be refused. The real write re-checks admission again before the process kill.
+    let isAuthorizedLocalAgeLimit = false;
+    if (requestedLocalAgeLimit && this.reapGuard) {
+      try {
+        this.state.assertSessionWriteAllowed(session);
+        isAuthorizedLocalAgeLimit = true;
+      } catch {
+        // Not locally owned/writable in the current posture: the normal lease
+        // boundary below remains authoritative.
+      }
+    }
+    const isAuthorizedTopicMovedCloseout = reason.startsWith('topic moved')
+      && opts?.localPostTransferCloseout === true;
+    const isAuthorizedReroutedLifetime = reason === 'rerouted-lifetime'
+      && opts?.reroutedLifetimeReapCapability === REROUTED_LIFETIME_REAP_CAPABILITY
+      && session.launchLane === 'rerouted-interactive'
+      && session.completionMode === 'pattern'
+      && typeof session.maxLifetimeMinutes === 'number'
+      && Number.isFinite(session.maxLifetimeMinutes)
+      && session.maxLifetimeMinutes > 0
+      && !!session.startedAt
+      && Date.now() - Date.parse(session.startedAt) > session.maxLifetimeMinutes * 60_000;
+    const authorityScope = origin === 'operator'
+      ? 'operator' as const
+      : holdsServingLease
+        ? 'lease-holder' as const
+        : isAuthorizedLocalAgeLimit
+          ? 'local-age-limit' as const
+          : 'local-post-transfer-closeout' as const;
 
     // ── Authority gates (autonomous only; operator bypasses) ──
-    // An `origin:'operator'` kill — stamped ONLY by the Bearer-authed HTTP route
-    // layer and by the transfer handler executing the user's explicit
-    // "move this to <machine>" command (post-transfer closeout, 2026-06-05) —
-    // must always happen: the user commanded it. It bypasses protected, the
-    // lease gate, and the KEEP-guard. (The transfer handler additionally skips
-    // protected sessions BEFORE calling, so the bypass never reaches them on
-    // that path.) Autonomous killers (the default) can only *request*; the
-    // authority holds the safety checks.
+    // Runtime-private `origin:'operator'` calls may bypass these gates. Every
+    // call through public terminateSession is normalized to autonomous above.
     if (origin === 'autonomous') {
       // Protected set — never autonomously reap a protected session.
       if (this.config.protectedSessions.includes(session.tmuxSession)) {
@@ -1047,7 +2826,28 @@ rm()  { "${shimRunner}" rm  "$@"; }
         return { terminated: false, skipped: 'protected' };
       }
       // Lease-holder gate: a standby machine never reaps another machine's sessions.
-      if (this.isAwakeMachine && !this.isAwakeMachine()) {
+      // F8 carve-out: the runtime-private topic-moved closeout is exempt — it closes THIS
+      // machine's OWN leftover session for a topic that moved AWAY (the old
+      // owner is by definition usually not the lease holder, so the gate
+      // structurally vetoed the exact teardown the transfer requires). The
+      // capability lifts ONLY this gate; protected (above) and the KEEP-guard
+      // cascade (below) are unaffected. No public caller can supply it.
+      // Local age-limit carve-out: the private monitor capability authorizes
+      // cleanup of a process in THIS manager's machine-local state/tmux tree.
+      // A peer cannot perform that cleanup remotely, and the capability is not
+      // part of terminateSession's public options. The literal reason check is
+      // defense in depth against capability reuse for another kill class.
+      // Topic-transfer drain carve-out: the drain runner closes THIS machine's
+      // own copy of a topic it was ordered (fenced by the transferring CAS) to
+      // hand away. The old owner is usually not the lease holder, so without
+      // this the gate refused every remote drain close — and ownership moved
+      // while the session stayed alive (2026-10-23). Runtime-private flag.
+      const isAuthorizedTopicTransferClose = opts?.topicTransferClose === true;
+      if (!holdsServingLease
+          && !isAuthorizedTopicMovedCloseout
+          && !isAuthorizedTopicTransferClose
+          && !isAuthorizedLocalAgeLimit
+          && opts?.memoryAudienceClose !== true) {
         this.emit('reapBlocked', { session, reason, skipped: 'not-lease-holder', origin });
         return { terminated: false, skipped: 'not-lease-holder' };
       }
@@ -1062,7 +2862,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // session would pin a tombstone in the running list and re-create the boot
       // death-spiral the purge guards against. A proven-dead session has no
       // liveness to protect, so skip the guard. Lease + protected + CAS still apply.
-      if (!opts?.knownDead) {
+      if (!opts?.knownDead && opts?.memoryAudienceClose !== true) {
         // Build the set of keep-reasons the active bypass flags TREAT AS BYPASSED,
         // then ask the guard for the first keep-reason that is NOT bypassed. This
         // re-checks EVERY other guard (the contract the spec's Part E promises):
@@ -1072,11 +2872,53 @@ rm()  { "${shimRunner}" rm  "$@"; }
         const bypassedReasons: string[] = [];
         if (opts?.bypassRecoveryFlag) bypassedReasons.push('recovery-in-flight');
         if (opts?.bypassActiveProcessKeep) bypassedReasons.push('active-process');
-        if (opts?.bypassRecentUserMessageForConfirmedMove) bypassedReasons.push('recent-user-message');
-        const blocked = this.reapGuard?.blockedReason(
-          session,
-          bypassedReasons.length > 0 ? bypassedReasons : undefined,
-        );
+        // A rerouted one-shot is an interactive REPL, so a live child process can
+        // remain after its hard deadline. The monitor's private capability and
+        // this second expiry check let the hard cap bypass only process-activity
+        // evidence. Protected sessions, user activity, commitments and other
+        // KEEP reasons still veto termination.
+        if (isAuthorizedReroutedLifetime) {
+          bypassedReasons.push('active-process', 'main-process-active', 'process-uninspectable');
+        }
+        if (opts?.bypassRecentUserMessageForConfirmedMove || opts?.topicTransferClose === true) {
+          bypassedReasons.push('recent-user-message');
+        }
+        // `standDownDrainedClose` (duplicate-session stand-down §Drained-close).
+        // P20 — VERIFY THE STATE, NOT ITS SYMBOL: the caller's claim buys nothing
+        // on its own. This authority asks its OWN probe whether the session is
+        // genuinely a stand-down entry in the `drained` state, and only then
+        // applies the frozen three-reason list from standDownDrain.ts. A false
+        // probe (feature dark, entry released, not yet drained) means NO bypass —
+        // the ordinary cascade runs and the close is refused, which is the safe
+        // direction.
+        if (opts?.standDownDrainedClose && this.standDownDrainProbe?.(session.tmuxSession) === true) {
+          bypassedReasons.push(...DRAINED_CLOSE_BYPASSED_REASONS);
+        }
+        // A standing session (`sessions.standingSessions`) is kept from every
+        // autonomous END. Lifted only by trusted, runtime-private assertions:
+        // the reaper's post-transfer closeout and the topic-transfer drain (a
+        // topic that moved away — keeping it would leave the coordinator live on
+        // two machines), a verified drained stand-down close (same), and the
+        // recovery engine's kill-to-respawn (a restart, which standing sessions
+        // must keep). Only the `standing-session` reason is lifted; every other
+        // KEEP-guard is still re-checked. Public callers cannot supply any of
+        // these: `bypassRecoveryFlag` and the closeout flags are authority-only.
+        if (opts?.localPostTransferCloseout === true
+            || opts?.topicTransferClose === true
+            || (opts?.disposition === 'recovery-bounce' && opts?.bypassRecoveryFlag === true)
+            || (opts?.standDownDrainedClose && this.standDownDrainProbe?.(session.tmuxSession) === true)) {
+          bypassedReasons.push('standing-session');
+        }
+        // C2/R4-2: the idle-zombie branch precomputes the guard verdict (no bypass
+        // flags) and threads it here so the guard is evaluated ONCE this tick.
+        // Every other caller leaves precomputedGuardVerdict undefined and the guard
+        // is evaluated fresh (today's behavior, honoring any bypass flags).
+        const blocked = precomputedGuardVerdict !== undefined
+          ? precomputedGuardVerdict.blocked
+          : this.reapGuard?.blockedReason(
+              session,
+              bypassedReasons.length > 0 ? bypassedReasons : undefined,
+            );
         // `bypassRecoveryFlag` (UNIFIED-SESSION-LIFECYCLE §P0 #8): the recovery
         // engine itself sets the recovery-in-flight flag synchronously before
         // its kill-to-respawn, so the guard would otherwise refuse the
@@ -1158,29 +3000,149 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
       const midWork = isMidWork(workEvidence);
 
-      // Emit BEFORE destroying tmux so listeners (TopicResumeMap, SlackAdapter)
-      // can capture resume UUIDs while the session is still alive.
-      this.emit('beforeSessionKill', session);
-      try {
-        await execFileAsync(this.config.tmuxPath, ['kill-session', '-t', `=${session.tmuxSession}`]);
-      } catch { /* session may already be dead */ }
-      session.status = opts?.finalStatus ?? 'completed';
-      session.endedAt = new Date().toISOString();
-      session.endedReason = reason;
+      const endedSession: Session = {
+        ...session,
+        status: opts?.finalStatus ?? 'completed',
+        endedAt: new Date().toISOString(),
+        endedReason: reason,
+      };
       if (!opts?.knownDead) {
-        session.endedMidWork = midWork;
-        if (workEvidence.length > 0) session.endedWorkEvidence = workEvidence;
+        endedSession.endedMidWork = midWork;
+        if (workEvidence.length > 0) endedSession.endedWorkEvidence = workEvidence;
       }
-      this.state.saveSession(session);
-      this.emit('sessionComplete', session);
+      const usesLocalProcessAuthority = origin === 'operator'
+        || isAuthorizedLocalAgeLimit
+        || isAuthorizedTopicMovedCloseout;
+      // Continuity observers inspect the still-live process before the terminal
+      // commit, but are never cleanup authority. Invoke each independently so a
+      // faulty observer cannot suppress the rest. If a listener changes write
+      // admission, the immediately-following save fails closed before tmux.
+      this.#emitListenersIsolated('beforeSessionKill', session);
+
+      // Every live-process kill uses one write-first, bounded-synchronous protocol. This
+      // removes the ordinary lease-holder branch's former await window (tmux gone
+      // before a late ownership/write refusal) and gives local nonholder cleanup
+      // the same state/process ordering. A `knownDead` oracle verdict needs only
+      // the durable transition: by definition there is no tmux process to kill.
+      // saveSession rechecks admission here.
+      try {
+        this.state.saveSession(endedSession);
+      } catch {
+        const skipped = usesLocalProcessAuthority ? 'local-write-refused' : 'state-write-refused';
+        this.emit('reapBlocked', { session, reason, skipped, origin });
+        return { terminated: false, skipped };
+      }
+
+      if (!opts?.knownDead) {
+        try {
+          // No event-loop turn exists between the terminal commit and the local
+          // process action. The timeout bounds tmux transport failure.
+          withSyncOp(() => execFileSync(
+            this.config.tmuxPath,
+            ['kill-session', '-t', `=${session.tmuxSession}`],
+            // SIGTERM is not a real bound for a wedged tmux client: it can ignore
+            // the default signal and keep execFileSync blocking the event loop.
+            // Match the async hot-path invariant and enforce the timeout with KILL.
+            { encoding: 'utf-8', timeout: this.tmuxCallTimeoutMs, killSignal: 'SIGKILL' },
+          ));
+        } catch (err) {
+          const killErrorText = err instanceof Error ? err.message : String(err);
+          const definitelyAbsent = /can't find session|no such session|no server running|session not found/i.test(killErrorText);
+          if (!definitelyAbsent) {
+            // The process may still be alive. Compensate the write-first record
+            // back to its exact live snapshot and never emit a false reap event.
+            let compensationFailed = false;
+            try {
+              this.state.saveSession(session);
+            } catch (rollbackErr) {
+              compensationFailed = true;
+              console.error('[SessionManager] cleanup kill failed and state compensation also failed:', rollbackErr);
+            }
+            const skipped = compensationFailed
+              ? 'tmux-kill-failed-compensation-failed'
+              : 'tmux-kill-failed';
+            this.emit('reapBlocked', { session, reason, skipped, origin });
+            return { terminated: false, skipped };
+          }
+        }
+      }
+      // The process is gone and the terminal state is durable. Lifecycle
+      // observers run independently from here onward: a listener exception must
+      // never turn a successful kill into a rejected promise or suppress the
+      // durable reap audit emitted by a later listener.
+      this.revokeOriginSession(session.id);
+      this.#emitListenersIsolated('sessionComplete', endedSession);
       // The single reap-notification signal (§P3): terminal reaps may reach the
       // user; recovery-bounce reaps are silent. One emission, at the one chokepoint.
-      this.emit('sessionReaped', { session, reason, disposition, origin, midWork, workEvidence, ...(opts?.via ? { via: opts.via } : {}) });
+      this.#emitListenersIsolated('sessionReaped', {
+        session: endedSession,
+        reason,
+        disposition,
+        origin,
+        authorityScope,
+        midWork,
+        workEvidence,
+        ...(opts?.via ? { via: opts.via } : {}),
+        ...(reason === 'age-limit' && opts?.seenWorkingPastAgeLimit ? { seenWorkingPastAgeLimit: true } : {}),
+      });
       this.idlePromptSince.delete(session.id);
       this.reapingSessions.delete(session.id);
       return { terminated: true };
     } finally {
       this.terminating.delete(sessionId);
+    }
+  }
+
+  /**
+   * The only non-lease-holder age-limit entrypoint. The caller is the local
+   * maintenance loop after it has independently proven age and positive idle.
+   * All remaining termination authority checks are re-evaluated downstream.
+   */
+  #terminateLocalAgeExpiredSession(sessionId: string): Promise<{ terminated: boolean; skipped?: string }> {
+    return this.#terminateSessionInternal(sessionId, 'age-limit', {
+      finalStatus: 'killed',
+      disposition: 'terminal',
+      localAgeLimitReapCapability: LOCAL_AGE_LIMIT_REAP_CAPABILITY,
+      workEvidence: this.#ageKillWorkEvidence(sessionId),
+      // The session's transcript was written after it passed its age limit, so it
+      // lived and worked its full lifetime: its revival is not a kill-resume-kill
+      // loop (2026-09-30 18:14Z, topic 52075: refused by the resurrection cap).
+      seenWorkingPastAgeLimit: this.ageGateConfirmedWorkPastLimit.has(sessionId),
+    });
+  }
+
+  /**
+   * Pre-kill work evidence for an age-limit kill, collected the way the idle
+   * reaper collects it: the guard's observe-only set plus a dirty worktree.
+   * Without the dirty-worktree probe, an age-killed session with uncommitted
+   * work was recorded `midWork:false` and never revived, while the idle reaper
+   * revived the same session for the same worktree (2026-09-30 01:52Z, topic
+   * 52075: resume queue `enqueue-skipped insufficient-evidence`). The probe is
+   * bounded, cached and fail-open; it runs here in the monitor loop, never on
+   * the terminate chokepoint.
+   */
+  #ageKillWorkEvidence(sessionId: string): string[] {
+    const evidence = this.collectWorkEvidence(sessionId);
+    const cwd = this.state.getSession(sessionId)?.cwd;
+    if (this.worktreeDirtyCheck && cwd) {
+      try { if (this.worktreeDirtyCheck(cwd)) evidence.push('uncommitted-worktree-work'); }
+      catch { /* @silent-fallback-ok: evidence collection never endangers the kill path; a failed probe just omits the signal */ }
+    }
+    return evidence;
+  }
+
+  /**
+   * Deliver an irreversible-transition lifecycle event to every listener even
+   * when one observer throws. `rawListeners` preserves EventEmitter's `once`
+   * wrapper semantics while direct invocation lets us isolate each callback.
+   */
+  #emitListenersIsolated(eventName: string, ...args: unknown[]): void {
+    for (const listener of this.rawListeners(eventName)) {
+      try {
+        Reflect.apply(listener, this, args);
+      } catch (err) { // @silent-fallback-ok — observer isolation is deliberate; the fault is surfaced and cannot roll back an authoritative lifecycle transition
+        console.error(`[SessionManager] ${eventName} listener failed; lifecycle transition remains authoritative:`, err);
+      }
     }
   }
 
@@ -1192,6 +3154,11 @@ rm()  { "${shimRunner}" rm  "$@"; }
    */
   setPressureTierProvider(provider: () => 'normal' | 'moderate' | 'critical'): void {
     this.pressureTier = provider;
+  }
+
+  /** Wire the shared dirty-worktree probe (see `worktreeDirtyCheck`). */
+  setWorktreeDirtyCheck(check: (worktreePath: string) => boolean): void {
+    this.worktreeDirtyCheck = check;
   }
 
   /**
@@ -1236,6 +3203,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
    */
   setClaudeSessionId(instarSessionId: string, claudeSessionId: string): void {
     if (!claudeSessionId) return;
+    // A hook reports this, and a confined session can call that route itself.
+    if (!isSafeSessionRef(claudeSessionId)) { console.warn(`[SessionManager] refused a session id for ${instarSessionId}`); return; }
     const sessions = this.state.listSessions({ status: 'running' });
     const session = sessions.find(s => s.id === instarSessionId);
     if (!session || session.claudeSessionId === claudeSessionId) return;
@@ -1247,6 +3216,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
     }
     session.claudeSessionId = claudeSessionId;
     this.state.saveSession(session);
+    this.originLifecycle?.bindNative(instarSessionId, claudeSessionId);
   }
 
   /**
@@ -1291,12 +3261,25 @@ rm()  { "${shimRunner}" rm  "$@"; }
         : matches[0];
       return {
         topicId,
-        topicName: (topicToName[String(topicId)] as string) || `Topic ${topicId}`,
+        topicName: (topicToName[String(topicId)] as string) || topicRef(topicId),
         channel: 'telegram', // Currently only Telegram uses the registry
         sessionName: tmuxSession,
       };
     } catch {
       // Registry read failure — fail open (no binding = no check)
+      return null;
+    }
+  }
+
+  private getSessionNameForTopic(topicId: number): string | null {
+    if (!this.registryPath || !Number.isSafeInteger(topicId)) return null;
+    try {
+      const registry = JSON.parse(fs.readFileSync(this.registryPath, 'utf8')) as {
+        topicToSession?: Record<string, unknown>;
+      };
+      const sessionName = registry.topicToSession?.[String(topicId)];
+      return typeof sessionName === 'string' && sessionName.length > 0 ? sessionName : null;
+    } catch { // @silent-fallback-ok: missing/malformed registry cannot authorize successor binding
       return null;
     }
   }
@@ -1314,31 +3297,93 @@ rm()  { "${shimRunner}" rm  "$@"; }
     this.monitorInterval = setInterval(() => {
       // Prevent overlapping monitor ticks
       if (this.monitoringInProgress) return;
-      this.monitorTick().catch(err => {
+      this.#monitorTick().catch(err => {
         console.error(`[SessionManager] Monitor tick error: ${err}`);
       });
     }, intervalMs);
   }
 
-  private async monitorTick(): Promise<void> {
+  async #monitorTick(): Promise<void> {
     this.monitoringInProgress = true;
     try {
       const running = this.state.listSessions({ status: 'running' });
+      // Sweep the permission-prompt resolver's bounded state once per tick (evict
+      // entries for ended sessions + per-entry TTL). The resolver's sweep is internally
+      // guarded (it never throws into the monitor loop), so no outer guard is needed.
+      this.permissionPromptResolver?.sweep(new Set(running.map(s => s.tmuxSession)));
+      // Evict startup-tail samples for sessions that are no longer running
+      // (bounded map — same hygiene as the resolver sweep above).
+      if (this.startupTails.size > 0) {
+        const live = new Set(running.map(s => s.tmuxSession));
+        for (const key of this.startupTails.keys()) {
+          if (!live.has(key)) this.startupTails.delete(key);
+        }
+      }
+      if (this.loginExpiredFirstSeen.size > 0 || this.interactiveLoginLastCheckAt.size > 0 || this.interactiveLoginReportedAt.size > 0 || this.codexSigninTrigger.size > 0) {
+        const live = new Set(running.map(s => s.tmuxSession));
+        for (const m of [this.loginExpiredFirstSeen, this.interactiveLoginLastCheckAt, this.interactiveLoginReportedAt, this.codexSigninTrigger]) {
+          for (const key of m.keys()) {
+            if (!live.has(key)) m.delete(key);
+          }
+        }
+      }
+      // Drop age-gate work memory for sessions that are no longer running
+      // (bounded map — any exit path, not only an age kill).
+      if (this.ageGateLastWorkingAt.size > 0 || this.ageGateConfirmedWorkPastLimit.size > 0) {
+        const liveIds = new Set(running.map(s => s.id));
+        for (const id of this.ageGateLastWorkingAt.keys()) {
+          if (!liveIds.has(id)) this.ageGateLastWorkingAt.delete(id);
+        }
+        for (const id of this.ageGateConfirmedWorkPastLimit) {
+          if (!liveIds.has(id)) this.ageGateConfirmedWorkPastLimit.delete(id);
+        }
+      }
       for (const session of running) {
         // Grace period: don't check sessions that started less than 15 seconds ago.
         // Claude Code takes several seconds to start — the process might not be
         // visible in tmux yet when the monitor runs its first check.
+        let ageMs: number | undefined;
         if (session.startedAt) {
-          const ageMs = Date.now() - new Date(session.startedAt).getTime();
+          ageMs = Date.now() - new Date(session.startedAt).getTime();
           if (ageMs < 15_000) continue;
+        }
+
+        // Startup-window evidence sample (see `startupTails`). Taken BEFORE the
+        // liveness probe: if the pane is already gone the capture is empty and
+        // the previous sample is kept — which is exactly the evidence we want.
+        if (ageMs !== undefined && ageMs < STARTUP_TAIL_WINDOW_MS) {
+          try {
+            const tail = await this.captureOutputMaybeAsync(session.tmuxSession, STARTUP_TAIL_LINES);
+            if (tail && tail.trim().length > 0) {
+              this.startupTails.set(session.tmuxSession, { tail, at: Date.now() });
+            }
+          } catch { /* @silent-fallback-ok — evidence sampling must never affect the tick */ }
         }
 
         const alive = await this.isSessionAliveAsync(session.tmuxSession);
         // (A) tri-state: ONLY a definitive `false` (dead) marks the session
         // completed. `'indeterminate'` (slow/timed-out tmux) does NOT — it falls
         // through to be re-checked next tick rather than reaping a live session.
+        if (alive === 'indeterminate') {
+          featureEvidence.recordAtMostEvery('monitoring.tmuxResilience.asyncHotPath', `kept:${session.tmuxSession}`, 300_000, { kind: 'held', reason: 'indeterminate-probe-kept-session', context: { session: session.tmuxSession } });
+        }
+        if (alive === false && this.tmuxAsyncEnabled) {
+          // A definitive-dead verdict is the one a spurious reap would come from; the review grades these rows.
+          featureEvidence.record('monitoring.tmuxResilience.asyncHotPath', { kind: 'fired', reason: 'probe-classified-session-dead', context: { session: session.tmuxSession } });
+        }
         if (alive === false) {
-          // CAS re-read after the await: an operator kill (or another killer)
+          const lastSample = this.startupTails.get(session.tmuxSession);
+          const knownExitCode = this.terminalExitCodes.get(session.tmuxSession);
+          const exitCode = knownExitCode ?? 0;
+          // Retained Codex panes preserve the terminal error after the process exits.
+          // Read at the death boundary so a later 429 is not missed by startup sampling.
+          const exitTail = session.framework === 'codex-cli'
+            ? (await this.captureOutputMaybeAsync(session.tmuxSession, 60)) || lastSample?.tail || ''
+            : lastSample?.tail || '';
+          const codexRateLimited = session.framework === 'codex-cli'
+            && knownExitCode !== undefined && knownExitCode !== 0
+            && /(?:\b429\b[^\n]*too many requests|too many requests[^\n]*\b429\b)/i.test(exitTail);
+          // CAS re-read after the Codex capture await: an operator kill (or another killer)
           // can land mid-probe, so re-read the live record before mutating it —
           // mirrors terminateSession's status CAS. If it already drifted off
           // 'running', another writer owns the transition; skip this inline
@@ -1350,7 +3395,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           // Check if this session had a pending Telegram injection that never got a response
           const pendingInjection = this.pendingInjections.get(session.tmuxSession);
           if (pendingInjection) {
-            console.warn(`[SessionManager] Session "${session.name}" died with unanswered Telegram injection for topic ${pendingInjection.topicId} (injected ${Math.round((Date.now() - pendingInjection.injectedAt) / 1000)}s ago)`);
+            console.warn(`[SessionManager] Session "${session.name}" died with unanswered Telegram injection for ${topicRef(pendingInjection.topicId)} (injected ${Math.round((Date.now() - pendingInjection.injectedAt) / 1000)}s ago)`);
             this.pendingInjections.delete(session.tmuxSession);
             this.emit('injectionDropped', {
               topicId: pendingInjection.topicId,
@@ -1359,10 +3404,58 @@ rm()  { "${shimRunner}" rm  "$@"; }
               injectedAt: pendingInjection.injectedAt,
             });
           }
-          fresh.status = 'completed';
+          // The process ended ON ITS OWN — no reaper, no operator, no kill path
+          // owns this transition. Stamp WHY so the record is not a reason-less
+          // `completed` (2026-08-22: the codex interactive death class was
+          // invisible in the records precisely because this branch wrote
+          // nothing), and hand the last startup-window tail sample to the
+          // reap-log `exited` row via `sessionExited`. `sessionComplete` still
+          // fires for every existing listener — this ADDS a record, it changes
+          // no existing semantics.
+          const uptimeSeconds = fresh.startedAt
+            ? Math.max(0, Math.round((Date.now() - new Date(fresh.startedAt).getTime()) / 1000))
+            : undefined;
+          this.terminalExitCodes.delete(session.tmuxSession);
+          // A headless one-shot (`claude -p` / completionMode 'exit') finishes BY exiting, often well
+          // inside the startup window. Under `remain-on-exit failed` a failed exit keeps its pane and
+          // status, so one that vanished after the option was set exited 0: it finished its work, it
+          // did not die starting up (instar-proof-1, 2026-11-03: every short job was counted as a
+          // start failure and the machine dropped itself from placement). Interactive sessions keep
+          // the old rule: a clean exit at an update or trust prompt is still a failed start.
+          const finishedHeadless = knownExitCode === undefined
+            && fresh.launchLane === 'headless'
+            && fresh.completionMode !== 'pattern'
+            && this.failedExitRetained.has(session.tmuxSession);
+          this.failedExitRetained.delete(session.tmuxSession);
+          const duringStartup = !finishedHeadless && uptimeSeconds !== undefined && uptimeSeconds * 1000 < STARTUP_TAIL_WINDOW_MS;
+          const midWork = exitCode !== 0;
+          this.startupTails.delete(session.tmuxSession);
+          fresh.status = codexRateLimited ? 'failed' : 'completed';
           fresh.endedAt = new Date().toISOString();
+          fresh.endedReason = codexRateLimited ? 'codex-rate-limited'
+            : duringStartup ? 'process-exited-during-startup' : 'process-exited';
           this.state.saveSession(fresh);
+          console.warn(
+            `[SessionManager] Session "${fresh.name}" (${fresh.framework ?? 'unknown framework'}) exited on its own` +
+            `${uptimeSeconds !== undefined ? ` after ${uptimeSeconds}s` : ''} — not killed by instar.` +
+            `${duringStartup ? ' Died DURING STARTUP.' : ''}` +
+            `${lastSample ? ` Last pane tail sampled ${Math.round((Date.now() - lastSample.at) / 1000)}s before detection (recorded in reap-log).` : ' No startup tail sample was available.'}`,
+          );
+          this.emit('sessionExited', {
+            session: fresh,
+            reason: fresh.endedReason,
+            uptimeSeconds,
+            lastTail: exitTail || undefined,
+            exitCode,
+            midWork,
+            outcome: midWork ? 'stopped-mid-work' : 'completed',
+          });
+          if (codexRateLimited) this.#emitListenersIsolated('codexRateLimitExit', fresh);
+          this.revokeOriginSession(fresh.id);
           this.emit('sessionComplete', fresh);
+          // The result is recorded; a job's retained dead pane has no further
+          // use. Job names are unique per run, so no later spawn reclaims it.
+          if (fresh.jobSlug) await this.removeDeadJobPane(fresh.tmuxSession);
           continue;
         }
 
@@ -1383,6 +3476,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           // maps only 'killed' → 'timeout'). A sentinel completion is a clean
           // finish, NOT a timeout.
           if (!this.config.protectedSessions.includes(session.tmuxSession) &&
+              !this.isStandingSession(session.tmuxSession) &&
               await this.detectSessionCompletionMaybeAsync(session)) {
             console.log(`[SessionManager] Rerouted session "${session.name}" completed (sentinel detected). Reaping as success.`);
             await this.terminateSession(session.id, 'sentinel-complete', {
@@ -1398,13 +3492,16 @@ rm()  { "${shimRunner}" rm  "$@"; }
           if (session.startedAt && session.maxLifetimeMinutes) {
             const lifeElapsedMin = (Date.now() - new Date(session.startedAt).getTime()) / 60000;
             if (lifeElapsedMin > session.maxLifetimeMinutes &&
-                !this.config.protectedSessions.includes(session.tmuxSession)) {
-              console.warn(`[SessionManager] Rerouted session "${session.name}" exceeded its hard lifetime (${Math.round(lifeElapsedMin)}m > ${session.maxLifetimeMinutes}m) without a completion sentinel. Killing (timeout).`);
-              const killed = await this.terminateSession(session.id, 'rerouted-lifetime', {
+                !this.config.protectedSessions.includes(session.tmuxSession) &&
+                !this.isStandingSession(session.tmuxSession)) {
+              const killed = await this.#terminateSessionInternal(session.id, 'rerouted-lifetime', {
                 finalStatus: 'killed',
                 disposition: 'terminal',
+                origin: 'autonomous',
+                reroutedLifetimeReapCapability: REROUTED_LIFETIME_REAP_CAPABILITY,
               });
               if (killed.terminated) {
+                console.warn(`[SessionManager] Rerouted session "${session.name}" exceeded its hard lifetime (${Math.round(lifeElapsedMin)}m > ${session.maxLifetimeMinutes}m) without a completion sentinel. Killed (timeout).`);
                 DegradationReporter.getInstance().report({
                   feature: 'SessionManager.monitorTick.reroutedLifetime',
                   primary: 'rerouted-interactive session completes via its sentinel within the lifetime cap',
@@ -1416,10 +3513,35 @@ rm()  { "${shimRunner}" rm  "$@"; }
               continue;
             }
           }
+          // (c) Dead login → end it now instead of at the lifetime cap. A
+          // rerouted session launched under a login whose interactive sign-in
+          // has expired prints "Login expired · Please run /login" and can never
+          // make progress; left alone it holds its scheduler slot until (b)
+          // fires 480 min later (2026-10-18: two such sessions stalled every job
+          // on the machine for a day). Signal-only classifier + a dwell so a
+          // single frame never ends a session; never touches pool status.
+          if (!this.config.protectedSessions.includes(session.tmuxSession) &&
+              !this.isStandingSession(session.tmuxSession)) {
+            if (await this.endIfLoginExpired(session)) continue;
+          }
+          if (session.framework === 'codex-cli') await this.checkCodexSigninTrigger(session);
           // Still running, no sentinel, under lifetime — leave it; re-check next
           // tick. Skip the rest of the loop body (the default exit/idle paths
           // below are tuned for the headless lane, not a held REPL).
           continue;
+        }
+
+        // Interactive (non-job) Claude Code session stuck at an expired login
+        // (CMT-1008): detection only — the recovery sink marks the pool and
+        // swaps the session onto a signed-in account. Falls through so the
+        // default lane below is unchanged.
+        if ((session.framework ?? 'claude-code') === 'claude-code' && !session.jobSlug) {
+          await this.reportInteractiveLoginExpired(session);
+        }
+        // Codex session whose screen looks like a sign-in problem (codex-device-limit-tripwire
+        // §2 B): asks for one fresh read of its account; the read, not the screen, decides.
+        if (session.framework === 'codex-cli') {
+          await this.checkCodexSigninTrigger(session);
         }
 
         // Gemini CLI can complete a Telegram turn by rendering the final
@@ -1450,16 +3572,21 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // Check for completion patterns even while session appears alive
         // (catches sessions where Claude finished but tmux is still open)
         if (!this.config.protectedSessions.includes(session.tmuxSession) &&
+            !this.isStandingSession(session.tmuxSession) &&
             await this.detectCompletionMaybeAsync(session.tmuxSession)) {
           console.log(`[SessionManager] Session "${session.name}" completed (pattern detected). Cleaning up.`);
           // Emit beforeSessionKill so listeners (TopicResumeMap, SlackAdapter) can save resume UUIDs
           this.emit('beforeSessionKill', session);
           try {
             await execFileAsync(this.config.tmuxPath, ['kill-session', '-t', `=${session.tmuxSession}`]);
-          } catch { /* ignore */ }
+          } catch {
+            // Origin preparation authority must survive a failed kill of a live pane.
+            if (this.originLifecycle && await this.isSessionAliveAsync(session.tmuxSession)) continue;
+          }
           session.status = 'completed';
           session.endedAt = new Date().toISOString();
           this.state.saveSession(session);
+          this.revokeOriginSession(session.id);
           this.emit('sessionComplete', session);
           continue;
         }
@@ -1483,7 +3610,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
           const elapsed = (Date.now() - new Date(session.startedAt).getTime()) / 60000;
           const buffer = Math.min(maxMinutes * 0.2, 60); // 20% buffer, max 60 min
           const limit = maxMinutes + buffer;
-          if (elapsed > limit && !this.config.protectedSessions.includes(session.tmuxSession)) {
+          if (elapsed > limit && !this.config.protectedSessions.includes(session.tmuxSession)
+              && !this.isStandingSession(session.tmuxSession)) {
             // Activity check — defer kill if the session is doing real work.
             const ageGateOutput = await this.captureMeaningfulTailMaybeAsync(session.tmuxSession, 5);
             const ageGateIsIdle = ageGateOutput && IDLE_PROMPT_PATTERNS.some(p => ageGateOutput.includes(p));
@@ -1498,7 +3626,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
             // is alive and producing. Treat it exactly like a live child process:
             // defer the kill.
             const ageGateTranscriptActive = this.isTranscriptRecentlyActive(session, AGE_GATE_TRANSCRIPT_ACTIVE_MS);
-            const ageGateTrulyIdle = isAgeGateTrulyIdle(!!ageGateIsIdle, ageGateHasProcs, ageGateTranscriptActive);
+            const ageGateNow = Date.now();
+            const ageGateLastWorking = this.ageGateLastWorkingAt.get(session.id);
+            const ageGateRecentlyWorking = ageGateLastWorking !== undefined
+              && ageGateNow - ageGateLastWorking < AGE_GATE_RECENT_WORK_MS;
+            const ageGateSeenWorking = !isAgeGateTrulyIdle(!!ageGateIsIdle, ageGateHasProcs, ageGateTranscriptActive);
+            if (ageGateSeenWorking) this.ageGateLastWorkingAt.set(session.id, ageGateNow);
+            if (ageGateTranscriptActive) this.ageGateConfirmedWorkPastLimit.add(session.id);
+            const ageGateTrulyIdle = isAgeGateTrulyIdle(!!ageGateIsIdle, ageGateHasProcs, ageGateTranscriptActive, ageGateRecentlyWorking);
 
             if (!ageGateTrulyIdle) {
               // Over age limit but actively working. Log once per session to
@@ -1508,7 +3643,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
                 this.overAgeButActiveLogged.add(session.id);
                 console.warn(
                   `[SessionManager] Session "${session.name}" is past the age limit (${Math.round(elapsed)}m > ${maxMinutes}m) ` +
-                  `but is actively working (procs=${ageGateHasProcs}, idleAtPrompt=${!!ageGateIsIdle}, transcriptActive=${ageGateTranscriptActive}). Deferring kill; ` +
+                  `but is actively working (procs=${ageGateHasProcs}, idleAtPrompt=${!!ageGateIsIdle}, transcriptActive=${ageGateTranscriptActive}, recentlyWorking=${ageGateRecentlyWorking}). Deferring kill; ` +
                   `the idle-detection block will catch it once it stops producing work.`
                 );
               }
@@ -1524,7 +3659,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
               // Check for unanswered injection before timeout kill
               const pendingInjection = this.pendingInjections.get(session.tmuxSession);
               if (pendingInjection) {
-                console.warn(`[SessionManager] Timed-out session "${session.name}" had unanswered injection for topic ${pendingInjection.topicId}`);
+                console.warn(`[SessionManager] Timed-out session "${session.name}" had unanswered injection for ${topicRef(pendingInjection.topicId)}`);
                 this.pendingInjections.delete(session.tmuxSession);
                 this.emit('injectionDropped', {
                   topicId: pendingInjection.topicId,
@@ -1534,19 +3669,33 @@ rm()  { "${shimRunner}" rm  "$@"; }
                 });
               }
               console.warn(`[SessionManager] Session "${session.name}" exceeded timeout (${Math.round(elapsed)}m > ${maxMinutes}m) and is idle. Requesting kill via ReapAuthority.`);
+              // Unified self-action backpressure: admit the age-kill through the
+              // governor BEFORE the ReapAuthority funnel (observe-only: always
+              // allows + records the would-verdict; an enforce-mode non-allow
+              // stands down this tick — the level-triggered over-age condition
+              // re-fires on the next monitor pass).
+              const ageKillTarget = deriveTargetKey(session.id);
+              const ageKillAdmission = ageKillGov.admitSync(ageKillTarget, { incarnation: session.id, lane: 'job' });
+              if (ageKillAdmission.outcome !== 'allow') {
+                continue;
+              }
+              const ageKillSink = consumeAdmissionToken(ageKillAdmission.token, 'age-kill-backoff', { targetKey: ageKillTarget.key });
+              if (!ageKillSink.proceed) {
+                continue;
+              }
               // Route through the single ReapAuthority (§P0) instead of an inline
               // kill: this restores the beforeSessionKill/sessionComplete emission,
-              // adds the sessionReaped signal + reap-log entry, applies the lease
-              // gate, and — critically — gains the P2 KEEP-guard's topic-bound
-              // grace, so a session that just received a user message is not
-              // age-killed out from under the user.
-              const ageKillResult = await this.terminateSession(session.id, 'age-limit', {
-                finalStatus: 'killed',
-                disposition: 'terminal',
-              });
+              // adds the sessionReaped signal + reap-log entry, applies the
+              // authority boundary (lease-holder or this private local-process
+              // capability), and — critically — gains the P2 KEEP-guard's
+              // topic-bound grace, so a session that just received a user
+              // message is not age-killed out from under the user.
+              const ageKillResult = await this.#terminateLocalAgeExpiredSession(session.id);
               if (ageKillResult.terminated) {
                 // Actually killed — drop any back-off state for the (now gone) session.
                 this.ageKillBackoff.recordKilled(session.id);
+                this.ageGateLastWorkingAt.delete(session.id);
+                this.ageGateConfirmedWorkPastLimit.delete(session.id);
               } else {
                 // The KEEP-guard kept it (skipped:<reason>). Respect that and back off:
                 // suppress re-requests for the back-off window instead of nagging every
@@ -1570,11 +3719,43 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // Skip sessions the SessionReaper has leased for a two-phase reap — it
         // is the single actor on them while reaping (§3.6).
         if (!this.config.protectedSessions.includes(session.tmuxSession) && !this.isReaping(session.id)) {
-          const output = await this.captureMeaningfulTailMaybeAsync(session.tmuxSession, 5);
+          // One 80-row capture feeds the 5-row tail below AND the resolver's non-blank
+          // reads (second-pass review 2026-10-19: no second capture per tick).
+          const rawTail = await this.captureRawTailMaybeAsync(session.tmuxSession, 80);
+          const output = rawTail === null ? null : meaningfulTail(rawTail, 5);
+
+          // ── Permission-Prompt Auto-Resolver (always-on safety floor) ──
+          // Cheap pre-gate on the last 5 NON-BLANK rows, keyed on the MENU SHAPE
+          // (a glyph/❯-led numbered option, or a generic blocking affordance —
+          // all bottom-anchored). Only on a hit do a fuller capture + evaluate,
+          // so the common (no-menu) case adds ZERO extra captures.
+          // Non-blank, not raw rows: live 2026-10-19 a blocking menu sat above 17
+          // blank rows and one status line, so every raw-row tail was blanks plus
+          // that line and the resolver never saw the menu (see meaningfulNonBlankTail).
+          // A confined session's ONLY answerer is its own startup state machine, and only before
+          // delivery (docs/specs/confined-spawn-subscription-reroute.md D3): no generic auto-answerer
+          // may press a key in it — on the trust dialog Enter selects "No, exit", and after startup an
+          // auto-approval would be policy outside the policy.
+          const confinedSession = Boolean(session.confinedConfigHome);
+          if (confinedSession && session.confinedDeliveredAt && output && !this.confinedDialogReported.has(session.id) &&
+              (/Enter to confirm|Esc to cancel|Esc to keep/i.test(output) || LOGIN_REQUIRED.test(output))) {
+            this.confinedDialogReported.add(session.id);
+            this.reportConfinedDialog(session.tmuxSession, 'dialog-after-delivery', output);
+          }
+          const resolverPregate = this.permissionPromptResolver && rawTail && !confinedSession ? meaningfulNonBlankTail(rawTail, 5) : null;
+          if (this.permissionPromptResolver && resolverPregate && !confinedSession && RESOLVER_PREGATE_RE.test(resolverPregate)) {
+            try {
+              const full = meaningfulNonBlankTail(rawTail!, 16);
+              if (full) {
+                await this.permissionPromptResolver.evaluate(session.tmuxSession, toPaneTailLines(full));
+              }
+            } catch { /* resolver must never throw into the monitor loop */ }
+          }
+
           const isIdleAtPrompt = output && IDLE_PROMPT_PATTERNS.some(p => output.includes(p));
 
           // ── Prompt Gate: feed captured output to InputDetector ──
-          if (this.promptDetector && output) {
+          if (this.promptDetector && output && !confinedSession) {
             const fullOutput = await this.captureOutputMaybeAsync(session.tmuxSession, 50);
             if (fullOutput) {
               this.promptDetector.onCapture(session.tmuxSession, fullOutput);
@@ -1603,11 +3784,15 @@ rm()  { "${shimRunner}" rm  "$@"; }
                 now,
               );
               if (action === 'emit') {
+                featureEvidence.record('monitoring.idleThrottleSettleGate', { kind: 'fired', reason: 'settled-handed-to-rate-limit-sentinel', context: { session: session.tmuxSession, snapshotRead: settledSnapshot != null } });
                 this.idleThrottleSettle.delete(session.tmuxSession);
                 this.emit('rateLimitedAtIdle', session.tmuxSession);
                 continue; // Settled → sentinel owns recovery.
               }
               if (action === 'wait') {
+                if (!this.idleThrottleSettle.has(session.tmuxSession)) {
+                  featureEvidence.record('monitoring.idleThrottleSettleGate', { kind: 'held', reason: 'throttle-seen-waiting-to-settle', context: { session: session.tmuxSession } });
+                }
                 if (nextState) this.idleThrottleSettle.set(session.tmuxSession, nextState);
                 continue; // Not settled yet — re-sample next idle tick; do NOT emit, and
                           // (like the watchdog's 'waiting') do not run the generic-error
@@ -1615,10 +3800,21 @@ rm()  { "${shimRunner}" rm  "$@"; }
               }
               // 'fall-through': no current throttle in the settled window (a stale buffer
               // line) → clear tracking and proceed to the normal idle machinery below.
+              if (this.idleThrottleSettle.has(session.tmuxSession) || settledSnapshot == null) {
+                // The row the gate exists for: a throttle string that never settled gets no hand-off.
+                if (settledSnapshot == null) {
+                  featureEvidence.recordAtMostEvery('monitoring.idleThrottleSettleGate', `read-failed:${session.tmuxSession}`, 3_600_000, { kind: 'error', reason: 'pane-read-failed', context: { session: session.tmuxSession } });
+                } else {
+                  featureEvidence.record('monitoring.idleThrottleSettleGate', { kind: 'held', reason: 'throttle-gone-before-settle-no-handoff', context: { session: session.tmuxSession } });
+                }
+              }
               this.idleThrottleSettle.delete(session.tmuxSession);
             }
             if (!this.idlePromptSince.has(session.id)) {
-              this.idlePromptSince.set(session.id, now);
+              // Seed from the DURABLE idle-start instant when the record carries a
+              // usable one, so a server restart does not reset the clock and leave a
+              // topic-bound session un-closable forever (see idleSincePersistence.ts).
+              this.seedIdleClock(session, now);
 
               // ── Pasted text stuck: detect unsubmitted paste and retry Enter ──
               // Claude Code shows "[Pasted text #N]" when bracketed paste content
@@ -1631,7 +3827,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
                   this.pasteRetried.add(session.id);
                   console.log(`[SessionManager] Session "${session.name}" has unsubmitted pasted text — resending Enter.`);
                   await this.sendKeyMaybeAsync(session.tmuxSession, 'Enter');
-                  this.idlePromptSince.delete(session.id); // Reset idle timer
+                  this.clearIdleClock(session); // Reset idle timer (durable too)
+                  this.idleKillBackoff?.reset(session.id);
                   continue; // Skip to next session
                 }
               }
@@ -1641,7 +3838,13 @@ rm()  { "${shimRunner}" rm  "$@"; }
               // inject a nudge to get it working again instead of waiting 15m to kill.
               const nudgeTotal = this.errorNudgeTotal.get(session.id) ?? 0;
               if (shouldErrorNudge(this.errorNudgedSessions.has(session.id), nudgeTotal)) {
-                const recentOutput = await this.captureOutputMaybeAsync(session.tmuxSession, 30);
+                // 45 rows (RATE_LIMIT_SETTLED_CAPTURE_LINES), not 30: Claude Code's input
+                // box + footer + tips render 15-25 rows BELOW the API-error line, so a
+                // 30-row capture can miss the error entirely (the 2026-05-30 incident; the
+                // same reason detectRateLimited/SessionWatchdog capture 45). The classifier
+                // tail-gates within this; detectRateLimited only inspects its own last ~20
+                // lines, so the wider capture is a no-op for it (CMT-1785).
+                const recentOutput = await this.captureOutputMaybeAsync(session.tmuxSession, RATE_LIMIT_SETTLED_CAPTURE_LINES);
                 if (recentOutput) {
                   // Server-side throttle ("Server is temporarily limiting
                   // requests · not your usage limit") gets a DIFFERENT path:
@@ -1660,7 +3863,30 @@ rm()  { "${shimRunner}" rm  "$@"; }
                     this.emit('rateLimitedAtIdle', session.tmuxSession);
                     continue; // Skip to next session — sentinel owns recovery.
                   }
-                  const hasError = TERMINAL_ERROR_PATTERNS.some(p => recentOutput.includes(p));
+                  // CMT-1785: tail-gated + frame-discriminated classify replaces the bare
+                  // buffer-wide `.includes()` (which fired on stale-scrollback + quoted
+                  // content). A SIGNAL feeding the existing apiErrorAtIdle authority; the
+                  // match set is a strict subset of the old bare match, so it can only
+                  // SUPPRESS spurious fires, never add one.
+                  const idleErr = classifyIdleError(recentOutput, TERMINAL_ERROR_PATTERNS);
+                  const hasError = idleErr.isTerminalError;
+                  // Structured observability (once per idle episode): record fired vs
+                  // suppressed so a wave of suppressions on genuine errors (the under-fire
+                  // risk) is observable. Armed here; cleared with errorNudgedSessions.
+                  if (!this.idleErrorClassified.has(session.id)) {
+                    const bareCandidate = TERMINAL_ERROR_PATTERNS.some(p => recentOutput.includes(p));
+                    if (idleErr.isTerminalError || bareCandidate) {
+                      this.idleErrorClassified.add(session.id);
+                      console.log(`[SessionManager] ${JSON.stringify({
+                        event: 'idle-error-classify',
+                        session: session.name,
+                        result: idleErr.isTerminalError ? 'fired' : 'suppressed',
+                        matchedPattern: idleErr.matchedPattern,
+                        tailDepthFromEnd: idleErr.tailDepthFromEnd,
+                        reason: idleErr.isTerminalError ? undefined : 'no-frame-or-outside-tail',
+                      })}`);
+                    }
+                  }
                   if (hasError) {
                     // Arm the per-episode guard (re-armed on recovery — see the
                     // "Session is active" branch). Prevents per-tick re-emit/re-nudge.
@@ -1673,7 +3899,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
                     // generalizes that proven recovery to the whole transient-API class.)
                     if (this.listenerCount('apiErrorAtIdle') > 0) {
                       this.emit('apiErrorAtIdle', session.tmuxSession);
-                      this.idlePromptSince.delete(session.id);
+                      this.clearIdleClock(session);
+                      this.idleKillBackoff?.reset(session.id);
                       continue; // Skip to next session — sentinel owns recovery.
                     }
                     // Fallback (no sentinel wired, e.g. bare/test): the re-armable
@@ -1681,7 +3908,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
                     this.errorNudgeTotal.set(session.id, nudgeTotal + 1);
                     console.log(`[SessionManager] Session "${session.name}" idle after API error — nudging to continue (nudge #${nudgeTotal + 1} this session).`);
                     this.sendInput(session.tmuxSession, 'You hit an API error. Please continue your work — skip or work around the action that failed.');
-                    this.idlePromptSince.delete(session.id); // Reset idle timer
+                    this.clearIdleClock(session); // Reset idle timer (durable too)
+                    this.idleKillBackoff?.reset(session.id);
                     continue; // Skip to next session
                   }
                 }
@@ -1702,13 +3930,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
                 // reset the idle clock so we don't race the recovery window.
                 if (this.activeRecoveryChecker && this.activeRecoveryChecker(session)) {
                   console.log(`[SessionManager] Skipping zombie kill for "${session.name}" — compaction recovery in flight.`);
-                  this.idlePromptSince.delete(session.id);
+                  this.clearIdleClock(session);
+                  this.idleKillBackoff?.reset(session.id); // recovery window → re-evaluate fresh next tick
                   continue;
                 }
                 // Check for unanswered injection before killing
                 const pendingInjection = this.pendingInjections.get(session.tmuxSession);
                 if (pendingInjection) {
-                  console.warn(`[SessionManager] Zombie session "${session.name}" had unanswered injection for topic ${pendingInjection.topicId}`);
+                  console.warn(`[SessionManager] Zombie session "${session.name}" had unanswered injection for ${topicRef(pendingInjection.topicId)}`);
                   this.pendingInjections.delete(session.tmuxSession);
                   this.emit('injectionDropped', {
                     topicId: pendingInjection.topicId,
@@ -1718,13 +3947,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
                   });
                 }
                 const bindingNote = binding != null ? ` (topic-bound, threshold ${killThresholdMinutes}m)` : ` (threshold ${killThresholdMinutes}m)`;
-                console.warn(`[SessionManager] Session "${session.name}" idle at prompt for ${Math.round(idleMs / 60_000)}m with no active processes${bindingNote}. Killing zombie.`);
                 // Funnel through the single-writer path so the reaper and this
-                // idle-kill can never double-kill or double-emit (§3.6). Explicit
-                // terminal disposition → the §P3 notifier surfaces it to the user.
-                await this.terminateSession(session.id, 'idle-zombie', {
-                  disposition: 'terminal',
-                });
+                // idle-kill can never double-kill or double-emit (§3.6). The
+                // veto-backoff ledger (Fix A) suppresses the every-5s re-attempt on
+                // a permanently-vetoed session; the WARN + terminate live in the
+                // helper's enabled/disabled split.
+                await this.handleIdleZombie(session, idleMs, binding ?? null, now, bindingNote, killThresholdMinutes);
                 continue;
               }
             }
@@ -1734,8 +3962,10 @@ rm()  { "${shimRunner}" rm  "$@"; }
             // nudge worked, or the error cleared), so a FUTURE API-error episode in
             // this same long-running session deserves its own nudge. (errorNudgeTotal
             // is NOT cleared here — it's the lifetime runaway cap.)
-            this.idlePromptSince.delete(session.id);
+            this.clearIdleClock(session);
+            this.idleKillBackoff?.reset(session.id); // resumed work → re-evaluate next tick, don't stay suppressed
             this.errorNudgedSessions.delete(session.id);
+            this.idleErrorClassified.delete(session.id); // CMT-1785: re-arm the once-per-episode classify audit
             this.idleThrottleSettle.delete(session.tmuxSession); // session moved on — reset the settle clock
           }
         }
@@ -1746,12 +3976,26 @@ rm()  { "${shimRunner}" rm  "$@"; }
       if (Date.now() - this.lastCleanupAt > CLEANUP_INTERVAL_MS) {
         this.lastCleanupAt = Date.now();
         this.cleanupStaleSessions();
+        await this.sweepDeadJobPanes();
       }
 
       // Update cached session list (non-blocking) for health endpoint
       const stillRunning = this.state.listSessions({ status: 'running' });
       this._cachedRunningSessions = stillRunning;
       this._cachedRunningCount = stillRunning.length;
+      // Stage-B observation shares the monitor's single-flight cadence. The
+      // observer has its own bounded row/byte budgets and never queues an
+      // overlapping sweep.
+      if (this.codexDeliveryObserver) {
+        void this.codexDeliveryObserver.sweep().then(() => {
+          this.dispatchPreparedInboundDeliveries();
+          for (const notice of this.inboundDeliveries?.pendingNotices(20) ?? []) {
+            this.emit('inboundDeliveryNotice', notice);
+          }
+        }).catch((err) => { // @silent-fallback-ok: logged async observer failure leaves all durable rows queued/fail-closed
+          console.error(`[SessionManager] Codex delivery observation sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
     } finally {
       this.monitoringInProgress = false;
     }
@@ -1768,16 +4012,41 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
+   * The numbers behind a memory-pressure refusal, so the message can be checked
+   * against other readings (trustworthy-machine-load, 2026-10-27: a refusal at
+   * ~80% used was misread as "41% free", a different macOS figure that counts
+   * compressible memory as free). Never throws.
+   */
+  private memoryPressureEvidence(deps: MemReadDeps = {}): string {
+    try {
+      const usedPercent = Math.round(100 - hostFreeMemPct(deps));
+      return `${usedPercent}% used, i.e. 100 minus free+inactive+purgeable, read just after the check; thresholds high 75%, critical 90%`;
+    } catch {
+      return 'reading unavailable'; // @silent-fallback-ok — evidence text for a message, never a decision input
+    }
+  }
+
+  /**
    * Current host memory-pressure tier (june15-headless-spawn-reroute PR2, O2).
    * Extracted from getSessionDiagnostics' inline computation so the reroute
    * pre-spawn gate and the diagnostics surface read ONE definition of pressure.
    * The reroute gate refuses to hold a fresh ~200-500MB REPL when the host is
    * already 'high'/'critical' — the 2026-06-05 laptop-meltdown class.
+   *
+   * Reads the CORRECTED available-memory percentage (free + inactive + purgeable
+   * on macOS via vm_stat; MemAvailable on Linux) via `hostFreeMemPct` — NOT
+   * `os.freemem()`, which on macOS reports only raw free pages (~2.7% on a
+   * healthy 17GB host) and therefore pinned this method at 'critical'
+   * PERMANENTLY, so force-mode `evaluateRerouteGate` threw on every job spawn.
+   * Spec: macos-memory-pressure-metric (the sibling the original fix missed —
+   * SessionReaper/HostPressureSampler were corrected, this caller was not).
+   * Thresholds are unchanged; only the measurement source moved.
    */
-  private currentMemoryPressure(): MemoryPressure {
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
+  private currentMemoryPressure(deps: MemReadDeps = {}): MemoryPressure {
+    return this.memoryPressureTier(Math.round(100 - hostFreeMemPct(deps)));
+  }
+
+  private memoryPressureTier(usedPercent: number): MemoryPressure {
     if (usedPercent >= 90) return 'critical';
     if (usedPercent >= 75) return 'high';
     if (usedPercent >= 60) return 'moderate';
@@ -1850,6 +4119,11 @@ rm()  { "${shimRunner}" rm  "$@"; }
     return reroute;
   }
 
+  /** The tmux session name `spawnSession` gives a session named `name` (callers record it before spawning). */
+  plannedTmuxSessionName(name: string): string {
+    return `${path.basename(this.config.projectDir)}-${sanitizeSessionName(name)}`;
+  }
+
   /**
    * Spawn a new Claude Code session in tmux.
    *
@@ -1858,7 +4132,69 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * (PARALLEL-DEV-ISOLATION-SPEC.md). Without `topicId`, falls back to the
    * legacy main-checkout behavior for back-compat with non-topic-bound jobs.
    */
-  async spawnSession(options: {
+  /**
+   * Overload admission (trustworthy-machine-load Part C). Set by the server when
+   * WorkAdmission is constructed; null = no admission control (today's behavior).
+   */
+  private admissionGate: ((kind: AdmissionKind, sessionName: string) => AdmissionDecision) | null = null;
+  /** Releases a recovery slot taken at admission when the spawn fails before `running` (second-pass #1). */
+  private admissionRelease: ((sessionName: string) => void) | null = null;
+
+  setAdmissionGate(
+    gate: ((kind: AdmissionKind, sessionName: string) => AdmissionDecision) | null,
+    release: ((sessionName: string) => void) | null = null,
+  ): void {
+    this.admissionGate = gate;
+    this.admissionRelease = release;
+  }
+
+  private releaseAdmissionFor(sessionName: string): void {
+    try { this.admissionRelease?.(sessionName); } catch { /* @silent-fallback-ok — the slot is reclaimed by the startup grace / pid death */ }
+  }
+
+  /** Throws AdmissionRefusedError when an enforcing admission gate refuses the spawn. */
+  private checkAdmission(kind: AdmissionKind, sessionName: string): void {
+    if (!this.admissionGate) return;
+    let decision: AdmissionDecision;
+    try { decision = this.admissionGate(kind, sessionName); } catch (err) {
+      // @silent-fallback-ok (logged): a broken admission gate fails toward starting
+      // the session — reachability over protection (The Agent Is Always Reachable).
+      console.warn(`[SessionManager] admission gate failed, admitting ${sessionName}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!decision.allowed) throw new AdmissionRefusedError(decision.reason ?? 'overloaded', decision.detail ?? 'machine overloaded');
+  }
+
+  async spawnSession(options: Parameters<SessionManager['spawnSessionInternal']>[0]): Promise<Session> {
+    const running = this.listRunningSessions();
+    const effectiveCount = running.length + this.pendingHeadlessSpawns;
+    const scheduled = Boolean(options.jobSlug && options.triggeredBy?.startsWith('scheduler:'));
+    // Human conversations can exceed the soft autonomous cap. Permit exactly
+    // one scheduled job alongside them while memory is healthy and the hard
+    // absolute cap still has room. This remains a bounded loan, not an
+    // increase in parallel job capacity or the rerouted memory cap.
+    if (effectiveCount >= this.config.maxSessions
+      && !(scheduled && this.scheduledOverflowAvailable(running, this.currentMemoryPressure()))) {
+      throw new SessionCapacityRefusedError(effectiveCount, this.config.maxSessions);
+    }
+    this.pendingHeadlessSpawns++;
+    if (scheduled) this.pendingScheduledSpawns++;
+    try {
+      return await this.spawnSessionInternal(options);
+    } finally {
+      this.pendingHeadlessSpawns--;
+      if (scheduled) this.pendingScheduledSpawns--;
+    }
+  }
+
+  private scheduledOverflowAvailable(running: Session[], pressure: MemoryPressure): boolean {
+    return pressure !== 'high' && pressure !== 'critical'
+      && running.length + this.pendingHeadlessSpawns < this.config.maxSessions * 3
+      && this.pendingScheduledSpawns === 0
+      && !running.some(s => s.jobSlug);
+  }
+
+  private async spawnSessionInternal(options: {
     name: string;
     prompt: string;
     /** Either a Claude tier name, a generic tier ('fast'|'balanced'|'capable'),
@@ -1870,6 +4206,10 @@ rm()  { "${shimRunner}" rm  "$@"; }
     triggeredBy?: string;
     maxDurationMinutes?: number;
     topicId?: number | 'platform';
+    /** durable-conversation-identity §7: the authenticated bootstrap
+     *  conversation ids this session may open durable state on. Falls back to
+     *  [topicId] when topicId is numeric. */
+    bootstrapConversationIds?: number[];
     worktreeMode?: 'dev' | 'read-only' | 'doc-fix' | 'platform';
     worktreeSlug?: string;
     /** Per-call framework override; falls back to INSTAR_FRAMEWORK env, then claude-code. */
@@ -1919,28 +4259,88 @@ rm()  { "${shimRunner}" rm  "$@"; }
      *  covered by the existing resume-crash fallback. No effect on non-claude
      *  frameworks or interactive spawns. */
     resumeSessionId?: string;
+    /** Claude Code only: opt this spawned turn into xhigh effort + dynamic
+     * workflow orchestration via Claude's supported prompt keyword. */
+    ultracode?: boolean;
+    /**
+     * Explicit subscription-account pin (spec skill-driven-signin-repair): launch this headless
+     * session under THIS pool account's login, for Claude (`CLAUDE_CONFIG_DIR`) or Codex
+     * (`CODEX_HOME`). The home is resolved through the credential-location gate, so a re-pointed
+     * slot is followed. It always wins over the global headroom resolver, which pins Claude only
+     * and cannot exclude an account. Refused when `framework` is not claude-code or codex-cli, or
+     * when the resolved headless framework differs from the requested one (a pinned launch must
+     * never silently land on another framework's login).
+     */
+    accountPin?: { accountId: string; configHome: string };
+    /**
+     * Feedback executor (docs/specs/feedback-triage-and-execution.md §4 step 4): run the session in
+     * this directory instead of the project directory. Limited to paths under
+     * `<projectDir>/.worktrees/`; mutually exclusive with `topicId` worktree resolution.
+     */
+    cwd?: string;
+    /**
+     * Drop the agent's own authority from the session environment: no INSTAR_AUTH_TOKEN, no origin
+     * or bind token, no vault GitHub token, no fencing token, and every credential-shaped variable
+     * the server process carries is blanked. Refused when the agent authenticates Claude through an
+     * env token (that token would reach the session's child processes).
+     */
+    omitAuthEnv?: boolean;
+    /**
+     * A framework confinement adapter. `claude-code` is the only framework with one: the policy is a
+     * `--settings` file (OS sandbox for Bash and children + permission rules), loaded with
+     * `--setting-sources local` so no user or project hooks run, and no MCP servers. Any other
+     * framework, or a launch that would be rerouted to the interactive lane, is refused.
+     */
+    confinement?: { framework: 'claude-code'; settingsPath: string; tmpDir: string };
+    /**
+     * Narrow a claude-code session to exactly these tools (job-cost-reduction §5.6.2, triage
+     * sessions), on both the headless and the rerouted interactive lane: no
+     * `--dangerously-skip-permissions`; `--permission-mode dontAsk --tools <list> --no-chrome`,
+     * `--allowedTools <list>` and `--strict-mcp-config --mcp-config {}`. Asserted; the spawn fails
+     * if the form was not applied. Not an OS sandbox. No effect on other frameworks (they have no
+     * tool flag). Mutually exclusive with `confinement`, which has its own tool set.
+     */
+    confinedTools?: string[];
+    /**
+     * Launch on the agent's default model, ignoring `model` (the job's tier). Triage sessions use it:
+     * the operator asked for "a real session with real intelligence", not the template's tier.
+     */
+    useAgentDefaultModel?: boolean;
   }): Promise<Session> {
-    const runningSessions = this.listRunningSessions();
-    if (runningSessions.length >= this.config.maxSessions) {
-      throw new Error(
-        `Max sessions (${this.config.maxSessions}) reached. ` +
-        `Running: ${runningSessions.map(s => s.name).join(', ')}`
-      );
+    if (options.cwd !== undefined) {
+      const worktreesRoot = path.resolve(this.config.projectDir, '.worktrees');
+      const requested = path.resolve(options.cwd);
+      if (!path.isAbsolute(options.cwd) || !requested.startsWith(`${worktreesRoot}${path.sep}`) || options.topicId !== undefined) {
+        throw new Error('spawn-cwd-refused: cwd must be an absolute path under <projectDir>/.worktrees/ and cannot combine with topicId');
+      }
+      if (!fs.existsSync(requested)) throw new Error('spawn-cwd-refused: directory does not exist');
     }
-
+    if (options.confinement && !options.omitAuthEnv) throw new Error('confinement-requires-omit-auth-env');
+    if (options.confinement && options.confinedTools) throw new Error('confined-tools-conflicts-with-confinement');
+    if (options.confinedTools && options.confinedTools.length === 0) throw new Error('confined-tools-invalid: empty tool list');
+    if (options.useAgentDefaultModel) options = { ...options, model: undefined };
+    if (options.confinedTools) {
+      // dontAsk refuses any tool the settings do not allow: the allowlist IS the tool list.
+      options = { ...options, allowedTools: [...options.confinedTools], disableProjectMcp: true };
+    }
+    if (options.omitAuthEnv && (this.config.anthropicApiKey ?? '').length > 0) {
+      throw new Error('omit-auth-env-unsupported: the agent authenticates Claude through an env token');
+    }
     const sessionId = this.generateId();
-    const safeName = sanitizeSessionName(options.name);
-    const tmuxSession = `${path.basename(this.config.projectDir)}-${safeName}`;
+    const tmuxSession = this.plannedTmuxSessionName(options.name);
 
     // Check if tmux session already exists
     if (this.tmuxSessionExists(tmuxSession)) {
       throw new Error(`tmux session "${tmuxSession}" already exists`);
     }
+    // Overload admission (Part C1): automatic work is not started on an
+    // overloaded machine; the caller retries (jobs) or keeps its message queued.
+    this.checkAdmission('automatic', tmuxSession);
 
     // ── PARALLEL-DEV-ISOLATION (PARALLEL-DEV-ISOLATION-SPEC.md AC-1) ──
     // If WorktreeManager is wired AND topicId provided, resolve a topic worktree
     // and use its cwd. Otherwise fall back to projectDir (legacy behavior).
-    let resolvedCwd = this.config.projectDir;
+    let resolvedCwd = options.cwd !== undefined ? path.resolve(options.cwd) : this.config.projectDir;
     let workTreeFencingToken: string | null = null;
     let shimDir: string | null = null;
     if (this.worktreeManager && options.topicId !== undefined) {
@@ -1964,7 +4364,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         }
       } catch (err: any) {
         if (err && err.code === 'LOCK_HELD') {
-          throw new Error(`Cannot spawn session for topic ${options.topicId}: lock held by ${JSON.stringify(err.holder)}`);
+          throw new Error(`Cannot spawn session for ${topicRef(options.topicId)}: lock held by ${JSON.stringify(err.holder)}`);
         }
         throw err;
       }
@@ -1980,7 +4380,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Framework resolution: the per-call options.framework wins, falling
     // back to the agent's configured sessions.framework and then to the
     // INSTAR_FRAMEWORK env. Defaults to claude-code for back-compat.
-    const headlessFramework = resolveInteractiveFramework({
+    const requestedHeadlessFramework = resolveInteractiveFramework({
       perCall: options.framework,
       // config.framework is the agent's resolved runtime framework
       // (derived at load from sessions.framework | enabledFrameworks[0]
@@ -1988,15 +4388,109 @@ rm()  { "${shimRunner}" rm  "$@"; }
       configFramework: this.config.framework,
       envFramework: frameworkFromEnv(),
     });
-    const headlessBinaryPath =
-      this.config.frameworkBinaryPaths?.[headlessFramework]
-      ?? this.config.claudePath;
+    // CLOSED-LANE FALLBACK (round-12 adversarial, grok-build spec §4.3 lane 3).
+    // Making `resolveConfiguredFramework` finally return 'grok-build' fixed a
+    // real defect (a Grok-primary agent silently ran Claude) and created a new
+    // one: grok's HEADLESS builder refuses unconditionally until scratch-cwd
+    // wiring lands, so that same agent's scheduled jobs, upgrade-notify and
+    // pipe spawns would ALL throw. Pre-fix they ran mislabelled-but-working.
+    //
+    // Neither extreme is right: running Claude under a grok LABEL is the §2.0
+    // impersonation, and failing every job is a worse outcome than the bug we
+    // fixed. So fall back to a framework whose headless lane is OPEN and label
+    // the session HONESTLY as that framework — fallback WITH disclosure, the
+    // same shape §5.2 uses for an unlaunchable pin. Once the headless lane
+    // opens this branch stops being reachable. <!-- tracked: CMT-1317 -->
+    // Round-13 (adversarial): the first version hardcoded `claude-code` with no
+    // availability check — on a Grok-primary agent that never enabled Claude it
+    // would spawn a binary that may not exist. The fallback now picks a
+    // framework that is ENABLED and whose binary is genuinely present, and when
+    // there is no such framework it returns null so the lane's OWN refusal
+    // stands (a legible `grok-headless-cwd-ungated` beats a mystery ENOENT).
+    const fallbackFramework = resolveHeadlessFallbackFramework({
+      requested: requestedHeadlessFramework,
+      enabledFrameworks: this.config.enabledFrameworks,
+      frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+      claudePath: this.config.claudePath,
+      binaryExists: (candidatePath) => {
+        try {
+          return candidatePath.includes('/')
+            ? fs.existsSync(candidatePath)
+            : true; // a bare command name resolves through PATH at spawn time
+        } catch {
+          // @silent-fallback-ok — an unprobeable candidate is treated as
+          // present; the spawn itself is the authority, and a probe error must
+          // not silently narrow the fallback set.
+          return true;
+        }
+      },
+    });
+    const headlessFramework = fallbackFramework ?? requestedHeadlessFramework;
+    if (headlessFramework !== requestedHeadlessFramework) {
+      if (!this.closedHeadlessLaneDisclosed.has(requestedHeadlessFramework)) {
+        this.closedHeadlessLaneDisclosed.add(requestedHeadlessFramework);
+        console.warn(
+          `[SessionManager] headless lane for "${requestedHeadlessFramework}" is not open yet — ` +
+          `running this and subsequent headless spawns on "${headlessFramework}" and labelling them ` +
+          `as such (never as ${requestedHeadlessFramework}). Interactive sessions are unaffected.`,
+        );
+      }
+    } else if (headlessLaneIsClosed(requestedHeadlessFramework)
+        && !this.closedHeadlessLaneDisclosed.has(`${requestedHeadlessFramework}:no-fallback`)) {
+      this.closedHeadlessLaneDisclosed.add(`${requestedHeadlessFramework}:no-fallback`);
+      console.warn(
+        `[SessionManager] headless lane for "${requestedHeadlessFramework}" is not open yet and NO ` +
+        `enabled framework with a present binary can take it — letting the lane's own refusal stand ` +
+        `so the failure names itself. Enable a second framework to give jobs a working lane.`,
+      );
+    }
+    // Shared impersonation fence (spec §2.0) — see resolveFrameworkBinaryPath.
+    // This site was the THIRD resolution point and the one the fence had
+    // MISSED (round-9 adversarial): a grok-labelled headless spawn resolved to
+    // `claudePath`, i.e. the CLAUDE binary, and only an unrelated cwd gate
+    // masked it.
+    const headlessConfiguredBinary = resolveFrameworkBinaryPath({
+      framework: headlessFramework,
+      frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+      claudePath: this.config.claudePath,
+      configuredFramework: this.config.framework,
+    });
+    if (!headlessConfiguredBinary) {
+      throw new Error(`No binary path available for framework "${headlessFramework}"`);
+    }
+    // CMT-798: launch claude-code from its retained per-version copy.
+    const headlessBinaryPath = this.resolveLaunchBinary(headlessFramework, headlessConfiguredBinary);
 
     // Codex rate-limit model-swap (dark by default): when the agent's main
     // codex model has exhausted its weekly window, launch on a configured
     // fallback model (separate quota bucket) instead of stalling. No-op +
     // zero disk I/O unless codex.rateLimitModelSwap is enabled. Best-effort.
+
+
+    // grok headless bound: the lane is open, but NOT into an instar source
+    // checkout (grok self-updates). Rationale + why a scratch cwd was rejected:
+    // upgrades/side-effects/grok-build-framework-integration.md. The detector
+    // FAILS CLOSED, so an ambiguous path refuses rather than proceeds.
+    if (headlessFramework === 'grok-build' && isInstarSourceTree(resolvedCwd)) {
+      throw new Error(
+        'grok-headless-source-tree: refusing a grok-build headless job whose working ' +
+          'directory is an instar source checkout — grok self-updates, and this is the ' +
+          'case the headless bound exists for. Run this job on an agent whose project ' +
+          'directory is its agent home, or use the confined one-shot reviewer lane.',
+      );
+    }
+
+    if (options.accountPin) {
+      if (headlessFramework !== options.framework
+        || (headlessFramework !== 'claude-code' && headlessFramework !== 'codex-cli')) {
+        throw new Error(`account-pin-framework-unsupported: ${headlessFramework}`);
+      }
+      if (!path.isAbsolute(options.accountPin.configHome)) throw new Error('account-pin-config-home-invalid');
+    }
     const launchModel = await this.resolveCodexLaunchModel(headlessFramework, options.model);
+
+
+
 
     // ── Headless-spawn reroute (june15-headless-spawn-reroute, PR2) ──
     // For claude-code ONLY, when subscriptionPath.mode is 'force' (or 'auto'
@@ -2013,8 +4507,11 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // below (degradation-reported); under 'force' it REFUSES loudly (no headless
     // fallback — force guarantees zero `claude -p`). So this branch only commits
     // to the reroute when the gate passes; otherwise control falls through.
+    if (options.confinement && (headlessFramework !== options.confinement.framework || headlessFramework !== 'claude-code')) {
+      throw new Error(`confinement-unsupported-framework: ${headlessFramework}`);
+    }
     if (await this.shouldRerouteToInteractive(headlessFramework)) {
-      const gate = this.evaluateRerouteGate(options.name);
+      const gate = this.evaluateRerouteGate(options.name, Boolean(options.jobSlug && options.triggeredBy?.startsWith('scheduler:')));
       if (gate.allow) {
         return await this.spawnReroutedInteractive({
           sessionId,
@@ -2032,6 +4529,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // headless build below.
     }
 
+    let headlessThreadline = this.planHeadlessThreadlineMcp(headlessFramework, headlessBinaryPath, options); // threadline-mcp-local-http D2/D3
     const headlessSpec = buildHeadlessLaunch(headlessFramework, {
       binaryPath: headlessBinaryPath,
       prompt: options.prompt,
@@ -2042,9 +4540,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // spawn — uses THIS agent's threadline MCP, not whichever agent last won
       // the shared ~/.codex/config.toml.
       ...(this.config.codexThreadlineMcp ? { codexThreadlineMcp: this.config.codexThreadlineMcp } : {}),
+      ...(headlessThreadline.transport === 'http' && headlessThreadline.codexArgs
+        ? { codexThreadlineHttpArgs: headlessThreadline.codexArgs } : {}),
       // Reply spawns set this so the codex worker can call threadline_send;
       // jobs leave it unset and keep the workspace-write sandbox.
       ...(options.codexAllowMcpTools ? { codexAllowMcpTools: true } : {}),
+      ...(options.ultracode ? { ultracode: true } : {}),
     });
 
     // Extra claude-code headless flags, spliced before the `-p` prompt positional
@@ -2060,12 +4561,31 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const extraClaudeFlags = claudeHeadlessExtraFlags({
       framework: headlessFramework,
       allowedTools: options.allowedTools,
-      disableProjectMcp: options.disableProjectMcp,
+      disableProjectMcp: options.disableProjectMcp || Boolean(options.confinement),
+      ...(options.confinement ? { confinementSettingsPath: options.confinement.settingsPath } : {}),
     });
+    if (options.confinement && !extraClaudeFlags.includes('--settings')) {
+      throw new Error('confinement-adapter-missing: the --settings flag was not applied');
+    }
     if (extraClaudeFlags.length > 0) {
       const dashPIndex = headlessSpec.argv.indexOf('-p');
       if (dashPIndex > 0) {
         headlessSpec.argv.splice(dashPIndex, 0, ...extraClaudeFlags);
+      }
+    }
+    if (options.confinedTools && headlessFramework === 'claude-code') {
+      applyClaudeToolConfinement(headlessSpec.argv, options.confinedTools);
+    }
+    // Claude Code HTTP wiring: one per-spawn `--mcp-config` (non-strict) naming the
+    // stable per-agent file; its same-named `threadline` entry replaces the global stdio one.
+    if (headlessFramework === 'claude-code' && headlessThreadline.transport === 'http' && headlessThreadline.claudeConfigPath) {
+      const dashPIndex = headlessSpec.argv.indexOf('-p');
+      if (dashPIndex > 0) {
+        headlessSpec.argv.splice(dashPIndex, 0, '--mcp-config', headlessThreadline.claudeConfigPath);
+      } else {
+        // No `-p` to anchor on: the HTTP entry was not inserted, so the session
+        // runs the stdio helper — record it as that, never as 'http'.
+        headlessThreadline = { transport: 'stdio', reason: 'mcp-config-not-inserted', secretEnvFlags: headlessThreadline.secretEnvFlags };
       }
     }
 
@@ -2079,7 +4599,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
     if (headlessFramework === 'claude-code') {
       const continuityFlags: string[] = options.sessionId
         ? ['--session-id', options.sessionId]
-        : options.resumeSessionId
+        : isSafeSessionRef(options.resumeSessionId)
           ? ['--resume', options.resumeSessionId]
           : [];
       if (continuityFlags.length > 0) {
@@ -2104,15 +4624,22 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // claude-code session under a chosen pool account's config home and tag it,
     // so auto-swap can move it when that account walls. No-op unless the resolver
     // is wired (pinSessionsToPool enabled) and returns an account.
-    const pinnedAccount = headlessFramework === 'claude-code'
-      ? (this.spawnAccountResolver?.() ?? null)
-      : null;
+    const pinnedAccount = options.accountPin
+      ? options.accountPin
+      : headlessFramework === 'claude-code'
+        ? (this.spawnAccountResolver?.() ?? null)
+        : null;
     if (pinnedAccount) {
       // Census #6: pin to the account's CURRENT slot per the ledger gate, not its enrollment home.
       const pinnedHome = this.resolvePinnedSpawnHome(pinnedAccount);
-      headlessSpec.envOverrides.CLAUDE_CONFIG_DIR = pinnedHome;
-      this.ensurePinnedHomeInteractiveReady(pinnedHome, 'headless pin');
+      if (headlessFramework === 'codex-cli') {
+        headlessSpec.envOverrides.CODEX_HOME = pinnedHome;
+      } else {
+        headlessSpec.envOverrides.CLAUDE_CONFIG_DIR = pinnedHome;
+        this.ensurePinnedHomeInteractiveReady(pinnedHome, 'headless pin');
+      }
     }
+    assertBrowserMcpProfilesSafe(resolvedCwd, headlessFramework, this.originConfigHome(headlessFramework, headlessSpec.envOverrides), this.config.projectDir);
     const frameworkEnvFlags: string[] = [];
     for (const [k, v] of Object.entries(headlessSpec.envOverrides)) {
       frameworkEnvFlags.push('-e', `${k}=${v}`);
@@ -2134,6 +4661,26 @@ rm()  { "${shimRunner}" rm  "$@"; }
         ? ((this.config.anthropicApiKey ?? '') !== '' ? 'env' : 'store')
         : undefined;
 
+    if (!options.omitAuthEnv) this.linkAgentOwnedMemory(headlessFramework, headlessSpec.envOverrides, resolvedCwd);
+    const originEnvFlags = options.omitAuthEnv ? ['-e', 'INSTAR_ORIGIN_TOKEN='] : await this.originTokenEnvFlags({
+      sessionId, harnessId: headlessFramework, projectDir: resolvedCwd,
+      configuredModel: resolveModelForFramework(headlessFramework, launchModel) ?? launchModel,
+      configHome: this.originConfigHome(headlessFramework, headlessSpec.envOverrides),
+    });
+    // omitAuthEnv: blank every credential-shaped variable the tmux server could hand down.
+    const omitAuthEnvFlags: string[] = [];
+    if (options.omitAuthEnv) {
+      for (const key of Object.keys(process.env).sort()) {
+        if (isCredentialEnvName(key) && key !== 'CLAUDE_CONFIG_DIR') omitAuthEnvFlags.push('-e', `${key}=`);
+      }
+      omitAuthEnvFlags.push('-e', 'GH_TOKEN=', '-e', 'GITHUB_TOKEN=', '-e', 'INSTAR_BIND_TOKEN=', '-e', 'INSTAR_FENCING_TOKEN=');
+    }
+    if (options.confinement) {
+      // Claude Code's own shell bookkeeping and its default writable temp follow CLAUDE_CODE_TMPDIR:
+      // the attempt's temp directory, never the shared system temp.
+      omitAuthEnvFlags.push(...applyClaudeConfinement(headlessSpec.argv, options.confinement, { sessionId, tmuxSession },
+        headlessSpec.envOverrides.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR));
+    }
     try {
       // §B in-flight marker: this spawn is EXCLUDED from §A async conversion
       // (its synchronous timing is part of the spawn contract) but still funnels
@@ -2149,11 +4696,31 @@ rm()  { "${shimRunner}" rm  "$@"; }
         ...(this.config.claudeCodeMaxRetries != null
           ? ['-e', `CLAUDE_CODE_MAX_RETRIES=${this.config.claudeCodeMaxRetries}`]
           : []),
-        '-e', `INSTAR_SESSION_ID=${sessionId}`, // Expose instar session ID to hook events
+        '-e', `INSTAR_SESSION_ID=${sessionId}`,
+        ...originEnvFlags, // Expose instar session ID to hook events
         '-e', `INSTAR_SESSION_NAME=${tmuxSession}`, // Threadline binding: attributes a relay-send to its origin session
         '-e', `INSTAR_SERVER_URL=http://localhost:${this.config.port}`,
-        '-e', `INSTAR_AUTH_TOKEN=${this.config.authToken}`,
+        '-e', `INSTAR_AUTH_TOKEN=${options.omitAuthEnv ? '' : this.config.authToken}`,
+        ...this.memorySystemEnvFlags(),
+        ...headlessThreadline.secretEnvFlags, // threadline-mcp-local-http D2 (flag on only; blank when stripped)
+        // Long waits (threadline-mcp-local-http "Bounds", deadline 5): the client
+        // outlasts the 300 s reply wait on every claude-code spawn, stdio and HTTP alike.
+        ...(headlessFramework === 'claude-code' ? CLAUDE_MCP_TOOL_TIMEOUT_ENV_FLAGS : []),
         '-e', `INSTAR_AGENT_ID=${this.config.projectName}`,
+        // The agent HOME (the `.instar` PARENT), distinct from CLAUDE_PROJECT_DIR.
+        // A worktree session's project dir has no `.instar/config.json` and no
+        // `.instar/state/`, so any hook that resolved those from the project dir
+        // silently no-opped for exactly the sessions doing mutating work. Hooks
+        // resolve agent-scoped files as `<INSTAR_AGENT_HOME>/.instar/...` — the
+        // `.instar` segment is part of every such path, never implied.
+        '-e', `INSTAR_AGENT_HOME=${this.config.projectDir}`,
+        // durable-conversation-identity §7: per-session bind token scoping
+        // durable-state opens to this spawn's bootstrap conversation set.
+        ...(options.omitAuthEnv ? [] : this.bindTokenEnvFlags(
+          tmuxSession,
+          options.bootstrapConversationIds ??
+            (typeof options.topicId === 'number' ? [options.topicId] : []),
+        )),
         // Structural message-kind stamping (outbound-jargon-filepath-gap §2.1):
         // a job-spawned session is marked 'automated' in its ENVIRONMENT, so
         // telegram-reply.sh forwards the kind regardless of what the model
@@ -2162,10 +4729,17 @@ rm()  { "${shimRunner}" rm  "$@"; }
           ? [
               '-e', 'INSTAR_MESSAGE_KIND=automated',
               '-e', `INSTAR_JOB_SLUG=${options.jobSlug}`,
+              ...this.jobFailureFileEnvFlags(tmuxSession),
               '-e', 'INSTAR_SENDER_CLASS=llm-session',
+              // Test-runner bound (test-runner-concurrency-bound §2.6): a
+              // server-launched job session is BACKGROUND class — test suites
+              // it runs get the short fail-loud acquire budget, never the long
+              // interactive one. Derived from the launch site, never from
+              // user input. Interactive (jobSlug-less) spawns get NONE.
+              '-e', 'INSTAR_HOST_TEST_RUN_CLASS=background',
             ]
           : []),
-        ...this.ghTokenEnvFlags(), // P3b: per-agent vault GitHub token (empty when no vault token)
+        ...(options.omitAuthEnv ? [] : this.ghTokenEnvFlags()), // P3b: per-agent vault GitHub token (empty when no vault token)
         ...(workTreeFencingToken ? ['-e', `INSTAR_FENCING_TOKEN=${workTreeFencingToken}`] : []),
         ...(workTreeFencingToken ? ['-e', `INSTAR_WORKTREE_PATH=${resolvedCwd}`] : []),
         ...(shimDir ? ['-e', `PATH=${shimmedPath}`, '-e', `BASH_ENV=${path.join(shimDir, '.shellrc')}`] : []),
@@ -2175,9 +4749,18 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // or data operations against the wrong database. (Learned from Portal incident 2026-02-22)
         '-e', 'DATABASE_URL=',
         '-e', 'DIRECT_DATABASE_URL=',
+        // Round-18 (security): the round-17 scrub landed on the LEAST-exposed
+        // of the spawn sites — the 10-minute scoped triage pane — while the
+        // long-lived interactive panes, where the agent runs arbitrary Bash and
+        // can invoke grok directly, inherited the metered key from the tmux
+        // server env. Found by grepping the codebase's OWN scrub convention:
+        // DATABASE_URL_PROD= appears at every spawn site, XAI_API_KEY= at one.
+        '-e', 'XAI_API_KEY=',
+        '-e', 'GROK_DEPLOYMENT_KEY=',
         '-e', 'DATABASE_URL_PROD=',
         '-e', 'DATABASE_URL_DEV=',
         '-e', 'DATABASE_URL_TEST=',
+        ...omitAuthEnvFlags,
         ...headlessSpec.argv,
       ], { encoding: 'utf-8' }));
 
@@ -2190,7 +4773,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // @silent-fallback-ok — history-limit is a nice-to-have
       }
     } catch (err) {
-      throw new Error(`Failed to create tmux session: ${err}`);
+      this.revokeOriginSession(sessionId);
+      throw new Error(`Failed to create tmux session: ${this.originSpawnError(err)}`);
     }
 
     const session: Session = {
@@ -2201,12 +4785,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
       tmuxSession,
       startedAt: new Date().toISOString(),
       triggeredBy: options.triggeredBy,
-      // Record the framework-RESOLVED model, not the raw tier alias. A Codex
+      // Record the framework-RESOLVED launch model, not the raw tier alias. A Codex
       // agent's session must show its real gpt-5.x model on the dashboard, not
-      // the Claude tier nickname (haiku/sonnet) the caller passed. Falls back
-      // to the raw value when no mapping applies. + carry the framework so the
+      // the Claude tier nickname (haiku/sonnet) the caller passed. The launch
+      // model may also reflect a rate-limit swap. + carry the framework so the
       // dashboard can render engine-aware.
-      model: resolveModelForFramework(headlessFramework, options.model) ?? options.model,
+      model: resolveModelForFramework(headlessFramework, launchModel) ?? launchModel,
       framework: headlessFramework,
       prompt: options.prompt,
       maxDurationMinutes: options.maxDurationMinutes,
@@ -2221,9 +4805,36 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // headless one-shot signals completion by process exit — today's behavior).
       launchLane: 'headless',
       completionMode: 'exit',
+      ...(options.confinement ? { confinedConfigHome: headlessSpec.envOverrides.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigHome() } : {}),
+      ...this.threadlineTransportTag(headlessThreadline),
     };
 
-    this.state.saveSession(session);
+    try {
+      this.state.saveSession(session);
+    } catch (err) {
+      // The headless launch argv already carried the prompt into a successfully
+      // created tmux session. A persistence failure here is therefore
+      // post-delivery bookkeeping, not a spawn failure. Rejecting would invite
+      // the caller to redrive the same payload into a second live session.
+      const reason = err instanceof Error ? err.message : String(err);
+      const identifiedReason =
+        `Session "${tmuxSession}" (${sessionId}) state persistence failed: ${reason}`;
+      console.error(
+        `[SessionManager] Session "${tmuxSession}" is live and the prompt was delivered, ` +
+        `but session bookkeeping failed: ${reason}`,
+      );
+      DegradationReporter.getInstance().report({
+        feature: 'SessionManager.spawnSession.persistDeliveredSession',
+        primary: 'Persist the already-delivered headless session record',
+        fallback: 'Return the live session without converting delivery into a false spawn failure',
+        reason: identifiedReason,
+        impact:
+          `The caller will not duplicate the delivered prompt, but untracked tmux session ` +
+          `"${tmuxSession}" (${sessionId}) is outside normal monitoring and automatic reaping ` +
+          `and may survive restart until manually cleaned up`,
+      });
+    }
+    this.retainFailedExitStatus(tmuxSession);
     return session;
   }
 
@@ -2240,18 +4851,44 @@ rm()  { "${shimRunner}" rm  "$@"; }
    *    pot still works; the host stays healthy).
    * Returns `{ allow: true }` when the reroute may proceed.
    */
-  private evaluateRerouteGate(spawnName: string): { allow: boolean } {
-    const mode = this.config.subscriptionPathMode ?? 'off';
+  /**
+   * Would a confined claude-code spawn be REFUSED for reroute capacity right now? Only `force`
+   * refuses (under `auto` a full lane degrades to headless; under `off` nothing reroutes). Same
+   * counters as `evaluateRerouteGate`. Read by the feedback executor's admission so it claims
+   * nothing while the lane is full (docs/specs/confined-spawn-subscription-reroute.md, Cap contention).
+   */
+  confinedRerouteCapacity(): 'available' | 'saturated' | 'not-rerouted' {
+    const pressure = this.currentMemoryPressure();
+    const running = this.listRunningSessions();
+    // Feedback canaries/builds are not scheduler-proven spawns. The early check
+    // must use their actual gate, not the scheduler's reserved global slot.
+    if (running.length + this.pendingHeadlessSpawns >= this.config.maxSessions) return 'saturated';
+    if ((this.config.subscriptionPathMode ?? 'off') !== 'force') return 'not-rerouted';
+    return this.countReroutedInteractiveSessions() >= this.rerouteAdmissionCap(false)
+      || pressure === 'high' || pressure === 'critical' ? 'saturated' : 'available';
+  }
+
+  private rerouteAdmissionCap(scheduledJob: boolean): number {
     const maxRerouted = this.config.subscriptionMaxRerouted ?? 3;
+    // A one-slot host cannot reserve without blocking all conversations.
+    return !scheduledJob && maxRerouted > 1 ? maxRerouted - 1 : maxRerouted;
+  }
+
+  private evaluateRerouteGate(spawnName: string, scheduledJob = false): { allow: boolean } {
+    const mode = this.config.subscriptionPathMode ?? 'off';
     const reroutedCount = this.countReroutedInteractiveSessions();
     const pressure = this.currentMemoryPressure();
     const pressureElevated = pressure === 'high' || pressure === 'critical';
-    if (reroutedCount < maxRerouted && !pressureElevated) {
+    // Keep one of the existing memory-bounded slots for scheduled jobs when
+    // conversations would otherwise fill the entire lane. A one-slot host
+    // cannot reserve without blocking all conversations, so retain its cap.
+    const admissionCap = this.rerouteAdmissionCap(scheduledJob);
+    if (reroutedCount < admissionCap && !pressureElevated) {
       return { allow: true };
     }
-    const why = reroutedCount >= maxRerouted
-      ? `rerouted-session cap reached (${reroutedCount}/${maxRerouted})`
-      : `host memory pressure is ${pressure}`;
+    const why = reroutedCount >= admissionCap
+      ? `rerouted-session cap reached (${reroutedCount}/${admissionCap})`
+      : `host memory pressure is ${pressure} (${this.memoryPressureEvidence()})`;
     if (mode === 'force') {
       // Loud refusal — force-mode has no headless fallback. Report AND throw.
       DegradationReporter.getInstance().report({
@@ -2259,9 +4896,10 @@ rm()  { "${shimRunner}" rm  "$@"; }
         primary: 'reroute claude-code one-shot onto the interactive subscription lane',
         fallback: 'spawn REFUSED (force-mode has no headless fallback)',
         reason: `Cannot reroute: ${why}`,
-        impact: `Job/A2A spawn "${spawnName}" refused under force-mode to protect the host; it will retry on its next trigger`,
+        impact: `Spawn "${spawnName}" waited for capacity; the caller owns its retry`,
+        internalOnly: true,
       });
-      throw new Error(`Reroute refused (force-mode): ${why}`);
+      throw new RerouteRefusedError(why);
     }
     // 'auto' — degrade to the headless lane (host stays healthy). Caller falls
     // through to the headless build.
@@ -2357,7 +4995,23 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // is keyed on the session id suffix so two concurrent rerouted sessions
     // can't false-trigger each other.
     const sentinel = `INSTAR_JOB_COMPLETE_${sessionId.slice(-8)}`;
-    const promptWithSentinel = `${options.prompt}\n\nWhen you have fully completed this task, print exactly this marker as your final line: ${sentinel}`;
+    // ── The sentinel must NOT appear literally in the prompt (2026-08-20) ──
+    // The prompt is INJECTED into the REPL, so every character of it is echoed
+    // onto the pane the monitor scans. Emitting the assembled sentinel inside
+    // the instruction made the pane satisfy `detectSessionCompletion` from the
+    // moment the prompt rendered: the monitor read its own instruction back and
+    // reaped the session as SUCCESS on its first look after the 15s grace.
+    // Measured on a live 3-machine fleet: 31/31 rerouted sessions killed at
+    // 15-41s, ALL recorded `completed`, incl. 25 scheduled jobs reporting
+    // "success, 0 failures" while doing ~16s of work each.
+    // Fix: hand the model the two halves and have it join them. The assembled
+    // literal then exists ONLY when the model actually prints it. If the model
+    // mis-joins, the session is NOT detected and falls through to the hard
+    // lifetime cap — recorded as a timeout, i.e. the SAFE direction (a loud
+    // non-completion) rather than a silent false success.
+    const sentinelPrefix = 'INSTAR_JOB_COMPLETE';
+    const sentinelSuffix = sessionId.slice(-8);
+    const promptWithSentinel = `${withClaudeUltracodePrompt(options.prompt, options.ultracode)}\n\nWhen you have fully completed this task, your FINAL line must be a completion marker assembled from these three pieces joined together with no spaces and nothing else on the line:\n  piece 1: ${sentinelPrefix}\n  piece 2: _\n  piece 3: ${sentinelSuffix}\nWrite the assembled marker ONLY on that final line — never earlier in your output, and never quote it back while describing what you are doing.`;
 
     // ── Build the INTERACTIVE launch (no `-p`) ──
     // Carry the resolved model + the A2A continuity flag through. sessionId
@@ -2382,10 +5036,27 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const extraClaudeFlags = claudeHeadlessExtraFlags({
       framework: 'claude-code',
       allowedTools: options.allowedTools,
-      disableProjectMcp: options.disableProjectMcp,
+      disableProjectMcp: options.disableProjectMcp || Boolean(options.confinement),
+      ...(options.confinement ? { confinementSettingsPath: options.confinement.settingsPath } : {}),
     });
+    if (options.confinement && !extraClaudeFlags.includes('--settings')) {
+      throw new Error('confinement-adapter-missing: the --settings flag was not applied');
+    }
     if (extraClaudeFlags.length > 0) {
       launchSpec.argv.push(...extraClaudeFlags);
+    }
+    if (options.confinedTools) applyClaudeToolConfinement(launchSpec.argv, options.confinedTools);
+    // Threadline MCP over local HTTP (threadline-mcp-local-http D2/D3): never for a
+    // stripped spawn (no agent authority, confined, or an empty strict MCP config).
+    const reroutedThreadline = this.planThreadlineMcp({
+      framework: 'claude-code',
+      binaryPath,
+      knownVersion: this.claudeLaunchVersions.get(binaryPath) ?? null,
+      stripped: Boolean(options.omitAuthEnv) || Boolean(options.confinement)
+        || Boolean(options.disableProjectMcp) || Boolean(options.confinedTools),
+    });
+    if (reroutedThreadline.transport === 'http' && reroutedThreadline.claudeConfigPath) {
+      launchSpec.argv.push('--mcp-config', reroutedThreadline.claudeConfigPath);
     }
 
     // K9: build PATH env with shim prepended (when shim was installed) — same as
@@ -2396,13 +5067,23 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Subscription-pool pinning (Subscription & Auth Standard): this lane is
     // always claude-code, so launch under the chosen pool account's config home
     // and tag the session. No-op unless the resolver is wired + returns an account.
-    const pinnedAccount = this.spawnAccountResolver?.() ?? null;
+    // An explicit account pin (spec skill-driven-signin-repair) always wins over the resolver.
+    const pinnedAccount = options.accountPin ?? this.spawnAccountResolver?.() ?? null;
     if (pinnedAccount) {
       // Census #6: pin to the account's CURRENT slot per the ledger gate, not its enrollment home.
       const pinnedHome = this.resolvePinnedSpawnHome(pinnedAccount);
       launchSpec.envOverrides.CLAUDE_CONFIG_DIR = pinnedHome;
       this.ensurePinnedHomeInteractiveReady(pinnedHome, 'interactive-reroute pin');
+    } else if (!this.defaultHomeFirstRunChecked && !options.confinement && !process.env.VITEST) {
+      // (Skipped under vitest: the default login is the operator's real home, and a
+      // test's temp project dir must never land in their ~/.claude.json.)
+      // The default login has first-run screens too. A machine that never ran
+      // Claude Code interactively (a fresh server, or a machine this agent was
+      // moved to without `instar init`) otherwise kills every session at them.
+      this.defaultHomeFirstRunChecked = true;
+      this.ensurePinnedHomeInteractiveReady(process.env.CLAUDE_CONFIG_DIR || null, 'default login');
     }
+    assertBrowserMcpProfilesSafe(resolvedCwd, 'claude-code', this.originConfigHome('claude-code', launchSpec.envOverrides), this.config.projectDir);
     const frameworkEnvFlags: string[] = [];
     for (const [k, v] of Object.entries(launchSpec.envOverrides)) {
       frameworkEnvFlags.push('-e', `${k}=${v}`);
@@ -2418,6 +5099,37 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const reroutedCredentialSource: 'store' | 'env' =
       (this.config.anthropicApiKey ?? '') !== '' ? 'env' : 'store';
 
+    // Confined (docs/specs/confined-spawn-subscription-reroute.md): the same guarantees as the
+    // headless confined launch — no agent authority in the tmux env, the shared adapter (G2/G4/G6),
+    // and the prompt delivered as a FILE behind one fixed typed line (D1), never typed itself.
+    const confinement = options.confinement;
+    // omitAuthEnv (job-cost-reduction §5.6.2): the token blanking and the credential-shaped-variable
+    // blanking are keyed on omitAuthEnv here exactly as on the headless lane (confinement implies it).
+    const omitAuth = Boolean(confinement) || Boolean(options.omitAuthEnv);
+    let confinedEnvFlags: string[] = [];
+    let confinedPromptPath: string | null = null;
+    if (omitAuth) {
+      for (const key of Object.keys(process.env).sort()) {
+        if (isCredentialEnvName(key) && key !== 'CLAUDE_CONFIG_DIR') confinedEnvFlags.push('-e', `${key}=`);
+      }
+      confinedEnvFlags.push('-e', 'GH_TOKEN=', '-e', 'GITHUB_TOKEN=', '-e', 'INSTAR_BIND_TOKEN=', '-e', 'INSTAR_FENCING_TOKEN=');
+    }
+    if (confinement) {
+      // The trust dialog is matched on the exact workspace path, which must be whitespace-free; refuse
+      // by name here rather than failing every startup as `dialog-unknown` (spec D2 rule 3).
+      if (/\s/.test(resolvedCwd)) throw new Error('confinement-adapter-missing: workspace-path-whitespace — the confined workspace path contains whitespace');
+      confinedEnvFlags.push(...applyClaudeConfinement(launchSpec.argv, confinement, { sessionId, tmuxSession },
+        launchSpec.envOverrides.CLAUDE_CONFIG_DIR ?? process.env.CLAUDE_CONFIG_DIR));
+      confinedPromptPath = path.join(path.resolve(confinement.tmpDir), `confined-prompt-${sessionId}.md`);
+      confinedPromptLine(confinedPromptPath); // validates the path shape before anything runs
+      fs.writeFileSync(confinedPromptPath, promptWithSentinel, { mode: 0o600, flag: 'wx' });
+    } else if (!omitAuth) {
+      this.linkAgentOwnedMemory('claude-code', launchSpec.envOverrides, resolvedCwd);
+    }
+    const originEnvFlags = omitAuth ? ['-e', 'INSTAR_ORIGIN_TOKEN='] : await this.originTokenEnvFlags({
+      sessionId, harnessId: 'claude-code', projectDir: resolvedCwd, configuredModel: launchModel,
+      configHome: this.originConfigHome('claude-code', launchSpec.envOverrides),
+    });
     try {
       // §B: excluded from §A async conversion (spawn timing is contractual) but
       // funnels through withSyncOp so a drift during this blocking spawn reads as
@@ -2435,10 +5147,21 @@ rm()  { "${shimRunner}" rm  "$@"; }
           ? ['-e', `CLAUDE_CODE_MAX_RETRIES=${this.config.claudeCodeMaxRetries}`]
           : []),
         '-e', `INSTAR_SESSION_ID=${sessionId}`,
+        ...originEnvFlags,
         '-e', `INSTAR_SESSION_NAME=${tmuxSession}`,
         '-e', `INSTAR_SERVER_URL=http://localhost:${this.config.port}`,
-        '-e', `INSTAR_AUTH_TOKEN=${this.config.authToken}`,
+        '-e', `INSTAR_AUTH_TOKEN=${omitAuth ? '' : this.config.authToken}`,
+        ...this.memorySystemEnvFlags(),
+        ...reroutedThreadline.secretEnvFlags, // threadline-mcp-local-http D2 (flag on only; blank when stripped)
+        ...CLAUDE_MCP_TOOL_TIMEOUT_ENV_FLAGS, // long waits: the client outlasts the 300 s reply wait
         '-e', `INSTAR_AGENT_ID=${this.config.projectName}`,
+        // The agent HOME (the `.instar` PARENT), distinct from CLAUDE_PROJECT_DIR.
+        // A worktree session's project dir has no `.instar/config.json` and no
+        // `.instar/state/`, so any hook that resolved those from the project dir
+        // silently no-opped for exactly the sessions doing mutating work. Hooks
+        // resolve agent-scoped files as `<INSTAR_AGENT_HOME>/.instar/...` — the
+        // `.instar` segment is part of every such path, never implied.
+        '-e', `INSTAR_AGENT_HOME=${this.config.projectDir}`,
         // Structural message-kind stamping (outbound-jargon-filepath-gap §2.1).
         // This rerouted-interactive lane is the path the June-15 subscription
         // lever routes JOB spawns through — omitting it here would leave a
@@ -2447,20 +5170,36 @@ rm()  { "${shimRunner}" rm  "$@"; }
           ? [
               '-e', 'INSTAR_MESSAGE_KIND=automated',
               '-e', `INSTAR_JOB_SLUG=${options.jobSlug}`,
+              ...this.jobFailureFileEnvFlags(tmuxSession),
               '-e', 'INSTAR_SENDER_CLASS=llm-session',
+              // Test-runner bound (test-runner-concurrency-bound §2.6): a
+              // server-launched job session is BACKGROUND class — test suites
+              // it runs get the short fail-loud acquire budget, never the long
+              // interactive one. Derived from the launch site, never from
+              // user input. Interactive (jobSlug-less) spawns get NONE.
+              '-e', 'INSTAR_HOST_TEST_RUN_CLASS=background',
             ]
           : []),
-        ...this.ghTokenEnvFlags(), // P3b: per-agent vault GitHub token (empty when no vault token)
-        ...(workTreeFencingToken ? ['-e', `INSTAR_FENCING_TOKEN=${workTreeFencingToken}`] : []),
-        ...(workTreeFencingToken ? ['-e', `INSTAR_WORKTREE_PATH=${resolvedCwd}`] : []),
+        ...(omitAuth ? [] : this.ghTokenEnvFlags()), // P3b: per-agent vault GitHub token (empty when no vault token)
+        ...(workTreeFencingToken && !omitAuth ? ['-e', `INSTAR_FENCING_TOKEN=${workTreeFencingToken}`] : []),
+        ...(workTreeFencingToken && !omitAuth ? ['-e', `INSTAR_WORKTREE_PATH=${resolvedCwd}`] : []),
         ...(shimDir ? ['-e', `PATH=${shimmedPath}`, '-e', `BASH_ENV=${path.join(shimDir, '.shellrc')}`] : []),
         ...anthropicEnvFlags,
         // Same DB-credential isolation as every other spawn (Portal 2026-02-22).
         '-e', 'DATABASE_URL=',
         '-e', 'DIRECT_DATABASE_URL=',
+        // Round-18 (security): the round-17 scrub landed on the LEAST-exposed
+        // of the spawn sites — the 10-minute scoped triage pane — while the
+        // long-lived interactive panes, where the agent runs arbitrary Bash and
+        // can invoke grok directly, inherited the metered key from the tmux
+        // server env. Found by grepping the codebase's OWN scrub convention:
+        // DATABASE_URL_PROD= appears at every spawn site, XAI_API_KEY= at one.
+        '-e', 'XAI_API_KEY=',
+        '-e', 'GROK_DEPLOYMENT_KEY=',
         '-e', 'DATABASE_URL_PROD=',
         '-e', 'DATABASE_URL_DEV=',
         '-e', 'DATABASE_URL_TEST=',
+        ...confinedEnvFlags,
         ...launchSpec.argv,
       ], { encoding: 'utf-8' }));
 
@@ -2472,7 +5211,8 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // @silent-fallback-ok — history-limit is a nice-to-have
       }
     } catch (err) {
-      throw new Error(`Failed to create rerouted interactive tmux session: ${err}`);
+      this.revokeOriginSession(sessionId);
+      throw new Error(`Failed to create rerouted interactive tmux session: ${this.originSpawnError(err)}`);
     }
 
     const session: Session = {
@@ -2496,9 +5236,24 @@ rm()  { "${shimRunner}" rm  "$@"; }
       launchLane: 'rerouted-interactive',
       completionMode: 'pattern',
       completionPatterns: [sentinel],
-      maxLifetimeMinutes: lifetimeMinutes,
+      // A confined caller's own bound is its contract (the canary 10 min, a build its lease).
+      // A triage session (omitAuthEnv) has its own bound too (job-cost-reduction §5.6.2: 2× expected, ≤30 min).
+      maxLifetimeMinutes: omitAuth ? (options.maxDurationMinutes ?? lifetimeMinutes) : lifetimeMinutes,
+      ...(confinement ? { confinedConfigHome: launchSpec.envOverrides.CLAUDE_CONFIG_DIR ?? defaultClaudeConfigHome() } : {}),
+      ...this.threadlineTransportTag(reroutedThreadline),
     };
+    // Saved BEFORE any startup step: the monitor and both auto-answerers see this session only
+    // from this save on, and the save already carries the confinement marker (spec D3, Restart boundary).
     this.state.saveSession(session);
+
+    if (confinement && confinedPromptPath) {
+      this.runConfinedStartup(session, resolvedCwd, confinedPromptLine(confinedPromptPath)).catch((err) => {
+        // @silent-fallback-ok — runConfinedStartup reports its own failures; this guards only an unexpected rejection.
+        console.error(`[SessionManager] Confined startup for "${tmuxSession}" rejected unexpectedly: ${err}`);
+      });
+      this.retainFailedExitStatus(tmuxSession);
+      return session;
+    }
 
     // Deliver the prompt asynchronously — do NOT block spawnSession's return on
     // readiness (callers expect the Session back promptly; the ready-gate is
@@ -2512,7 +5267,113 @@ rm()  { "${shimRunner}" rm  "$@"; }
       console.error(`[SessionManager] Error during rerouted ready-and-inject for "${tmuxSession}": ${err}`);
     });
 
+    this.retainFailedExitStatus(tmuxSession);
     return session;
+  }
+
+  /**
+   * Drive a confined interactive session from launch to its one typed line (spec D2): the pure
+   * state machine decides; this only captures, sends the keys it names, and types the fixed line.
+   * On failure: nothing is typed, the session is killed, and a degradation names what was seen.
+   */
+  private async runConfinedStartup(session: Session, workspace: string, line: string, sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<boolean> {
+    const tmuxSession = session.tmuxSession;
+    let state: ConfinedStartupState = initialConfinedStartupState(Date.now());
+    // The VISIBLE screen only (no scrollback): a dialog that scrolled away is not the current state.
+    const capture = (): string => {
+      try {
+        return withSyncOp(() => execFileSync(this.config.tmuxPath, ['capture-pane', '-p', '-t', `=${tmuxSession}:`], { encoding: 'utf-8', timeout: 5000 }));
+      } catch { return ''; } // @silent-fallback-ok — an unreadable pane classifies as `starting`; the budget bounds it
+    };
+    const failNow = (rule: string, observation: ConfinedStartupObservation): void => {
+      state = { ...state, phase: 'failed', failure: { rule, observation } };
+    };
+    // Bounded twice: the state machine's wall-clock budget, and an iteration cap that holds even if
+    // the clock or the sleep misbehaves (No Unbounded Loops).
+    const maxIterations = Math.ceil(CONFINED_STARTUP_BUDGET_MS / 500) + 20;
+    this.confinedStartupHolders.add(tmuxSession);
+    try {
+    for (let iteration = 0; ; iteration++) {
+      if (iteration >= maxIterations) { failNow('startup-iteration-cap', 'starting'); break; }
+      await sleep(500);
+      if (!this.tmuxSessionExists(tmuxSession)) { failNow('session-exited-during-startup', 'starting'); break; }
+      const pane = capture();
+      const step = stepConfinedStartup(state, pane, workspace, Date.now());
+      const before = state.phase;
+      state = step.state;
+      if (step.action.kind === 'keys') {
+        for (const key of step.action.keys) this.sendKey(tmuxSession, key);
+      } else if (step.action.kind === 'type-line') {
+        // Type the fixed line WITHOUT submitting, confirm it is echoed at a ready prompt with no
+        // dialog on screen, and only then press Enter: a dialog that appeared in between must never
+        // receive the Enter (spec D2, `ready` row).
+        try {
+          // confined-write-allowed: the D2 startup driver itself, which holds this session in confinedStartupHolders; the line is instar-built from a validated path
+          withSyncOp(() => execFileSync(this.config.tmuxPath, buildLiteralSendArgs(`=${tmuxSession}:`, line), { encoding: 'utf-8', timeout: 5000 }));
+        } catch { failNow('fixed-line-not-typed', 'ready'); break; }
+        await sleep(300);
+        const echoed = capture();
+        if (classifyConfinedStartupPane(echoed, workspace) !== 'ready' || !squash(echoed).includes(squash(line.slice(0, 60)))) {
+          failNow('fixed-line-not-confirmed-at-ready-prompt', classifyConfinedStartupPane(echoed, workspace));
+          break;
+        }
+        this.sendKey(tmuxSession, 'Enter');
+        // After the Enter: the session must still be in the confined permission mode with no dialog
+        // up. A dialog that slipped in between the last capture and the Enter could only have taken
+        // that Enter. Up to three samples over ~1 s: one clean frame passes; a positively bad frame
+        // (another mode, a dialog) fails at once; only half-drawn frames all the way to the window
+        // end fail (spec D2 residual; detection, not prevention).
+        let postSubmit: 'clean' | 'bad' | 'unclear' = 'unclear';
+        let after = '';
+        for (let sample = 0; sample < 3 && postSubmit === 'unclear'; sample++) {
+          await sleep(300);
+          after = capture();
+          if (showsOtherPermissionMode(after) || /Enter to confirm|Esc to cancel|Esc to keep/i.test(after)) postSubmit = 'bad';
+          else if (after.includes("don't ask on")) postSubmit = 'clean';
+        }
+        if (postSubmit !== 'clean') {
+          failNow(postSubmit === 'bad' ? 'post-submit-mode-or-dialog-check' : 'post-submit-frame-never-clean', classifyConfinedStartupPane(after, workspace));
+          break;
+        }
+        try {
+          const current = this.state.getSession(session.id) ?? session;
+          this.state.saveSession({ ...current, confinedDeliveredAt: new Date().toISOString() });
+        } catch (err) {
+          // @silent-fallback-ok — reported: an unrecorded delivery is killed at the next boot (never re-typed).
+          console.error(`[SessionManager] Confined startup: could not record delivery for "${tmuxSession}": ${err}`);
+        }
+      }
+      if (before !== state.phase || step.action.kind !== 'wait') {
+        console.log(`[SessionManager] confined-startup "${tmuxSession}": ${before} → ${state.phase} (action ${step.action.kind})`);
+      }
+      if (state.phase === 'delivered') return true;
+      if (state.phase === 'failed') break;
+    }
+    } finally {
+      this.confinedStartupHolders.delete(tmuxSession);
+    }
+    this.reportConfinedDialog(tmuxSession, `startup ${state.failure?.rule ?? 'unknown'} (observed ${state.failure?.observation ?? 'unknown'})`, capture());
+    try { this.killSession(session.id); } catch { /* @silent-fallback-ok — the lifetime cap still ends it */ }
+    return false;
+  }
+
+  /** Confined sessions whose post-delivery dialog was already reported (signal once per session). */
+  private readonly confinedDialogReported = new Set<string>();
+
+  /**
+   * Name what a confined session is stuck on (spec D2/D3): a degradation with the rule and the
+   * dialog's first line, bounded and printable-only. Signal only: nothing is pressed.
+   */
+  private reportConfinedDialog(tmuxSession: string, rule: string, pane: string): void {
+    const loginRequired = LOGIN_REQUIRED.test(pane);
+    const firstLine = (pane.split('\n').find((l) => /Enter to confirm|Esc to|\?|login/i.test(l)) ?? '').trim().replace(/[^\x20-\x7E]/g, '').slice(0, 120); // bounded-input-reviewed: a degradation-report label (the dialog's first line), never a model input or a decision input; 120 chars names it
+    DegradationReporter.getInstance().report({
+      feature: 'SessionManager.confinedSession',
+      primary: 'run a confined interactive session to its result',
+      fallback: loginRequired ? 'the session cannot run: its Claude login is missing or expired' : 'nothing pressed; the confined session waits or was ended',
+      reason: `${loginRequired ? 'login-required' : rule}${firstLine ? `: ${firstLine}` : ''}`,
+      impact: `Confined session "${tmuxSession}" produced no result; its caller sees it end without one`,
+    });
   }
 
   /**
@@ -2548,6 +5409,22 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
+   * A Codex pane can remain alive even though its first prompt never established
+   * a rollout generation. Once the startup grace has elapsed, conversational
+   * ingress must replace that incarnation rather than retrying unverifiable
+   * injections forever. This is deliberately separate from isSessionAlive():
+   * process liveness remains truthful for watchdog/reaper callers.
+   */
+  requiresCodexGenerationRespawn(tmuxSession: string, now = Date.now(), graceMs = 120_000): boolean {
+    if (!this.stageBActivation.active) return false;
+    const session = this.state.listSessions({ status: 'running' })
+      .find((candidate) => candidate.tmuxSession === tmuxSession);
+    if (!session || session.framework !== 'codex-cli' || session.claudeSessionId) return false;
+    const startedAt = Date.parse(session.startedAt);
+    return Number.isFinite(startedAt) && now - startedAt >= graceMs;
+  }
+
+  /**
    * Check if a session is still running by checking tmux AND verifying
    * that the Claude process is running inside (not a zombie tmux pane).
    */
@@ -2558,10 +5435,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
     try {
       const paneInfo = withSyncOp(() => execFileSync(
         this.config.tmuxPath,
-        ['display-message', '-t', `=${tmuxSession}:`, '-p', '#{pane_current_command}||#{pane_start_command}'],
+        ['display-message', '-t', `=${tmuxSession}:`, '-p', '#{pane_current_command}||#{pane_start_command}||#{pane_dead}||#{pane_dead_status}||#{pane_dead_signal}'],
         { encoding: 'utf-8', timeout: 5000 }
       )).trim();
-      const [paneCmd, startCmd] = paneInfo.split('||');
+      const fields = paneInfo.split('||');
+      if (fields[2] === '1') {
+        return this.terminalPaneLiveness(tmuxSession, fields[3], fields[4]) !== false;
+      }
+      const [paneCmd, startCmd] = fields;
       // Claude Code runs as 'claude' or 'node' process
       if (paneCmd && (paneCmd.includes('claude') || paneCmd.includes('node'))) {
         return true;
@@ -2584,6 +5465,20 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // @silent-fallback-ok — pane inspection, assumes alive
       return true;
     }
+  }
+
+  /** tmux may close the pane fd before waitpid publishes an exit status.
+   * An empty status is unknown, never exit zero. A signal is also terminal
+   * evidence, though tmux exposes no numeric exit code for that case. */
+  private terminalPaneLiveness(tmuxSession: string, status?: string, signal?: string): false | 'indeterminate' {
+    if (status?.trim()) {
+      const code = Number(status);
+      if (Number.isFinite(code)) {
+        this.terminalExitCodes.set(tmuxSession, Math.trunc(code));
+        return false;
+      }
+    }
+    return signal?.trim() ? false : 'indeterminate';
   }
 
   /**
@@ -2643,10 +5538,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
       try {
         const { stdout } = await execFileAsync(
           this.config.tmuxPath,
-          ['display-message', '-t', `=${tmuxSession}:`, '-p', '#{pane_current_command}||#{pane_start_command}'],
+          ['display-message', '-t', `=${tmuxSession}:`, '-p', '#{pane_current_command}||#{pane_start_command}||#{pane_dead}||#{pane_dead_status}||#{pane_dead_signal}'],
           { timeout: 5000 }
         );
-        return this.classifyPaneCommand(tmuxSession, stdout.trim());
+        const fields = stdout.trim().split('||');
+        if (fields[2] === '1') {
+          return this.terminalPaneLiveness(tmuxSession, fields[3], fields[4]);
+        }
+        return this.classifyPaneCommand(tmuxSession, fields.slice(0, 2).join('||'));
       } catch {
         // @silent-fallback-ok: legacy off-path body, byte-for-byte. An unprobeable
         // display-message (the session exists but the pane read failed/timed out) ⇒ assume
@@ -2670,10 +5569,81 @@ rm()  { "${shimRunner}" rm  "$@"; }
       '-t',
       `=${tmuxSession}:`,
       '-p',
-      '#{pane_current_command}||#{pane_start_command}',
+      '#{pane_current_command}||#{pane_start_command}||#{pane_dead}||#{pane_dead_status}||#{pane_dead_signal}',
     ]);
     if (disp.state !== 'success') return true; // unprobeable ⇒ assume alive (preserves the legacy catch)
-    return this.classifyPaneCommand(tmuxSession, disp.stdout.trim());
+    const fields = disp.stdout.trim().split('||');
+    if (fields[2] === '1') {
+      return this.terminalPaneLiveness(tmuxSession, fields[3], fields[4]);
+    }
+    return this.classifyPaneCommand(tmuxSession, fields.slice(0, 2).join('||'));
+  }
+
+  /** Keep only failed panes long enough for the monitor to read
+   * `pane_dead_status`. Clean exit (0) still follows tmux's normal teardown. */
+  private retainFailedExitStatus(tmuxSession: string): void {
+    try {
+      withSyncOp(() => execFileSync(this.config.tmuxPath, [
+        'set-option', '-t', `=${tmuxSession}:`, 'remain-on-exit', 'failed',
+      ], { encoding: 'utf-8', timeout: 5000 }));
+      this.failedExitRetained.add(tmuxSession);
+    } catch (err) {
+      // @silent-fallback-ok — logged; the only loss is the failed pane's exit code (tmux tears it down normally).
+      console.warn(`[SessionManager] Could not retain failed exit status for "${tmuxSession}": ${err}`);
+    }
+  }
+
+  /**
+   * Remove a job's tmux session once its pane is dead. Job panes keep
+   * `remain-on-exit failed` only so the monitor can read the exit status; a
+   * non-zero exit otherwise leaves one dead session behind per run. Re-probes
+   * `pane_dead` for EVERY pane in every window first: the whole session is
+   * killed only when all of them are dead (an operator may have split a live
+   * pane into a failed job's session), and an uncertain read keeps it.
+   */
+  private async removeDeadJobPane(tmuxSession: string): Promise<boolean> {
+    if (this.config.protectedSessions.includes(tmuxSession)) return false;
+    const probe = await this.tmuxExecAsync(['list-panes', '-s', '-t', `=${tmuxSession}:`, '-F', '#{pane_dead}']);
+    if (probe.state !== 'success') return false;
+    const panes = probe.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+    if (panes.length === 0 || panes.some(p => p !== '1')) return false;
+    const kill = await this.tmuxExecAsync(['kill-session', '-t', `=${tmuxSession}`]);
+    return kill.state === 'success';
+  }
+
+  /**
+   * Bounded backstop for dead job panes a completion path missed (e.g. left
+   * over from before a restart). Only sessions named like this agent's job
+   * sessions, whose tmux environment names THIS agent home and a job slug,
+   * and which no running record still owns. Interactive sessions carry no
+   * INSTAR_JOB_SLUG, and other agents carry a different INSTAR_AGENT_HOME.
+   * Every candidate that reaches tmux probing is charged against
+   * `maxAttempts` whether or not it is removed, and an unanswered tmux read
+   * ends the pass, so a backlog of rejected or unprobeable candidates cannot
+   * stretch one monitor tick; the rest waits for the next pass.
+   */
+  async sweepDeadJobPanes(maxAttempts = 50): Promise<number> {
+    const listed = await this.tmuxExecAsync(['list-sessions', '-F', '#{session_name}\t#{pane_dead}']);
+    if (listed.state !== 'success') return 0;
+    const prefix = `${path.basename(this.config.projectDir)}-job-`;
+    const running = new Set(this.state.listSessions({ status: 'running' }).map(s => s.tmuxSession));
+    let killed = 0;
+    let attempts = 0;
+    for (const line of listed.stdout.split('\n')) {
+      if (attempts >= maxAttempts) break;
+      const [name, dead] = line.split('\t');
+      if (!name?.startsWith(prefix) || dead !== '1' || running.has(name)) continue;
+      attempts++;
+      const env = await this.tmuxExecAsync(['show-environment', '-t', `=${name}`]);
+      if (env.state === 'indeterminate') break; // tmux is not answering — defer the rest
+      if (env.state !== 'success') continue;
+      const vars = env.stdout.split('\n');
+      if (!vars.includes(`INSTAR_AGENT_HOME=${this.config.projectDir}`)) continue;
+      if (!vars.some(v => v.startsWith('INSTAR_JOB_SLUG='))) continue;
+      if (await this.removeDeadJobPane(name)) killed++;
+    }
+    if (killed > 0) console.log(`[SessionManager] Removed ${killed} dead job session(s) left by finished jobs.`);
+    return killed;
   }
 
   /**
@@ -2708,22 +5678,63 @@ rm()  { "${shimRunner}" rm  "$@"; }
           encoding: 'utf-8',
         }));
       } catch {
-        // Session might already be dead
+        // @silent-fallback-ok — an explicit absent-session probe is required;
+        // uncertain kill outcomes preserve live-session preparation authority.
+        if (this.originLifecycle && !this.originConfirmsProcessGone(session.tmuxSession)) return false;
       }
 
       session.status = 'killed';
       session.endedAt = new Date().toISOString();
       session.endedReason = 'manual-kill';
       this.state.saveSession(session);
+      this.revokeOriginSession(session.id);
       // NB: killSession historically does NOT emit 'sessionComplete' (only
       // beforeSessionKill). Preserved to avoid changing listener semantics —
       // the CAS guard + endedReason are the only additions here.
       this.idlePromptSince.delete(session.id);
+      this.idleKillBackoff?.clear(session.id); // session gone → drop veto-backoff state (map-leak eviction)
+      this.noteIdleZombieVetoEnded(session.id);
       this.reapingSessions.delete(session.id);
+      // G3 (MESH-SELF-HEAL-SPEC §3.3, FD7): "a topic→session binding exists IFF a
+      // live session exists." killSession historically did NOT clear the binding,
+      // so a killed session left a stale binding that a later inbound resumed (the
+      // 2026-06-27 stale-binding respawn). Emit `sessionKilled` AFTER the pane is
+      // destroyed so a server-side listener can clear the binding — but ONLY if it
+      // still points to THIS exact session (a kill-to-restart that already
+      // re-registered a new session name must NOT be cleared). Race-safe by design.
+      this.emit('sessionKilled', session);
       return true;
     } finally {
       this.terminating.delete(sessionId);
     }
+  }
+
+  /**
+   * Kill the running session whose TMUX NAME is `tmuxSession`, resolving that
+   * name to the session id first.
+   *
+   * W26 lane 1 — the stop that does not stop. `killSession(sessionId)` resolves
+   * its argument through the state store BY ID. The emergency-stop path was
+   * handing it a tmux name, so the lookup missed and it returned `false`
+   * silently while every caller reported "killed". This helper is the one place
+   * that resolution lives, so the two emergency-stop call sites (the
+   * `onSentinelKillSession` wiring and the route's direct fallback) cannot drift
+   * apart, and the resolution is unit-testable in isolation.
+   *
+   * Returns the REAL outcome: `false` when no running session carries that tmux
+   * name (a miss the caller must report as a failed kill, never as success), and
+   * `false` when the underlying kill itself fails. Resolves against the state
+   * record (status `running`) rather than a live tmux probe, so a wedged or
+   * already-dead pane is still resolved and `killSession` — which is defensive
+   * about a pane that is already gone — reconciles the record.
+   */
+  killSessionByTmuxName(tmuxSession: string): boolean {
+    if (!tmuxSession) return false;
+    const session = this.state
+      .listSessions({ status: 'running' })
+      .find((s) => s.tmuxSession === tmuxSession);
+    if (!session) return false;
+    return this.killSession(session.id);
   }
 
   /**
@@ -2766,8 +5777,13 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
     }
 
-    // Filter out baseline processes
+    // Filter out baseline processes. A tool shell (Claude's snapshot shell OR
+    // Codex's `zsh -lc`) wins over the baseline match: its command text is the
+    // agent's own command line, which may merely mention a baseline name
+    // (`caffeinate`, `mcp-stdio-entry`, a bare `mcp`, …).
     const activeProcesses = descendants.filter(p => {
+      if (isMcpLauncherShell(p.command, processes.get(processes.get(p.pid)?.ppid ?? '')?.command)) return false;
+      if (isToolShellCommand(p.command)) return true;
       return !BASELINE_PROCESS_PATTERNS.some(pattern => pattern.test(p.command));
     });
 
@@ -2779,6 +5795,10 @@ rm()  { "${shimRunner}" rm  "$@"; }
       const proc = processes.get(p.pid);
       // Direct child of pane PID running claude/node is the main process
       if (proc?.ppid === panePid) {
+        // A Claude Code tool shell sources a snapshot under the config home
+        // (`~/.claude…/shell-snapshots/…`), so its command line contains the word
+        // "claude" — it is the agent's running command, never the main process.
+        if (isToolShellCommand(p.command)) return true;
         return !/\bclaude\b/.test(p.command) && !/\bnode\b.*\bclaude\b/.test(p.command);
       }
       return true;
@@ -2810,6 +5830,58 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // If we can't check processes, assume active (fail-safe: don't kill)
       return true;
     }
+  }
+
+  /**
+   * Does this session have a live Claude Code tool shell (a Bash tool call still
+   * running — typically a `run_in_background` watch or build)? Such a session is
+   * WAITING on its own work, not abandoned, however quiet its pane and topic are.
+   *
+   * Separate from `hasActiveProcesses` because that probe answers "is any child
+   * alive" (an idle MCP server also qualifies), while this answers "is the
+   * agent's own command still running". THROWS when the tree cannot be
+   * inspected (tmux or ps failure) — an unreadable tree is UNKNOWN, not an
+   * observed shell: the reaper's keep path treats a throw as "keep", and its
+   * evidence collector omits the signal (never records `background-shell` on
+   * a failed probe).
+   */
+  hasLiveToolShell(tmuxSession: string): boolean {
+    const panePid = withSyncOp(() => execFileSync(
+      this.config.tmuxPath,
+      ['list-panes', '-t', `=${tmuxSession}:`, '-F', '#{pane_pid}'],
+      { encoding: 'utf-8', timeout: 5000 }
+    )).trim();
+    if (!panePid || !/^\d+$/.test(panePid)) return false;
+    const psOutput = withSyncOp(() => execFileSync(
+      'ps', ['-eo', 'pid,ppid,command'],
+      { encoding: 'utf-8', timeout: 5000 }
+    ));
+    return SessionManager.computeHasLiveToolShell(panePid, psOutput);
+  }
+
+  /** Pure half of `hasLiveToolShell`: any descendant of `panePid` whose command
+   *  is a Claude Code tool shell. */
+  static computeHasLiveToolShell(panePid: string, psOutput: string): boolean {
+    const children = new Map<string, Array<{ pid: string; command: string }>>();
+    for (const line of psOutput.split('\n').slice(1)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const list = children.get(m[2]) ?? [];
+      list.push({ pid: m[1], command: m[3] });
+      children.set(m[2], list);
+    }
+    const seen = new Set<string>([panePid]);
+    const queue = [panePid];
+    while (queue.length > 0) {
+      const parent = queue.shift()!;
+      for (const c of children.get(parent) ?? []) {
+        if (seen.has(c.pid)) continue;
+        if (CLAUDE_TOOL_SHELL_PATTERN.test(c.command)) return true;
+        seen.add(c.pid);
+        queue.push(c.pid);
+      }
+    }
+    return false;
   }
 
   /**
@@ -2944,7 +6016,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         total += parseProcTimeToSeconds(p.time);
       }
       return total;
-    } catch {
+    } catch { /* @silent-fallback-ok: an unreadable process sample contributes no CPU evidence */
       return 0;
     }
   }
@@ -3013,9 +6085,109 @@ rm()  { "${shimRunner}" rm  "$@"; }
       const pane = this.captureOutput(tmuxSession, 30);
       if (this.paneShowsActiveWork(pane)) return true;
       return this.hasActiveProcesses(tmuxSession);
-    } catch {
+    } catch { /* @silent-fallback-ok: probe failure cannot positively claim active work */
       return false;
     }
+  }
+
+  // ── swap-continuity-antithrash §4.1: the tri-state work-state probe ──────
+
+  /** Shared short-TTL `ps -eo pid,ppid,command` snapshot. The work-gate probe
+   *  frequency (deferred intents re-checked per tick + per-10 s reactive grace
+   *  loops across a wave) must never fan out one `ps` fork per probe — every
+   *  concurrent caller within the TTL reuses ONE process-table read (the §4.1
+   *  one-ps-per-TTL mandate; the wiring test pins it). */
+  private psSnapshotShared: { atMs: number; promise: Promise<string | null> } | null = null;
+  private psSnapshotForkCount = 0;
+  private readonly psSnapshotTtlMs = 2_000;
+
+  /** Observability for the §12 wiring test: how many real `ps` forks the
+   *  shared snapshot has issued. */
+  get psSnapshotForks(): number {
+    return this.psSnapshotForkCount;
+  }
+
+  private getPsSnapshotShared(): Promise<string | null> {
+    const now = Date.now();
+    if (this.psSnapshotShared && now - this.psSnapshotShared.atMs < this.psSnapshotTtlMs) {
+      return this.psSnapshotShared.promise;
+    }
+    this.psSnapshotForkCount += 1;
+    const promise = execFileAsync('ps', ['-eo', 'pid,ppid,command'], {
+      timeout: 5000,
+      killSignal: 'SIGKILL' as const,
+    })
+      .then((r) => r.stdout)
+      .catch(() => null);
+    this.psSnapshotShared = { atMs: now, promise };
+    return promise;
+  }
+
+  /**
+   * Tri-state in-flight work probe (swap-continuity-antithrash §4.1) — the
+   * public async surface the SwapWorkGate composes. Unlike
+   * `isSessionActivelyWorking` (which swallows its own failures to `false` —
+   * the OPPOSITE resolution I7 requires for optimization callers), each leg
+   * that cannot be read reports its own `indeterminate` instead of a silent
+   * boolean, and the whole probe is event-loop-safe: coalesced tmux calls +
+   * the shared ps snapshot, NEVER the synchronous execFileSync path.
+   *
+   *  - 'working'       — the pane shows Claude's mid-turn footer OR a live
+   *                      non-baseline child process exists.
+   *  - 'idle'          — every leg affirmatively reports no work (a
+   *                      definitely-absent tmux session is affirmatively idle).
+   *  - 'indeterminate' — a leg was attempted and could not be read.
+   */
+  async checkSessionWorkState(tmuxSession: string): Promise<'working' | 'idle' | 'indeterminate'> {
+    // Footer leg (the extended-think discriminator: a long think shows the
+    // footer but spawns no child process and writes nothing to JSONL).
+    let footer: 'working' | 'idle' | 'indeterminate';
+    const cap = await this.tmuxExecCoalesced('capture-pane', tmuxSession, [
+      'capture-pane',
+      '-t',
+      `=${tmuxSession}:`,
+      '-p',
+      '-S',
+      '-30',
+    ]);
+    if (cap.state === 'success') {
+      footer = paneShowsClaudeWorking(cap.stdout) ? 'working' : 'idle';
+    } else if (cap.state === 'definitely-absent') {
+      // The tmux session does not exist — affirmatively no in-flight work.
+      return 'idle';
+    } else {
+      footer = 'indeterminate';
+    }
+    if (footer === 'working') return 'working';
+
+    // Child-process leg — the batched path around the pure
+    // computeHasActiveProcesses (deliberately NOT hasActiveProcessesAsync,
+    // which forks its own full `ps -eo` per call and folds failure to `true`
+    // — the wrong shape twice over for this probe, §4.1).
+    let proc: 'working' | 'idle' | 'indeterminate';
+    const panes = await this.tmuxExecCoalesced('list-panes', tmuxSession, [
+      'list-panes',
+      '-t',
+      `=${tmuxSession}:`,
+      '-F',
+      '#{pane_pid}',
+    ]);
+    if (panes.state === 'definitely-absent') {
+      proc = 'idle';
+    } else if (panes.state !== 'success') {
+      proc = 'indeterminate';
+    } else {
+      const panePid = panes.stdout.trim();
+      if (!panePid || !/^\d+$/.test(panePid)) {
+        proc = 'idle';
+      } else {
+        const ps = await this.getPsSnapshotShared();
+        proc = ps === null ? 'indeterminate' : this.computeHasActiveProcesses(panePid, ps) ? 'working' : 'idle';
+      }
+    }
+    if (proc === 'working') return 'working';
+    if (footer === 'indeterminate' || proc === 'indeterminate') return 'indeterminate';
+    return 'idle';
   }
 
   /**
@@ -3035,6 +6207,91 @@ rm()  { "${shimRunner}" rm  "$@"; }
       ));
     } catch {
       // @silent-fallback-ok — capture output, null handled by caller
+      return null;
+    }
+  }
+
+  /**
+   * Capture the current output of a tmux session WITH ANSI escape sequences
+   * (`capture-pane -e`) preserved.
+   *
+   * Exists for consumers that need the RENDERING of pane text, not just its
+   * bytes — the F2 ghost-text exclusion in StuckInputSentinel reads the SGR
+   * dim attribute to tell the harness's model-generated composer suggestion
+   * (rendered dim, never typed) apart from genuinely stuck real input, which
+   * are byte-identical once attributes are stripped. Returns null on any
+   * capture failure, exactly like captureOutput.
+   */
+  // RULE 3: EXEMPT — primitive output capture (styled twin of captureOutput
+  // above); the state-detection patterns live in the consumers.
+  captureOutputAnsi(tmuxSession: string, lines: number = 100): string | null {
+    try {
+      return withSyncOp(() => execFileSync(
+        this.config.tmuxPath,
+        ['capture-pane', '-t', `=${tmuxSession}:`, '-p', '-e', '-S', `-${lines}`],
+        { encoding: 'utf-8', timeout: 5000 }
+      ));
+    } catch {
+      // @silent-fallback-ok — capture output, null handled by caller
+      return null;
+    }
+  }
+
+  /** Complete visible Codex viewport plus race-checked tmux cursor geometry. */
+  captureCodexComposerFrame(tmuxSession: string): CodexComposerFrame | null {
+    const target = `=${tmuxSession}:`;
+    const format = '#{cursor_x}|#{cursor_y}|#{pane_width}|#{pane_height}|#{alternate_on}|#{pane_in_mode}';
+    try {
+      const before = withSyncOp(() => execFileSync(this.config.tmuxPath,
+        ['display-message', '-p', '-t', target, format], { encoding: 'utf8', timeout: 750 })).trim();
+      const ansiViewport = withSyncOp(() => execFileSync(this.config.tmuxPath,
+        ['capture-pane', '-p', '-e', '-t', target], { encoding: 'utf8', timeout: 750 }));
+      const joinedViewport = withSyncOp(() => execFileSync(this.config.tmuxPath,
+        ['capture-pane', '-p', '-J', '-t', target], { encoding: 'utf8', timeout: 750 }));
+      const after = withSyncOp(() => execFileSync(this.config.tmuxPath,
+        ['display-message', '-p', '-t', target, format], { encoding: 'utf8', timeout: 750 })).trim();
+      const fields = before.split('|').map(Number);
+      if (fields.length !== 6 || fields.some((field) => !Number.isSafeInteger(field))) return null;
+      const [cursorX, cursorY, width, height, alternateOn, paneInMode] = fields;
+      return {
+        ansiViewport, joinedViewport, cursorX, cursorY, width, height,
+        alternateOn: alternateOn === 1, paneInMode: paneInMode === 1,
+        stableMetadata: before === after,
+      };
+    } catch { // @silent-fallback-ok: incomplete composer evidence fails closed
+      return null;
+    }
+  }
+
+  /** Async observer capture: concurrency is owned by CodexDeliveryObserver and
+   * this entire four-sample frame has one 750ms wall-clock deadline. */
+  async captureCodexComposerFrameAsync(tmuxSession: string): Promise<CodexComposerFrame | null> {
+    const target = `=${tmuxSession}:`;
+    const format = '#{cursor_x}|#{cursor_y}|#{pane_width}|#{pane_height}|#{alternate_on}|#{pane_in_mode}';
+    const deadline = Date.now() + 750;
+    const run = (args: string[]): Promise<string> => new Promise((resolve, reject) => {
+      const timeout = Math.max(1, deadline - Date.now());
+      execFile(this.config.tmuxPath, args, { encoding: 'utf8', timeout }, (err, stdout) => {
+        if (err || Date.now() > deadline) reject(err ?? new Error('composer capture deadline exceeded'));
+        else resolve(stdout);
+      });
+    });
+    try {
+      const before = (await run(['display-message', '-p', '-t', target, format])).trim();
+      const [ansiViewport, joinedViewport] = await Promise.all([
+        run(['capture-pane', '-p', '-e', '-t', target]),
+        run(['capture-pane', '-p', '-J', '-t', target]),
+      ]);
+      const after = (await run(['display-message', '-p', '-t', target, format])).trim();
+      const fields = before.split('|').map(Number);
+      if (fields.length !== 6 || fields.some((field) => !Number.isSafeInteger(field))) return null;
+      const [cursorX, cursorY, width, height, alternateOn, paneInMode] = fields;
+      return {
+        ansiViewport, joinedViewport, cursorX, cursorY, width, height,
+        alternateOn: alternateOn === 1, paneInMode: paneInMode === 1,
+        stableMetadata: before === after,
+      };
+    } catch { // @silent-fallback-ok: timeout/race is typed unknown evidence
       return null;
     }
   }
@@ -3063,7 +6320,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * (indeterminate/absent/timeout) resolves to `null`, exactly like the sync
    * version's catch — the caller's null handling is byte-for-byte preserved.
    */
-  private async captureOutputAsync(tmuxSession: string, lines: number = 100): Promise<string | null> {
+  async captureOutputAsync(tmuxSession: string, lines: number = 100): Promise<string | null> {
     const out = await this.tmuxExecCoalesced('capture-pane', tmuxSession, [
       'capture-pane',
       '-t',
@@ -3083,6 +6340,15 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
+   * The raw last `rows` of a pane (no trim), for callers that derive more than one tail
+   * from a single capture. 80 rows is enough to skip the blank padding a host draws
+   * between a blocking menu and its bottom status line (17 rows, live 2026-10-19).
+   */
+  private async captureRawTailMaybeAsync(tmuxSession: string, rows: number): Promise<string | null> {
+    return this.tmuxAsyncEnabled ? this.captureOutputAsync(tmuxSession, rows) : this.captureOutput(tmuxSession, rows);
+  }
+
+  /**
    * Transcript-activity probe — ground-truth liveness independent of the tmux
    * pane and process tree. A session doing MCP/tool work (e.g. driving Playwright)
    * runs that work OUT of the pane's process tree and, between tool calls, shows an
@@ -3095,6 +6361,119 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * transcript we cannot read (the safe direction is to fall through to the
    * pane/procs verdict, not to keep a possibly-dead session alive forever).
    */
+  /** Frameworks whose closed-headless-lane fallback has already been disclosed. */
+  private readonly closedHeadlessLaneDisclosed = new Set<string>();
+
+  /** A helper's limit is never evidence that the session serving the topic is
+   * unable to reply. Corroborate the exact main transcript and account home. */
+  confirmSessionUsageLimit(tmuxSession: string): string | false {
+    const session = this.listRunningSessions().find(s => s.tmuxSession === tmuxSession);
+    if (!session?.claudeSessionId || (session.framework ?? 'claude-code') !== 'claude-code') return false;
+    const configHome = this.configHomeForSession(tmuxSession, { defaultWhenUnset: true });
+    if (!configHome) return false;
+    return confirmSessionUsageLimit(resolveFrameworkTranscriptPath({
+      framework: 'claude-code', sessionId: session.claudeSessionId,
+      projectDir: session.cwd ?? this.config.projectDir, configHome,
+    }), session.claudeSessionId) ? session.claudeSessionId : false;
+  }
+
+  /**
+   * Last-modified time of the session's framework transcript, in ms, or null when
+   * it cannot be read (no session id, no resolvable path, missing file, stat
+   * error). Used to corroborate a persisted idle-start instant: a transcript
+   * modified AFTER it proves the session worked since then.
+   */
+  transcriptMtimeMs(session: Session): number | null {
+    try {
+      const sessionId = session.claudeSessionId;
+      if (!sessionId) return null;
+      const jsonlPath = resolveFrameworkTranscriptPath({
+        framework: session.framework ?? 'claude-code',
+        sessionId,
+        projectDir: session.cwd ?? this.config.projectDir,
+      });
+      if (!jsonlPath) return null;
+      return fs.statSync(jsonlPath).mtimeMs;
+    } catch {
+      // @silent-fallback-ok — an unreadable transcript is NOT corroboration;
+      // resolveIdleSinceSeed treats null as "cannot refute", and the seed is
+      // still bounded by the persisted instant itself.
+      return null;
+    }
+  }
+
+  /**
+   * Start a session's idle clock, preferring the DURABLE instant on the record so
+   * the clock survives a server restart (the 2026-10-22 sagemind saturation: an
+   * in-memory-only clock never reaches the 240-minute topic-bound threshold on an
+   * agent that restarts every ~30 minutes, so idle conversations are never closed
+   * and every slot fills). Every uncertainty falls back to `now`, which is the
+   * pre-existing behaviour — a seeded clock only ever brings a kill FORWARD, so
+   * the safe direction is to start fresh.
+   */
+  private seedIdleClock(session: Session, now: number): void {
+    const verdict = resolveIdleSinceSeed({
+      persistedIdleSince: session.idleSince,
+      transcriptMtimeMs: this.transcriptMtimeMs(session),
+      now,
+    });
+    const seedAt = verdict.seedAtMs ?? now;
+    this.idlePromptSince.set(session.id, seedAt);
+    if (verdict.seedAtMs != null) {
+      console.log(
+        `[SessionManager] Session "${session.name}" idle clock resumed from its recorded start ` +
+        `(${Math.round((now - seedAt) / 60_000)}m idle across a restart).`
+      );
+      return;
+    }
+    // Fresh episode (or an unusable recorded value) — record this instant so the
+    // NEXT restart can resume from it. The snapshot is kept in sync so the rest
+    // of this tick sees the same value the disk holds.
+    const iso = new Date(seedAt).toISOString();
+    session.idleSince = iso;
+    this.persistIdleSince(session, iso);
+  }
+
+  /**
+   * End a session's idle episode: drop the in-memory clock AND the durable
+   * instant, so a later restart cannot resurrect a stale clock for a session that
+   * has since done work.
+   */
+  private clearIdleClock(session: Session): void {
+    this.idlePromptSince.delete(session.id);
+    delete session.idleSince;
+    this.persistIdleSince(session, undefined);
+  }
+
+  /**
+   * Write `idleSince` onto the FRESH on-disk record, never onto the monitor
+   * loop's snapshot. The loop's `session` is a shallow copy taken at tick start
+   * and can be seconds stale by the time a later session is reached; saving it
+   * back whole (status 'running' included) could resurrect a record that a
+   * mid-tick kill-to-respawn had already replaced under the SAME tmux name —
+   * `saveSession`'s supersede pass would then close the NEW live record and
+   * leave the pane tracked by the stale one (second-pass review finding). So:
+   * read the record as it is now, refuse unless it is still the same running
+   * session, change only this one field, and save that. `getSession` and
+   * `saveSession` have no await between them, so a concurrent in-process
+   * field write (claudeSessionId, confinedDeliveredAt) is not dropped either.
+   * A no-op when the field already holds the value.
+   */
+  private persistIdleSince(snapshot: Session, idleSince: string | undefined): void {
+    try {
+      const fresh = this.state.getSession(snapshot.id);
+      if (!fresh || fresh.status !== 'running' || fresh.tmuxSession !== snapshot.tmuxSession) return;
+      if ((fresh.idleSince ?? undefined) === idleSince) return;
+      if (idleSince == null) delete fresh.idleSince;
+      else fresh.idleSince = idleSince;
+      this.state.saveSession(fresh);
+    } catch {
+      // @silent-fallback-ok — a failed persist only costs the restart-resume of
+      // this one clock (today's behaviour), never a wrong kill; on a standby the
+      // save throws by design.
+    }
+  }
+
   isTranscriptRecentlyActive(session: Session, withinMs: number): boolean {
     try {
       const sessionId = session.claudeSessionId;
@@ -3103,6 +6482,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         framework: session.framework ?? 'claude-code',
         sessionId,
         projectDir: session.cwd ?? this.config.projectDir,
+        ...this.claudeConfigHomeOption(session),
       });
       if (!jsonlPath) return false;
       const stat = fs.statSync(jsonlPath);
@@ -3112,6 +6492,101 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // activity; fall through to the pane/procs verdict rather than pinning a
       // possibly-dead session alive on a read error.
       return false;
+    }
+  }
+
+  /**
+   * The corroborated DRAIN observations for a duplicate-session stand-down
+   * (docs/specs/duplicate-session-standdown.md §Drained-close). The I/O half of
+   * `evaluateDrain`, which owns the actual verdict.
+   *
+   * Every leg is allowed to answer `null` = COULD NOT DETERMINE, and the verdict
+   * function resolves any such answer to NOT drained. That is deliberate: this
+   * feeds a decision to CLOSE a session, so an unprobeable pane or an unreadable
+   * transcript must read as "wait", never as "quiet".
+   */
+  standDownDrainObservations(
+    session: Session,
+    drainBoundaryAt: number,
+  ): import('./standDownDrain.js').DrainObservations {
+    const output = (() => {
+      try { return this.captureOutput(session.tmuxSession, 40); } catch { return null; /* @silent-fallback-ok — unreadable pane ⇒ NULL leg ⇒ evaluateDrain resolves to NOT drained (wait) */ }
+    })();
+    // IDLE_PROMPT_PATTERNS alone corroborates NOTHING here: those are status-bar
+    // strings ("bypass permissions on", "shift+tab to cycle") that are present
+    // whether or not a turn is in flight — which is why every other consumer in
+    // this repo pairs them with a second signal and never trusts them alone. The
+    // precise signal for "a turn is running right now" is the footer hint, and it
+    // already exists as paneShowsClaudeWorking. Without this the pane leg was
+    // effectively always true, and a session mid-turn could satisfy the whole
+    // "corroborated" drain predicate.
+    const idleAtPrompt = output == null || output === ''
+      ? null
+      : (IDLE_PROMPT_PATTERNS.some((p) => output.includes(p)) && !paneShowsClaudeWorking(output));
+
+    // The process tree, with the resident MCP stack excluded — see
+    // standDownDrain.drainProcessShape for why `hasActiveProcesses` is the wrong
+    // probe here (a browser MCP would keep every session un-drained forever).
+    const processWorking = (() => {
+      try {
+        const panePid = withSyncOp(() => execFileSync(
+          this.config.tmuxPath,
+          ['list-panes', '-t', `=${session.tmuxSession}:`, '-F', '#{pane_pid}'],
+          { encoding: 'utf-8', timeout: 5000 },
+        )).trim();
+        const psOutput = withSyncOp(() => execFileSync('ps', ['-eo', 'pid,ppid,command'], { encoding: 'utf-8', timeout: 5000 }));
+        const shape = drainProcessShape(panePid, psOutput);
+        return shape === null ? null : shape.working;
+      } catch { return null; /* @silent-fallback-ok — unknown tree ⇒ NOT drained (wait) */ }
+    })();
+
+    const transcript = this.readTranscriptTailSinceBoundary(session, drainBoundaryAt);
+    return {
+      idleAtPrompt,
+      processWorking,
+      transcriptGrew: transcript === null ? null : transcript.grew,
+      growthIsBlockEchoOnly: transcript?.growthIsBlockEchoOnly ?? false,
+      nonAllowlistedCallsSinceBoundary: transcript?.nonAllowlistedCalls ?? 0,
+    };
+  }
+
+  /** Bounded tail read of the framework transcript, parsed for the two
+   *  transcript-derived drain legs. `null` = could not read ⇒ NOT drained. */
+  private readTranscriptTailSinceBoundary(
+    session: Session,
+    drainBoundaryAt: number,
+  ): { grew: boolean; growthIsBlockEchoOnly: boolean; nonAllowlistedCalls: number } | null {
+    try {
+      const sessionId = session.claudeSessionId;
+      if (!sessionId) return null;
+      const jsonlPath = resolveFrameworkTranscriptPath({
+        framework: session.framework ?? 'claude-code',
+        sessionId,
+        projectDir: session.cwd ?? this.config.projectDir,
+        ...this.claudeConfigHomeOption(session),
+      });
+      if (!jsonlPath) return null;
+      const stat = fs.statSync(jsonlPath);
+      // Bounded: a transcript can be hundreds of MB and this runs on a cadence.
+      const TAIL_BYTES = 512 * 1024;
+      const start = Math.max(0, stat.size - TAIL_BYTES);
+      const fd = fs.openSync(jsonlPath, 'r');
+      let raw: string;
+      try {
+        const buf = Buffer.alloc(Math.min(TAIL_BYTES, stat.size));
+        fs.readSync(fd, buf, 0, buf.length, start);
+        raw = buf.toString('utf-8');
+      } finally { fs.closeSync(fd); }
+      // A partial first line from the byte-offset read is dropped, not guessed.
+      const lines = raw.split('\n').slice(start > 0 ? 1 : 0);
+      const parsed: Array<Record<string, unknown>> = [];
+      for (const l of lines) {
+        if (!l.trim()) continue;
+        try { parsed.push(JSON.parse(l) as Record<string, unknown>); } catch { /* @silent-fallback-ok — a torn JSONL line is not evidence of anything; the other legs still gate the verdict */ }
+      }
+      return analyseTranscriptSinceBoundary(parsed, drainBoundaryAt);
+    } catch {
+      return null; // @silent-fallback-ok — unreadable ⇒ NOT drained (wait)
     }
   }
 
@@ -3156,6 +6631,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       this.buildContextStore.record(tmuxSession, this.config.projectDir, currentCwd);
     } catch (err) {
       console.warn(`[SessionManager] Failed to record build context for "${tmuxSession}": ${err instanceof Error ? err.message : String(err)}`);
+      featureEvidence.recordAtMostEvery('sessions.respawnBuildContext', `capture-failed|${tmuxSession}`, 60 * 60 * 1000, { kind: 'error', reason: 'capture-failed', context: { tmuxSession, errorName: err instanceof Error ? err.name : 'unknown' } });
     }
   }
 
@@ -3168,6 +6644,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       this.buildContextStore.record(tmuxSession, this.config.projectDir, currentCwd);
     } catch (err) {
       console.warn(`[SessionManager] Failed to record build context for "${tmuxSession}": ${err instanceof Error ? err.message : String(err)}`);
+      featureEvidence.recordAtMostEvery('sessions.respawnBuildContext', `capture-failed|${tmuxSession}`, 60 * 60 * 1000, { kind: 'error', reason: 'capture-failed', context: { tmuxSession, errorName: err instanceof Error ? err.name : 'unknown' } });
     }
   }
 
@@ -3178,8 +6655,12 @@ rm()  { "${shimRunner}" rm  "$@"; }
   ): string | undefined {
     if (!resumeSessionId || !this.buildContextStore) return initialMessage;
     const restore = this.buildContextStore.getRestore(tmuxSession);
-    if (!restore) return initialMessage;
+    if (!restore) {
+      featureEvidence.record('sessions.respawnBuildContext', { kind: 'held', reason: 'no-usable-context-on-resume', context: { tmuxSession } });
+      return initialMessage;
+    }
     console.log(`[SessionManager] Restoring build context for "${tmuxSession}" from ${restore.entry.currentCwd}`);
+    featureEvidence.record('sessions.respawnBuildContext', { kind: 'fired', reason: 'context-restored-on-resume', context: { tmuxSession, contextAgeMs: Date.now() - restore.entry.updatedAt } });
     return [restore.note, initialMessage].filter(Boolean).join('\n\n');
   }
 
@@ -3228,29 +6709,208 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
+   * Resolve a running session's REAL login slot (its live `CLAUDE_CONFIG_DIR`)
+   * by reading the tmux env we set in its session env block at spawn. This is
+   * the authoritative config home the session is ACTUALLY running on — which is
+   * exactly what the MissingLoginSessionDetector must correlate on. The recorded
+   * `subscriptionAccountId` is NOT a reliable proxy: under identity drift the
+   * recorded account diverges from the config home the session really runs on
+   * (2026-07-22 justin-gmail incident — a session recorded `adriana` while its
+   * `CLAUDE_CONFIG_DIR` was the login-missing justin-gmail slot), and resolving
+   * via the account would land on the wrong slot and miss the gap entirely.
+   *
+   * Mirrors getSessionFramework's tmux-env read: bounded (2s timeout), funneled
+   * through withSyncOp so the in-flight marker sees the block, and fail-toward-
+   * silence — any error / missing var returns undefined (the caller then skips
+   * the session; a guessed/empty config home would be a false correlation). NOT
+   * cached: a quota-aware swap or a respawn can re-point a live name at a new
+   * slot, so this reads fresh each tick (a handful of sessions, cheap + bounded).
+   */
+  /**
+   * The `configHome` resolver option for a claude-code session, read from its
+   * LIVE `CLAUDE_CONFIG_DIR` (see configHomeForSession). A pool-routed session
+   * keeps its transcript under that home, so every transcript probe that
+   * omits it reads "no transcript" for a session that is alive (the age-kill
+   * liveness protection and drain probes were structural no-ops for pooled
+   * claude sessions). Non-claude frameworks and an unreadable env yield no
+   * option, which preserves the default-home path exactly.
+   */
+  private claudeConfigHomeOption(session: Session): { configHome?: string } {
+    if ((session.framework ?? 'claude-code') !== 'claude-code' || !session.tmuxSession) return {};
+    const configHome = this.configHomeForSession(session.tmuxSession);
+    return configHome ? { configHome } : {};
+  }
+
+  configHomeForSession(tmuxSession: string, opts?: { defaultWhenUnset?: boolean }): string | undefined {
+    try {
+      const out = withSyncOp(() => execFileSync(
+        this.config.tmuxPath,
+        ['show-environment', '-t', `=${tmuxSession}`, 'CLAUDE_CONFIG_DIR'],
+        { encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] },
+      )).trim();
+      const prefix = 'CLAUDE_CONFIG_DIR=';
+      if (out.startsWith('-CLAUDE_CONFIG_DIR') && opts?.defaultWhenUnset) {
+        // Explicitly unset in the session → the spawn used the process-level default.
+        return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+      }
+      if (!out.startsWith(prefix)) return undefined; // unset (tmux prints `-CLAUDE_CONFIG_DIR`) or absent
+      const value = out.slice(prefix.length).trim();
+      return value.length > 0 ? value : undefined;
+    } catch {
+      // @silent-fallback-ok — config-home lookup is fail-toward-silence: the
+      // detector skips a session it can't place rather than guess a slot.
+      return undefined;
+    }
+  }
+
+  /**
    * Send input to a running tmux session.
    */
   sendInput(tmuxSession: string, input: string): boolean {
-    try {
-      // Note: use `=session:` (trailing colon) for pane-level tmux commands
-      // Send text literally, then Enter separately. `--` terminates option
-      // parsing so input can never be interpreted as a send-keys flag
-      // (FABLE-MODEL-ESCALATION-SPEC §5.3 hardening; safe for all callers).
-      withSyncOp(() => execFileSync(
-        this.config.tmuxPath,
-        ['send-keys', '-t', `=${tmuxSession}:`, '-l', '--', input],
-        { encoding: 'utf-8', timeout: 5000 }
-      ));
-      withSyncOp(() => execFileSync(
-        this.config.tmuxPath,
-        ['send-keys', '-t', `=${tmuxSession}:`, 'Enter'],
-        { encoding: 'utf-8', timeout: 5000 }
-      ));
-      return true;
-    } catch {
-      // @silent-fallback-ok — send-keys boolean return
-      return false;
+    // One production injection funnel. Historically this method duplicated a
+    // raw `tmux send-keys` implementation and silently bypassed the Stage-B
+    // journal/lock used by injectMessage(). Every in-process caller now reaches
+    // the same rawInject authority; InputGuard remains the responsibility of
+    // the external injectMessage boundary.
+    return this.rawInject(tmuxSession, input);
+  }
+
+  /** Privacy-safe lifecycle counts for authenticated diagnostics. */
+  /**
+   * The ONE place a claude-code launch binary is chosen (CMT-798). Other
+   * frameworks pass through untouched. On a retained hit the path returned is
+   * the per-version copy; on any retainer fallback it is `binaryPath` itself
+   * (the retainer already logged why, loudly). Also schedules a throttled,
+   * non-blocking prune of unused old versions — prune never deletes a version
+   * a live process maps.
+   */
+  resolveLaunchBinary(framework: IntelligenceFramework, binaryPath: string): string {
+    if (framework !== 'claude-code') return binaryPath;
+    // Native hook events (D4 / Multi-machine posture): re-validate the
+    // reporter entries in .claude/settings.json against this machine's
+    // decision immediately before the spawn — a git sync can overwrite the
+    // file between boot and launch. Idempotent; instar-owned entries only.
+    if (this.nativeHookLaunchCheck) {
+      try {
+        this.nativeHookLaunchCheck();
+      } catch (err) {
+        // @silent-fallback-ok — logged; the reporter-settings re-validation must never block a claude-code spawn.
+        console.warn(`[SessionManager] native hook launch check failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
+    const resolution = this.claudeBinaryRetainer.resolve(binaryPath);
+    this.claudeLaunchVersions.set(resolution.path, resolution.version);
+    if (resolution.source === 'retained') {
+      const now = Date.now();
+      if (now - this.lastClaudeBinaryPruneAt >= SessionManager.CLAUDE_BINARY_PRUNE_INTERVAL_MS) {
+        this.lastClaudeBinaryPruneAt = now;
+        void this.claudeBinaryRetainer.prune().catch((err) => {
+          // @silent-fallback-ok — logged; a failed prune keeps old retained copies until the next interval (pre-existing fail-safe; the native-hook launch check above moved it out of its old exemption window).
+          console.warn(`[SessionManager] retained Claude binary prune failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+    }
+    return resolution.path;
+  }
+
+  private nativeHookLaunchCheck: (() => unknown) | null = null;
+
+  /** Wire the native-hook-events launch-time settings re-validation (server.ts). */
+  setNativeHookLaunchCheck(fn: (() => unknown) | null): void {
+    this.nativeHookLaunchCheck = fn;
+  }
+
+  /** Registry-First read for `GET /sessions/claude-binary`. */
+  claudeBinaryStatus(): RetainerStatus {
+    return this.claudeBinaryRetainer.status();
+  }
+
+  /** Run one prune pass now (the route's POST lever + tests). */
+  pruneRetainedClaudeBinaries() {
+    return this.claudeBinaryRetainer.prune();
+  }
+
+  inboundDeliveryStatus(): (ReturnType<InboundDeliveryStore['status']> & {
+    observer: ReturnType<CodexDeliveryObserver['status']> | null;
+    activation: StageBActivationStatus;
+  })
+    | { unavailable: true; activation: StageBActivationStatus } {
+    return this.inboundDeliveries
+      ? {
+          ...this.inboundDeliveries.status(),
+          observer: this.codexDeliveryObserver?.status() ?? null,
+          activation: this.stageBActivation,
+        }
+      : { unavailable: true, activation: this.stageBActivation };
+  }
+
+  /** Test-only trigger for the exact production observer composition. */
+  async sweepInboundDeliveryObserverForTesting(): Promise<void> {
+    await this.codexDeliveryObserver?.sweep();
+    this.dispatchPreparedInboundDeliveries();
+  }
+
+  scopedRecoveryStatus(): { enabled: boolean; mode: 'dark' | 'durable-authority' } {
+    return this.stageCRecoveryEnabled
+      ? { enabled: true, mode: 'durable-authority' }
+      : { enabled: false, mode: 'dark' };
+  }
+
+  markInboundDeliveryNoticeDelivered(notice: import('./InboundDeliveryStore.js').InboundDeliveryNotice): boolean {
+    return this.inboundDeliveries?.markNoticeDelivered(notice) ?? false;
+  }
+
+  markCodexObserverNoticeDelivered(episodeId: string): boolean {
+    return this.inboundDeliveries?.markObserverNoticeDelivered(episodeId) ?? false;
+  }
+
+  /** Ownership-authority projection: source fences live delivery rows at transferring(e+1). */
+  transferInboundDeliveryOwnership(conversationId: string, source: string, sourceEpoch: number,
+    target: string, transferEpoch: number): number {
+    if (!this.stageBActivation.active || !this.inboundDeliveries) return 0;
+    return this.inboundDeliveries.transferLiveRows(conversationId, source, sourceEpoch, target, transferEpoch);
+  }
+
+  /** Ownership-authority projection: target claims verified imported rows at active(e+2). */
+  claimTransferredInboundDeliveries(conversationId: string, target: string,
+    transferEpoch: number, activeEpoch: number): number {
+    if (!this.stageBActivation.active || !this.inboundDeliveries) return 0;
+    return this.inboundDeliveries.claimTransferredRows(conversationId, target, transferEpoch, activeEpoch);
+  }
+
+  /** Build a recipient-encrypted transfer and atomically fence the source rows. */
+  exportInboundDeliveryTransfer(input: {
+    conversationId: string; sourceMachineId: string; sourceEpoch: number;
+    targetMachineId: string; transferEpoch: number; activeEpoch: number;
+    targetEncryptionPublicKey: string;
+  }): EncryptedDeliveryTransfer | null {
+    if (!this.stageBActivation.active || !this.inboundDeliveries || !this.inboundDeliveryHmacKey) return null;
+    return this.inboundDeliveries.exportLiveRows({
+      ...input,
+      localHmacKey: this.inboundDeliveryHmacKey,
+    });
+  }
+
+  /** Import a signed-peer carrier after mesh authentication and recipient decryption. */
+  importInboundDeliveryTransfer(input: {
+    transfer: EncryptedDeliveryTransfer; ownEncryptionPrivateKey: KeyObject;
+    authenticatedSourceMachineId: string; expectedTargetMachineId: string;
+    expectedConversationId: string; expectedTransferEpoch: number;
+  }): { imported: number; duplicate: number; activeEpoch: number } | null {
+    if (!this.stageBActivation.active || !this.inboundDeliveries || !this.inboundDeliveryHmacKey) return null;
+    return this.inboundDeliveries.importLiveRows({
+      ...input,
+      localHmacKey: this.inboundDeliveryHmacKey,
+    });
+  }
+
+  restoreInboundDeliveryAfterAbortedTransfer(
+    conversationId: string, sourceMachineId: string, transferEpoch: number, activeEpoch: number,
+  ): number {
+    if (!this.stageBActivation.active || !this.inboundDeliveries) return 0;
+    return this.inboundDeliveries.restoreAbortedTransfer(
+      conversationId, sourceMachineId, transferEpoch, activeEpoch,
+    );
   }
 
   /**
@@ -3258,7 +6918,44 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * Use for special keys like 'C-c' (Ctrl+C), 'Enter', 'Escape'.
    * Unlike sendInput() which uses -l (literal), this sends key names directly.
    */
+  /**
+   * A confined session whose task has been delivered takes no further keys or text from ANY
+   * Instar writer (sentinel nudges, prompt answers, recovery keys): its only answerer was the D2
+   * startup driver, and only before delivery (docs/specs/confined-spawn-subscription-reroute.md
+   * D3). Killing it stays allowed. Refusals are logged once per session.
+   */
+  private confinedWriteRefused(tmuxSession: string, what: string): boolean {
+    // The D2 startup driver is the ONLY writer allowed into a confined session, and only while it
+    // holds the session (from its first capture to `delivered` or `failed`).
+    //
+    // Both Sets below are class-field initialisers, so they exist only when the constructor ran.
+    // Narrow harnesses build this recovery surface with `Object.create(SessionManager.prototype)`
+    // (see the same note on fireStuckInputRecovery), where they are `undefined` — and an unguarded
+    // `.has()` threw a TypeError that BOTH enclosing catches swallowed, silently sending ZERO
+    // stuck-input recovery keys instead of the escalating four. Optional chaining keeps D3's teeth:
+    // the refusal verdict comes from `session.confinedConfigHome`, not from these Sets, so a
+    // genuinely confined session is still refused — only the holder allow-list and the
+    // once-per-session warning degrade, and both are additive.
+    if (this.confinedStartupHolders?.has(tmuxSession)) return false;
+    const session = this.state.listSessions({ status: 'running' }).find((s) => s.tmuxSession === tmuxSession);
+    if (!session?.confinedConfigHome) return false;
+    if (!this.confinedWriteRefusals?.has(session.id)) {
+      this.confinedWriteRefusals?.add(session.id);
+      console.warn(`[SessionManager] refused ${what} into confined session "${tmuxSession}" (D3: only the startup driver may press a key in a confined session)`);
+    }
+    return true;
+  }
+  private readonly confinedWriteRefusals = new Set<string>();
+  /** tmux sessions the D2 startup driver currently holds (the one writer a confined session admits). */
+  private readonly confinedStartupHolders = new Set<string>();
+
+  /** Public form of the D3 guard for writers outside SessionManager (the server's tmuxOps.sendKeys). */
+  isConfinedWriteRefused(tmuxSession: string): boolean {
+    return this.confinedWriteRefused(tmuxSession, 'text');
+  }
+
   sendKey(tmuxSession: string, key: string): boolean {
+    if (this.confinedWriteRefused(tmuxSession, `key ${key}`)) return false;
     try {
       withSyncOp(() =>
         execFileSync(
@@ -3283,6 +6980,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * stays synchronous because its timing IS the correctness mechanism).
    */
   private async sendKeyAsync(tmuxSession: string, key: string): Promise<boolean> {
+    if (this.confinedWriteRefused(tmuxSession, `key ${key}`)) return false;
     if (this.tmuxInflightCount >= this.tmuxMaxInFlight) return false;
     this.tmuxInflightCount += 1;
     try {
@@ -3301,6 +6999,19 @@ rm()  { "${shimRunner}" rm  "$@"; }
    */
   listRunningSessions(): Session[] {
     const sessions = this.state.listSessions({ status: 'running' });
+    // In async-hot-path mode the monitor is the sole tmux liveness authority.
+    // Re-probing every row synchronously here defeats that architecture: every
+    // sentinel/status caller fans out has-session + display-message, and a
+    // shared tmux server with thousands of panes can keep Node's event loop
+    // blocked almost continuously. State may briefly retain a dead row until
+    // the next bounded monitor tick; that conservative lag is safer than
+    // declaring a live session dead from a slow probe and keeps /health and
+    // inbound custody responsive.
+    if (this.tmuxAsyncEnabled) {
+      this._cachedRunningCount = sessions.length;
+      this._cachedRunningSessions = sessions;
+      return sessions;
+    }
     const alive = sessions.filter(s => this.isSessionAlive(s.tmuxSession));
     // Update cache as a side effect
     this._cachedRunningCount = alive.length;
@@ -3344,7 +7055,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * and `indeterminate` are kept. An indeterminate session lingers one extra tick
    * (cheap, caught by monitoring) rather than being falsely reaped (expensive).
    */
-  async purgeDeadSessions(): Promise<number> {
+  async purgeDeadSessions(onlyKnownDead = false): Promise<number> {
     const running = this.state.listSessions({ status: 'running' });
     if (running.length === 0) return 0;
 
@@ -3362,12 +7073,26 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // KEEP-guard is bypassed via `knownDead` — the oracle has already proven
         // this session dead, and the guard's liveness-blind topic-state KEEPs would
         // otherwise pin a tombstone and re-create the death-spiral.
-        const r = await this.terminateSession(session.id, 'boot-purge-dead', {
+        const r = await this.#terminateSessionInternal(session.id, 'boot-purge-dead', {
           knownDead: true,
           finalStatus: 'completed',
         });
         if (r.terminated) purged++;
         else skipped++; // not-lease-holder / protected — recorded, kept for next awake tick
+      } else if (onlyKnownDead) {
+        kept++;
+      } else if (session.launchLane === 'rerouted-interactive' && session.confinedConfigHome && !session.confinedDeliveredAt) {
+        // Confined startup never completed before the restart (spec Restart boundary): its in-memory
+        // startup state is gone and is never resumed, so the session is killed — nothing is typed twice.
+        const r = await this.#terminateSessionInternal(session.id, 'boot-reconcile-confined-undelivered', {
+          finalStatus: 'killed',
+          disposition: 'terminal',
+          origin: 'operator',
+        });
+        if (r.terminated) {
+          console.log(`[SessionManager] Startup reconcile: killed confined rerouted session "${session.name}" whose startup never completed.`);
+        }
+        kept++;
       } else if (session.launchLane === 'rerouted-interactive' && session.jobSlug) {
         // Boot reconciliation (june15-headless-spawn-reroute, PR2 finding O3):
         // a rerouted JOB session that survived a restart is still ALIVE in tmux,
@@ -3377,7 +7102,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // the job reruns cleanly with fresh run-tracking; adopting an orphan REPL
         // whose run-id we no longer hold would silently never finalize). Operator
         // kill so the lease/KEEP-guards don't pin the orphan.
-        const r = await this.terminateSession(session.id, 'boot-reconcile-rerouted-job', {
+        const r = await this.#terminateSessionInternal(session.id, 'boot-reconcile-rerouted-job', {
           finalStatus: 'killed',
           disposition: 'terminal',
           origin: 'operator',
@@ -3447,16 +7172,22 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
     const staleSessions = sessions.filter(s => s.isStale);
 
-    // Memory pressure assessment
+    // Memory pressure assessment. Reads the CORRECTED available-memory figure
+    // (free + inactive + purgeable on macOS via vm_stat; MemAvailable on Linux)
+    // — NOT os.freemem(), which counts only raw free pages and would report a
+    // healthy host at ~97% used. Kept in step with currentMemoryPressure() below
+    // so the reported PERCENTAGE and the reported TIER cannot contradict each
+    // other (pre-fix this surface could show "97% used" beside tier 'low').
+    // Spec: macos-memory-pressure-metric.
     const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
-    const freeMemMB = Math.round(freeMem / 1048576);
+    const freePct = hostFreeMemPct();
+    const usedPercent = Math.round(100 - freePct);
+    const freeMemMB = Math.round((totalMem * (freePct / 100)) / 1048576);
     const totalMemMB = Math.round(totalMem / 1048576);
 
-    // Shared with the reroute pre-spawn gate (june15-headless-spawn-reroute O2)
-    // via currentMemoryPressure() — one definition of the pressure tiers.
-    const memoryPressure: MemoryPressure = this.currentMemoryPressure();
+    // Use the same sampled percentage for the number and its tier. A second
+    // host read can cross a threshold while diagnostics are being assembled.
+    const memoryPressure: MemoryPressure = this.memoryPressureTier(usedPercent);
 
     // Build actionable suggestions
     const suggestions: string[] = [];
@@ -3549,7 +7280,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
     for (const session of running) {
       if (this.config.protectedSessions.includes(session.tmuxSession)) continue;
 
-      if (!this.isSessionAlive(session.tmuxSession) || this.detectCompletion(session.tmuxSession)) {
+      // A live standing session is never closed on a completion pattern; a dead one is.
+      if (!this.isSessionAlive(session.tmuxSession)
+          || (!this.isStandingSession(session.tmuxSession) && this.detectCompletion(session.tmuxSession))) {
         session.status = 'completed';
         session.endedAt = new Date().toISOString();
         this.state.saveSession(session);
@@ -3570,30 +7303,58 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
-   * Remove stale session state files for sessions that have been
-   * killed or completed beyond the retention period.
-   * Killed sessions: removed after 1 hour.
-   * Completed sessions: removed after 24 hours.
+   * Remove stale session state files for sessions that reached a TERMINAL
+   * status (completed / failed / killed) beyond the retention period.
+   *
+   * Defaults — config-tunable via `sessions.retention` (session-listing
+   * hygiene, CMT-1936; the SessionManager snapshots config at boot, so a
+   * retention change takes effect at the next server restart):
+   *   - killed / failed records: 60 min (`killedTtlMinutes`)
+   *   - completed BACKGROUND records — a scheduler job (`jobSlug`) or a
+   *     headless one-shot (`launchLane === 'headless'`, e.g. the 15-min-cadence
+   *     mentor Stage-A compose runs that walled the Mini's session list):
+   *     60 min (`completedJobTtlMinutes`)
+   *   - completed INTERACTIVE records: 24 h (`completedTtlHours`)
+   *   - hard cap: at most `maxFinished` (default 50) terminal records retained
+   *     regardless of age — oldest-ended pruned first. The cap now counts
+   *     EVERY terminal record (completed AND failed AND killed), so no
+   *     terminal class can accumulate without bound.
+   *
+   * Timestamp honesty: a terminal record whose `endedAt` is missing or
+   * unparseable falls back to `startedAt`; a record with NEITHER parseable is
+   * treated as expired. (Pre-fix, a missing `endedAt` skipped the record
+   * forever — an unbounded hole — and `failed` records were never pruned.)
    */
   cleanupStaleSessions(): string[] {
     const allSessions = this.state.listSessions();
     const now = Date.now();
-    const KILLED_TTL_MS = 60 * 60 * 1000;            // 1 hour
-    const COMPLETED_JOB_TTL_MS = 60 * 60 * 1000;     // 1 hour for jobs
-    const COMPLETED_TTL_MS = 24 * 60 * 60 * 1000;    // 24 hours for interactive
+    const retention = this.config.retention;
+    // Nullish-safe positive-number read (0 is a valid, immediate-prune TTL).
+    const posNum = (v: unknown, dflt: number): number =>
+      typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : dflt;
+    const KILLED_TTL_MS = posNum(retention?.killedTtlMinutes, 60) * 60 * 1000;
+    const COMPLETED_JOB_TTL_MS = posNum(retention?.completedJobTtlMinutes, 60) * 60 * 1000;
+    const COMPLETED_TTL_MS = posNum(retention?.completedTtlHours, 24) * 60 * 60 * 1000;
+    const MAX_FINISHED = Math.floor(posNum(retention?.maxFinished, 50));
     const cleaned: string[] = [];
-    const completed: { id: string; endedAt: number }[] = [];
+    const retained: { id: string; endedAt: number }[] = [];
+
+    const parseTs = (iso: string | undefined): number => {
+      if (!iso) return Number.NaN;
+      const t = new Date(iso).getTime();
+      return Number.isFinite(t) ? t : Number.NaN;
+    };
 
     for (const session of allSessions) {
-      if (session.status !== 'killed' && session.status !== 'completed') continue;
-      const endedAt = session.endedAt ? new Date(session.endedAt).getTime() : 0;
-      if (!endedAt) continue;
-
-      const age = now - endedAt;
+      if (session.status !== 'killed' && session.status !== 'completed' && session.status !== 'failed') continue;
+      const endedAtRaw = parseTs(session.endedAt);
+      const endedAt = Number.isNaN(endedAtRaw) ? parseTs(session.startedAt) : endedAtRaw;
+      // Neither timestamp parseable → malformed terminal record → expired now.
+      const age = Number.isNaN(endedAt) ? Number.POSITIVE_INFINITY : now - endedAt;
       let ttl: number;
-      if (session.status === 'killed') {
+      if (session.status === 'killed' || session.status === 'failed') {
         ttl = KILLED_TTL_MS;
-      } else if (session.jobSlug) {
+      } else if (session.jobSlug || session.launchLane === 'headless') {
         ttl = COMPLETED_JOB_TTL_MS;
       } else {
         ttl = COMPLETED_TTL_MS;
@@ -3602,20 +7363,23 @@ rm()  { "${shimRunner}" rm  "$@"; }
       if (age > ttl) {
         if (this.state.removeSession(session.id)) {
           cleaned.push(session.id);
+          this.idleKillBackoff?.clear(session.id); // map-leak eviction (Fix A finding 1)
+          this.noteIdleZombieVetoEnded(session.id);
         }
-      } else if (session.status === 'completed') {
-        completed.push({ id: session.id, endedAt });
+      } else {
+        retained.push({ id: session.id, endedAt: Number.isNaN(endedAt) ? 0 : endedAt });
       }
     }
 
-    // Hard cap: prune oldest completed sessions if more than 50 remain
-    const MAX_COMPLETED = 50;
-    if (completed.length > MAX_COMPLETED) {
-      completed.sort((a, b) => a.endedAt - b.endedAt);
-      const excess = completed.slice(0, completed.length - MAX_COMPLETED);
+    // Hard cap: prune the oldest-ended terminal records beyond maxFinished.
+    if (retained.length > MAX_FINISHED) {
+      retained.sort((a, b) => a.endedAt - b.endedAt);
+      const excess = retained.slice(0, retained.length - MAX_FINISHED);
       for (const s of excess) {
         if (this.state.removeSession(s.id)) {
           cleaned.push(s.id);
+          this.idleKillBackoff?.clear(s.id); // map-leak eviction (Fix A finding 1)
+          this.noteIdleZombieVetoEnded(s.id);
         }
       }
     }
@@ -3648,9 +7412,121 @@ rm()  { "${shimRunner}" rm  "$@"; }
     });
     if (decision.swapped) {
       console.log(`[SessionManager] ${decision.reason}`);
-      return decision.model;
     }
-    return requestedModel;
+    const selected = decision.swapped ? decision.model : requestedModel;
+    if (framework === 'codex-cli' && selected === 'gpt-6.1-sol') {
+      const binary = resolveFrameworkBinaryPath({
+        framework,
+        frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+        claudePath: this.config.claudePath,
+        configuredFramework: this.config.framework,
+      });
+      if (!binary || !codexSupportsGpt61Sol(binary)) {
+        console.warn('[SessionManager] This machine has an older Codex CLI; using gpt-6-sol for this session.');
+        return 'gpt-6-sol';
+      }
+    }
+    return selected;
+  }
+
+  /**
+   * Dynamic MCP Lifecycle (DYNAMIC-MCP-LIFECYCLE-SPEC) — build the `--mcp-config`
+   * launch flags for a claude-code interactive session, so it launches with a
+   * lean/explicit MCP subset instead of the full `.mcp.json`.
+   *
+   * FAIL-SAFE by construction: the FIRST check is the (currently explicit)
+   * enable flag, so a dark agent returns `[]` (full `.mcp.json`) immediately —
+   * a strict no-op. The whole body is wrapped so ANY error (unreadable config,
+   * write failure, anything) returns `[]` — a session is NEVER stranded without
+   * its tools; the worst case is "the full tool set", never "missing tools".
+   *
+   * Resolution order is the spec's load-bearing gate (resolveSessionMcpServers):
+   * enabled → framework → committed state file → state-unreadable⇒lean baseline
+   * → baseline → full. When it resolves a trimmed set and no committed state file
+   * exists yet, it SEEDS one (so the driver + a later --resume restart know what
+   * is loaded). Until the on-demand load/offload driver lands, this gates behind
+   * the EXPLICIT `dynamicMcp.enabled` flag (NOT the dev-agent gate) so trimming
+   * cannot go live before there is a way to load a heavy server back.
+   */
+  private buildSessionMcpFlags(
+    topicId: number | undefined,
+    framework: string,
+    /**
+     * Threadline MCP over local HTTP (threadline-mcp-local-http D3): when the HTTP
+     * entry was chosen, the per-topic strict config's `threadline` entry is
+     * REPLACED by it (one writer, one `--mcp-config`); `out.threadline` reports
+     * what the resolved set ended up carrying.
+     */
+    threadline?: { httpEntry?: Record<string, unknown>; out?: { threadline?: 'http' | 'stdio' | 'absent' } },
+  ): string[] {
+    try {
+      const cfg = this.config.dynamicMcp;
+      const enabled = cfg?.enabled === true; // explicit-dark until the full path lands
+      if (!enabled) return [];
+      if (framework !== 'claude-code') return [];
+      if (topicId === undefined || topicId === null) return [];
+
+      const mcpJsonPath = path.join(this.config.projectDir, '.mcp.json');
+      let full: McpJson;
+      try { full = JSON.parse(fs.readFileSync(mcpJsonPath, 'utf-8')) as McpJson; }
+      catch { return []; } // no/unreadable .mcp.json ⇒ nothing to filter ⇒ full
+      const allNames = Object.keys((full && typeof full === 'object' ? full.mcpServers : undefined) ?? {});
+
+      const stateDir = path.join(this.config.projectDir, '.instar', 'state', 'mcp-loaded');
+      const statePath = path.join(stateDir, `${topicId}.json`);
+      let committedStateServers: string[] | null = null;
+      let stateFileUnreadable = false;
+      if (fs.existsSync(statePath)) {
+        try {
+          const st = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+          // Two-phase commit: only a `committed:true` file is authoritative; an
+          // un-committed (in-flight) file is ignored (treated as no state).
+          if (st && st.committed === true && Array.isArray(st.servers)) {
+            committedStateServers = st.servers.filter((s: unknown) => typeof s === 'string' && (s as string).length > 0);
+          }
+        } catch { stateFileUnreadable = true; }
+      }
+
+      const baselineServers = resolveBaselineServers(allNames, cfg);
+      const allowed = resolveSessionMcpServers({
+        enabled, framework, committedStateServers, stateFileUnreadable, baselineServers,
+      });
+      if (allowed === null) return []; // full .mcp.json
+
+      // Seed the committed loaded-set state file from the resolved baseline when
+      // none exists yet — best-effort (a seed failure never blocks the launch).
+      // Skip when the existing file was merely unreadable (never clobber it).
+      if (committedStateServers === null && !stateFileUnreadable) {
+        try {
+          fs.mkdirSync(stateDir, { recursive: true });
+          const tmp = path.join(stateDir, `${topicId}.json.tmp`);
+          fs.writeFileSync(tmp, JSON.stringify({ servers: allowed, committed: true, updatedAt: new Date().toISOString(), reason: 'baseline' }, null, 2));
+          fs.renameSync(tmp, statePath);
+        } catch { /* seeding is best-effort */ }
+      }
+
+      const filtered = filterMcpConfig(full, allowed);
+      if (threadline?.out) {
+        const servers = (filtered as { mcpServers?: Record<string, unknown> }).mcpServers;
+        if (servers && Object.prototype.hasOwnProperty.call(servers, 'threadline')) {
+          if (threadline.httpEntry) {
+            servers.threadline = threadline.httpEntry;
+            threadline.out.threadline = 'http';
+          } else {
+            threadline.out.threadline = 'stdio';
+          }
+        } else {
+          threadline.out.threadline = 'absent';
+        }
+      }
+      const outDir = path.join(this.config.projectDir, '.instar', 'state', 'session-mcp-config');
+      fs.mkdirSync(outDir, { recursive: true });
+      const outPath = path.join(outDir, `mcp-${topicId}-${Date.now()}.json`);
+      fs.writeFileSync(outPath, JSON.stringify(filtered, null, 2));
+      return ['--strict-mcp-config', '--mcp-config', outPath];
+    } catch {
+      return []; // @silent-fallback-ok — any failure ⇒ full .mcp.json (never strands a session)
+    }
   }
 
   /**
@@ -3658,10 +7534,66 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * Used for Telegram-driven conversational sessions.
    * Optionally sends an initial message after Claude is ready.
    */
-  async spawnInteractiveSession(initialMessage?: string, name?: string, options?: { telegramTopicId?: number; slackChannelId?: string; slackThreadTs?: string; resumeSessionId?: string; framework?: IntelligenceFramework; codexLocalProvider?: 'ollama' | 'lmstudio'; defaultModel?: string;
+  /**
+   * One change to who may read a conversation, against every spawn of it: a spawn holds this lock from
+   * resolving its audience through launch, so a grant can never interleave (team-roles-and-access §4.1).
+   */
+  async withConversationLock<T>(ref: string, fn: () => Promise<T>): Promise<T> {
+    const prior = this.conversationLocks.get(ref) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const tail = prior.then(() => held);
+    this.conversationLocks.set(ref, tail);
+    await prior;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.conversationLocks.get(ref) === tail) this.conversationLocks.delete(ref);
+    }
+  }
+
+  /**
+   * A change to who may read a conversation, for team access: under the conversation's lock, end its
+   * live session so a new one resolves the new place, then run the change.
+   */
+  async applyConversationChange<T>(ref: string, change: () => Promise<T> | T): Promise<T> {
+    return this.withConversationLock(ref, async () => {
+      const input: SessionPlaceInput = ref.startsWith('telegram:') ? { telegramTopicId: Number(ref.slice(9)) } : { memoryPlaceKey: `app:${ref}` };
+      for (const session of this.listRunningSessions()) {
+        const place = session.memoryPlaceInput;
+        const same = input.telegramTopicId !== undefined
+          ? (session.telegramTopicId === input.telegramTopicId || place?.telegramTopicId === input.telegramTopicId)
+          : place?.memoryPlaceKey === input.memoryPlaceKey;
+        // A session that will not end means the change must not go through under it.
+        if (same && !(await this.retireMemorySession(session))) throw new Error('team-access-session-still-running');
+      }
+      // A failed spawn can record the new audience without launching, so the next one must not be
+      // left to notice the change: the old transcript belongs to the old audience.
+      this.conversationResumeDropper?.(ref);
+      return change();
+    });
+  }
+
+  /** Spawn under the conversation's lock when it names one. See `spawnInteractiveSessionUnlocked`. */
+  async spawnInteractiveSession(...args: Parameters<SessionManager['spawnInteractiveSessionUnlocked']>): Promise<string> {
+    const options = args[2];
+    const ref = conversationRefOf({ telegramTopicId: options?.telegramTopicId, memoryPlaceKey: options?.memoryPlaceKey });
+    if (!ref) return this.spawnInteractiveSessionUnlocked(...args);
+    return this.withConversationLock(ref, () => this.spawnInteractiveSessionUnlocked(...args));
+  }
+
+  async spawnInteractiveSessionUnlocked(initialMessage?: string, name?: string, options?: { shapedForAudience?: string; reshapeForAudience?: (kind: string, message: string) => string; telegramTopicId?: number; slackChannelId?: string; slackThreadTs?: string; resumeSessionId?: string; framework?: IntelligenceFramework; codexLocalProvider?: 'ollama' | 'lmstudio'; defaultModel?: string;
+    /** durable-conversation-identity §7: the authenticated bootstrap
+     *  conversation ids this session may open durable state on (a Slack spawn
+     *  passes its minted conversation id). Falls back to [telegramTopicId]. */
+    bootstrapConversationIds?: number[];
     /** Warm-session A2A (claude-code only): pin a deterministic --session-id so an
      *  eviction mid-thread can --resume losslessly (#746). Ignored when resuming. */
     sessionId?: string;
+    /** Who started it (recorded on the session). The dashboard's New session box
+     *  passes 'dashboard-operator' so the console never files it under internal. */
+    triggeredBy?: string;
     /** Subscription & Auth Standard P1.3 (claude-code only): launch this session
      *  under the given account's config home (CLAUDE_CONFIG_DIR) — the account-swap
      *  mechanism. Additive; an explicit value always wins. When unset AND the
@@ -3688,6 +7620,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
      *  tree, not the module-level project dir. Unset = projectDir (today's
      *  behavior, byte-for-byte). */
     cwd?: string;
+    /** Do not return control to the bridge until the initial bootstrap has
+     * actually been injected. Used for framework handoffs so a newly mapped
+     * session cannot receive a user turn before its continuation context. */
+    awaitInitialInjection?: boolean;
+    /** Memory privacy: a place with no topic or channel argument (WhatsApp, iMessage, app). */
+    memoryPlaceKey?: string;
+    /** Memory privacy: set by callers that are not a conversation (dashboard, agent-to-agent). */
+    memoryPlace?: MemoryPlace;
   }): Promise<string> {
     const sanitized = name
       ? name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 40)
@@ -3700,15 +7640,53 @@ rm()  { "${shimRunner}" rm  "$@"; }
       throw new Error(`Cannot interact with protected session: ${tmuxSession}`);
     }
 
+    if (this.tmuxSessionExists(tmuxSession) && this.resumeFollowsAccountEnabled() && this.isPaneDead(tmuxSession)) {
+      // A same-name session whose Claude process already exited: reusing it
+      // would type the bootstrap into a dead pane. Record why it died, remove
+      // it, and spawn fresh below (spec §3.2).
+      this.logDeadPaneEvidence(tmuxSession, 'Spawn found a dead same-name session');
+      this.terminalExitCodes.delete(tmuxSession);
+      this.failedExitRetained.delete(tmuxSession);
+      try {
+        const stale = this.listRunningSessions().find((r) => r.tmuxSession === tmuxSession);
+        if (stale) {
+          stale.status = 'failed';
+          stale.endedAt = new Date().toISOString();
+          this.state.saveSession(stale);
+        }
+      } catch { /* @silent-fallback-ok — state cleanup is best-effort; the monitor also ends the record */ }
+      try {
+        withSyncOp(() => execFileSync(this.config.tmuxPath, ['kill-session', '-t', `=${tmuxSession}`], { stdio: 'ignore', timeout: 5000 }));
+      } catch { /* @silent-fallback-ok — already gone */ }
+    }
+    // Memory privacy: a same-name session is reused only if it serves this audience.
+    if (this.memoryPrivacyWiring?.privacy.enabled && this.tmuxSessionExists(tmuxSession)) {
+      const wiring = this.memoryPrivacyWiring;
+      const audience = wiring.privacy.audienceFor(wiring.privacy.placeFor({
+        telegramTopicId: options?.telegramTopicId, slackChannelId: options?.slackChannelId,
+        memoryPlaceKey: options?.memoryPlaceKey, memoryPlace: options?.memoryPlace,
+      }, wiring.telegramGroupKey()));
+      const known = this.listRunningSessions().some((s) => s.tmuxSession === tmuxSession);
+      if ((!known && isScopedAudience(audience)) || !(await this.retireSessionUnlessAudience(tmuxSession, audienceKey(audience)))) {
+        throw new MemoryPrivacyUnavailableError('a session that could not be ended');
+      }
+    }
     if (this.tmuxSessionExists(tmuxSession)) {
-      // Session already exists — just reuse it
+      // Session already exists — just reuse it. The initial message is
+      // instar-composed bootstrap content (F7) — mark it first-party so the
+      // InputGuard doesn't flag instar's own boot template as an injection.
       if (initialMessage) {
-        this.injectMessage(tmuxSession, initialMessage);
+        this.injectMessage(tmuxSession, initialMessage, {
+          firstParty: { source: 'session-bootstrap' },
+          conversationId: options?.bootstrapConversationIds?.[0] !== undefined
+            ? String(options.bootstrapConversationIds[0])
+            : undefined,
+        });
       }
       return tmuxSession;
     }
 
-    const effectiveInitialMessage = this.withBuildContextRestoreNote(
+    let effectiveInitialMessage = this.withBuildContextRestoreNote(
       tmuxSession,
       initialMessage,
       options?.resumeSessionId,
@@ -3732,6 +7710,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
         `Running: ${runningSessions.map(s => s.name).join(', ')}`
       );
     }
+    // Overload admission (Part C2): while overloaded, an operator session starts
+    // only by taking the one host-wide recovery slot.
+    this.checkAdmission('operator', tmuxSession);
 
     // Generate session ID before tmux spawn so we can pass it as env var
     const interactiveSessionId = this.generateId();
@@ -3753,20 +7734,36 @@ rm()  { "${shimRunner}" rm  "$@"; }
       configFramework: this.config.framework,
       envFramework: frameworkFromEnv(),
     });
-    const binaryPath =
-      this.config.frameworkBinaryPaths?.[framework]
-      ?? (framework === 'pi-cli'
-        // pi-cli must NEVER inherit the claudePath fallback: claudePath holds a
-        // CLAUDE binary on claude-code installs, and silently launching Claude
-        // with pi's flags violates the additive-only constraint
-        // (PI-HARNESS-INTEGRATION-SPEC §0.1). A bare 'pi' lets PATH resolution
-        // work when detection missed an install; a missing binary then fails
-        // loudly inside the pane instead of impersonating another framework.
-        ? 'pi'
-        : this.config.claudePath);
-    if (!binaryPath) {
+
+    // Memory privacy: decide the audience before anything else, and drop a resume
+    // whose transcript was read by a different audience.
+    const memoryPlan = this.planMemorySession(framework, tmuxSession, {
+      telegramTopicId: options?.telegramTopicId,
+      slackChannelId: options?.slackChannelId,
+      memoryPlaceKey: options?.memoryPlaceKey,
+      memoryPlace: options?.memoryPlace,
+    });
+    // A caller that shaped its message for one audience gets it reshaped if a grant changed that.
+    const actualAudience = memoryPlan?.audience.kind ?? 'open';
+    if (initialMessage && options?.reshapeForAudience && options.shapedForAudience !== undefined && options.shapedForAudience !== actualAudience) {
+      initialMessage = options.reshapeForAudience(actualAudience, initialMessage);
+    }
+    if (memoryPlan?.dropResume && options?.resumeSessionId) {
+      options = { ...options, resumeSessionId: undefined };
+    }
+
+    // Shared impersonation fence (spec §2.0) — see resolveFrameworkBinaryPath.
+    const configuredBinaryPath = resolveFrameworkBinaryPath({
+      framework,
+      frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+      claudePath: this.config.claudePath,
+      configuredFramework: this.config.framework,
+    });
+    if (!configuredBinaryPath) {
       throw new Error(`No binary path available for framework "${framework}"`);
     }
+    // CMT-798: launch claude-code from its retained per-version copy.
+    const binaryPath = this.resolveLaunchBinary(framework, configuredBinaryPath);
     // Per-call defaultModel override (used by /local-model to set Codex's
     // local model id) wins over config defaults. Config defaults survive
     // for cloud-Codex topics that haven't been customized.
@@ -3815,6 +7812,46 @@ rm()  { "${shimRunner}" rm  "$@"; }
         explicitConfigHome ? 'interactive account-swap' : 'interactive pin',
       );
     }
+    // Resume Follows the Account (docs/specs/resume-follows-account.md §3.1).
+    // Claude opens a resume transcript only from the login folder it runs
+    // under. When a topic conversation is launched under a pool/swap login,
+    // place the freshest copy there first; if none exists (or the id is an
+    // internal one-shot call), launch fresh instead of letting Claude exit
+    // with "No conversation found".
+    let resumeReopenFailed = false;
+    if (
+      options?.resumeSessionId &&
+      framework === 'claude-code' &&
+      effectiveConfigHome &&
+      (options.telegramTopicId !== undefined || options.slackChannelId) &&
+      this.resumeFollowsAccountEnabled()
+    ) {
+      const outcome = await placeResumeTranscript(options.resumeSessionId, effectiveConfigHome);
+      console.log(`[SessionManager] Resume placement for "${tmuxSession}": ${outcome} (uuid=${options.resumeSessionId}, home=${effectiveConfigHome})`);
+      if (outcome === 'not-found' || outcome === 'one-shot') {
+        resumeReopenFailed = true;
+        options = { ...options, resumeSessionId: undefined };
+      }
+      if (outcome === 'not-found' || outcome === 'one-shot' || outcome === 'forked') {
+        DegradationReporter.getInstance().report({
+          feature: 'SessionManager.resumePlacement',
+          primary: 'Place the topic conversation in the login the session launches under',
+          fallback: outcome === 'forked'
+            ? 'A diverged copy in the target login was set aside and the freshest copy placed'
+            : 'The session launched without its earlier conversation',
+          reason: `Why: resume placement outcome ${outcome}`,
+          impact: outcome === 'forked'
+            ? 'No data lost; the diverged copy is kept beside the transcript'
+            : 'The session starts from recent topic messages instead of the full conversation',
+        });
+      }
+    }
+    if (resumeReopenFailed && effectiveInitialMessage) {
+      effectiveInitialMessage = `${RESUME_REOPEN_FAILED_NOTE}\n\n${effectiveInitialMessage}`;
+    }
+    assertBrowserMcpProfilesSafe(options?.cwd ?? this.config.projectDir, framework, effectiveConfigHome, this.config.projectDir);
+    const { plan: interactiveThreadline, mcpFlags: interactiveMcpFlags, tag: interactiveTransportTag } =
+      this.planInteractiveThreadlineMcp(framework, binaryPath, options); // threadline-mcp-local-http D3
     const launchSpec = buildInteractiveLaunch(framework, {
       binaryPath,
       ...(options?.resumeSessionId ? { resumeSessionId: options.resumeSessionId } : {}),
@@ -3829,11 +7866,33 @@ rm()  { "${shimRunner}" rm  "$@"; }
       ...(effectiveConfigHome ? { configHome: effectiveConfigHome } : {}),
       // Per-agent codex threadline MCP override (ignored by non-codex builders).
       ...(this.config.codexThreadlineMcp ? { codexThreadlineMcp: this.config.codexThreadlineMcp } : {}),
+      ...(interactiveThreadline.transport === 'http' && interactiveThreadline.codexArgs
+        ? { codexThreadlineHttpArgs: interactiveThreadline.codexArgs } : {}),
+      // Dynamic MCP Lifecycle (claude-code only): launch with a lean/explicit MCP
+      // subset when resolved. Fail-safe to [] (full .mcp.json) — a no-op while the
+      // feature is dark, and never strands a launch. Ignored by other frameworks.
+      // Threadline HTTP (when chosen and dynamic MCP is off) rides the same flag slot.
+      ...(interactiveMcpFlags.length > 0 ? { mcpFlags: interactiveMcpFlags } : {}),
       // pi-cli: pin session transcripts into the agent state dir so they are
       // durable + discoverable (PI-HARNESS-INTEGRATION-SPEC §2.2). Ignored by
       // every other framework's builder.
       ...(framework === 'pi-cli'
         ? { piSessionDir: path.join(this.config.projectDir, '.instar', 'state', 'pi-sessions') }
+        : {}),
+      // grok-build interactive step-3 gate (grok-build spec §7 round-8):
+      // enabledFrameworks is the reviewer lever; interactive sessions need
+      // the DISTINCT sessions.grokInteractiveSessions opt-in.
+      ...(framework === 'grok-build'
+        ? {
+            grokInteractiveOptIn: computeGrokInteractiveOptIn({
+              ...(this.config.enabledFrameworks
+                ? { enabledFrameworks: this.config.enabledFrameworks }
+                : {}),
+              ...(this.config.grokInteractiveSessions !== undefined
+                ? { grokInteractiveSessions: this.config.grokInteractiveSessions }
+                : {}),
+            }),
+          }
         : {}),
       // Topic Profile §6: per-topic thinking mode (claude --effort / codex
       // model_reasoning_effort; strict no-op on gemini/pi).
@@ -3842,6 +7901,19 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // only; the builder validates the enum + drops an unknown value).
       ...(options?.effort ? { effort: options.effort } : {}),
     });
+
+    const memoryScoped = Boolean(memoryPlan?.scopeDir && memoryPlan.settingsPath);
+    if (memoryScoped) {
+      applyMemorySessionLaunch(launchSpec.argv, memoryPlan!.settingsPath!, memoryPlan!.scopeDir!);
+    } else {
+      this.linkAgentOwnedMemory(framework, launchSpec.envOverrides, options?.cwd ?? this.config.projectDir);
+    }
+    const memoryToken = memoryScoped
+      ? this.memoryPrivacyWiring!.privacy.issueSessionToken(interactiveSessionId, memoryPlan!.audience, memoryPlan!.placeKey)
+      : null;
+    const memoryScopeEnv = memoryPlan ? memoryScopeEnvValue(memoryPlan.audience) : null;
+    // Linux: the sandboxed shell reaches the agent server only through the sandbox proxy.
+    const memoryCurlHome = memoryScoped ? prepareSessionCurlHome(memoryPlan!.scopeDir!) : null;
 
     // Spawn the framework CLI in tmux — no bash -c shell intermediary.
     // Uses tmux -e flags to set/unset env vars directly, matching spawnSession pattern.
@@ -3857,13 +7929,43 @@ rm()  { "${shimRunner}" rm  "$@"; }
         ...(this.config.claudeCodeMaxRetries != null
           ? ['-e', `CLAUDE_CODE_MAX_RETRIES=${this.config.claudeCodeMaxRetries}`]
           : []),
-        '-e', `INSTAR_SESSION_ID=${interactiveSessionId}`, // Expose instar session ID to hook events
+        '-e', `INSTAR_SESSION_ID=${interactiveSessionId}`,
+        ...await this.originTokenEnvFlags({
+          sessionId: interactiveSessionId, harnessId: framework, projectDir: options?.cwd ?? this.config.projectDir,
+          configuredModel: resolveInteractiveLaunchModel(framework, launchDefaultModel, options?.codexLocalProvider),
+          nativeSessionId: options?.resumeSessionId ?? (framework === 'claude-code' ? options?.sessionId : undefined),
+          configHome: this.originConfigHome(framework, launchSpec.envOverrides),
+        }), // Expose instar session ID to hook events
         '-e', `INSTAR_SESSION_NAME=${tmuxSession}`, // Threadline binding: attributes a relay-send to its origin session
         '-e', `INSTAR_SERVER_URL=http://localhost:${this.config.port}`,
-        '-e', `INSTAR_AUTH_TOKEN=${this.config.authToken}`,
+        '-e', `INSTAR_AUTH_TOKEN=${memoryToken ?? this.config.authToken}`,
+        ...(memoryScopeEnv ? ['-e', `INSTAR_MEMORY_SCOPE=${memoryScopeEnv}`] : []),
+        ...(memoryScoped ? [
+          '-e', `INSTAR_PORT=${this.config.port}`,
+          '-e', `CLAUDE_CODE_TMPDIR=${path.join(memoryPlan!.scopeDir!, 'tmp')}`,
+          '-e', `TMPDIR=${path.join(memoryPlan!.scopeDir!, 'tmp')}`,
+        ] : []),
+        ...(memoryCurlHome ? ['-e', `CURL_HOME=${memoryCurlHome}`] : []),
+        ...(memoryScoped ? [] : interactiveThreadline.secretEnvFlags), // threadline-mcp-local-http D2 (flag on only)
+        ...(framework === 'claude-code' ? CLAUDE_MCP_TOOL_TIMEOUT_ENV_FLAGS : []), // long waits
         '-e', `INSTAR_AGENT_ID=${this.config.projectName}`,
+        // The agent HOME (the `.instar` PARENT), distinct from CLAUDE_PROJECT_DIR.
+        // A worktree session's project dir has no `.instar/config.json` and no
+        // `.instar/state/`, so any hook that resolved those from the project dir
+        // silently no-opped for exactly the sessions doing mutating work. Hooks
+        // resolve agent-scoped files as `<INSTAR_AGENT_HOME>/.instar/...` — the
+        // `.instar` segment is part of every such path, never implied.
+        '-e', `INSTAR_AGENT_HOME=${this.config.projectDir}`,
         '-e', `INSTAR_FRAMEWORK=${framework}`,
-        ...this.ghTokenEnvFlags(), // P3b: per-agent vault GitHub token (empty when no vault token)
+        // durable-conversation-identity §7: per-session bind token scoping
+        // durable-state opens to this spawn's bootstrap conversation set
+        // (Telegram topic, or the Slack dispatch's minted conversation id).
+        ...this.bindTokenEnvFlags(
+          tmuxSession,
+          options?.bootstrapConversationIds ??
+            (typeof options?.telegramTopicId === 'number' ? [options.telegramTopicId] : []),
+        ),
+        ...(memoryScoped ? [] : this.ghTokenEnvFlags()), // P3b: per-agent vault GitHub token (empty when no vault token)
         // Framework-specific env additions/clears (e.g., CLAUDECODE=)
         ...Object.entries(launchSpec.envOverrides).flatMap(([k, v]) => ['-e', `${k}=${v}`]),
         // OAuth tokens (sk-ant-oat01-...) go in CLAUDE_CODE_OAUTH_TOKEN to enable
@@ -3878,6 +7980,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // database URLs from the parent shell. (Learned from Portal incident 2026-02-22)
         '-e', 'DATABASE_URL=',
         '-e', 'DIRECT_DATABASE_URL=',
+        // Round-18 (security): the round-17 scrub landed on the LEAST-exposed
+        // of the spawn sites — the 10-minute scoped triage pane — while the
+        // long-lived interactive panes, where the agent runs arbitrary Bash and
+        // can invoke grok directly, inherited the metered key from the tmux
+        // server env. Found by grepping the codebase's OWN scrub convention:
+        // DATABASE_URL_PROD= appears at every spawn site, XAI_API_KEY= at one.
+        '-e', 'XAI_API_KEY=',
+        '-e', 'GROK_DEPLOYMENT_KEY=',
         '-e', 'DATABASE_URL_PROD=',
         '-e', 'DATABASE_URL_DEV=',
         '-e', 'DATABASE_URL_TEST=',
@@ -3898,6 +8008,24 @@ rm()  { "${shimRunner}" rm  "$@"; }
         tmuxArgs.push('-e', `INSTAR_SLACK_THREAD_TS=${options.slackThreadTs}`);
       }
 
+      // ── slack-followthrough-generalization §4.4: channel-neutral conversation id
+      // for the Action-Claim Stop hook. Resolved IDENTICALLY to the bind token's
+      // bootstrap set above (bootstrapConversationIds[0] ?? telegramTopicId), so
+      // the id the hook posts is ALWAYS in the token's set (§4.3 gate never 403s
+      // its own session). 1:1 GUARD (R2-EXT-C1): injected ONLY for a session that
+      // is 1:1 with the conversation — NEVER on the shared `lifeline` session, which
+      // serves both the Telegram system topic AND Slack DMs. On the lifeline the
+      // hook (which keys ONLY on INSTAR_CONVERSATION_ID, no fallback) registers
+      // nothing — a genuine untracked miss, never a cross-channel mis-delivery.
+      if (name !== 'lifeline') {
+        const conversationEnvId =
+          options?.bootstrapConversationIds?.[0] ??
+          (typeof options?.telegramTopicId === 'number' ? options.telegramTopicId : undefined);
+        if (typeof conversationEnvId === 'number') {
+          tmuxArgs.push('-e', `INSTAR_CONVERSATION_ID=${conversationEnvId}`);
+        }
+      }
+
       tmuxArgs.push(...launchSpec.argv);
 
       if (options?.resumeSessionId) {
@@ -3907,6 +8035,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
 
       withSyncOp(() => execFileSync(this.config.tmuxPath, tmuxArgs, { encoding: 'utf-8' }));
+      this.retainFailedExitStatus(tmuxSession);
 
       // Increase tmux scrollback buffer for dashboard history support
       try {
@@ -3917,13 +8046,16 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // @silent-fallback-ok — history-limit is a nice-to-have
       }
     } catch (err) {
-      throw new Error(`Failed to create interactive tmux session: ${err}`);
+      this.revokeOriginSession(interactiveSessionId);
+      this.releaseAdmissionFor(tmuxSession); // a failed spawn must not hold the recovery slot
+      throw new Error(`Failed to create interactive tmux session: ${this.originSpawnError(err)}`);
     }
 
     // Track it in state (with default timeout — interactive sessions shouldn't hang forever)
     const session: Session = {
       id: interactiveSessionId,
       name: name || tmuxSession,
+      ...(options?.telegramTopicId !== undefined ? { telegramTopicId: options.telegramTopicId } : {}),
       status: 'running',
       tmuxSession,
       startedAt: new Date().toISOString(),
@@ -3936,7 +8068,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // Left undefined only when no model was pinned (the CLI uses its own
       // account default).
       framework,
-      ...(resolveModelForFramework(framework, launchDefaultModel) ? { model: resolveModelForFramework(framework, launchDefaultModel) } : {}),
+      ...(resolveInteractiveLaunchModel(framework, launchDefaultModel, options?.codexLocalProvider)
+        ? { model: resolveInteractiveLaunchModel(framework, launchDefaultModel, options?.codexLocalProvider) }
+        : {}),
       // P1.3: which subscription-pool account this session runs under (an explicit
       // quota-aware swap/placement, OR the resolver-pinned account for B1 — the
       // user-facing interactive lane is now tagged just like the headless lane).
@@ -3944,11 +8078,20 @@ rm()  { "${shimRunner}" rm  "$@"; }
       ...(effectiveAccountId ? { subscriptionAccountId: effectiveAccountId } : {}),
       // §2.10 credential provenance — derived from the SAME predicate as the env block.
       ...(interactiveCredentialSource ? { credentialSource: interactiveCredentialSource } : {}),
+      ...(memoryPlan ? { memoryAudience: audienceKey(memoryPlan.audience) } : {}),
+      ...(memoryPlan?.scopeDir ? { memoryScopeDir: memoryPlan.scopeDir, memorySettingsPath: memoryPlan.settingsPath ?? undefined } : {}),
+      ...(memoryPlan ? { memoryPlaceInput: {
+        telegramTopicId: options?.telegramTopicId, slackChannelId: options?.slackChannelId,
+        memoryPlaceKey: options?.memoryPlaceKey, memoryPlace: options?.memoryPlace,
+      } } : {}),
+      ...(options?.slackChannelId ? { slackChannelId: options.slackChannelId } : {}),
+      ...(options?.triggeredBy ? { triggeredBy: options.triggeredBy } : {}),
       prompt: effectiveInitialMessage,
       maxDurationMinutes: this.effectiveMaxDurationMinutes,
       // R2.8/L13: record the spawn cwd so a resume-queue entry can revive
       // this session in ITS tree (worktree round-trip).
       cwd: options?.cwd ?? this.config.projectDir,
+      ...interactiveTransportTag,
     };
     this.state.saveSession(session);
 
@@ -3970,8 +8113,16 @@ rm()  { "${shimRunner}" rm  "$@"; }
         tmuxSession,
         initialMessage: effectiveInitialMessage,
         telegramTopicId: options?.telegramTopicId,
+        conversationId: options?.bootstrapConversationIds?.[0] ?? options?.telegramTopicId,
+        // Only a genuinely fresh Codex spawn may use the narrow offset-zero
+        // bootstrap lane. Resume/recovery records and records written by old
+        // binaries remain fail-closed even if session state is incomplete.
+        freshPreRolloutBootstrap: framework === 'codex-cli' && !options?.resumeSessionId,
       });
-      this.handleReadyAndInject(tmuxSession, name, effectiveInitialMessage, readyTimeout, options).catch((err) => {
+      const injection = this.handleReadyAndInject(tmuxSession, name, effectiveInitialMessage, readyTimeout, options);
+      if (options?.awaitInitialInjection) {
+        await injection;
+      } else injection.catch((err) => {
         console.error(`[SessionManager] Error during ready-and-inject for "${tmuxSession}": ${err}`);
       });
     }
@@ -3998,13 +8149,32 @@ rm()  { "${shimRunner}" rm  "$@"; }
     originalName: string | undefined,
     initialMessage: string,
     readyTimeout: number,
-    options?: { telegramTopicId?: number; slackChannelId?: string; slackThreadTs?: string; resumeSessionId?: string },
+    options?: {
+      telegramTopicId?: number; slackChannelId?: string; slackThreadTs?: string; resumeSessionId?: string; bootstrapConversationIds?: number[];
+      // Carried into the single fresh-spawn retry so it relaunches the same session shape (spec §3.2).
+      framework?: IntelligenceFramework; cwd?: string; defaultModel?: string; thinkingMode?: import('./topicProfileValidation.js').ThinkingMode; effort?: import('./topicProfileValidation.js').EffortLevel; configHome?: string; subscriptionAccountId?: string;
+    },
   ): Promise<void> {
     const ready = await this.waitForClaudeReadyWithRetry(tmuxSession, readyTimeout);
     if (ready) {
       const stabilizationMs = options?.resumeSessionId ? 5000 : 1000;
       await new Promise(r => setTimeout(r, stabilizationMs));
-      this.injectMessage(tmuxSession, initialMessage);
+      // First-party provenance (F7): this initial message is instar's OWN
+      // composed bootstrap (session context + the MANDATORY Telegram-relay
+      // instructions). Marking it here covers every spawn lane that funnels
+      // through ready-and-inject — cold spawns, moved-topic respawns, and the
+      // pending-inject boot recovery — so the InputGuard never flags instar's
+      // own boot template as a suspected prompt injection (audit F7).
+      const injected = this.injectMessage(tmuxSession, initialMessage, {
+        firstParty: { source: 'session-bootstrap' },
+        conversationId: options?.bootstrapConversationIds?.[0] !== undefined
+          ? String(options.bootstrapConversationIds[0])
+          : (options?.telegramTopicId !== undefined ? String(options.telegramTopicId) : undefined),
+      });
+      if (!injected) {
+        console.error(`[SessionManager] Initial message injection refused for "${tmuxSession}"; pending inject retained.`);
+        throw new Error(`Initial message injection refused for "${tmuxSession}"`);
+      }
       this.pendingInjects.clear(tmuxSession);
       console.log(`[SessionManager] Injected initial message into "${tmuxSession}" (${initialMessage.length} chars${stabilizationMs ? ', after stabilization delay' : ''})`);
       return;
@@ -4016,7 +8186,17 @@ rm()  { "${shimRunner}" rm  "$@"; }
     //       carrying the same initial message.
     //   (b) tmux is alive but readiness probe couldn't see the prompt. Best
     //       effort: inject anyway, the original behavior.
-    const stillAlive = this.tmuxSessionExists(tmuxSession);
+    // A crashed Claude leaves a DEAD pane inside a tmux session that still
+    // exists (remain-on-exit failed). Session existence is not "Claude is
+    // running" — read the pane's exit fact (spec §3.2).
+    const sessionExists = this.tmuxSessionExists(tmuxSession);
+    const paneDead = sessionExists && this.resumeFollowsAccountEnabled() && this.isPaneDead(tmuxSession);
+    if (paneDead) {
+      this.logDeadPaneEvidence(tmuxSession, options?.resumeSessionId ? 'Resumed session exited during startup' : 'Session exited during startup');
+      this.terminalExitCodes.delete(tmuxSession);
+      this.failedExitRetained.delete(tmuxSession);
+    }
+    const stillAlive = sessionExists && !paneDead;
     if (!stillAlive && options?.resumeSessionId) {
       console.warn(`[SessionManager] Resume failed for "${tmuxSession}" (UUID ${options.resumeSessionId}) — tmux died during startup. Falling back to fresh spawn.`);
 
@@ -4033,6 +8213,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           this.state.saveSession(failed);
         }
       } catch { /* state cleanup is best-effort */ }
+      this.releaseAdmissionFor(tmuxSession); // the fresh respawn below re-admits on its own
 
       this.emit('resumeFailed', {
         tmuxSession,
@@ -4054,16 +8235,26 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // would not preserve the auto-generated `interactive-${ts}` form.
       // resumeSessionId is intentionally omitted to break the bad-UUID cycle.
       try {
-        await this.spawnInteractiveSession(initialMessage, originalName, {
+        const retryMessage = this.resumeFollowsAccountEnabled() && !initialMessage.startsWith(RESUME_REOPEN_FAILED_NOTE)
+          ? `${RESUME_REOPEN_FAILED_NOTE}\n\n${initialMessage}`
+          : initialMessage;
+        await this.spawnInteractiveSessionUnlocked(retryMessage, originalName, {
           telegramTopicId: options.telegramTopicId,
           slackChannelId: options.slackChannelId,
           slackThreadTs: options.slackThreadTs,
+          bootstrapConversationIds: options.bootstrapConversationIds,
+          awaitInitialInjection: true,
+          // Relaunch the same session shape; a caller-pinned login is kept, a
+          // pool-resolved one is chosen again by the resolver (spec §3.2).
+          ...(options.framework ? { framework: options.framework } : {}),
+          ...(options.cwd ? { cwd: options.cwd } : {}),
+          ...(options.defaultModel ? { defaultModel: options.defaultModel } : {}),
+          ...(options.thinkingMode ? { thinkingMode: options.thinkingMode } : {}),
+          ...(options.effort ? { effort: options.effort } : {}),
+          ...(options.configHome ? { configHome: options.configHome } : {}),
+          ...(options.subscriptionAccountId ? { subscriptionAccountId: options.subscriptionAccountId } : {}),
         });
-        // HONEST LOG (finding 8d300555): the recursive spawn returns BEFORE its
-        // own readiness wait + inject complete — "succeeded" here only means
-        // "launched". The pending-inject record (re-written by the recursive
-        // call) is what guarantees delivery survives a restart in that window.
-        console.log(`[SessionManager] Fresh-spawn fallback launched for "${tmuxSession}" (inject pending — durable record held until verified).`);
+        console.log(`[SessionManager] Fresh-spawn fallback injected for "${tmuxSession}" (durable custody cleared only after verified acceptance).`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         console.error(`[SessionManager] Fresh-spawn fallback FAILED for "${tmuxSession}": ${errMsg}`);
@@ -4074,6 +8265,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           reason: `Why: ${errMsg}`,
           impact: 'User message not delivered; bridge will respawn on next message',
         });
+        throw err;
       }
       return;
     }
@@ -4081,9 +8273,56 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Tmux still alive but readiness probe couldn't confirm — best-effort inject.
     // (Preserves the original behavior for prompt-detection false negatives.)
     if (stillAlive) {
-      console.error(`[SessionManager] Claude not ready in session "${tmuxSession}" — message NOT injected. Session may need manual intervention.`);
+      // ...UNLESS the pane is sitting on a MENU. `classifyPaneState` exists for
+      // exactly this: callers whose not-ready branch is DESTRUCTIVE ask it
+      // instead of the boolean. Blind-injecting is destructive here — Enter
+      // SELECTS the focused option, so the message does not merely get lost, it
+      // ANSWERS a question on the operator's behalf.
+      //
+      // 2026-08-22: without this, the codex readiness fix was only half a fix.
+      // Refusing to type into a menu at the READY check just moved the same
+      // Enter to the timeout branch — codex's update menu (focused option:
+      // `Update now`, which exits codex) would still have killed the session,
+      // ~90s in rather than ~18s, and its trust-directory prompt would still
+      // have been auto-answered `Yes, continue`. A delayed identical outcome is
+      // not a fix.
+      //
+      // The message is NOT silently dropped: the durable pending-inject record
+      // is left INTACT (not cleared) — clearing it here is what would drop it.
+      // Be precise about what that buys, because it is easy to overstate:
+      // `recoverPendingInjects` runs at SERVER BOOT, not on a menu-clear watch,
+      // so the record is re-delivered on the next boot if the pane is still
+      // alive and the record is under its 6h expiry, and REPORTED as a loss
+      // otherwise. The immediate visibility comes from the DegradationReporter
+      // entry below, and the practical recovery is the bridge's existing
+      // respawn on the next inbound message. What this branch guarantees is
+      // narrow and worth having on its own: the message is never typed into a
+      // menu, and its non-delivery is never silent.
+      const paneState = this.classifyPaneState(tmuxSession);
+      if (paneState === 'menu') {
+        console.error(`[SessionManager] Session "${tmuxSession}" is sitting on a MENU — refusing to inject (Enter would select an option). Pending inject retained for re-delivery.`);
+        DegradationReporter.getInstance().report({
+          feature: 'SessionManager.handleReadyAndInject',
+          primary: 'Inject the initial message once the session is ready',
+          fallback: `Session "${tmuxSession}" is parked on a selection menu; the message was NOT typed into it`,
+          reason: 'Why: typing at a menu selects an option rather than sending text — it can answer a permission/update question on the operator\'s behalf, and on some menus the focused option terminates the process.',
+          impact: 'The initial message is retained as a durable pending inject (re-delivered at the next server boot while unexpired, reported as a loss otherwise); the bridge also respawns on the next inbound message. The parked menu itself is reported by PermissionPromptAutoResolver Layer 3.',
+        });
+        throw new Error(`Initial message injection refused for menu-bound session "${tmuxSession}"`);
+      }
+      console.error(`[SessionManager] Session not ready in "${tmuxSession}" — message NOT injected. Session may need manual intervention.`);
       console.log(`[SessionManager] Session "${tmuxSession}" still alive — attempting injection anyway`);
-      this.injectMessage(tmuxSession, initialMessage);
+      // Same instar-composed bootstrap as the ready path above — first-party (F7).
+      const injected = this.injectMessage(tmuxSession, initialMessage, {
+        firstParty: { source: 'session-bootstrap' },
+        conversationId: options?.bootstrapConversationIds?.[0] !== undefined
+          ? String(options.bootstrapConversationIds[0])
+          : (options?.telegramTopicId !== undefined ? String(options.telegramTopicId) : undefined),
+      });
+      if (!injected) {
+        console.error(`[SessionManager] Initial message injection refused for "${tmuxSession}" after readiness timeout; pending inject retained.`);
+        throw new Error(`Initial message injection refused for "${tmuxSession}" after readiness timeout`);
+      }
       this.pendingInjects.clear(tmuxSession);
       return;
     }
@@ -4093,10 +8332,17 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // notice. The bridge already retries on the next inbound message.
     // (The pending-inject record is deliberately NOT cleared here — the boot
     // sweep reports the loss loudly instead of letting it vanish.)
-    console.error(`[SessionManager] Claude not ready in session "${tmuxSession}" — tmux died during fresh startup. Message NOT injected.`);
+    console.error(`[SessionManager] Session not ready in "${tmuxSession}" — tmux died during fresh startup. Message NOT injected.`);
+    if (paneDead) {
+      // Remove the dead session so the next inbound message spawns cleanly
+      // instead of reusing a pane with no process (spec §3.2).
+      try {
+        await execFileAsync(this.config.tmuxPath, ['kill-session', '-t', `=${tmuxSession}`]);
+      } catch { /* @silent-fallback-ok — already gone */ }
+    }
     DegradationReporter.getInstance().report({
       feature: 'SessionManager.handleReadyAndInject',
-      primary: 'Wait for Claude ready, inject initial message',
+      primary: 'Wait for session ready, inject initial message',
       fallback: 'tmux died during startup with no --resume to fall back from',
       reason: 'fresh-spawn crashed during startup; readiness probe could not verify prompt',
       impact: 'Initial message dropped; bridge will respawn on next inbound message',
@@ -4123,6 +8369,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // path clears the record on success.
         await this.handleReadyAndInject(record.tmuxSession, undefined, record.initialMessage, 90_000, {
           telegramTopicId: record.telegramTopicId,
+          bootstrapConversationIds: record.conversationId !== undefined ? [record.conversationId] : undefined,
         });
       },
       reportLoss: (record, reason) => {
@@ -4130,7 +8377,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           feature: 'SessionManager.recoverPendingInjects',
           primary: 'Re-deliver an inject orphaned by a server restart',
           fallback: `Pending inject for "${record.tmuxSession}" not re-delivered: ${reason}`,
-          reason: `Why: queued ${record.createdAt}${record.telegramTopicId !== undefined ? ` for topic ${record.telegramTopicId}` : ''}`,
+          reason: `Why: queued ${record.createdAt}${record.telegramTopicId !== undefined ? ` for ${topicRef(record.telegramTopicId)}` : ''}`,
           impact: 'A queued initial message may not have reached its session; the bridge respawns on the next inbound message.',
         });
       },
@@ -4140,6 +8387,81 @@ rm()  { "${shimRunner}" rm  "$@"; }
       console.log(`[SessionManager] Pending-inject recovery: ${result.redelivered.length} redelivered, ${result.deadSession.length} dead-session, ${result.expired.length} expired, ${result.failed.length} failed.`);
     }
     return result;
+  }
+
+  private dispatchPreparedInboundDeliveries(): void {
+    if (!this.inboundDeliveries || !this.inboundDeliveryHmacKey || !this.trackedPhysicalEffects) return;
+    // Selection is bounded by the store's live-row ceiling, while physical
+    // effects remain capped at four per tick. Applying LIMIT 4 before the
+    // runtime incarnation/ownership predicates lets durable rows for dead or
+    // stale owners permanently starve a later eligible delivery.
+    let eligibleEffects = 0;
+    const runningByTmux = new Map(this.state.listSessions({ status: 'running' })
+      .map((session) => [session.tmuxSession, session]));
+    for (let delivery of this.inboundDeliveries.dispatchablePrepared(Number.MAX_SAFE_INTEGER)) {
+      if (eligibleEffects >= 4) break;
+      const session = runningByTmux.get(delivery.incarnation);
+      if (!session || delivery.framework !== 'codex-cli' || !session.claudeSessionId) continue;
+      if (!this.inboundDeliveries.ownsLiveDelivery(
+        delivery.conversationId, delivery.deliveryId, delivery.ownerMachineId, delivery.ownerEpoch,
+      ) || this.localMachineId() !== delivery.ownerMachineId
+        || this.ownerEpochForConversation(delivery.conversationId) !== delivery.ownerEpoch) continue;
+      const envelope = this.inboundDeliveries.openReplayEnvelope(
+        delivery.conversationId, delivery.deliveryId, this.inboundDeliveryHmacKey,
+      );
+      if (envelope === null) {
+        this.inboundDeliveries.transition(delivery.conversationId, delivery.deliveryId, 'prepared', 'dispatch-failed');
+        continue;
+      }
+      if (delivery.rolloutPath === null) {
+        const rolloutPath = this.codexRolloutPathForSession(session);
+        let baseline = -1;
+        try { if (rolloutPath) baseline = fs.statSync(rolloutPath).size; } catch { baseline = -1; }
+        if (!rolloutPath || baseline < 0 || !this.inboundDeliveries.bindRolloutBaseline(
+          delivery.conversationId, delivery.deliveryId, rolloutPath, session.claudeSessionId, baseline,
+        )) continue;
+        delivery = this.inboundDeliveries.get(delivery.conversationId, delivery.deliveryId) ?? delivery;
+      }
+      eligibleEffects += 1;
+      const result = this.trackedPhysicalEffects.dispatchSync({
+        scope: delivery.incarnation,
+        conversationId: delivery.conversationId,
+        deliveryId: delivery.deliveryId,
+        deadlineMs: Date.now() + 15_000,
+        reconcile: () => {
+          this.inboundDeliveries!.reconcileInterruptedEffects();
+          return !this.inboundDeliveries!.hasUnreconciledEffects(delivery.conversationId);
+        },
+        fence: () => this.inboundDeliveries!.ownsLiveDelivery(
+          delivery.conversationId, delivery.deliveryId, delivery.ownerMachineId, delivery.ownerEpoch,
+        ) && this.localMachineId() === delivery.ownerMachineId
+          && this.ownerEpochForConversation(delivery.conversationId) === delivery.ownerEpoch,
+        effect: () => this.performTmuxInjectionEffect(delivery.incarnation, envelope, delivery.framework),
+      });
+      if (!result.ok) {
+        console.error(`[SessionManager] Prepared FIFO dispatch refused for ${delivery.incarnation}: ${result.reason}`);
+      }
+    }
+    this.refreshLifecycleCompatibilityProjection();
+  }
+
+  private refreshLifecycleCompatibilityProjection(): void {
+    if (!this.inboundDeliveries) return;
+    const rows = this.inboundDeliveries.compatibilityTombstones();
+    for (const row of rows) this.pendingInjects.projectTombstone(row);
+    const floorPath = path.join(this.vaultStateDir, 'state', 'codex-lifecycle-downgrade-floor.json');
+    try {
+      if (rows.length > 0) {
+        fs.mkdirSync(path.dirname(floorPath), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(floorPath, JSON.stringify({ schemaVersion: 1, liveEvidence: rows.length, projectedAt: Date.now() }), { mode: 0o600 });
+      } else {
+        SafeFsExecutor.safeUnlinkSync(floorPath, { operation: 'SessionManager.refreshLifecycleCompatibilityProjection' });
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        console.error(`[SessionManager] Lifecycle downgrade-floor refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   /**
@@ -4165,16 +8487,46 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Generate session ID before tmux spawn so we can pass it as env var
     const triageSessionId = this.generateId();
 
-    // Kill existing triage session if present (triage sessions are ephemeral)
+    // Kill existing triage session if present (triage sessions are ephemeral) —
+    // but only one this agent started. The name is derived from the project
+    // BASENAME, so another project dir with the same basename (or any other
+    // tmux user) can hold it; a name alone is not ownership.
     if (this.tmuxSessionExists(tmuxSession)) {
+      if (!this.ownsLiveTmuxSession(tmuxSession)) {
+        throw new Error(`Cannot create triage session: tmux session ${tmuxSession} exists and was not started by this agent — not killing it`);
+      }
       try {
-        withSyncOp(() => execFileSync(this.config.tmuxPath, ['kill-session', '-t', tmuxSession], { encoding: 'utf-8' }));
+        withSyncOp(() => execFileSync(this.config.tmuxPath, ['kill-session', '-t', `=${tmuxSession}`], { encoding: 'utf-8' }));
       } catch {
         // Best-effort
       }
     }
 
+    this.linkAgentOwnedMemory('claude-code', {}, this.config.projectDir);
+    // Planned once the triage binary is resolved (below); the env slot needs it first.
+    let triageThreadline: ThreadlineSpawnPlan = { transport: 'stdio', reason: 'not-wired', secretEnvFlags: [] };
+    let triageCredentialSource: 'env' | 'store' = 'store';
+    let triageAuthFile: string | null = null;
+    const triageBinaryForPlan = resolveFrameworkBinaryPath({
+      framework: 'claude-code',
+      frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+      claudePath: this.config.claudePath,
+      configuredFramework: this.config.framework,
+    });
+
     try {
+      const triageLaunchBinary = triageBinaryForPlan ? this.resolveLaunchBinary('claude-code', triageBinaryForPlan) : null;
+      if (triageLaunchBinary) {
+        // Threadline MCP over local HTTP (threadline-mcp-local-http D2/D3): this lane
+        // has no stripped mode and always carries the agent token, so it gets the
+        // HTTP entry like any other non-stripped claude-code spawn.
+        triageThreadline = this.planThreadlineMcp({
+          framework: 'claude-code',
+          binaryPath: triageLaunchBinary,
+          knownVersion: this.claudeLaunchVersions.get(triageLaunchBinary) ?? null,
+          stripped: false,
+        });
+      }
       const tmuxArgs = [
         'new-session', '-d',
         '-s', tmuxSession,
@@ -4182,11 +8534,30 @@ rm()  { "${shimRunner}" rm  "$@"; }
         '-x', '200', '-y', '50',
         '-e', 'CLAUDECODE=',
         '-e', `INSTAR_SESSION_ID=${triageSessionId}`,
+        ...await this.originTokenEnvFlags({
+          sessionId: triageSessionId, harnessId: 'claude-code', projectDir: this.config.projectDir,
+          nativeSessionId: options.resumeSessionId, configHome: process.env.CLAUDE_CONFIG_DIR,
+        }),
         '-e', `INSTAR_SESSION_NAME=${tmuxSession}`, // Threadline binding: attributes a relay-send to its origin session
         '-e', `INSTAR_SERVER_URL=http://localhost:${this.config.port}`,
         '-e', `INSTAR_AUTH_TOKEN=${this.config.authToken}`,
+        ...triageThreadline.secretEnvFlags, // threadline-mcp-local-http D2 (flag on only)
+        ...CLAUDE_MCP_TOOL_TIMEOUT_ENV_FLAGS, // long waits: the client outlasts the 300 s reply wait
         '-e', `INSTAR_AGENT_ID=${this.config.projectName}`,
+        // The agent HOME (the `.instar` PARENT), distinct from CLAUDE_PROJECT_DIR.
+        // A worktree session's project dir has no `.instar/config.json` and no
+        // `.instar/state/`, so any hook that resolved those from the project dir
+        // silently no-opped for exactly the sessions doing mutating work. Hooks
+        // resolve agent-scoped files as `<INSTAR_AGENT_HOME>/.instar/...` — the
+        // `.instar` segment is part of every such path, never implied.
+        '-e', `INSTAR_AGENT_HOME=${this.config.projectDir}`,
         '-e', 'ANTHROPIC_API_KEY=',
+        // Round-17 (lessons-aware): this pane runs Claude Code argv, so a
+        // metered key for ANY provider resident here defeats the same
+        // invariant ANTHROPIC_API_KEY= was added for. XAI_API_KEY in
+        // particular is grok's documented fallback billing path.
+        '-e', 'XAI_API_KEY=',
+        '-e', 'GROK_DEPLOYMENT_KEY=',
         '-e', 'DATABASE_URL=',
         '-e', 'DIRECT_DATABASE_URL=',
         '-e', 'DATABASE_URL_PROD=',
@@ -4194,7 +8565,37 @@ rm()  { "${shimRunner}" rm  "$@"; }
         '-e', 'DATABASE_URL_TEST=',
       ];
 
-      tmuxArgs.push(this.config.claudePath);
+      // Round-17 (lessons-aware): the FIFTH binary-resolution site, and the
+      // one the §2.0 symmetry claim missed. `config.claudePath` is selected by
+      // the CONFIGURED framework, so on a grok-primary agent it IS the grok
+      // binary — and this pane would have exec'd grok with Claude Code argv,
+      // outside every grok control. The shared fence resolves a genuine
+      // claude-code binary or nothing; nothing is a refusal, never a
+      // substitution, because a triage pane that silently runs the wrong
+      // framework is worse than a triage pane that does not start.
+      const triageBinary = resolveFrameworkBinaryPath({
+        framework: 'claude-code',
+        frameworkBinaryPaths: this.config.frameworkBinaryPaths,
+        claudePath: this.config.claudePath,
+        configuredFramework: this.config.framework,
+      });
+      // Only an explicit `false` refuses: an 'unknown' probe result means the
+      // prober failed, which is not evidence the binary is missing.
+      if (!triageBinary || frameworkBinaryExists(triageBinary) === false) {
+        throw new Error(
+          'triage-session-no-claude-binary: triage runs Claude Code argv and no genuine ' +
+            'claude-code binary resolved on this agent (configured framework: ' +
+            `${this.config.framework ?? 'unset'}). Refusing rather than ` +
+            'spawning another framework\'s binary with Claude flags.',
+        );
+      }
+      // A key-only agent has no stored login, so triage answered "Not logged in". The key arrives
+      // through a private file, not `-e`, so it stays out of argv (spec cloud-key-internal-calls).
+      triageAuthFile = writeClaudeAuthEnvFile(path.join(this.config.projectDir, '.instar'));
+      triageCredentialSource = triageAuthFile ? 'env' : 'store';
+      if (triageAuthFile) tmuxArgs.push(...claudeAuthExecPrefix(triageAuthFile));
+      // CMT-798: triage panes are claude-code sessions too — retained copy.
+      tmuxArgs.push(this.resolveLaunchBinary('claude-code', triageBinary));
 
       // Scoped permissions: allowedTools + permissionMode (NOT --dangerously-skip-permissions)
       if (options.allowedTools.length > 0) {
@@ -4202,12 +8603,16 @@ rm()  { "${shimRunner}" rm  "$@"; }
       }
       tmuxArgs.push('--permission-mode', options.permissionMode);
 
-      if (options.resumeSessionId) {
+      if (isSafeSessionRef(options.resumeSessionId)) {
         tmuxArgs.push('--resume', options.resumeSessionId);
         console.log(`[SessionManager] Resuming triage session: ${options.resumeSessionId}`);
       }
+      if (triageThreadline.transport === 'http' && triageThreadline.claudeConfigPath) {
+        tmuxArgs.push('--mcp-config', triageThreadline.claudeConfigPath);
+      }
 
       withSyncOp(() => execFileSync(this.config.tmuxPath, tmuxArgs, { encoding: 'utf-8' }));
+      this.retainFailedExitStatus(tmuxSession);
 
       // Increase tmux scrollback buffer for dashboard history support
       try {
@@ -4218,22 +8623,26 @@ rm()  { "${shimRunner}" rm  "$@"; }
         // @silent-fallback-ok — history-limit is a nice-to-have
       }
     } catch (err) {
-      throw new Error(`Failed to create triage tmux session: ${err}`);
+      removeClaudeAuthEnvFile(triageAuthFile);
+      this.revokeOriginSession(triageSessionId);
+      throw new Error(`Failed to create triage tmux session: ${this.originSpawnError(err)}`);
     }
 
     // Track it but with a shorter timeout (triage sessions should be brief)
     const session: Session = {
+      memoryAudience: 'system',
+      memoryPlaceInput: { memoryPlace: { kind: 'system' } },
       id: triageSessionId,
       name,
       status: 'running',
       tmuxSession,
       startedAt: new Date().toISOString(),
       maxDurationMinutes: 10,
-      // §2.10 provenance — the triage lane hardcodes an EMPTY `ANTHROPIC_API_KEY=` above
-      // (it always reads the per-CLAUDE_CONFIG_DIR store, never an env token), so 'store' is
-      // the deterministic provenance here. Set explicitly so no claude-code spawn record is
-      // provenance-blind (an env-token lane that forgot the flag would be a lint-caught bug).
-      credentialSource: 'store',
+      // §2.10 provenance — 'env' when the configured sign-in key was handed over above, 'store'
+      // otherwise. Set explicitly so no claude-code spawn record is provenance-blind (an env-token
+      // lane that forgot the flag would be a lint-caught bug).
+      credentialSource: triageCredentialSource,
+      ...this.threadlineTransportTag(triageThreadline),
     };
     this.state.saveSession(session);
 
@@ -4278,43 +8687,157 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
-   * Inject a paste notification and CONFIRM it actually submitted (was not left
-   * stuck at the prompt by the paste-end Enter race). Returns true only when the
-   * injected marker is no longer sitting at the input prompt within the recovery
-   * window — i.e. the session genuinely consumed the message. Observes outcome
-   * across the same window verifyInjection (fired by injectMessage) uses to resend
-   * Enter, so this does NOT duplicate recovery; it only reports the result.
+   * Inject a paste notification and OBSERVE whether it actually submitted.
    *
-   * Used by topic-linkage reply surfacing, which must not treat a
-   * dispatched-but-stuck inject as "delivered to the user" (the A2 bug: a stalled
-   * inject silently resolved the commitment and suppressed the Telegram fallback).
+   * Contract (ACT-091 — the delivery verdict is load-bearing: it decides the
+   * promising auto-ack, the topic surface and the commitment):
+   *
+   *  - `submitted`   — within the confirmation window the injected marker left
+   *                    the input prompt. The session consumed it.
+   *  - `stuck`       — after the window the marker is still at an IDLE prompt
+   *                    (no mid-turn footer): the paste-end Enter race left the
+   *                    text unsubmitted. Also the verdict when the inject throws
+   *                    or the session disappears.
+   *  - `queued-busy` — after the window the marker is still at the prompt AND
+   *                    the pane shows Claude Code's mid-turn footer
+   *                    (`paneShowsActiveWork`). Claude Code holds text typed
+   *                    during a turn as queued input and submits it at the next
+   *                    tool round, so this looks identical to `stuck` to the
+   *                    marker check alone — the false negative that logged
+   *                    "no live session received it" for a reply the live
+   *                    session did receive (2026-10-12 22:21Z). It is NOT
+   *                    reported as submitted: the footer is screen text, and a
+   *                    stale footer over an idle prompt would make stuck text
+   *                    look queued. `settle()` starts a bounded, non-blocking
+   *                    watch (`watchQueuedInjection`) and resolves to the
+   *                    outcome once the text has actually left the prompt or
+   *                    provably has not.
+   *
+   * Observes outcome across the same window verifyInjection (fired by
+   * injectMessage) uses to resend Enter, so this does NOT duplicate recovery;
+   * it only reports the result. A marker too short to verify counts as
+   * submitted (there is nothing to observe).
    */
-  async injectPasteNotificationConfirmed(tmuxSession: string, notification: string): Promise<boolean> {
+  async injectPasteNotificationObserved(tmuxSession: string, notification: string): Promise<InjectionConfirmation> {
     let injected: string;
     try {
       injected = this.injectPasteNotification(tmuxSession, notification);
     } catch {
-      return false;
+      return { state: 'stuck' };
     }
-    const marker = injected.replace(/^\s+/, '').slice(0, 40).trim();
-    // Marker too short to verify reliably — treat dispatch as success.
-    if (!marker || marker.length < 8) return true;
+    const marker = SessionManager.extractInjectionMarker(injected);
+    if (!marker) return { state: 'submitted' };
 
     // Absolute times-from-injection (ms) at which to check. Extends just past
     // verifyInjection's last recovery attempt (6500ms) so we observe the final state.
     const schedule = [1000, 3000, 5000, 7500];
     let prev = 0;
+    let lastPane = '';
     for (const t of schedule) {
       await new Promise((r) => setTimeout(r, t - prev));
       prev = t;
-      if (!this.tmuxSessionExists(tmuxSession)) return false;
-      const pane = this.captureOutput(tmuxSession, 30) || '';
-      if (!this.isMarkerStuckAtPrompt(pane, marker)) return true; // submitted
+      if (!this.tmuxSessionExists(tmuxSession)) return { state: 'stuck' };
+      lastPane = this.captureOutput(tmuxSession, 30) || '';
+      if (!this.isMarkerStuckAtPrompt(lastPane, marker)) return { state: 'submitted' };
     }
-    return false; // still stuck after the full recovery window
+    if (this.paneShowsActiveWork(lastPane)) {
+      let watch: Promise<InjectionSettlement> | null = null;
+      return {
+        state: 'queued-busy',
+        // Lazy: a caller that cannot act on a late verdict never starts the watch.
+        settle: () => (watch ??= this.watchQueuedInjection(tmuxSession, marker)),
+      };
+    }
+    return { state: 'stuck' }; // still at an idle prompt after the full recovery window
   }
 
-  injectTelegramMessage(tmuxSession: string, topicId: number, text: string, topicName?: string, senderName?: string, telegramUserId?: number, messageId?: number): boolean {
+  /**
+   * Inject a paste notification and CONFIRM it submitted within the window.
+   * `true` ONLY for `submitted`; a `queued-busy` observation is `false` here
+   * (not yet proven), so a caller that CAN wait for the late verdict must use
+   * `injectPasteNotificationObserved` instead. Used by the cross-machine
+   * topic-reply inject, whose mesh RPC cannot hold for a turn to end.
+   */
+  async injectPasteNotificationConfirmed(tmuxSession: string, notification: string): Promise<boolean> {
+    const r = await this.injectPasteNotificationObserved(tmuxSession, notification);
+    return r.state === 'submitted';
+  }
+
+  /**
+   * How long a `queued-busy` injection is watched before it is given up as
+   * undelivered: 10 minutes — the Bash tool's maximum foreground timeout, i.e.
+   * the longest a single tool call can hold a turn before Claude Code reads
+   * its queued input at the next tool round. Reaching it resolves `ceiling`
+   * (NOT delivered): a promising ack is never sent on a guess.
+   */
+  static readonly QUEUED_INJECTION_WATCH_CEILING_MS = 10 * 60_000;
+
+  /**
+   * The follow-up watch for a `queued-busy` injection. Non-blocking for the
+   * caller (it runs on timers); polls the pane every 5 s for the first minute,
+   * then every 15 s, until the ceiling. Resolves:
+   *  - `submitted`    — the marker left the prompt (the queued text was taken
+   *                     when the turn reached its next round);
+   *  - `stuck`        — the prompt is idle again (no footer) and the marker is
+   *                     still there, on TWO consecutive polls — the debounce
+   *                     covers the frame between a turn ending and the queued
+   *                     text submitting; also on a capture error;
+   *  - `session-gone` — the tmux session disappeared;
+   *  - `ceiling`      — still busy with the marker at the prompt at the ceiling.
+   * Observe-only: it fires no recovery Enter. Only `submitted` is a delivery.
+   */
+  private async watchQueuedInjection(tmuxSession: string, marker: string): Promise<InjectionSettlement> {
+    const ceiling = SessionManager.QUEUED_INJECTION_WATCH_CEILING_MS;
+    let elapsed = 0;
+    let idleStuckStreak = 0;
+    while (elapsed < ceiling) {
+      const step = elapsed < 60_000 ? 5_000 : 15_000;
+      await new Promise((r) => setTimeout(r, step));
+      elapsed += step;
+      try {
+        if (!this.tmuxSessionExists(tmuxSession)) return 'session-gone';
+        const pane = this.captureOutput(tmuxSession, 30) || '';
+        if (!this.isMarkerStuckAtPrompt(pane, marker)) return 'submitted';
+        if (this.paneShowsActiveWork(pane)) {
+          idleStuckStreak = 0;
+        } else if (++idleStuckStreak >= 2) {
+          return 'stuck';
+        }
+      } catch {
+        return 'stuck'; // an unreadable pane cannot prove a delivery
+      }
+    }
+    return 'ceiling';
+  }
+
+  injectTelegramMessage(
+    tmuxSession: string,
+    topicId: number,
+    text: string,
+    topicName?: string,
+    senderName?: string,
+    telegramUserId?: number,
+    messageId?: number,
+    opts?: {
+      /**
+       * W21 re-delivery provenance. TRUE only when instar's own no-loss
+       * recovery is RE-injecting a message it already delivered once
+       * (`reinjectStuck` → `metadata.replay: true`). Purely additive: it adds
+       * a visible marker to the tag and nothing else — it can never refuse,
+       * delay, reorder or drop a message. Travels as THIS in-process
+       * parameter, never as content, so a body that merely contains the
+       * marker text cannot mint it.
+       */
+      reDelivered?: boolean;
+      /**
+       * Agent-signed provenance (ASP). Set ONLY from the inbound classifier's
+       * own verdict for this message (see messaging/shared/signedInbound.ts),
+       * never from content. Additive: it changes the tag's sender clause to
+       * name the signing agent and the account that carried the message.
+       */
+      signedByAgent?: string;
+    },
+  ): boolean {
     // Structural dedup at the delivery chokepoint: a given Telegram messageId
     // must reach a session at most once. Upstream paths can over-forward the SAME
     // user message (lifeline re-forward, PendingRelayStore re-drive, sentinel
@@ -4335,7 +8858,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
       if (priorAt !== undefined) {
         console.warn(
           `[SessionManager] Suppressed duplicate Telegram delivery to "${tmuxSession}" ` +
-          `(topic ${topicId}, messageId ${messageId}, ${Math.round((now - priorAt) / 1000)}s after first) — ` +
+          `(${topicRef(topicId)}, messageId ${messageId}, ${Math.round((now - priorAt) / 1000)}s after first) — ` +
           `a single user message was forwarded more than once; delivering only once.`,
         );
         return true; // already delivered on the first call — success without re-injecting
@@ -4380,7 +8903,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
     // Build tag using the shared builder — includes UID when available
     // Format: [telegram:42 "Agent Updates" from Justin (uid:12345)]
-    const topicTag = buildInjectionTag(topicId, safeTopic, safeName, telegramUserId);
+    const topicTag = buildInjectionTag(topicId, safeTopic, safeName, telegramUserId, opts?.reDelivered, opts?.signedByAgent);
     const taggedText = `${topicTag} ${transformed}`;
 
     if (taggedText.length <= FILE_THRESHOLD) {
@@ -4393,8 +8916,14 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const filename = `msg-${topicId}-${Date.now()}-${randomUUID().slice(0, 8)}.txt`;
     const filepath = path.join(tmpDir, filename);
     fs.writeFileSync(filepath, taggedText);
+    this.registerMemoryInboundFile(`telegram:${topicId}`, filepath);
 
-    const ref = `[telegram:${topicId}] [Long message saved to ${filepath} — read it to see the full message]`;
+    // The session sees ONLY this line until it opens the file, so the marker has
+    // to ride here too — the observed 2026-08-20 re-deliveries were all long
+    // messages, i.e. exactly this branch. buildInjectionTag(topicId) with a
+    // falsy flag returns `[telegram:N]`, byte-identical to the previous literal.
+    const refTag = buildInjectionTag(topicId, safeTopic, undefined, undefined, opts?.reDelivered, opts?.signedByAgent);
+    const ref = `${refTag} [Long message saved to ${filepath} — read it to see the full message]`;
     return this.injectMessage(tmuxSession, ref) !== false;
   }
 
@@ -4513,12 +9042,58 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * before injection. Suspicious messages still reach the session but with
    * a system-reminder warning injected afterward (async, non-blocking).
    *
+   * `opts.firstParty` — first-party provenance for instar's OWN injections
+   * (F7, roadmap 0.6, test-as-self 2026-07-02): the session-boot bootstrap
+   * (context + the MANDATORY Telegram-relay instructions) is composed by
+   * instar itself, but it reached the guard as ordinary untagged text — so the
+   * InputGuard flagged instar's own boot template as a suspected prompt
+   * injection and the freshly-spawned session distrusted its own bootstrap.
+   * The provenance travels as THIS in-process parameter — never as content.
+   * That is deliberately stronger than any in-content marker: no HTTP surface
+   * or message body can reach this parameter, so content that merely LOOKS
+   * like a bootstrap (or like any marker) cannot mint the flag by
+   * construction — there is nothing to string-match and therefore nothing to
+   * forge. Only in-process injector code that AUTHORED the text sets it.
+   * Every first-party injection is recorded in the security log
+   * (`first-party-injection`) so the guard bypass stays auditable. Everything
+   * without the flag keeps the exact pre-F7 guard behavior.
+   *
    * For multi-line text, uses bracketed paste mode escape sequences so the
    * terminal treats newlines as literal text rather than Enter keypresses.
    * This avoids tmux load-buffer/paste-buffer which trigger macOS TCC
    * "access data from other apps" permission prompts.
    */
-  injectMessage(tmuxSession: string, text: string): boolean {
+  injectMessage(
+    tmuxSession: string,
+    text: string,
+    opts?: {
+      /** In-process first-party provenance (F7). `source` is the audit label
+       *  (e.g. 'session-bootstrap'). See the method doc — content can never
+       *  mint this flag; only instar's own injector code can. */
+      firstParty?: { source: string };
+      /** Canonical durable delivery-ledger conversation key. */
+      conversationId?: string;
+    },
+  ): boolean {
+    text = this.withInboundFilesInScope(tmuxSession, text);
+    // ── First-party provenance (F7): instar-authored content, verified by
+    // the in-process parameter (never by what the text says) — the guard
+    // layers below exist to vet content of UNVERIFIED origin, and instar's
+    // own bootstrap is not that. Logged, then injected directly.
+    if (opts?.firstParty) {
+      if (this.inputGuard) {
+        try {
+          this.inputGuard.logSecurityEvent({
+            event: 'first-party-injection',
+            session: tmuxSession,
+            source: opts.firstParty.source,
+            messagePreview: text.slice(0, 100),
+          });
+        } catch { /* logging must never block a bootstrap injection */ }
+      }
+      return this.rawInject(tmuxSession, text, opts.conversationId);
+    }
+
     // ── Input Guard: Layer 1 + 1.5 (deterministic, synchronous) ──
     if (this.inputGuard) {
       // Parse the message's own [telegram:N] tag so getTopicBinding can
@@ -4536,7 +9111,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
           // Wrong topic — log, alert, and drop
           console.error(
             `[InputGuard] BLOCKED cross-topic injection: message bound for different topic, ` +
-            `session "${tmuxSession}" is bound to topic ${binding.topicId}`
+            `session "${tmuxSession}" is bound to ${topicRef(binding.topicId)}`
           );
           this.inputGuard.logSecurityEvent({
             event: 'input-provenance-block',
@@ -4568,11 +9143,11 @@ rm()  { "${shimRunner}" rm  "$@"; }
             }
             if (action === 'warn') {
               // Inject the message, then inject warning afterward
-              const result = this.rawInject(tmuxSession, text);
+              const result = this.rawInject(tmuxSession, text, opts?.conversationId);
               // Small delay so warning arrives after message
               setTimeout(() => {
                 const warning = this.inputGuard!.buildWarning(binding, `Matched injection pattern: ${pattern}`);
-                this.rawInject(tmuxSession, warning);
+                this.rawInject(tmuxSession, warning, opts?.conversationId);
               }, 500);
               return result;
             }
@@ -4581,7 +9156,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
           // Layer 2: Async LLM topic coherence review (non-blocking)
           // Inject immediately, review in background
-          const injected = this.rawInject(tmuxSession, text);
+          const injected = this.rawInject(tmuxSession, text, opts?.conversationId);
           this.inputGuard.reviewTopicCoherence(text, binding).then(result => {
             if (result.verdict === 'suspicious') {
               const action = this.inputGuard!['config'].action ?? 'warn';
@@ -4597,7 +9172,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
 
               if (action === 'warn') {
                 const warning = this.inputGuard!.buildWarning(binding, result.reason);
-                this.rawInject(tmuxSession, warning);
+                this.rawInject(tmuxSession, warning, opts?.conversationId);
               }
               // block mode doesn't apply after async review — message already injected
               // log mode: already logged above
@@ -4613,7 +9188,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
     }
 
     // ── Normal injection (verified provenance or no InputGuard) ──
-    return this.rawInject(tmuxSession, text);
+    return this.rawInject(tmuxSession, text, opts?.conversationId);
   }
 
   /**
@@ -4650,27 +9225,76 @@ rm()  { "${shimRunner}" rm  "$@"; }
   }
 
   /**
+   * Inject a trusted TUI control command without misclassifying it as an
+   * inbound delivery. Control commands do not produce the normal user-message
+   * transcript shape, so placing them in InboundDeliveryStore guarantees a
+   * false `unknown`. They still serialize through the same physical-effect
+   * lock as deliveries, preserving the one-writer pane invariant.
+   *
+   * This is intentionally closed to the sole measured command used by context
+   * exhaustion recovery. It is in-process only and bypasses InputGuard because
+   * the command is authored by Instar, not by a user/topic.
+   */
+  injectInternalControlCommand(tmuxSession: string, conversationId: string, command: '/compact'): boolean {
+    if (command !== '/compact' || !conversationId || !this.isSessionAlive(tmuxSession)) return false;
+    const framework = this.getSessionFramework(tmuxSession);
+    if (this.stageBActivation.active && framework === 'codex-cli') {
+      if (!this.trackedPhysicalEffects || !this.inboundDeliveries) return false;
+      const ownerEpoch = this.ownerEpochForConversation(conversationId);
+      const result = this.trackedPhysicalEffects.controlSync({
+        scope: tmuxSession,
+        deadlineMs: Date.now() + 15_000,
+        reconcile: () => {
+          this.inboundDeliveries!.reconcileInterruptedEffects();
+          return !this.inboundDeliveries!.hasUnreconciledEffects(conversationId);
+        },
+        fence: () => this.isSessionAlive(tmuxSession)
+          && this.ownerEpochForConversation(conversationId) === ownerEpoch
+          && !this.inboundDeliveries!.hasOtherActiveDispatch(conversationId, '')
+          && (conversationId === tmuxSession
+            || !this.inboundDeliveries!.hasOtherActiveDispatch(tmuxSession, '')),
+        effect: () => this.performTmuxInjectionEffect(tmuxSession, command, framework),
+      });
+      if (!result.ok) {
+        console.error(`[SessionManager] Control injection refused for ${tmuxSession}: ${result.reason}`);
+        return false;
+      }
+      return true;
+    }
+    this.performTmuxInjectionEffect(tmuxSession, command, framework);
+    return true;
+  }
+
+  /**
    * Raw tmux send-keys injection. No validation — just sends text to the session.
    * Used by injectMessage after provenance checks pass.
    */
-  private rawInject(tmuxSession: string, text: string): boolean {
+  private rawInject(tmuxSession: string, text: string, authoritativeConversationId?: string): boolean {
+    if (this.confinedWriteRefused(tmuxSession, 'text')) return false;
     // Strip any EMBEDDED bracketed-paste markers from the prompt content before
     // we wrap it in our own \x1b[200~…\x1b[201~ (june15-headless-spawn-reroute,
     // PR2 finding S2). A job/A2A prompt containing a literal \x1b[201~ would
     // otherwise forge a paste boundary and submit extra REPL turns — the
     // headless `-p` argv path was immune, and InputGuard only scans topic-bound
     // sessions, so rerouted job/A2A prompts need this sanitizer at the chokepoint.
-    text = text.replace(/\x1b\[20[01]~/g, '');
+    // BOTH encodings: CSI has a two-byte 7-bit form (ESC '[') and a single-byte
+    // 8-bit form (0x9B). The original pattern required a literal ESC, so the
+    // 8-bit spelling of the SAME control sequence passed through untouched —
+    // verified by running both payloads against it. Widened rather than
+    // replaced with a full C0/C1 strip so legitimate message bytes are still
+    // delivered verbatim; this removes only the sequence that can forge a
+    // paste boundary.
+    text = text.replace(/(?:\x1b\[|\x9b)20[01]~/g, '');
     // Reset idle-prompt timer — this session is about to receive new input,
     // so it's not a zombie. Without this, the zombie detector can kill a session
     // that just received a message but hasn't produced output yet.
     const running = this.state.listSessions({ status: 'running' });
     const match = running.find(s => s.tmuxSession === tmuxSession);
     if (match) {
-      this.idlePromptSince.delete(match.id);
+      this.clearIdleClock(match);
+      this.idleKillBackoff?.reset(match.id); // new input arriving → re-evaluate fresh, not a zombie
     }
 
-    const exactTarget = `=${tmuxSession}:`;
     // Framework-specific submit semantics. Claude Code's readline buffers
     // the bracketed paste and accepts a single Enter ~500ms later to
     // submit. Codex's TUI takes longer to commit a paste into its
@@ -4681,92 +9305,165 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // submits if the first was eaten; if both land, the second is a
     // harmless no-op against an empty buffer).
     const framework = this.getSessionFramework(tmuxSession);
-    const postPasteDelaySec = framework === 'codex-cli' ? '1.5' : '0.5';
-    const enterPresses = framework === 'codex-cli' ? 2 : 1;
-    const maxAttempts = 2;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const conversationId = authoritativeConversationId
+      ?? String(this.getTopicBinding(tmuxSession)?.topicId ?? tmuxSession);
+    let delivery: ReturnType<InboundDeliveryStore['prepare']> | null = null;
+    // Stage B's acceptance authority is the Codex rollout adapter. Other
+    // frameworks have no matching transcript observer, so journaling them here
+    // would create permanently-dispatched rows that can only age into false
+    // unknowns and eventually block that conversation's FIFO. Keep their
+    // established injection path byte-equivalent until they gain their own
+    // generation-bound acceptance adapter.
+    if (this.stageBActivation.active && framework === 'codex-cli') {
+      if (!this.inboundDeliveries || !this.inboundDeliveryHmacKey) return false;
       try {
-        // §B: the injection send-keys + /bin/sleep stay SYNCHRONOUS — their
-        // synchronous timing IS the correctness mechanism (D1) and so are EXCLUDED
-        // from §A async conversion — but every blocking call funnels through
-        // withSyncOp so a sleep/wake drift across this sequence reads as an
-        // event-loop BLOCK, not sleep.
-        if (text.includes('\n')) {
-          // Multi-line: use bracketed paste mode.
-          // The terminal (and Claude Code's readline) treats everything between
-          // \e[200~ and \e[201~ as a single paste — newlines are literal, not Enter.
-          // This completely avoids load-buffer/paste-buffer and their TCC prompts.
-          withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '\x1b[200~'], {
-            encoding: 'utf-8', timeout: 5000,
-          }));
-          withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '-l', text], {
-            encoding: 'utf-8', timeout: 10000,
-          }));
-          withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '\x1b[201~'], {
-            encoding: 'utf-8', timeout: 5000,
-          }));
-          withSyncOp(() => execFileSync('/bin/sleep', [postPasteDelaySec], { timeout: 4000 }));
-          for (let i = 0; i < enterPresses; i++) {
-            withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, 'Enter'], {
-              encoding: 'utf-8', timeout: 5000,
-            }));
-            if (i < enterPresses - 1) {
-              try { withSyncOp(() => execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })); } catch { /* ignore */ }
-            }
-          }
-        } else {
-          // Single-line: simple send-keys
-          withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '-l', text], {
-            encoding: 'utf-8', timeout: 10000,
-          }));
-          for (let i = 0; i < enterPresses; i++) {
-            withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, 'Enter'], {
-              encoding: 'utf-8', timeout: 5000,
-            }));
-            if (i < enterPresses - 1) {
-              try { withSyncOp(() => execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })); } catch { /* ignore */ }
-            }
-          }
+        const transcriptPath = match ? this.codexRolloutPathForSession(match) : null;
+        let baseline = -1;
+        try { if (transcriptPath) baseline = fs.statSync(transcriptPath).size; } catch { // @silent-fallback-ok: missing baseline fails closed before pane mutation
+          baseline = -1;
         }
+        const rolloutId = match?.claudeSessionId ?? null;
+        const preRolloutBootstrap = !transcriptPath && !rolloutId
+          && this.pendingInjects.matches(tmuxSession, text);
+        // A stale/generationless incarnation must not manufacture a terminal
+        // dispatch-failed delivery merely because it cannot yet authorize a
+        // physical effect. The owning ingress sees `false`, retains its source
+        // custody, and (for conversational routes) respawns the stale session.
+        if (!preRolloutBootstrap && (!transcriptPath || !rolloutId || baseline < 0)) {
+          console.error(`[SessionManager] Refusing unverifiable Codex injection for ${tmuxSession}: rollout baseline unavailable`);
+          return false;
+        }
+        delivery = this.inboundDeliveries.prepare({
+        conversationId,
+        incarnation: tmuxSession,
+        framework: 'codex-cli',
+        envelope: text,
+        hmacKey: this.inboundDeliveryHmacKey,
+        ownerMachineId: this.localMachineId(),
+        ownerEpoch: this.ownerEpochForConversation(conversationId),
+        });
+        if (this.inboundDeliveries.hasOtherActiveDispatch(conversationId, delivery.deliveryId)) {
+          // FIFO: custody is already durable, but only the oldest row may own
+          // an unconsumed physical dispatch. The monitor drains this prepared
+          // row after the predecessor reaches a terminal response.
+          this.refreshLifecycleCompatibilityProjection();
+          return true;
+        }
+        if (!preRolloutBootstrap && !this.inboundDeliveries.bindRolloutBaseline(
+          conversationId, delivery.deliveryId, transcriptPath!, rolloutId!, baseline,
+        )) {
+          this.inboundDeliveries.transition(conversationId, delivery.deliveryId, 'prepared', 'dispatch-failed');
+          this.refreshLifecycleCompatibilityProjection();
+          console.error(`[SessionManager] Refusing unverifiable Codex injection for ${tmuxSession}: rollout baseline unavailable`);
+          return false;
+        }
+        delivery = this.inboundDeliveries.get(conversationId, delivery.deliveryId);
+        this.refreshLifecycleCompatibilityProjection();
+      } catch (err) {
+        console.error(`[SessionManager] Refusing unjournaled tmux injection: ${err instanceof Error ? err.message : String(err)}`);
+        return false;
+      }
+    }
+    try {
+      if (delivery) {
+        const ownerMachineId = delivery.ownerMachineId;
+        const ownerEpoch = delivery.ownerEpoch;
+        const result = this.trackedPhysicalEffects!.dispatchSync({
+          scope: tmuxSession, conversationId, deliveryId: delivery.deliveryId,
+          deadlineMs: Date.now() + 15_000,
+          reconcile: () => {
+            this.inboundDeliveries!.reconcileInterruptedEffects();
+            return !this.inboundDeliveries!.hasUnreconciledEffects(conversationId);
+          },
+          fence: () => this.inboundDeliveries!.ownsLiveDelivery(
+            conversationId, delivery!.deliveryId, ownerMachineId, ownerEpoch,
+          ) && this.localMachineId() === ownerMachineId
+            && this.ownerEpochForConversation(conversationId) === ownerEpoch,
+          effect: () => this.performTmuxInjectionEffect(tmuxSession, text, framework),
+        });
+        if (!result.ok) {
+          this.refreshLifecycleCompatibilityProjection();
+          console.error(`[SessionManager] Tracked injection refused for ${tmuxSession}: ${result.reason}`);
+          return false;
+        }
+        this.refreshLifecycleCompatibilityProjection();
+      } else {
+        this.performTmuxInjectionEffect(tmuxSession, text, framework);
+      }
         // Track the just-injected message so the persistent StuckInputSentinel
         // can recover it if it strands at the prompt. This is the durable-across-
         // turn backstop for codex specifically: codex holds a busy-delivery as an
         // unsubmitted draft and does NOT auto-submit it when the turn ends, and a
         // long codex turn far outlasts verifyInjection's 6.5s in-process window.
-        if (framework === 'codex-cli') {
-          this.recordStrandedDraftMarker(tmuxSession, text, framework);
-        }
+      if (framework === 'codex-cli') {
+        this.recordStrandedDraftMarker(tmuxSession, text, framework, delivery?.deliveryId, conversationId);
+      }
         // Verify Enter actually submitted — on fresh Claude Code TUIs (v2.1.105+)
         // the Enter after bracketed-paste-end is occasionally eaten, leaving the
         // text sitting in the input box unsubmitted. verifyInjection captures the
         // pane after a short delay and sends one extra Enter if the marker text
         // is still visible at the ❯ (or codex `›`) prompt.
-        this.verifyInjection(tmuxSession, text);
-        return true;
-      } catch (err) {
+      this.verifyInjection(tmuxSession, text);
+      return true;
+    } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[SessionManager] Failed to inject message into ${tmuxSession} (attempt ${attempt}/${maxAttempts}): ${errMsg}`);
-        if (attempt < maxAttempts) {
-          // Synchronous sleep between retry attempts. We use execFileSync('/bin/sleep')
-          // rather than an async delay because the entire injection path is synchronous:
-          // rawInject → injectMessage → injectTelegramMessage all use execFileSync for
-          // tmux send-keys. Converting to async would require changing the call chain
-          // through multiple callers. The 300ms pause is brief and only hits on failure
-          // (max once per injection), so the event loop impact is negligible in practice.
-          try { withSyncOp(() => execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })); } catch { /* ignore */ }
-          continue;
-        }
+        console.error(`[SessionManager] Failed to inject message into ${tmuxSession}: ${errMsg}`);
+        // Once dispatch-started is durable, any thrown tmux error may have
+        // happened after a partial paste or submit. Preserve uncertainty and
+        // never blindly repeat the body inside this call.
         DegradationReporter.getInstance().report({
           feature: 'SessionManager.injectMessage',
           primary: 'Inject Telegram message into tmux session',
           fallback: 'Message delivery failed — caller notified for user-facing error relay',
-          reason: `Failed to inject message after ${maxAttempts} attempts: ${errMsg}`,
+          reason: `Failed to inject message: ${errMsg}`,
           impact: 'User message not delivered to session',
         });
-        return false;
+      return false;
+    }
+  }
+
+  /** The sole tmux mutation body; Stage B calls it only while holding the physical-effect lease. */
+  private performTmuxInjectionEffect(tmuxSession: string, text: string, framework: string | null): void {
+    // D3 (docs/specs/confined-spawn-subscription-reroute.md): the real text chokepoint. A confined
+    // session takes text from no Instar writer (prompt delivery, control commands, retries).
+    if (this.confinedWriteRefused(tmuxSession, 'text')) return;
+    const exactTarget = `=${tmuxSession}:`;
+    const postPasteDelaySec = framework === 'codex-cli' ? '1.5' : '0.5';
+    const enterPresses = framework === 'codex-cli' ? 2 : 1;
+    if (text.includes('\n')) {
+      withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '\x1b[200~'], { encoding: 'utf-8', timeout: 5000 }));
+      for (const chunk of chunkLiteralForTmux(text)) {
+        withSyncOp(() => execFileSync(this.config.tmuxPath, buildLiteralSendArgs(exactTarget, chunk), { encoding: 'utf-8', timeout: 10000 }));
+      }
+      withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, '\x1b[201~'], { encoding: 'utf-8', timeout: 5000 }));
+      withSyncOp(() => execFileSync('/bin/sleep', [postPasteDelaySec], { timeout: 4000 }));
+    } else {
+      for (const chunk of chunkLiteralForTmux(text)) {
+        withSyncOp(() => execFileSync(this.config.tmuxPath, buildLiteralSendArgs(exactTarget, chunk), { encoding: 'utf-8', timeout: 10000 }));
       }
     }
-    return false;
+    for (let i = 0; i < enterPresses; i++) {
+      withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', exactTarget, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
+      if (i < enterPresses - 1) {
+        try { withSyncOp(() => execFileSync('/bin/sleep', ['0.3'], { timeout: 2000 })); } catch { /* @silent-fallback-ok */ }
+      }
+    }
+  }
+
+  /**
+   * The identity of the CURRENT incarnation behind a tmux session name, for
+   * scoping an injection-verification ladder to the attempt that started it.
+   * Returns the session's native (claude/codex) conversation id, or null when
+   * no session record or no id is bound yet. A respawn rotates this id
+   * (`setClaudeSessionId` logs exactly that), which is the signal that a pane
+   * carrying the same marker belongs to a different attempt.
+   */
+  private injectionIncarnationId(tmuxSession: string): string | null {
+    try {
+      return this.state.findSessionByTmux(tmuxSession)?.claudeSessionId ?? null;
+    } catch {
+      return null; // a state read failure must never turn into a false verdict
+    }
   }
 
   /**
@@ -4793,12 +9490,49 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // Polling schedule in ms from injection. Each entry is the absolute
     // time-from-injection at which that attempt fires. Stops on success
     // (marker no longer at ❯) or after the last entry.
-    const markerCheckSchedule = [500, 1500, 3500, 6500];
+    // The last entry is a VERIFY-ONLY pass: it presses nothing and exists so a
+    // run that fired its whole ladder still reads the pane one last time and
+    // reports what actually happened. Without it the ladder's final keypress
+    // outcome was never observed, so "recovered" was an assumption.
+    const markerCheckSchedule = [500, 1500, 3500, 6500, 9000];
+    const verifyOnlyIdx = markerCheckSchedule.length - 1;
     let recoveryFiredOnce = false;
+    let recoveryRefusedOnce = false;
+
+    // ── The ladder is scoped to ONE incarnation (2026-10-21) ──
+    // The marker is text and the target is a tmux NAME, and both survive a
+    // respawn — so when a recovery rung (or the resume/respawn path) replaces
+    // the session in place, the re-injected prompt renders the SAME marker at
+    // the SAME prompt in a brand-new pane. The remaining rungs then measure a
+    // one-second-old injection against a nine-second deadline and report the
+    // message as never delivered.
+    // Measured on the Studio, 2026-10-22 02:25/02:35/02:50/03:25 UTC: in each
+    // case the `health-check` job logged `Injection stuck … Auto-recovering
+    // (attempt 1/5)`, then `claudeSessionId rotated … (respawn/resume)`, then
+    // this ladder's verify-only pass reported `The message is NOT delivered`
+    // and filed a DegradationReporter entry — while the respawned session went
+    // on to run the job, print its completion sentinel and be reaped as a
+    // success. The work was never lost; the alarm was false, four times in one
+    // hour, in the one place that is supposed to report a lost message.
+    // Anchor on the incarnation, not on the state of the prompt: a rotated
+    // claudeSessionId means this pane belongs to a different attempt, which
+    // performed its own injection and therefore owns its own ladder.
+    const incarnationAtInjection = this.injectionIncarnationId(tmuxSession);
 
     const runCheck = (attempt: number): void => {
       try {
         if (!this.tmuxSessionExists(tmuxSession)) return;
+        // A null→value transition is the FIRST binding of a native session id,
+        // not a respawn, so only a change between two known ids abandons the
+        // ladder. Unknown-either-side keeps today's behaviour.
+        const incarnationNow = this.injectionIncarnationId(tmuxSession);
+        if (incarnationAtInjection && incarnationNow && incarnationNow !== incarnationAtInjection) {
+          console.log(
+            `[SessionManager] Injection verification for "${tmuxSession}" abandoned at attempt ${attempt + 1}: ` +
+            'the session was respawned (native id rotated), so this pane is a different attempt that verifies itself.',
+          );
+          return;
+        }
         const pane = this.captureOutput(tmuxSession, 30) || '';
         if (!this.isMarkerStuckAtPrompt(pane, marker)) {
           // Submitted (or marker no longer at the input prompt) — stop polling
@@ -4809,8 +9543,11 @@ rm()  { "${shimRunner}" rm  "$@"; }
         }
 
         // The marker is at the prompt — but if the session is actively working,
-        // that's NOT a stuck Enter: the injected text is correctly queued and
-        // Claude submits it when the current turn ends. Firing Enter now is a
+        // that's NOT a stuck Enter: the injected text is correctly queued and is
+        // submitted when the current turn ends. (Not universal — codex holds the
+        // draft instead, which is exactly why the stranded-draft marker above
+        // exists for it. Frameworks beyond claude/codex are unmeasured here.)
+        // Firing Enter now is a
         // no-op at best and a premature/duplicate submit at worst — and it's
         // the noisy "Injection stuck — Auto-recovering" spam that fires on
         // every inbound to a busy session. Skip recovery this tick; keep
@@ -4824,8 +9561,53 @@ rm()  { "${shimRunner}" rm  "$@"; }
           return;
         }
 
-        // Still stuck. Fire escalating recovery action.
-        this.fireStuckInputRecovery(tmuxSession, attempt);
+        // Final pass: the ladder is spent and the marker is STILL at an idle
+        // prompt, so every rung we fired failed. Press nothing — say so. The
+        // persistent StuckInputSentinel owns recovery from here (it survives a
+        // server restart, which these in-process timers do not), and it is the
+        // layer that escalates; this report exists so the failure is on the
+        // record at the moment it is known rather than inferred later.
+        if (attempt >= verifyOnlyIdx) {
+          if (recoveryFiredOnce || recoveryRefusedOnce) {
+            console.warn(`[SessionManager] Injection recovery FAILED in "${tmuxSession}" — marker "${marker.slice(0, 30)}…" is still at an idle prompt after the full ladder. The message is NOT delivered; handing off to StuckInputSentinel.`);
+            DegradationReporter.getInstance().report({
+              feature: 'SessionManager.verifyInjection.unsubmitted',
+              primary: 'Bracketed paste + Enter submits injected message',
+              fallback: 'Persistent StuckInputSentinel continues recovery across server restarts',
+              reason: 'Marker still at an idle prompt after every in-process recovery rung',
+              impact: 'Message still unsubmitted — NOT recovered by the in-process verifier',
+            });
+          }
+          return;
+        }
+
+        // Still stuck. Fire escalating recovery action — and CONSUME its outcome.
+        // Ignoring the return value is how this reported success it had not
+        // earned: a `refused` verdict means no key was ever sent, yet the
+        // degradation below still read "Recovered without user intervention"
+        // while the operator's message sat at the prompt (indra, 2026-10-20).
+        const fired = this.fireStuckInputRecovery(tmuxSession, attempt);
+        if (fired.status === 'refused') {
+          if (!recoveryRefusedOnce) {
+            recoveryRefusedOnce = true;
+            console.warn(`[SessionManager] Injection stuck in "${tmuxSession}" and recovery was REFUSED (${fired.reason ?? 'no reason given'}) — marker "${marker.slice(0, 30)}…" is still at the prompt and no key was sent. The message is NOT delivered.`);
+            DegradationReporter.getInstance().report({
+              feature: 'SessionManager.verifyInjection.unsubmitted',
+              primary: 'Bracketed paste + Enter submits injected message',
+              fallback: 'None — the recovery keypress was refused before it was sent',
+              reason: `Recovery refused: ${fired.reason ?? 'unknown'}`,
+              impact: 'Message left unsubmitted at the prompt; the persistent StuckInputSentinel is the remaining backstop',
+            });
+          }
+          // Keep polling: a refusal can be transient (ownership moving), and
+          // the next rung re-asks rather than assuming the answer is permanent.
+          const nextRefusedIdx = attempt + 1;
+          if (nextRefusedIdx < markerCheckSchedule.length) {
+            const delay = markerCheckSchedule[nextRefusedIdx] - markerCheckSchedule[attempt];
+            setTimeout(() => runCheck(nextRefusedIdx), delay);
+          }
+          return;
+        }
 
         if (!recoveryFiredOnce) {
           recoveryFiredOnce = true;
@@ -4834,8 +9616,21 @@ rm()  { "${shimRunner}" rm  "$@"; }
             feature: 'SessionManager.verifyInjection',
             primary: 'Bracketed paste + Enter submits injected message',
             fallback: 'Auto-resent Enter after detecting stuck input',
-            reason: 'Enter eaten by paste-end race on fresh Claude Code TUI',
-            impact: 'Recovered without user intervention',
+            // States the OBSERVED condition, not a presumed cause. This recovery
+            // runs for every framework (the codex branch is separate, above), so
+            // naming Claude Code here handed an operator on a grok/gemini/pi
+            // session a diagnosis about a program that was not running. The
+            // provenance is kept as provenance — where it was first seen — which
+            // is what makes it useful without making it a claim about THIS pane.
+            reason:
+              'Enter after bracketed-paste-end did not submit; text left at the prompt ' +
+              '(first observed on Claude Code TUI v2.1.105+, but the race is not framework-specific)',
+            // Reports what was DONE, not what it achieved. The outcome is not
+            // known at this point — the key has only just been sent — and the
+            // verify-only pass above is what states whether it worked. Claiming
+            // recovery here is what made a 28-minute undelivered message read
+            // as self-healed in the degradation record.
+            impact: 'Recovery keypress sent; outcome reported by the verification pass that follows',
           });
         }
 
@@ -4929,23 +9724,53 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * (a newer message supersedes an older stuck one). No-op when the marker is
    * too short to track reliably. See the strandedDraftMarkers field for why this
    * primarily matters for codex sessions. */
-  recordStrandedDraftMarker(tmuxSession: string, text: string, framework: string): void {
+  recordStrandedDraftMarker(tmuxSession: string, text: string, framework: string,
+    deliveryId?: string, conversationId = tmuxSession): void {
     const marker = SessionManager.extractInjectionMarker(text);
     if (!marker) return;
-    this.strandedDraftMarkers.set(tmuxSession, { marker, framework, injectedAt: Date.now() });
+    this.strandedDraftMarkers.set(tmuxSession, { marker, framework, injectedAt: Date.now(), deliveryId, conversationId });
   }
 
   /** Read the stranded-draft marker record for a session (or undefined). Used by
    *  StuckInputSentinel to do marker-based recovery for codex sessions. */
-  getStrandedDraftMarker(tmuxSession: string): { marker: string; framework: string; injectedAt: number } | undefined {
+  getStrandedDraftMarker(tmuxSession: string): { marker: string; framework: string; injectedAt: number; deliveryId?: string; conversationId?: string } | undefined {
     return this.strandedDraftMarkers.get(tmuxSession);
+  }
+
+  /** Durable facts used by the independently dark recovery actuation authority. */
+  strandedDraftRecoverySnapshot(tmuxSession: string): import('./InboundDeliveryStore.js').DeliveryRecoverySnapshot | null {
+    const marker = this.strandedDraftMarkers.get(tmuxSession);
+    if (!marker?.deliveryId || !marker.conversationId || !this.inboundDeliveries) return null;
+    return this.inboundDeliveries.recoverySnapshot(marker.conversationId, marker.deliveryId);
+  }
+
+  /** Full-envelope, HMAC-correlated composer evidence for Stage-B keypress
+   * authorization. Prefix/absence checks are never sufficient. */
+  trackedDraftComposerState(tmuxSession: string, _pane: string): ComposerObservation {
+    const marker = this.strandedDraftMarkers.get(tmuxSession);
+    if (!marker?.deliveryId || !marker.conversationId || !this.inboundDeliveries || !this.inboundDeliveryHmacKey) {
+      return 'unknown';
+    }
+    const row = this.inboundDeliveries.get(marker.conversationId, marker.deliveryId);
+    if (!row || row.transportState !== 'dispatched') return 'unknown';
+    const observed = observeCodexComposerFrame(
+      this.captureCodexComposerFrame(tmuxSession), row.envelopeHmac, this.inboundDeliveryHmacKey,
+    );
+    if (observed !== 'unknown') this.inboundDeliveries.recordComposerState(marker.conversationId, marker.deliveryId, observed);
+    return observed;
+  }
+
+  markStrandedDraftExhausted(tmuxSession: string): boolean {
+    const marker = this.strandedDraftMarkers.get(tmuxSession);
+    return !!marker?.deliveryId && !!marker.conversationId && !!this.inboundDeliveries
+      && this.inboundDeliveries.markKeypressExhausted(marker.conversationId, marker.deliveryId);
   }
 
   /** Clear the stranded-draft marker for a session — called once the marker is
    *  no longer stuck at the prompt (confirmed submitted) or the session is
    *  gone. */
   clearStrandedDraftMarker(tmuxSession: string): void {
-    this.strandedDraftMarkers.delete(tmuxSession);
+    this.strandedDraftMarkers?.delete(tmuxSession);
   }
 
   /** All tmux sessions with a stranded-draft marker. Used by the sentinel to GC
@@ -4961,25 +9786,74 @@ rm()  { "${shimRunner}" rm  "$@"; }
    * race windows. Bounded; called from verifyInjection's polling loop and
    * from the persistent StuckInputSentinel after a server restart.
    */
-  fireStuckInputRecovery(tmuxSession: string, attempt: number): void {
+  fireStuckInputRecovery(tmuxSession: string, attempt: number):
+    { status: 'attempted' | 'effect-unknown' | 'refused'; reason?: string } {
     const target = `=${tmuxSession}:`;
     const tmuxPath = this.config.tmuxPath;
-    try {
-      // §B: the stuck-input recovery send-keys stay sync (escalating timing IS the
-      // mechanism) but funnel through withSyncOp for the marker.
-      if (attempt === 0 || attempt === 1) {
-        withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
-      } else if (attempt === 2) {
-        // Escalate: literal carriage-return — bypasses any Enter-specific consumer.
-        withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'C-m'], { encoding: 'utf-8', timeout: 5000 }));
-      } else {
-        // Final attempt: Enter, brief sleep, Enter — covers sub-second consume races.
-        withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
-        try { withSyncOp(() => execFileSync('/bin/sleep', ['0.15'], { timeout: 1000 })); } catch { /* @silent-fallback-ok — sleep is best-effort */ }
-        withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
+    // Legacy harnesses may instantiate this narrow recovery surface without
+    // running the full SessionManager constructor. Journaling is additive for
+    // those harnesses; production instances always own the map and store.
+    const markerEvidence = this.strandedDraftMarkers?.get(tmuxSession);
+    const deliveryId = markerEvidence?.deliveryId;
+    const conversationId = markerEvidence?.conversationId ?? tmuxSession;
+    // Stage B fences a recovery keypress behind the SAME durable delivery row
+    // that authorized the original injection, so a key can never be replayed
+    // against a conversation this machine no longer owns. That fence is only
+    // satisfiable where such a row exists — and rows are prepared for
+    // codex-cli ONLY (see the stageB branch in injectIntoSession). Requiring it
+    // for every framework turned every claude-code recovery into a permanent
+    // refusal: one agent logged 75,001 consecutive
+    // `refused/missing-durable-delivery-evidence` rows, every one at attempt 0,
+    // so the keypress ladder never advanced, never exhausted and never
+    // escalated. An operator's message sat unsubmitted at the prompt for 28
+    // minutes while the logs reported recovery (indra, 2026-10-20).
+    // Keep the fence wherever the evidence exists; where it structurally cannot
+    // exist, fall through to the pre-Stage-B best-effort keypress — the same
+    // untracked path this session's own injection still takes.
+    if (this.stageBActivation.active && deliveryId) {
+      if (!this.inboundDeliveries || !this.trackedPhysicalEffects) {
+        return { status: 'refused', reason: 'missing-durable-delivery-evidence' };
       }
+      const delivery = this.inboundDeliveries.get(conversationId, deliveryId);
+      if (!delivery) return { status: 'refused', reason: 'missing-durable-delivery-evidence' };
+      const result = this.trackedPhysicalEffects.keyAttemptSync({
+        scope: tmuxSession, conversationId, deliveryId, attemptIndex: attempt,
+        deadlineMs: Date.now() + 8_000,
+        reconcile: () => {
+          this.inboundDeliveries!.reconcileInterruptedEffects();
+          return !this.inboundDeliveries!.hasUnreconciledEffects(conversationId);
+        },
+        fence: () => this.inboundDeliveries!.ownsLiveDelivery(
+          conversationId, deliveryId, delivery.ownerMachineId, delivery.ownerEpoch,
+        ) && this.localMachineId() === delivery.ownerMachineId
+          && this.ownerEpochForConversation(conversationId) === delivery.ownerEpoch,
+        effect: () => this.performStuckInputKeyEffect(target, tmuxPath, attempt),
+      });
+      if (result.ok) return { status: 'attempted' };
+      return result.status === 'effect-unknown'
+        ? { status: 'effect-unknown', reason: result.reason }
+        : { status: 'refused', reason: result.reason };
+    }
+    try {
+      this.performStuckInputKeyEffect(target, tmuxPath, attempt);
+      return { status: 'attempted' };
     } catch (err) {
       console.error(`[SessionManager] fireStuckInputRecovery error for "${tmuxSession}" attempt ${attempt}: ${err instanceof Error ? err.message : err}`);
+      return { status: 'effect-unknown', reason: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  private performStuckInputKeyEffect(target: string, tmuxPath: string, attempt: number): void {
+    // D3: the stuck-input recovery keys are raw sends; a confined session takes none of them.
+    if (this.confinedWriteRefused(target.replace(/^=/, '').replace(/:$/, ''), 'stuck-input recovery key')) return;
+    if (attempt === 0 || attempt === 1) {
+      withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
+    } else if (attempt === 2) {
+      withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'C-m'], { encoding: 'utf-8', timeout: 5000 }));
+    } else {
+      withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
+      try { withSyncOp(() => execFileSync('/bin/sleep', ['0.15'], { timeout: 1000 })); } catch { /* @silent-fallback-ok */ }
+      withSyncOp(() => execFileSync(tmuxPath, ['send-keys', '-t', target, 'Enter'], { encoding: 'utf-8', timeout: 5000 }));
     }
   }
 
@@ -4991,21 +9865,54 @@ rm()  { "${shimRunner}" rm  "$@"; }
     const start = Date.now();
     // Wait a minimum startup delay before checking (Claude needs time to load)
     await new Promise(r => setTimeout(r, 3000));
+    let polls = 0;
     while (Date.now() - start < timeoutMs) {
       if (!this.tmuxSessionExists(tmuxSession)) {
         console.error(`[SessionManager] Session "${tmuxSession}" died during startup`);
         return false;
       }
+      // Every 2 s, also read the pane-exit fact: a crashed Claude keeps its
+      // session (remain-on-exit failed), so existence alone would wait out the
+      // whole timeout (spec §3.2).
+      if (++polls % 4 === 0 && this.resumeFollowsAccountEnabled() && this.isPaneDead(tmuxSession)) {
+        console.error(`[SessionManager] Session "${tmuxSession}" exited during startup (dead pane)`);
+        return false;
+      }
       if (this.detectClaudePrompt(tmuxSession)) {
-        console.log(`[SessionManager] Claude ready in "${tmuxSession}" after ${Date.now() - start}ms`);
+        console.log(`[SessionManager] Session ready in "${tmuxSession}" after ${Date.now() - start}ms`);
+        // The positive signal the start-failure tracker resets on: this machine
+        // has just demonstrated it CAN start a session, so any standing
+        // "cannot start" placement block is cleared without operator action.
+        this.emit('sessionStartSucceeded', { tmuxSession });
         return true;
       }
       await new Promise(r => setTimeout(r, 500));
     }
     // Log what we see on timeout for debugging
     const finalOutput = this.captureOutput(tmuxSession, 30);
-    console.error(`[SessionManager] Claude not ready in "${tmuxSession}" after ${timeoutMs}ms. Output: ${(finalOutput || '').slice(-300)}`);
+    console.error(`[SessionManager] Session not ready in "${tmuxSession}" after ${timeoutMs}ms. Output: ${(finalOutput || '').slice(-300)}`);
     return false;
+  }
+
+  /**
+   * Classify what a live session's pane is showing: `ready`, `menu`, or
+   * `not-ready`.
+   *
+   * Exists for callers whose not-ready branch is DESTRUCTIVE. `waitForClaudeReady`
+   * collapses to a boolean, and the Slack stuck-session path in `server.ts` KILLS
+   * a live session on `false` — so a pane merely sitting on a startup question
+   * (`menu`) would be destroyed for politely waiting on an answer. Those callers
+   * ask this instead and leave a `menu` alone.
+   *
+   * Returns `null` when the pane cannot be captured — an unreadable pane is not
+   * evidence of anything, and must not be read as a reason to act.
+   */
+  classifyPaneState(tmuxSession: string): PaneReadiness | null {
+    const output = this.captureOutput(tmuxSession, 20);
+    if (!output) return null;
+    const lines = output.split('\n').filter(l => l.trim());
+    if (lines.length === 0) return null;
+    return classifyPaneReadiness(lines.slice(-6).join('\n'));
   }
 
   /**
@@ -5029,6 +9936,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // If we don't accept, any injected text selects "No" and crashes the session.
     const fullText = lines.join('\n');
     if (fullText.includes('Yes, I accept') && fullText.includes('No, exit')) {
+      // D3: a confined session's only answerer is its startup driver (exact-match frames); this
+      // generic auto-accept never presses a key in one. Readiness stays false; the driver decides.
+      if (this.confinedWriteRefused(tmuxSession, 'consent auto-accept keys')) return false;
       console.log(`[SessionManager] Consent dialog detected in "${tmuxSession}" — auto-accepting`);
       try {
         // Press Down to select "Yes, I accept", then Enter to confirm
@@ -5038,7 +9948,7 @@ rm()  { "${shimRunner}" rm  "$@"; }
         withSyncOp(() => execFileSync(this.config.tmuxPath, ['send-keys', '-t', `=${tmuxSession}:`, 'Enter'], {
           encoding: 'utf-8', timeout: 5000,
         }));
-      } catch {
+      } catch { // @silent-fallback-ok: legacy consent helper is best-effort and readiness remains false
         // Best-effort — if this fails, the session will be stuck but not crashed
       }
       return false; // Not ready yet — will be ready on next poll
@@ -5050,20 +9960,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
     // blank lines or separators push them around.
     const tail = lines.slice(-6).join('\n');
 
-    // Primary: the prompt character
-    if (tail.includes('❯')) return true;
-
-    // Secondary: permission mode indicators (visible in status bar)
-    if (tail.includes('bypass permissions')) return true;
-
-    // Tertiary: model/effort indicators in the status bar
-    // These appear when Claude Code has fully loaded and is ready for input.
-    if (/\/(effort|model|fast)/.test(tail)) return true;
-
-    // Quaternary: the "medium · /effort" or "high · /effort" pattern
-    if (/(?:low|medium|high)\s*·\s*\/effort/.test(tail)) return true;
-
-    return false;
+    // Classification lives in claudeReadinessProbe.ts — pure, so the 2026-07-26
+    // banner that fooled the old probe is a literal regression fixture there.
+    return isReadyPromptTail(tail);
   }
 
   /**
@@ -5084,6 +9983,9 @@ rm()  { "${shimRunner}" rm  "$@"; }
     if (!this.tmuxSessionExists(tmuxSession)) {
       return false;
     }
+    if (this.resumeFollowsAccountEnabled() && this.isPaneDead(tmuxSession)) {
+      return false;
+    }
 
     // Extended wait: the session is alive but prompt wasn't detected.
     // Give it one more chance with a 15-second grace period.
@@ -5096,13 +9998,39 @@ rm()  { "${shimRunner}" rm  "$@"; }
         return false;
       }
       if (this.detectClaudePrompt(tmuxSession)) {
-        console.log(`[SessionManager] Claude ready in "${tmuxSession}" during extended wait (${Date.now() - extendedStart}ms after primary timeout)`);
+        console.log(`[SessionManager] Session ready in "${tmuxSession}" during extended wait (${Date.now() - extendedStart}ms after primary timeout)`);
+        this.emit('sessionStartSucceeded', { tmuxSession });
         return true;
       }
       await new Promise(r => setTimeout(r, 1000));
     }
 
     return false;
+  }
+
+  /**
+   * Proof that the LIVE tmux session `name` is an incarnation this agent spawned:
+   * every spawn path sets `INSTAR_SESSION_ID=<fresh id>` in the session's tmux
+   * environment and saves a record with that id for that tmux name. A session
+   * that merely reuses a name this agent once used (another agent, another
+   * project dir with the same basename, a user) carries no such id. Automatic
+   * kills of a session found by NAME must pass this check first.
+   */
+  ownsLiveTmuxSession(name: string): boolean {
+    let out: string;
+    try {
+      out = withSyncOp(() => execFileSync(this.config.tmuxPath, ['show-environment', '-t', `=${name}`, 'INSTAR_SESSION_ID'], {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      })).trim();
+    } catch {
+      // @silent-fallback-ok — no session / no id means ownership is unproven
+      return false;
+    }
+    if (!out.startsWith('INSTAR_SESSION_ID=')) return false;
+    const id = out.slice('INSTAR_SESSION_ID='.length);
+    return /^[a-zA-Z0-9_-]+$/.test(id) && this.state.getSession(id)?.tmuxSession === name;
   }
 
   tmuxSessionExists(name: string): boolean {
@@ -5119,6 +10047,52 @@ rm()  { "${shimRunner}" rm  "$@"; }
       // @silent-fallback-ok — session existence check
       return false;
     }
+  }
+
+  /** Resume Follows the Account kill switch (spec §3.4). Absent = on. */
+  private resumeFollowsAccountEnabled(): boolean {
+    return this.config.resumeFollowsAccount?.enabled !== false;
+  }
+
+  /**
+   * True only when tmux positively reports the pane's process has exited
+   * (`pane_dead` = 1). Topic panes keep `remain-on-exit failed`, so a crashed
+   * Claude leaves a dead pane inside a session that `has-session` still reports
+   * as existing. Any probe error or other output returns false, preserving the
+   * previous behaviour. Standard: "Verify the State, Not Its Symbol".
+   */
+  isPaneDead(tmuxSession: string): boolean {
+    try {
+      const out = withSyncOp(() => execFileSync(this.config.tmuxPath, ['display-message', '-t', `=${tmuxSession}:`, '-p', '#{pane_dead}||#{pane_dead_status}'], {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      })).trim();
+      const [dead, status] = out.split('||');
+      if (dead !== '1') return false;
+      const code = Number(status);
+      if (status?.trim() && Number.isFinite(code)) this.terminalExitCodes.set(tmuxSession, Math.trunc(code));
+      return true;
+    } catch {
+      // @silent-fallback-ok — an unprobeable pane is treated as alive (previous behaviour).
+      return false;
+    }
+  }
+
+  /** Log the tail of a dead pane before it is killed, so the crash reason survives. */
+  private logDeadPaneEvidence(tmuxSession: string, context: string): void {
+    let tail = '';
+    try {
+      tail = withSyncOp(() => execFileSync(this.config.tmuxPath, ['capture-pane', '-p', '-t', `=${tmuxSession}:`, '-S', '-20'], {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 5000,
+      })).split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-8).join(' | ');
+    } catch {
+      // @silent-fallback-ok — evidence capture is best-effort; the kill proceeds.
+    }
+    const code = this.terminalExitCodes.get(tmuxSession);
+    console.warn(`[SessionManager] ${context}: pane in "${tmuxSession}" exited${code !== undefined ? ` with status ${code}` : ''}. Last output: ${tail.slice(0, 600) || '(none captured)'}`);
   }
 
   private generateId(): string {

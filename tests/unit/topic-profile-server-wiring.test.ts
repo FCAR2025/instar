@@ -65,12 +65,77 @@ describe('server-boot wiring: Topic Profile orchestrator + carrier (TOPIC-PROFIL
     });
 
     it('spawn port drives the real spawnSessionForTopic (not a stub)', () => {
-      expect(depsBlock()).toContain('await spawnSessionForTopic(sessionManager, telegram');
+      expect(depsBlock()).toMatch(/await spawnSessionForTopic\([\s\S]*?sessionManager,[\s\S]*?telegram,/);
+      expect(depsBlock()).toContain('{ awaitInitialInjection: true, ...(carriedBrief ? { carriedBrief } : {}) }');
     });
 
-    it('claudeResume + killFresh delegate to the real resume map', () => {
+    it('spawn port carries the replaced session\'s direct-spawn brief into a CONTINUATION respawn only', () => {
+      const block = depsBlock();
+      expect(block).toContain("directive.method === 'continuation'");
+      expect(block).toContain('_topicSpawnBriefs.getForSession(n, directive.replacedSessionName)');
+      expect(block).toContain('_topicSpawnBriefs.rebind(n, directive.replacedSessionName, spawnedName)');
+      // The brief store is the SAME instance the routes record into.
+      expect(src).toContain('spawnBriefs: _topicSpawnBriefs,');
+      expect(src).toContain('const _topicSpawnBriefs = new TopicSpawnBriefStore(config.stateDir);');
+      expect(src).toContain('_topicSpawnBriefsRef = _topicSpawnBriefs;');
+    });
+
+    it('a spawn the orchestrator did not start clears the topic brief (no stale task on a reused session name)', () => {
+      expect(src).toMatch(/if \(_topicSpawnBriefsRef && !_orchestratorSpawnInFlight\.has\(String\(topicId\)\)\) \{\s*try \{ _topicSpawnBriefsRef\.clear\(topicId\); \}/);
+    });
+
+    it('a history-only handoff never fabricates a latest message, and resumes in-flight work via the shared helper', () => {
+      expect(src).toContain('if (hasLatestMessage)');
+      // merge-line-author-eligibility-and-handoff-resume D2: the no-message branch
+      // no longer says "wait silently" unconditionally; it uses the pure helper.
+      expect(src).not.toContain('HANDOFF ONLY: No new user message accompanies this framework switch.');
+      const start = src.indexOf('// D2: resume in-flight work');
+      expect(start).toBeGreaterThan(0);
+      const branch = src.slice(start, src.indexOf('bootstrapMessage = parts.join', start));
+      expect(branch).toContain('parts.push(buildHandoffContinuationInstruction(openCommitments));');
+      expect(branch).not.toContain("The user's latest message:");
+      // Unreadable commitments are 'unavailable', never an empty list.
+      expect(branch).toContain("let openCommitments: HandoffCommitment[] | 'unavailable' = 'unavailable';");
+    });
+
+    it('the open-commitments reader is late-bound to the REAL CommitmentTracker (not a stub)', () => {
+      expect(src).toContain('_activeCommitmentsForTopic = (topicId) => commitmentTracker.getActiveByTopicId(topicId);');
+      const ctor = src.indexOf('const commitmentTracker = new CommitmentTracker({');
+      const bind = src.indexOf('_activeCommitmentsForTopic = (topicId) => commitmentTracker.getActiveByTopicId(topicId);');
+      expect(ctor).toBeGreaterThan(0);
+      expect(bind).toBeGreaterThan(ctor);
+    });
+
+    it('claudeResume delegates to the real resume map', () => {
       expect(depsBlock()).toContain('_topicResumeMap?.getProvenance(n) === \'hook\'');
-      expect(depsBlock()).toContain('_topicResumeMap?.remove(Number(topic))');
+      expect(depsBlock()).toContain('_topicResumeMap?.park(n, reason)');
+    });
+
+    // Regression (second-pass review, topic 60487): killFresh used to call
+    // _topicResumeMap.remove(), which DELETES the entry. The orchestrator has
+    // already PARKED it by then (recoverable, and already invisible to every
+    // resolution read), so the delete was redundant — and it made the new
+    // kill-failure abort unrecoverable: unpark() finds nothing to restore, so a
+    // session that survived a failed kill permanently lost its resume id. This
+    // pins the destructive call out. Paired with the orchestrator unit test
+    // 'a failed FRESH kill un-parks the still-live session's resume entry',
+    // which asserts the abort restores what the port left parked.
+    it('killFresh never DELETES the resume entry — the orchestrator parked it, and a park is recoverable', () => {
+      expect(depsBlock()).not.toContain('_topicResumeMap?.remove(');
+    });
+
+    // Regression (topic 60487, 2026-08-27): both kill ports were wired to
+    // killSession(), which resolves BY ID — but listTopicSessions() supplies
+    // the session's TMUX NAME. The lookup missed, the kill returned false with
+    // no kill, and the respawn then injected into the still-live old session
+    // while the audit recorded `respawn-applied`. killSessionByTmuxName is the
+    // single place that name->id resolution lives (SessionManager §W26 lane 1).
+    it('both kill ports resolve the tmux NAME they are given — never killSession(id)', () => {
+      const block = depsBlock();
+      expect(block).toContain('killForResume: async (sessionName) => sessionManager.killSessionByTmuxName(sessionName)');
+      expect(block).toContain('return sessionManager.killSessionByTmuxName(sessionName);');
+      // and neither port may hand a name to the id-resolving kill
+      expect(block).not.toContain('sessionManager.killSession(sessionName)');
     });
 
     it('isProtectedSession fails CLOSED to protected (§8 hard invariant), not open', () => {

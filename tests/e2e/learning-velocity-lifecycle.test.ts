@@ -61,5 +61,22 @@ describe('GET /metrics/learning-velocity — (E2E over HTTP)', () => {
     expect(body.byType.learning).toBe(4);
     expect(typeof body.adaptabilityScore).toBe('number');
     expect(body.windowDays).toBe(30);
+    // ACT-1244: the counting rule and its accounting must survive the PRODUCTION
+    // initialization path, not just the route-level test — a score whose denominator
+    // is invisible is the failure this change removes, and the place a reader
+    // actually reads it is the live endpoint.
+    expect(body.counting).toMatch(/count on completion/i);
+    expect(body.counting).toMatch(/never on filing/i);
+    expect(body.counting).toMatch(/corrections count when verified/i);
+    expect(body.counting).toMatch(/never on detection/i);
+    expect(body.evolutionActions).toBeDefined();
+    expect(typeof body.evolutionActions.considered).toBe('number');
+    expect(typeof body.evolutionActions.counted).toBe('number');
+    expect(body.evolutionActions.excluded).toBeDefined();
+    expect(body.corrections).toBeDefined();
+    expect(typeof body.corrections.considered).toBe('number');
+    expect(typeof body.corrections.counted).toBe('number');
+    expect(typeof body.corrections.coalescedRecords).toBe('number');
+    expect(body.corrections.excluded).toBeDefined();
   });
 });

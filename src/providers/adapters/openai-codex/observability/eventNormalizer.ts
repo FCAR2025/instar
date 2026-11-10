@@ -98,7 +98,7 @@ export function normalizeCodexJsonlEvent(line: string): CanonicalEvent | null {
         type: 'error',
         message,
         recoverable: false,
-        errorKind: classifyErrorMessage(message),
+        errorKind: classifyCodexErrorMessage(message),
       };
     }
 
@@ -109,7 +109,7 @@ export function normalizeCodexJsonlEvent(line: string): CanonicalEvent | null {
         type: 'error',
         message,
         recoverable: true,
-        errorKind: classifyErrorMessage(message),
+        errorKind: classifyCodexErrorMessage(message),
       };
     }
 
@@ -187,10 +187,41 @@ export function normalizeCodexJsonlEvent(line: string): CanonicalEvent | null {
   }
 }
 
-function classifyErrorMessage(message: string): 'auth' | 'quota' | 'rate-limit' | 'timeout' | 'network' | 'malformed-response' | 'unsupported' | 'unknown' {
-  if (/unauthorized|forbidden|401|403|invalid.*token|not supported.*ChatGPT account/i.test(message)) return 'auth';
+export function classifyCodexErrorMessage(message: string): 'auth' | 'quota' | 'rate-limit' | 'timeout' | 'network' | 'malformed-response' | 'unsupported' | 'unknown' {
+  // This is Codex's specific ChatGPT-account model-retirement response. Keep
+  // it ahead of generic auth classification: callers may safely retry this
+  // one condition with a known-good model, but must surface every neighboring
+  // 400/auth/rate-limit/network failure unchanged.
+  if (/The '[^']+' model is not supported when using Codex with a ChatGPT account\.?/i.test(message)) return 'unsupported';
+  if (/unauthorized|forbidden|401|403|invalid.*token/i.test(message)) return 'auth';
   if (/quota|insufficient_quota/i.test(message)) return 'quota';
   if (/rate.?limit|429/i.test(message)) return 'rate-limit';
+  // The SECOND retirement shape, added 2026-09-09. When OpenAI removes a model
+  // id outright (rather than de-listing it from the ChatGPT surface) Codex
+  // surfaces a 404 instead of the 400 above — e.g. gpt-5.5:
+  //   "unexpected status 404 Not Found: The model `gpt-5.5` does not exist or
+  //    you do not have access to it."
+  // This previously fell through to 'unknown', so the model-retirement
+  // self-heal never fired for it and every call using that id failed forever.
+  //
+  // ORDERING IS LOAD-BEARING, IN BOTH DIRECTIONS. It must sit:
+  //   BELOW auth / quota / rate-limit — one message can carry BOTH a specific
+  //     failure token AND this wording (e.g. "unexpected status 403 Forbidden:
+  //     The model `x` does not exist or you do not have access to it").
+  //     Matching first would reclassify a real auth or throttle failure as a
+  //     retryable retirement and hide it from every consumer of `errorKind`.
+  //   ABOVE timeout / network — those patterns are substring matches and DO
+  //     collide with the real retirement message: Codex prefixes its retries
+  //     with "Reconnecting... 2/5 (…)", and "R-ECONN-ecting" matches the
+  //     network branch's /ECONN/i. Placing this branch after `network` sends
+  //     the genuine outage message to 'network' and the self-heal never fires
+  //     — verified: it is exactly what happened when this was moved last.
+  // The tests pin BOTH bounds, so neither move can silently regress.
+  //
+  // The match is also deliberately narrow: it requires Codex's quoted-model-id
+  // wording, so a generic 404 (a bad route, a missing file) is NOT reclassified
+  // as a retryable model retirement.
+  if (/The model ['"`][^'"`]+['"`] does not exist or you do not have access to it\.?/i.test(message)) return 'unsupported';
   if (/timeout|408|504/i.test(message)) return 'timeout';
   if (/network|ECONN|ETIMEDOUT|dns/i.test(message)) return 'network';
   if (/malformed|parse|invalid JSON/i.test(message)) return 'malformed-response';

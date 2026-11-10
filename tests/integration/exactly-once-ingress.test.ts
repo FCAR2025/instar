@@ -26,13 +26,17 @@ import { SafeFsExecutor } from '../../src/core/SafeFsExecutor.js';
 
 const AUTH = 'test-auth-token-deadbeef';
 const TOPIC = 13481;
+const SELF = 'm_self';
+const PEER = 'm_peer';
 
 interface Spies { routed: string[]; }
+interface OwnershipOpts { self?: string | null; ownerOf?: (topic: string) => string | null; }
 
 function buildContext(
   stateDir: string,
   ledger: MessageProcessingLedger | null,
   spies: Spies,
+  ownership: OwnershipOpts = {},
 ): RouteContext {
   return {
     config: {
@@ -55,6 +59,8 @@ function buildContext(
       logInboundMessage: () => {},
     } as never,
     coordinator: { getLeaseEpoch: () => 1 } as never,
+    sessionOwnershipRegistry: ownership.ownerOf ? { ownerOf: ownership.ownerOf } as never : null,
+    meshSelfId: ownership.self ?? null,
     messageLedger: ledger,
     currentInboundByTopic: ledger ? new Map<string, string>() : null,
     relationships: null, feedback: null, dispatches: null, updateChecker: null,
@@ -142,6 +148,52 @@ describe('/internal/telegram-forward — exactly-once ingress gate', () => {
     expect(r.body).toMatchObject({ ok: true, forwarded: true }); // delivered despite gate error
     expect(spies.routed).toEqual(['hello']);
   });
+
+  describe('ownership claim order (Addendum 2)', () => {
+    it('owner path claims and routes when this machine owns the topic', async () => {
+      const led = MessageProcessingLedger.openMemory();
+      const a = app(buildContext(stateDir, led, spies, { self: SELF, ownerOf: () => SELF }));
+
+      const r = await forward(a, 801, 'owner hello');
+
+      expect(r.body).toMatchObject({ ok: true, forwarded: true });
+      expect(spies.routed).toEqual(['owner hello']);
+      expect(led.get(dedupeKeyFor('telegram', TOPIC, 801))!.state).toBe('processing');
+    });
+
+    it('non-owner does NOT write a local ledger row', async () => {
+      const led = MessageProcessingLedger.openMemory();
+      const a = app(buildContext(stateDir, led, spies, { self: SELF, ownerOf: () => PEER }));
+
+      const r = await forward(a, 802, 'relay only');
+
+      expect(r.body).toMatchObject({ ok: true, forwarded: true });
+      expect(led.get(dedupeKeyFor('telegram', TOPIC, 802))).toBeNull();
+    });
+
+    it('non-owner STILL ROUTES after skipping the local claim', async () => {
+      const led = MessageProcessingLedger.openMemory();
+      const a = app(buildContext(stateDir, led, spies, { self: SELF, ownerOf: () => PEER }));
+
+      const r = await forward(a, 803, 'must relay');
+
+      expect(r.body).toMatchObject({ ok: true, forwarded: true });
+      expect(spies.routed).toEqual(['must relay']);
+    });
+
+    it('owner duplicate redelivery still dedupes at-most-once', async () => {
+      const led = MessageProcessingLedger.openMemory();
+      const a = app(buildContext(stateDir, led, spies, { self: SELF, ownerOf: () => SELF }));
+
+      const r1 = await forward(a, 804, 'dedupe me');
+      expect(r1.body).toMatchObject({ ok: true, forwarded: true });
+
+      const r2 = await forward(a, 804, 'dedupe me');
+      expect(r2.body).toMatchObject({ ok: true, deduped: true, reason: 'in-flight' });
+      expect(spies.routed).toEqual(['dedupe me']);
+      expect(led.get(dedupeKeyFor('telegram', TOPIC, 804))!.state).toBe('processing');
+    });
+  });
 });
 
 /**
@@ -152,12 +204,18 @@ describe('/internal/telegram-forward — exactly-once ingress gate', () => {
 describe('/internal/telegram-forward — exactly-once wiring integrity', () => {
   it('the dedup gate is between the sentinel intercept and the routing call', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'server', 'routes.ts'), 'utf-8');
-    const fwdIdx = src.indexOf("router.post('/internal/telegram-forward'");
-    const classifyIdx = src.indexOf('ctx.sentinel.classify(', fwdIdx);
+    // The forward route's body is the shared inbound handler (mobile-operator-chat §2.2).
+    const fwdIdx = src.indexOf('const telegramForwardHandler = async');
+    // operator-channel-sacred (topic 28130): the forward path now decides the
+    // inbound disposition via decideInboundDisposition (which consults the
+    // sentinel) instead of the old raw `sentinel.classify` — the dedup gate
+    // must still sit AFTER that decision so an emergency-stop is never deduped.
+    const sentinelIdx = src.indexOf('ctx.sentinel.decideInboundDisposition(', fwdIdx);
     const gateIdx = src.indexOf('decideIngress(ctx.messageLedger', fwdIdx);
     const routeIdx = src.indexOf('ctx.telegram.onTopicMessage(message)', fwdIdx);
+    expect(sentinelIdx).toBeGreaterThan(-1);       // sentinel disposition is on the forward path
     expect(gateIdx).toBeGreaterThan(-1);
-    expect(gateIdx).toBeGreaterThan(classifyIdx); // gate AFTER sentinel (stop never deduped)
+    expect(gateIdx).toBeGreaterThan(sentinelIdx);  // gate AFTER sentinel (stop never deduped)
     expect(gateIdx).toBeLessThan(routeIdx);        // gate BEFORE routing (dup never reaches session)
   });
 });

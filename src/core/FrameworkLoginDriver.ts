@@ -26,6 +26,31 @@ import type { LoginArtifact, LoginDriver } from './EnrollmentWizard.js';
 import type { LoginFlowKind, LoginProvider } from './PendingLoginStore.js';
 
 /**
+ * The per-framework login COMMAND the enrollment wizard spawns to obtain a public
+ * verification URL/code. SINGLE SOURCE OF TRUTH — server.ts merges this with any
+ * `subscriptionPool.enrollment.loginCommands` operator override.
+ *
+ * INVARIANT (guarded by framework-login-driver.test.ts): every framework whose
+ * enrollment flow-kind is `device-code` (Codex/OpenAI, grok/xAI — see
+ * EnrollmentWizard.defaultKind / remoteKind) MUST pass `--device-auth`. The command
+ * must match the kind: a device-code kind with a plain (browser-callback) login
+ * command prints NO code for the wizard to scrape, and a follow-me enrollment onto a
+ * headless machine dies with `login-did-not-start`. This is exactly the Codex bug —
+ * `codex login` (browser) could never enroll a Codex account onto a remote machine;
+ * `codex login --device-auth` prints a portable code that works anywhere.
+ */
+export const DEFAULT_ENROLL_LOGIN_COMMANDS: Record<string, string> = {
+  'claude-code': 'claude auth login',
+  'codex-cli': 'codex login --device-auth',
+  'gemini-cli': 'gemini',
+  'pi-cli': 'pi login',
+  // grok-build: the binary is `grok` (NEVER the colliding `agent` name), and
+  // device-code auth is the phone-approvable flow the enrollment wizard scrapes
+  // (public code/URL only, never a token).
+  'grok-build': 'grok login --device-auth',
+};
+
+/**
  * The tmux session name an enrollment login pane runs under. SINGLE SOURCE OF TRUTH —
  * both the spawn (server.ts) and any consumer that needs to reach the live pane
  * (e.g. WS5.2 code paste-back submit-code in routes.ts) MUST derive the name through
@@ -39,13 +64,92 @@ export function enrollPaneSessionName(framework: string, configHome?: string): s
   return `instar-enroll-${framework}-${slug}`;
 }
 
+/**
+ * The environment that confines an enrollment login to its own credential slot.
+ * SINGLE SOURCE OF TRUTH — the spawn (server.ts) derives the env through this
+ * helper so the mapping can never drift from what each CLI actually reads.
+ *
+ * The isolation variable is PER-FRAMEWORK, and handing a CLI a variable it does
+ * not read is worse than handing it none: the login silently lands in the
+ * AMBIENT home while the pool records an isolated `configHome`, so a second
+ * enrolment overwrites the first account's session while the pool shows both
+ * active. Each framework therefore gets the variable it genuinely honours, and
+ * a framework with NO known isolation variable gets NONE rather than a
+ * misleading one.
+ *
+ * `codex-cli` reads `CODEX_HOME` (verified against the CLI: `CLAUDE_CONFIG_DIR`
+ * pointed at an empty directory still reported "Logged in using ChatGPT", while
+ * `CODEX_HOME` pointed at the same directory correctly reported "Not logged
+ * in"). It previously fell through to `CLAUDE_CONFIG_DIR`, so every
+ * instar-started Codex sign-in ran against the machine's real `~/.codex` —
+ * which is how an enrolment signed the operator out of their default Codex
+ * login. `gemini-cli` and `pi-cli` have no isolation variable instar has
+ * verified, so they get none.
+ */
+export function enrollmentIsolationEnv(
+  framework: string,
+  configHome?: string,
+): Record<string, string> {
+  if (!configHome) return {};
+  switch (framework) {
+    case 'claude-code':
+      return { CLAUDE_CONFIG_DIR: configHome };
+    case 'codex-cli':
+      return { CODEX_HOME: configHome };
+    case 'grok-build':
+      return { GROK_HOME: configHome };
+    default:
+      return {};
+  }
+}
+
+/**
+ * Where a framework's login writes its credential — the file whose appearance
+ * proves a `device-code` sign-in succeeded (see `EnrollmentWizard`'s
+ * `credentialWitness`). MIRRORS `enrollmentIsolationEnv` by construction: the
+ * credential lands wherever that env points, or in the CLI's ambient home when
+ * the framework has no isolation variable.
+ *
+ * Returns null for a framework whose credential location instar has not
+ * verified — a witness that guesses a path would read an absent file forever
+ * and silently degrade to the old re-ask loop while looking supported.
+ *
+ * `env`/`homedir` are parameters rather than direct `process`/`os` reads so the
+ * resolution stays pure and testable.
+ */
+export function enrollmentCredentialPath(
+  framework: string,
+  configHome: string | undefined,
+  env: Record<string, string | undefined>,
+  homedir: string,
+): string | null {
+  const join = (dir: string, file: string) => `${dir.replace(/\/+$/, '')}/${file}`;
+  switch (framework) {
+    case 'codex-cli':
+      return join(configHome ?? env['CODEX_HOME'] ?? join(homedir, '.codex'), 'auth.json');
+    case 'grok-build':
+      return join(configHome ?? env['GROK_HOME'] ?? join(homedir, '.grok'), 'auth.json');
+    default:
+      return null;
+  }
+}
+
 /** A login flow we know how to launch + scrape. */
 export interface FrameworkLoginRequest {
   provider: LoginProvider;
-  framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli';
+  framework: 'claude-code' | 'codex-cli' | 'gemini-cli' | 'pi-cli' | 'grok-build';
   kind: LoginFlowKind;
   /** The account's CLAUDE_CONFIG_DIR — isolates this login to its own slot. */
   configHome?: string;
+  /** False for background renewal; production must suppress browser launch. */
+  openBrowser?: boolean;
+}
+
+/** Environment prefix used by login commands when no operator initiated this drive.
+ * Claude Code honors BROWSER as its opener; `true` accepts the open request without
+ * launching an application while the CLI still prints the URL for capture. */
+export function enrollmentBrowserEnv(openBrowser: boolean | undefined): Record<string, string> {
+  return openBrowser === false ? { BROWSER: 'true' } : {};
 }
 
 /** Injected I/O so the driver is decoupled + hermetically testable. */
@@ -137,12 +241,14 @@ export class FrameworkLoginDriver {
     kind: LoginFlowKind;
     configHome?: string;
     scrapeTimeoutMs?: number;
+    openBrowser?: boolean;
   }): Promise<LoginArtifact> {
     const { session } = await this.deps.spawn({
       provider: req.provider,
       framework: req.framework,
       kind: req.kind,
       configHome: req.configHome,
+      openBrowser: req.openBrowser,
     });
     const budgetMs =
       typeof req.scrapeTimeoutMs === 'number' && Number.isFinite(req.scrapeTimeoutMs) && req.scrapeTimeoutMs > 0

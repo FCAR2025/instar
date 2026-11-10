@@ -27,8 +27,32 @@
  *   4. Skip if the prompt text just appeared (give verifyInjection its 6.5s
  *      window to handle the common race first).
  *   5. If the same prompt text persists across MIN_TICKS_BEFORE_FIRE ticks
- *      without changing AND no activity indicator, fire one recovery action,
- *      then escalate next tick if still stuck.
+ *      without changing AND no activity indicator, verify the text is REAL
+ *      input (see the ghost-text exclusion below), then fire one recovery
+ *      action, then escalate next tick if still stuck.
+ *
+ * Ghost-text exclusion (F2, live finding 2026-07-02): Claude Code renders a
+ * model-generated prompt SUGGESTION ("ghost text") in the composer — dim-styled
+ * (SGR 2, e.g. `ESC[0;2m`), never typed by anyone. In a plain capture-pane
+ * frame the dim attribute is stripped, so ghost text is byte-identical to real
+ * stuck input, and the sentinel fired 4 Enter presses at a fabricated
+ * instruction during the 2026-07-02 live run (harmless today only because
+ * Enter does not accept ghost text — one harness UX change away from a
+ * watchdog auto-submitting a model-fabricated instruction). The invariant this
+ * gate encodes: THE SENTINEL NEVER AUTO-SUBMITS TEXT THE USER (OR AN
+ * AUTHORIZED INJECTOR) DID NOT ACTUALLY TYPE. Before any keypress on the
+ * generic `❯`-prompt path, the sentinel re-captures the pane WITH ANSI escapes
+ * (`capture-pane -e`) and classifies the prompt text's presentation:
+ *   - 'real'         — rendered at normal intensity → proceed with recovery.
+ *   - 'ghost'        — rendered entirely dim → NEVER press keys at it; the
+ *                      record is exhausted until the prompt text changes.
+ *   - 'inconclusive' — ANSI capture failed, frames raced, or mixed styling →
+ *                      fail toward NOT pressing keys this tick (log-only);
+ *                      re-assessed next tick.
+ * The codex marker path is NOT gated: it only ever fires when the exact marker
+ * text we ourselves injected is stuck at the prompt, so the invariant holds
+ * there by construction (and codex's dim placeholder-hint is already excluded
+ * by marker matching).
  *
  * Bounded escalation matches SessionManager.fireStuckInputRecovery:
  *   attempt 0,1 → Enter        attempt 2 → C-m        attempt 3 → Enter+sleep+Enter
@@ -55,6 +79,11 @@ import type { SessionManager } from './SessionManager.js';
 import { CLAUDE_WORKING_INDICATORS } from './claudeActivityIndicators.js';
 import { DegradationReporter } from '../monitoring/DegradationReporter.js';
 import { SessionRecoveryChannel, type RecoveryTier } from './SessionRecoveryChannel.js';
+import {
+  RecoveryActuationAuthority,
+  type RecoveryAuthoritySnapshot,
+} from './RecoveryActuationAuthority.js';
+import type { DeliveryRecoverySnapshot } from './InboundDeliveryStore.js';
 
 export interface StuckInputSentinelOptions {
   /** Poll interval. Default 10s. */
@@ -82,6 +111,25 @@ export interface StuckInputSentinelOptions {
   /** How many ticks to wait for the lifeline to ack a tier-C request before
    *  giving up (bounded — no restart loop). Default 6. */
   escalationTimeoutTicks?: number;
+  /** Durable, single-use authority. Required whenever deeper recovery is live. */
+  recoveryAuthority?: RecoveryActuationAuthority;
+  /** Monotonic operator-stop signal (typically the durable stop flag mtime). */
+  operatorStopEpoch?: () => number;
+  /** Called ONCE per wedge when recovery has genuinely given up and the text at
+   *  the prompt is therefore undelivered. Every terminal path used to end in
+   *  `exhausted = true` plus one row in a JSONL file nobody reads, so an
+   *  operator's message could sit unsubmitted indefinitely with nothing raised
+   *  anywhere (indra, 2026-10-20: 28 minutes). The sentinel stays signal-only —
+   *  the consumer owns the attention item and any user-facing notice. */
+  onUndeliverable?: (info: {
+    tmuxSession: string;
+    promptText: string;
+    reason: string;
+    attempts: number;
+    stuckSinceMs: number;
+    conversationId?: string;
+    deliveryId?: string;
+  }) => void;
 }
 
 /** In-memory record of what the sentinel has seen for a given session. */
@@ -94,9 +142,27 @@ interface SessionStuckRecord {
   consecutiveTicks: number;
   /** How many recovery actions have been fired so far for this text. */
   attempts: number;
-  /** Whether this record is exhausted (max attempts reached, won't fire
-   *  again until the prompt text changes). */
+  /** Whether this record is exhausted (max attempts reached — or the text was
+   *  classified as ghost text — won't fire again until the prompt text
+   *  changes). */
   exhausted: boolean;
+  /** Whether a ghost-text-skip / ghost-check-inconclusive event has already
+   *  been logged for this record's text (one observability row per stuck
+   *  text, not one per tick). */
+  ghostSkipLogged?: boolean;
+  /** How many consecutive ticks the recovery primitive has REFUSED to send a
+   *  key for this text. A refusal consumes no rung (nothing was sent), so
+   *  without its own budget the ladder never advances and the sentinel retries
+   *  the same impossible keypress forever: one agent accumulated 75,001
+   *  consecutive `refused/missing-durable-delivery-evidence` rows, every one at
+   *  attempt 0, never escalating and never alarming. */
+  consecutiveRefusals?: number;
+  /** Whether the one-per-wedge refusal row has already been written (the
+   *  refusal repeats every tick; its observability value does not). */
+  refusalLogged?: boolean;
+  /** Whether the operator has already been told about this wedge. One alarm
+   *  per stuck text — never one per tick. */
+  undeliverableRaised?: boolean;
   /** Deeper-tier escalation phase (after the keypress ladder exhausts).
    *   - 'none': not escalating (keypress ladder still running or escalation off).
    *   - 'requested': a tier-C recovery request is in flight to the lifeline;
@@ -107,6 +173,8 @@ interface SessionStuckRecord {
   recoveryAttemptId?: string;
   /** tickCounter value when the request was emitted (for the bounded wait). */
   recoveryRequestedTick?: number;
+  observedRecovery?: DeliveryRecoverySnapshot;
+  observedOperatorStopEpoch?: number;
 }
 
 /** Event row written to stuck-input-events.jsonl on each fire. */
@@ -116,8 +184,10 @@ export interface StuckInputEvent {
   promptText: string;
   attempt: number;
   action: 'Enter' | 'C-m' | 'Enter-sleep-Enter'
-    | 'escalate-request' | 'escalate-recovered' | 'escalate-failed' | 'escalate-timeout';
-  outcome: 'fired' | 'fire-error' | 'escalated' | 'recovered' | 'gave-up';
+    | 'escalate-request' | 'escalate-recovered' | 'escalate-failed' | 'escalate-timeout'
+    | 'ghost-text-skip' | 'ghost-check-inconclusive'
+    | 'undeliverable';
+  outcome: 'fired' | 'effect-unknown' | 'refused' | 'fire-error' | 'escalated' | 'recovered' | 'gave-up' | 'skipped';
   /** Recovery tier for escalation events (absent for keypress events). */
   tier?: RecoveryTier;
   error?: string;
@@ -136,6 +206,118 @@ const DEFAULT_MAX_ATTEMPTS = 4;
  *  single canonical "mid-turn footer" tell. */
 const ACTIVITY_INDICATORS: readonly string[] = CLAUDE_WORKING_INDICATORS;
 
+/**
+ * How the stuck prompt text is RENDERED in the live pane (F2 ghost-text
+ * exclusion). Classified from an ANSI capture (`tmux capture-pane -e`):
+ *   - 'real'         — normal intensity: genuinely typed/injected input.
+ *   - 'ghost'        — entirely dim (SGR 2): the harness's model-generated
+ *                      composer suggestion; never actually typed by anyone.
+ *   - 'inconclusive' — cannot prove either way (capture failed, frames raced,
+ *                      mixed styling). The sentinel fails toward NOT pressing.
+ */
+export type PromptTextPresentation = 'real' | 'ghost' | 'inconclusive';
+
+/** One physical pane line decoded from an ANSI capture: the visible text and
+ *  a parallel per-character dim(SGR 2)-active mask. */
+interface AnsiDimLine { text: string; dim: boolean[] }
+
+/**
+ * Decode a `capture-pane -e` frame into visible lines plus a per-character
+ * dim-attribute mask. Tracks SGR state across the whole frame (tmux may or may
+ * not re-emit attributes at line starts). Handles the extended-color forms
+ * (`38;5;n`, `38;2;r;g;b` and their colon-subparam variants) so a truecolor
+ * component value of `2` is never misread as the dim attribute.
+ */
+function parseAnsiDimLines(ansi: string): AnsiDimLine[] {
+  const lines: AnsiDimLine[] = [{ text: '', dim: [] }];
+  let dimActive = false;
+  let i = 0;
+  while (i < ansi.length) {
+    const ch = ansi[i];
+    if (ch === '\x1b') {
+      const csi = /^\x1b\[([0-9;:]*)([@-~])/.exec(ansi.slice(i, i + 64));
+      if (csi) {
+        if (csi[2] === 'm') {
+          const params = csi[1] === '' ? ['0'] : csi[1].split(';');
+          let j = 0;
+          while (j < params.length) {
+            const head = params[j].split(':')[0];
+            if (head === '38' || head === '48' || head === '58') {
+              // Extended color. Colon-subparam form (38:2:r:g:b) is fully
+              // contained in this token; semicolon form consumes the mode +
+              // component params (5;n or 2;r;g;b) without interpreting them.
+              if (!params[j].includes(':')) {
+                const mode = params[j + 1];
+                if (mode === '5') j += 2;
+                else if (mode === '2') j += 4;
+              }
+              j += 1;
+              continue;
+            }
+            if (head === '' || head === '0') dimActive = false;      // full reset
+            else if (head === '2') dimActive = true;                  // dim/faint on
+            else if (head === '22') dimActive = false;                // normal intensity
+            j += 1;
+          }
+        }
+        i += csi[0].length;
+        continue;
+      }
+      // Non-CSI escape — skip ESC + the next byte conservatively.
+      i += 2;
+      continue;
+    }
+    if (ch === '\n') {
+      lines.push({ text: '', dim: [] });
+      i += 1;
+      continue;
+    }
+    if (ch === '\r') { i += 1; continue; }
+    const line = lines[lines.length - 1];
+    line.text += ch;
+    line.dim.push(dimActive);
+    i += 1;
+  }
+  return lines;
+}
+
+/**
+ * Classify how the stuck prompt text is rendered, from an ANSI (`-e`) capture
+ * of the SAME pane. `expectedText` is the stuck text extracted from the plain
+ * capture; when the ANSI frame's own prompt extraction does not reproduce it
+ * exactly (the two captures raced, or the frame has no readable prompt), the
+ * verdict is 'inconclusive' — never a guess.
+ *
+ * Grounded in the 2026-07-02 live F2 evidence: Claude Code's ghost suggestion
+ * rendered with `ESC[0;2m` (dim). Real typed/injected input renders at normal
+ * intensity. Only the dim attribute (SGR 2) is used as the ghost tell —
+ * color-based heuristics were deliberately NOT added (a gray-but-normal-
+ * intensity theme must not disable genuine recovery).
+ *
+ * Exported for unit tests; the live path goes through evaluateSession.
+ */
+export function classifyPromptTextPresentation(ansiPane: string, expectedText: string): PromptTextPresentation {
+  try {
+    const parsed = parseAnsiDimLines(ansiPane);
+    const located = StuckInputSentinel.locatePromptText(parsed.map(l => l.text));
+    if (!located || located.text !== expectedText) return 'inconclusive';
+    const dimMask = parsed[located.lineIdx].dim;
+    let sawDim = false;
+    let sawNormal = false;
+    for (let k = 0; k < located.text.length; k++) {
+      const ch = located.text[k];
+      if (ch === ' ' || ch === '\t') continue; // whitespace carries no styling signal
+      if (dimMask[located.start + k]) sawDim = true;
+      else sawNormal = true;
+    }
+    if (sawDim && !sawNormal) return 'ghost';
+    if (sawNormal && !sawDim) return 'real';
+    return 'inconclusive'; // mixed styling (or no styleable chars) — do not guess
+  } catch {
+    return 'inconclusive'; // any parse failure fails toward NOT pressing keys
+  }
+}
+
 export class StuckInputSentinel {
   private readonly sessionManager: SessionManager;
   private readonly tickMs: number;
@@ -147,6 +329,9 @@ export class StuckInputSentinel {
   private readonly recoveryChannel: SessionRecoveryChannel | null;
   private readonly escalationEnabled: boolean;
   private readonly escalationTimeoutTicks: number;
+  private readonly recoveryAuthority: RecoveryActuationAuthority | null;
+  private readonly operatorStopEpoch: () => number;
+  private readonly onUndeliverable: StuckInputSentinelOptions['onUndeliverable'];
 
   /** Per-session sticky state. Keyed by tmuxSession. */
   private readonly records: Map<string, SessionStuckRecord> = new Map();
@@ -168,6 +353,46 @@ export class StuckInputSentinel {
     this.recoveryChannel = opts.recoveryChannel ?? null;
     this.escalationEnabled = opts.escalationEnabled ?? false;
     this.escalationTimeoutTicks = opts.escalationTimeoutTicks ?? 6;
+    this.recoveryAuthority = opts.recoveryAuthority ?? null;
+    this.operatorStopEpoch = opts.operatorStopEpoch ?? (() => 0);
+    this.onUndeliverable = opts.onUndeliverable;
+  }
+
+  /**
+   * Announce, exactly once per wedge, that the text at this prompt is not going
+   * to be delivered. Signal-only: it writes the terminal row and hands the fact
+   * to the consumer, which owns the attention item and any user-facing notice.
+   * A throwing consumer must never take the sentinel's tick loop down with it.
+   */
+  private raiseUndeliverable(
+    record: SessionStuckRecord, tmuxSession: string, stuckText: string, now: number, reason: string,
+  ): void {
+    if (record.undeliverableRaised) return;
+    record.undeliverableRaised = true;
+    const marker = this.sessionManager.getStrandedDraftMarker?.(tmuxSession);
+    this.recordEvent({
+      ts: new Date(now).toISOString(),
+      session: tmuxSession,
+      promptText: stuckText.slice(0, 200),
+      attempt: record.attempts,
+      action: 'undeliverable',
+      outcome: 'gave-up',
+      error: reason,
+    });
+    console.warn(`[StuckInputSentinel] UNDELIVERED input in "${tmuxSession}" — ${reason}. Text has been at the prompt for ${Math.round((now - record.firstSeenAt) / 1000)}s.`);
+    try {
+      this.onUndeliverable?.({
+        tmuxSession,
+        promptText: stuckText.slice(0, 200),
+        reason,
+        attempts: record.attempts,
+        stuckSinceMs: now - record.firstSeenAt,
+        conversationId: marker?.conversationId,
+        deliveryId: marker?.deliveryId,
+      });
+    } catch (err) {
+      console.error(`[StuckInputSentinel] onUndeliverable consumer threw for "${tmuxSession}": ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   start(): void {
@@ -209,7 +434,7 @@ export class StuckInputSentinel {
     for (const session of running) {
       const name = session.tmuxSession;
       seenSessions.add(name);
-      this.evaluateSession(name);
+      this.evaluateSession(name, session.framework);
     }
 
     // GC: drop records for sessions that are no longer running.
@@ -229,8 +454,21 @@ export class StuckInputSentinel {
   }
 
   /** Evaluate a single tmux session for stuck-input recovery. */
-  private evaluateSession(tmuxSession: string): void {
+  private evaluateSession(tmuxSession: string, framework?: string): void {
     const priorRecord = this.records.get(tmuxSession);
+    // Codex's empty composer contains model-generated placeholder text that is
+    // byte-indistinguishable from typed input once styling is stripped.  A
+    // durable stranded-draft marker is therefore the ONLY authority to inspect
+    // a Codex composer.  Besides preventing false Enter presses, this avoids a
+    // pair of synchronous tmux probes for every idle Codex session on every
+    // 10-second tick.  On hosts with thousands of global tmux sessions, each
+    // such command can take hundreds of milliseconds and starve `/health`.
+    const pendingBeforeCapture = this.sessionManager.getStrandedDraftMarker(tmuxSession);
+    if (framework === 'codex-cli' && !pendingBeforeCapture) {
+      this.finalizePendingRecovery(tmuxSession, priorRecord, 'no-tracked-draft');
+      this.records.delete(tmuxSession);
+      return;
+    }
     let pane: string | null;
     try {
       if (!this.sessionManager.tmuxSessionExists(tmuxSession)) {
@@ -265,12 +503,15 @@ export class StuckInputSentinel {
     // input once color is stripped, so the generic prompt-text reader would
     // false-fire on every idle codex session. The injected marker never equals
     // the placeholder. Everything else uses the generic `❯`-prompt reader.
-    const pending = this.sessionManager.getStrandedDraftMarker(tmuxSession);
+    const pending = pendingBeforeCapture ?? this.sessionManager.getStrandedDraftMarker(tmuxSession);
     const codexMarker = pending && pending.framework === 'codex-cli' ? pending.marker : null;
 
     let stuckText: string | null;
     if (codexMarker) {
-      stuckText = this.sessionManager.isMarkerStuckAtPrompt(pane, codexMarker) ? codexMarker : null;
+      const composer = this.sessionManager.trackedDraftComposerState?.(tmuxSession, pane)
+        ?? (this.sessionManager.isMarkerStuckAtPrompt(pane, codexMarker) ? 'present' : 'cleared');
+      if (composer === 'unknown') return;
+      stuckText = composer === 'present' ? codexMarker : null;
     } else {
       stuckText = this.extractPromptText(pane);
     }
@@ -295,6 +536,8 @@ export class StuckInputSentinel {
         attempts: 0,
         exhausted: false,
         recoveryPhase: 'none',
+        observedRecovery: this.sessionManager.strandedDraftRecoverySnapshot?.(tmuxSession) ?? undefined,
+        observedOperatorStopEpoch: this.operatorStopEpoch(),
       });
       return;
     }
@@ -305,6 +548,15 @@ export class StuckInputSentinel {
     if (existing.exhausted) return;
     if (existing.consecutiveTicks < this.minTicksBeforeFire) return;
     if (existing.attempts >= this.maxAttempts) {
+      this.sessionManager.markStrandedDraftExhausted?.(tmuxSession);
+      // Every rung was sent and the text is STILL at an idle prompt, so it is
+      // undelivered. Announce that before escalating: tier C is dark on most
+      // installs, and its legacy branch just sets `exhausted = true`, which is
+      // how a wedge used to end in silence.
+      this.raiseUndeliverable(
+        existing, tmuxSession, stuckText, now,
+        `keypress ladder exhausted after ${existing.attempts} attempts; prompt unchanged`,
+      );
       // Keypress ladder (tier A) exhausted. Either escalate to deeper-tier
       // recovery (tier C: cross-process server restart + replay request) when
       // enabled, or fall back to the legacy "mark exhausted, stop" behavior.
@@ -312,18 +564,91 @@ export class StuckInputSentinel {
       return;
     }
 
+    // F2 ghost-text exclusion: before pressing ANY key on the generic
+    // `❯`-prompt path, verify the stuck text is REAL input (typed or injected)
+    // and not the harness's dim-rendered, model-generated composer suggestion.
+    // The codex marker path is exempt by construction — it only fires when the
+    // exact text WE injected is stuck at the prompt (see the file header).
+    // Escalation (the maxAttempts branch above) is unreachable for ghost text:
+    // attempts only accrue through this gate, so four 'real' verdicts must
+    // precede any tier-C request.
+    if (!codexMarker) {
+      const presentation = this.assessPromptTextPresentation(tmuxSession, stuckText);
+      if (presentation !== 'real') {
+        // 'ghost' is sticky: the suggestion is never pressable; a prompt-text
+        // change resets the record. 'inconclusive' is transient: re-assess
+        // next tick (a raced capture self-heals; a persistent failure keeps
+        // failing toward NOT pressing keys).
+        if (presentation === 'ghost') existing.exhausted = true;
+        if (!existing.ghostSkipLogged) {
+          existing.ghostSkipLogged = true;
+          this.recordEvent({
+            ts: new Date(now).toISOString(),
+            session: tmuxSession,
+            promptText: stuckText.slice(0, 200),
+            attempt: existing.attempts,
+            action: presentation === 'ghost' ? 'ghost-text-skip' : 'ghost-check-inconclusive',
+            outcome: 'skipped',
+          });
+        }
+        return;
+      }
+    }
+
     // Fire one recovery action and record it.
     const attempt = existing.attempts;
     const action = StuckInputSentinel.actionForAttempt(attempt);
-    let outcome: StuckInputEvent['outcome'] = 'fired';
+    let outcome: StuckInputEvent['outcome'] = 'refused';
     let errMsg: string | undefined;
     try {
-      this.sessionManager.fireStuckInputRecovery(tmuxSession, attempt);
+      const result = this.sessionManager.fireStuckInputRecovery(tmuxSession, attempt);
+      if (result?.status === 'attempted') {
+        outcome = 'fired';
+        existing.attempts += 1;
+      } else if (result?.status === 'effect-unknown') {
+        // Once the effect boundary was crossed, the rung is permanently
+        // consumed even though its outcome cannot be proven.
+        outcome = 'effect-unknown';
+        existing.attempts += 1;
+        errMsg = result.reason;
+      } else {
+        outcome = 'refused';
+        errMsg = result?.reason ?? 'recovery primitive returned no durable outcome';
+      }
     } catch (err) {
       outcome = 'fire-error';
       errMsg = err instanceof Error ? err.message : String(err);
     }
-    existing.attempts += 1;
+
+    // A refusal means no key reached the pane, so it consumes no rung — but it
+    // must still consume a BUDGET, or an impossible keypress is retried until
+    // the session dies, silently (the 75,001-row loop). Give refusals the same
+    // budget as the keypress ladder, then treat the ladder as spent so the
+    // existing terminal path runs and the wedge is announced exactly once.
+    if (outcome === 'refused') {
+      existing.consecutiveRefusals = (existing.consecutiveRefusals ?? 0) + 1;
+      const firstRefusal = !existing.refusalLogged;
+      if (firstRefusal) existing.refusalLogged = true;
+      if (firstRefusal) {
+        this.recordEvent({
+          ts: new Date(now).toISOString(),
+          session: tmuxSession,
+          promptText: stuckText.slice(0, 200),
+          attempt,
+          action,
+          outcome,
+          error: errMsg,
+        });
+      }
+      if (existing.consecutiveRefusals >= this.maxAttempts) {
+        this.raiseUndeliverable(existing, tmuxSession, stuckText, now, `recovery refused ${existing.consecutiveRefusals}x: ${errMsg ?? 'unknown'}`);
+        this.sessionManager.markStrandedDraftExhausted?.(tmuxSession);
+        this.handleEscalation(existing, tmuxSession, stuckText, now);
+      }
+      return;
+    }
+    existing.consecutiveRefusals = 0;
+    existing.refusalLogged = false;
 
     this.recordEvent({
       ts: new Date(now).toISOString(),
@@ -335,14 +660,18 @@ export class StuckInputSentinel {
       error: errMsg,
     });
 
-    if (!this.degradationReportedOnce) {
+    if ((outcome === 'fired' || outcome === 'effect-unknown') && !this.degradationReportedOnce) {
       this.degradationReportedOnce = true;
       DegradationReporter.getInstance().report({
         feature: 'StuckInputSentinel.recover',
         primary: 'Bracketed paste + Enter submits injected message',
         fallback: 'Persistent sentinel re-fires Enter after in-process verifyInjection window expired (covers server-restart cases)',
         reason: 'Prompt text persistent for ≥2 sentinel ticks with no activity indicator',
-        impact: 'Recovered without user intervention; survives server restart',
+        // Reports what was DONE. The outcome is unknown at this point — the key
+        // has only just been sent — and the next tick is what observes whether
+        // the prompt cleared. A wedge that never clears ends in the
+        // `undeliverable` row instead, which is the honest terminal state.
+        impact: 'Recovery keypress sent (survives server restart); outcome observed on the following tick',
       });
     }
   }
@@ -352,23 +681,59 @@ export class StuckInputSentinel {
    *
    *  Public for unit tests; the live tick goes through evaluateSession. */
   extractPromptText(pane: string): string | null {
-    const lines = pane.split('\n');
+    return StuckInputSentinel.locatePromptText(pane.split('\n'))?.text ?? null;
+  }
+
+  /**
+   * Locate the stuck prompt text within the pane's lines: which line holds it,
+   * the column it starts at, and the trimmed text. This is extractPromptText's
+   * engine, factored out so the ghost-text classifier can map the SAME
+   * located characters onto an ANSI capture's per-character dim mask —
+   * guaranteeing the styling verdict is about exactly the text the plain-frame
+   * extraction saw, never a different region of the pane.
+   */
+  static locatePromptText(lines: string[]): { lineIdx: number; start: number; text: string } | null {
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i];
       if (!line || !line.includes('❯')) continue;
       // Take everything after the LAST ❯ on the line, trimmed.
       const idx = line.lastIndexOf('❯');
-      const after = line.slice(idx + 1).trim();
-      if (after.length > 0) return after;
+      const after = line.slice(idx + 1);
+      const text = after.trim();
+      if (text.length > 0) {
+        const start = idx + 1 + (after.length - after.trimStart().length);
+        return { lineIdx: i, start, text };
+      }
       // Empty prompt line — look at the immediately-following line for
       // wrapped multi-line input. If that's also empty, no stuck text.
       const next = lines[i + 1];
-      if (next && next.trim().length > 0 && !this.isStatusLine(next)) {
-        return next.trim();
+      if (next && next.trim().length > 0 && !StuckInputSentinel.isStatusLine(next)) {
+        return {
+          lineIdx: i + 1,
+          start: next.length - next.trimStart().length,
+          text: next.trim(),
+        };
       }
       return null;
     }
     return null;
+  }
+
+  /**
+   * F2 ghost-text gate: capture the SAME pane WITH ANSI escapes and classify
+   * how the stuck text is rendered. Every failure path — no ANSI capture
+   * support, capture returned null, capture threw — resolves to
+   * 'inconclusive', which the caller treats as "do NOT press keys this tick".
+   */
+  private assessPromptTextPresentation(tmuxSession: string, expectedText: string): PromptTextPresentation {
+    let ansiPane: string | null;
+    try {
+      ansiPane = this.sessionManager.captureOutputAnsi(tmuxSession, 30);
+    } catch {
+      return 'inconclusive';
+    }
+    if (!ansiPane) return 'inconclusive';
+    return classifyPromptTextPresentation(ansiPane, expectedText);
   }
 
   /** True if the pane currently shows a Claude Code "working" indicator.
@@ -400,8 +765,8 @@ export class StuckInputSentinel {
 
   /** Heuristic: lines that look like Claude Code status/separator content
    *  rather than wrapped input. Used to avoid mistaking a separator for
-   *  wrapped prompt text in extractPromptText. */
-  private isStatusLine(line: string): boolean {
+   *  wrapped prompt text in locatePromptText. */
+  private static isStatusLine(line: string): boolean {
     const t = line.trim();
     if (!t) return true;
     // Long runs of horizontal box-drawing chars are the input-box border.
@@ -466,7 +831,7 @@ export class StuckInputSentinel {
     record: SessionStuckRecord, tmuxSession: string, stuckText: string, now: number,
   ): void {
     const channel = this.recoveryChannel;
-    if (!this.escalationEnabled || !channel) {
+    if (!this.escalationEnabled || !channel || !this.recoveryAuthority) {
       record.exhausted = true; // legacy behavior
       return;
     }
@@ -475,18 +840,54 @@ export class StuckInputSentinel {
     const promptText = stuckText.slice(0, 200);
 
     if (record.recoveryPhase === 'none') {
+      const observed = record.observedRecovery;
+      const current = this.sessionManager.strandedDraftRecoverySnapshot?.(tmuxSession);
+      if (!observed || !current) {
+        record.exhausted = true;
+        this.recordEvent({ ts: isoNow, session: tmuxSession, promptText, attempt: record.attempts, action: 'escalate-failed', outcome: 'refused', tier: 'server-restart-replay', error: 'recovery-evidence-unavailable' });
+        return;
+      }
+      const authoritySnapshot: RecoveryAuthoritySnapshot = {
+        operatorStopEpoch: this.operatorStopEpoch(),
+        observedOperatorStopEpoch: record.observedOperatorStopEpoch ?? 0,
+        ownerEpoch: current.ownerEpoch,
+        observedOwnerEpoch: observed.ownerEpoch,
+        latestOrdinal: current.latestOrdinal,
+        deliveryOrdinal: observed.deliveryOrdinal,
+        sessionActive: false,
+        incarnation: current.incarnation,
+        observedIncarnation: observed.incarnation,
+        deliveryExhausted: current.deliveryExhausted,
+        breakerOpen: current.breakerOpen,
+      };
+      const authorized = this.recoveryAuthority.authorize({
+        ...authoritySnapshot,
+        conversationId: current.conversationId,
+        deliveryId: current.deliveryId,
+        now,
+      });
+      if (!authorized.ok) {
+        record.exhausted = true;
+        this.recordEvent({ ts: isoNow, session: tmuxSession, promptText, attempt: record.attempts, action: 'escalate-failed', outcome: 'refused', tier: 'server-restart-replay', error: authorized.reason });
+        return;
+      }
       // First escalation — request tier C from the lifeline.
       const attemptId = `${tmuxSession}#${record.firstSeenAt}`;
       const tier: RecoveryTier = 'server-restart-replay';
       try {
-        channel.requestRecovery({
+        const published = this.recoveryAuthority.publish(authorized.capability.id, () => channel.requestRecovery({
           sessionId: tmuxSession,
           tier,
           reason: `keypress ladder exhausted (${this.maxAttempts} attempts); prompt still stuck`,
           observedAt: isoNow,
           attemptId,
           requestedBy: 'StuckInputSentinel',
-        });
+        }), now);
+        if (!published.ok || !published.requested) {
+          record.exhausted = true;
+          this.recordEvent({ ts: isoNow, session: tmuxSession, promptText, attempt: record.attempts, action: 'escalate-failed', outcome: 'refused', tier, error: published.ok ? 'recovery-request-refused' : published.reason });
+          return;
+        }
         record.recoveryPhase = 'requested';
         record.recoveryAttemptId = attemptId;
         record.recoveryRequestedTick = this.tickCounter;

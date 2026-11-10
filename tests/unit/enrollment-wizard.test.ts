@@ -45,30 +45,24 @@ describe('EnrollmentWizard', () => {
     expect(EnrollmentWizard.defaultKind('openai')).toBe('device-code');
     expect(EnrollmentWizard.defaultKind('anthropic')).toBe('url-code-paste');
     expect(EnrollmentWizard.defaultKind('github-copilot')).toBe('url-code-paste');
+    // Round-12 (grok-build spec §3.3): xAI's login is `grok login --device-auth`
+    // — a flow whose whole point is the CODE. Falling into the url-code-paste
+    // branch handed the operator's phone a verification URL with no code at all,
+    // which is unusable; only the login COMMAND had been wired.
+    expect(EnrollmentWizard.defaultKind('xai')).toBe('device-code');
   });
 
-  it('flowNotice: url-code-paste (Claude) warns about the two-code sequence; device-code does not', () => {
-    const claude = EnrollmentWizard.flowNotice('url-code-paste');
-    expect(claude).toBeTruthy();
-    expect(claude).toMatch(/two codes/i);
-    expect(claude).toMatch(/email/i);
-    expect(EnrollmentWizard.flowNotice('device-code')).toBeUndefined();
-  });
+  it('start attaches NO flow notice on any enrollment (the two-codes disclaimer is retired)', async () => {
+    const claude = wizard([{ verificationUrl: 'https://claude.com/oauth/authorize?code=abc', ttlMs: 15 * 60_000 }]);
+    const cl = await claude.start({ id: 'sagemind-1', label: 'SageMind - Justin', provider: 'anthropic', framework: 'claude-code' });
+    expect(cl.kind).toBe('url-code-paste');
+    expect(cl.notice).toBeUndefined();
+    expect(claude.pending()[0].notice).toBeUndefined();
 
-  it('start attaches the two-code notice on a Claude (url-code-paste) enrollment', async () => {
-    const w = wizard([{ verificationUrl: 'https://claude.com/oauth/authorize?code=abc', ttlMs: 15 * 60_000 }]);
-    const l = await w.start({ id: 'sagemind-1', label: 'SageMind - Justin', provider: 'anthropic', framework: 'claude-code' });
-    expect(l.kind).toBe('url-code-paste');
-    expect(l.notice).toMatch(/two codes/i);
-    // it survives the store round-trip onto the phone surface
-    expect(w.pending()[0].notice).toMatch(/two codes/i);
-  });
-
-  it('start attaches NO notice on a device-code (Codex) enrollment', async () => {
-    const w = wizard([{ verificationUrl: 'https://auth.openai.com/codex/device', userCode: '7DAU-W4XJA', ttlMs: 15 * 60_000 }]);
-    const l = await w.start({ id: 'codex-1', label: 'codex', provider: 'openai', framework: 'codex-cli' });
-    expect(l.kind).toBe('device-code');
-    expect(l.notice).toBeUndefined();
+    const codex = wizard([{ verificationUrl: 'https://auth.openai.com/codex/device', userCode: '7DAU-W4XJA', ttlMs: 15 * 60_000 }]);
+    const cx = await codex.start({ id: 'codex-1', label: 'codex', provider: 'openai', framework: 'codex-cli' });
+    expect(cx.kind).toBe('device-code');
+    expect(cx.notice).toBeUndefined();
   });
 
   it('start drives the login + stores the public code/URL with TTL', async () => {
@@ -99,6 +93,66 @@ describe('EnrollmentWizard', () => {
     expect(driveCalls).toBe(2); // start + one reissue
     // Now valid again → pending surface shows the fresh code.
     expect(w.pending()[0].userCode).toBe('7EHB-L23HC');
+  });
+
+  it('auto-reissue refreshes the stored link without browser-open consent', async () => {
+    const requests: Parameters<LoginDriver>[0][] = [];
+    const w = new EnrollmentWizard({
+      store, now: () => clock,
+      driveLogin: async (req) => {
+        requests.push(req);
+        return { verificationUrl: `https://claude.com/oauth/${requests.length}`, ttlMs: 15 * 60_000 };
+      },
+    });
+    await w.start({ id: 'claude-1', label: 'Claude', provider: 'anthropic', framework: 'claude-code' });
+    clock = T0 + 16 * 60_000;
+    const renewed = await w.reissueExpired();
+    expect(requests.map((r) => r.openBrowser)).toEqual([true, false]);
+    expect(renewed[0].verificationUrl).toBe('https://claude.com/oauth/2');
+    expect(store.get('claude-1')?.verificationUrl).toBe('https://claude.com/oauth/2');
+  });
+
+  it('restores a durable pending flow after restart with a fresh artifact and no browser pop', async () => {
+    const requests: Parameters<LoginDriver>[0][] = [];
+    const first = new EnrollmentWizard({
+      store, now: () => clock,
+      driveLogin: async () => ({
+        verificationUrl: 'https://claude.com/oauth/old',
+        ttlMs: 15 * 60_000,
+      }),
+    });
+    await first.start({
+      id: 'claude-1', label: 'Claude', provider: 'anthropic',
+      framework: 'claude-code', configHome: '/tmp/claude-1',
+    });
+
+    // A new process loads the same durable store, but its old pane no longer
+    // exists. Boot recovery must re-drive it before traffic is served.
+    const restartedStore = new PendingLoginStore({ stateDir: dir, now: () => clock });
+    const restarted = new EnrollmentWizard({
+      store: restartedStore, now: () => clock,
+      driveLogin: async (req) => {
+        requests.push(req);
+        return { verificationUrl: 'https://claude.com/oauth/fresh', ttlMs: 15 * 60_000 };
+      },
+    });
+    const recovered = await restarted.recoverAfterRestart();
+
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].verificationUrl).toBe('https://claude.com/oauth/fresh');
+    expect(recovered[0].reissueCount).toBe(1);
+    expect(requests[0].openBrowser).toBe(false);
+  });
+
+  it('refreshes a live-but-dead-pane flow and leaves terminal flows untouched', async () => {
+    const w = wizard([
+      { verificationUrl: 'https://claude.com/oauth/old', ttlMs: 15 * 60_000 },
+      { verificationUrl: 'https://claude.com/oauth/fresh', ttlMs: 15 * 60_000 },
+    ]);
+    await w.start({ id: 'claude-1', label: 'Claude', provider: 'anthropic', framework: 'claude-code' });
+    expect((await w.refresh('claude-1'))?.verificationUrl).toBe('https://claude.com/oauth/fresh');
+    w.complete('claude-1');
+    expect(await w.refresh('claude-1')).toBeNull();
   });
 
   it('a driver failure during reissue is skipped (sweep continues, login stays expired)', async () => {
@@ -202,11 +256,14 @@ describe('EnrollmentWizard', () => {
         configHome,
         verificationUrl: 'https://claude.com/oauth',
         ...(expectedEmail !== undefined ? { expectedEmail } : {}),
+        ...(expectedEmail !== undefined ? { authRevisionBaseline: 'before' } : {}),
       });
     }
     function build(opts: {
       oracle?: { resolveSlotTenant: (slot: string) => Promise<{ email?: string; unavailable?: boolean; reason?: string }> };
       emitAttention?: (item: { id: string; title: string; body: string; priority: 'high'; source: 'agent' }) => void;
+      authRevisionWitness?: () => Promise<string | null> | string | null;
+      ensureReady?: (configHome: string) => { patched: boolean; reason: string };
     }) {
       return new EnrollmentWizard({
         store,
@@ -214,6 +271,8 @@ describe('EnrollmentWizard', () => {
         now: () => clock,
         oracle: opts.oracle,
         emitAttention: opts.emitAttention,
+        authRevisionWitness: opts.authRevisionWitness,
+        ensureReady: opts.ensureReady,
       });
     }
 
@@ -238,6 +297,28 @@ describe('EnrollmentWizard', () => {
       if (r.outcome === 'held') expect(r.reason).toBe('email-mismatch');
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit.mock.calls[0][0]).toMatchObject({ priority: 'high', source: 'agent' });
+    });
+
+    it('(b2) a held verdict carries BOTH account emails (expected + got) so the surface can name them — topic 29836 D3', async () => {
+      issueFollowMe('approved@x.com');
+      const w = build({ oracle: { resolveSlotTenant: async () => ({ email: 'other@x.com' }) } });
+      const r = await w.completeFollowMe('fm-1', 'the Mini');
+      expect(r.outcome).toBe('held');
+      if (r.outcome === 'held') {
+        expect(r.expected).toBe('approved@x.com');
+        expect(r.got).toBe('other@x.com');
+      }
+    });
+
+    it('(b3) an oracle-unavailable held carries got:null (honest "couldn\'t confirm"), never a fabricated email', async () => {
+      issueFollowMe('approved@x.com');
+      const w = build({ oracle: { resolveSlotTenant: async () => ({ unavailable: true, reason: 'probe down' }) } });
+      const r = await w.completeFollowMe('fm-1', 'the Mini');
+      expect(r.outcome).toBe('held');
+      if (r.outcome === 'held') {
+        expect(r.got).toBeNull();
+        expect(r.expected).toBe('approved@x.com');
+      }
     });
 
     it('(c) oracle unavailable → held (fail-closed)', async () => {
@@ -276,6 +357,203 @@ describe('EnrollmentWizard', () => {
       const w = build({ oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) } });
       const r = await w.completeFollowMe('nope', 'the Mini');
       expect(r.outcome).toBe('not-found');
+    });
+
+    // ── D5 (topic 29836) — the already-authorized short-circuit completion sweep ──
+    describe('sweepFollowMeCompletions', () => {
+      it('captures the auth revision before driving a follow-me login', async () => {
+        const order: string[] = [];
+        const w = new EnrollmentWizard({
+          store,
+          now: () => clock,
+          authRevisionWitness: async () => { order.push('baseline'); return 'before'; },
+          driveLogin: async () => {
+            order.push('drive');
+            return { verificationUrl: 'https://claude.com/oauth', ttlMs: 15 * 60_000 };
+          },
+        });
+
+        await w.start({
+          id: 'fm-1', label: 'main', provider: 'anthropic', framework: 'claude-code',
+          configHome: '/x/.claude-fm', expectedEmail: 'j@x.com',
+        });
+
+        expect(order).toEqual(['baseline', 'drive']);
+        expect(store.get('fm-1')?.authRevisionBaseline).toBe('before');
+      });
+
+      it('a landed credential + matching identity → validated + onValidated (pool add) called', async () => {
+        issueFollowMe('j@x.com');
+        const onValidated = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'after',
+        });
+        const results = await w.sweepFollowMeCompletions({
+          onValidated,
+        });
+        expect(results).toEqual([{ id: 'fm-1', outcome: 'validated' }]);
+        expect(onValidated).toHaveBeenCalledTimes(1);
+        expect(onValidated.mock.calls[0][1]).toBe('j@x.com');
+        expect(store.get('fm-1')?.status).toBe('completed');
+      });
+
+      it('a landed credential with a MISMATCHED identity → held, onValidated NOT called (fail-closed)', async () => {
+        issueFollowMe('approved@x.com');
+        const onValidated = vi.fn();
+        const emit = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'other@x.com' }) },
+          emitAttention: emit,
+          authRevisionWitness: () => 'after',
+        });
+        const results = await w.sweepFollowMeCompletions({ onValidated });
+        expect(results).toEqual([{ id: 'fm-1', outcome: 'held' }]);
+        expect(onValidated).not.toHaveBeenCalled();
+        expect(emit).toHaveBeenCalledTimes(1); // HIGH attention item raised
+      });
+
+      it('no landed credential → untouched (the login stays pending for the code paste-back)', async () => {
+        issueFollowMe('j@x.com');
+        const onValidated = vi.fn();
+        const w = build({ oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) } });
+        const results = await w.sweepFollowMeCompletions({ onValidated });
+        expect(results).toEqual([]);
+        expect(onValidated).not.toHaveBeenCalled();
+        expect(store.get('fm-1')?.status).toBe('pending');
+      });
+
+      it('a NON-follow-me login (no expectedEmail) is never swept (its completion stays explicit)', async () => {
+        store.issue({
+          id: 'plain-1', label: 'plain', provider: 'anthropic', framework: 'claude-code',
+          kind: 'url-code-paste', configHome: '/x/.claude-plain', verificationUrl: 'https://claude.com/oauth',
+        });
+        const onValidated = vi.fn();
+        const w = build({ oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) } });
+        const results = await w.sweepFollowMeCompletions({ onValidated });
+        expect(results).toEqual([]);
+        expect(store.get('plain-1')?.status).toBe('pending');
+      });
+
+      it('an auth revision probe that THROWS is treated as not-ready (never crashes the sweep)', async () => {
+        issueFollowMe('j@x.com');
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => { throw new Error('keychain boom'); },
+        });
+        const results = await w.sweepFollowMeCompletions({
+          onValidated: vi.fn(),
+        });
+        expect(results).toEqual([]);
+        expect(store.get('fm-1')?.status).toBe('pending');
+      });
+
+      it('an unchanged existing credential is never mistaken for completion', async () => {
+        issueFollowMe('j@x.com');
+        const onValidated = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'before',
+        });
+
+        const results = await w.sweepFollowMeCompletions({ onValidated });
+
+        expect(results).toEqual([]);
+        expect(onValidated).not.toHaveBeenCalled();
+        expect(store.get('fm-1')?.status).toBe('pending');
+      });
+
+      it('a legacy pending login with no captured baseline fails closed', async () => {
+        store.issue({
+          id: 'legacy', label: 'legacy', provider: 'anthropic', framework: 'claude-code',
+          kind: 'url-code-paste', configHome: '/x/.claude-legacy',
+          verificationUrl: 'https://claude.com/oauth', expectedEmail: 'j@x.com',
+        });
+        const onValidated = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'after',
+        });
+
+        const results = await w.sweepFollowMeCompletions({ onValidated });
+
+        expect(results).toEqual([]);
+        expect(onValidated).not.toHaveBeenCalled();
+        expect(store.get('legacy')?.status).toBe('pending');
+      });
+
+      it('an unreadable baseline recorded as null cannot later masquerade as a credential change', async () => {
+        store.issue({
+          id: 'unreadable', label: 'unreadable', provider: 'anthropic', framework: 'claude-code',
+          kind: 'url-code-paste', configHome: '/x/.claude-unreadable',
+          verificationUrl: 'https://claude.com/oauth', expectedEmail: 'j@x.com',
+          authRevisionBaseline: null,
+        });
+        const onValidated = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'now-readable',
+        });
+
+        expect(await w.sweepFollowMeCompletions({ onValidated })).toEqual([]);
+        expect(onValidated).not.toHaveBeenCalled();
+        expect(store.get('unreadable')?.status).toBe('pending');
+      });
+
+      it('a pool-finalization failure leaves the login pending and retries on the next sweep', async () => {
+        issueFollowMe('j@x.com');
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'after',
+        });
+        const onValidated = vi.fn()
+          .mockImplementationOnce(() => { throw new Error('pool write failed'); })
+          .mockImplementationOnce(() => {});
+
+        expect(await w.sweepFollowMeCompletions({ onValidated })).toEqual([]);
+        expect(store.get('fm-1')?.status).toBe('pending');
+        expect(await w.sweepFollowMeCompletions({ onValidated })).toEqual([{ id: 'fm-1', outcome: 'validated' }]);
+        expect(onValidated).toHaveBeenCalledTimes(2);
+        expect(store.get('fm-1')?.status).toBe('completed');
+      });
+
+      it('concurrent sweeps single-flight one login and finalize it exactly once', async () => {
+        issueFollowMe('j@x.com');
+        let releaseWitness!: () => void;
+        const witnessPaused = new Promise<void>((resolve) => { releaseWitness = resolve; });
+        let witnessEntered!: () => void;
+        const entered = new Promise<void>((resolve) => { witnessEntered = resolve; });
+        const onValidated = vi.fn();
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: async () => { witnessEntered(); await witnessPaused; return 'after'; },
+        });
+
+        const first = w.sweepFollowMeCompletions({ onValidated });
+        await entered;
+        const second = w.sweepFollowMeCompletions({ onValidated });
+        releaseWitness();
+
+        expect(await second).toEqual([]);
+        expect(await first).toEqual([{ id: 'fm-1', outcome: 'validated' }]);
+        expect(onValidated).toHaveBeenCalledTimes(1);
+      });
+
+      it('the winning sweep seeds Claude interactive readiness exactly once', async () => {
+        issueFollowMe('j@x.com');
+        const ensureReady = vi.fn(() => ({ patched: true, reason: 'seeded' }));
+        const w = build({
+          oracle: { resolveSlotTenant: async () => ({ email: 'j@x.com' }) },
+          authRevisionWitness: () => 'after',
+          ensureReady,
+        });
+
+        expect(await w.sweepFollowMeCompletions({ onValidated: vi.fn() }))
+          .toEqual([{ id: 'fm-1', outcome: 'validated' }]);
+        expect(await w.sweepFollowMeCompletions({ onValidated: vi.fn() })).toEqual([]);
+        expect(ensureReady).toHaveBeenCalledTimes(1);
+        expect(ensureReady).toHaveBeenCalledWith('/x/.claude-fm');
+      });
     });
   });
 
@@ -328,6 +606,7 @@ describe('EnrollmentWizard', () => {
     it('remoteKind prefers device-code for OpenAI; keeps url-code-paste for Claude', () => {
       expect(EnrollmentWizard.remoteKind('openai')).toBe('device-code');
       expect(EnrollmentWizard.remoteKind('anthropic')).toBe('url-code-paste');
+      expect(EnrollmentWizard.remoteKind('xai')).toBe('device-code');
     });
 
     it('a remote OpenAI start uses device-code (single-code Phase-C default)', async () => {
@@ -342,7 +621,7 @@ describe('EnrollmentWizard', () => {
       expect(l.kind).toBe('device-code');
     });
 
-    it('a remote Claude start stays url-code-paste (no single-code flow) + keeps the two-code notice', async () => {
+    it('a remote Claude start stays url-code-paste (no single-code flow), with no flow notice', async () => {
       let seenKind: string | undefined;
       const drive: LoginDriver = async (req) => {
         seenKind = req.kind;
@@ -351,7 +630,7 @@ describe('EnrollmentWizard', () => {
       const w = new EnrollmentWizard({ store, driveLogin: drive, now: () => clock });
       const l = await w.start({ id: 'claude-r', label: 'main', provider: 'anthropic', framework: 'claude-code', remote: true });
       expect(seenKind).toBe('url-code-paste');
-      expect(l.notice).toMatch(/two codes/i);
+      expect(l.notice).toBeUndefined();
     });
 
     it('an explicit kind always wins over the remote preference', async () => {
@@ -388,5 +667,136 @@ describe('EnrollmentWizard', () => {
       await w.start({ id: 'l1', label: 'l', provider: 'openai', framework: 'codex-cli', remoteScrapeTimeoutMs: 180_000 });
       expect(seenTimeout).toBeUndefined();
     });
+  });
+});
+
+/**
+ * A device-code sign-in (Codex, grok) completes INSIDE the CLI: the operator
+ * approves at the provider, the CLI writes its credential and exits, and nothing
+ * tells instar. Before the credential witness, that login stayed `pending`, its
+ * TTL elapsed, and the reissue sweep killed the pane and minted a new code — so a
+ * SUCCESSFUL sign-in was destroyed and re-asked forever (33 reissues over 8h,
+ * observed live 2026-08-16).
+ */
+describe('EnrollmentWizard — a login that succeeded without telling instar', () => {
+  const T0 = Date.parse('2026-08-16T00:00:00Z');
+  let dir: string;
+  let clock: number;
+  let store: PendingLoginStore;
+
+  function wizard(opts: {
+    credentialWitness?: (login: { framework: string; configHome?: string; createdAt: string; kind: string }) => number | null;
+    onDrive?: () => void;
+  } = {}) {
+    return new EnrollmentWizard({
+      store,
+      now: () => clock,
+      driveLogin: async () => {
+        opts.onDrive?.();
+        return { verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'NEW-CODE1', ttlMs: 15 * 60_000 };
+      },
+      credentialWitness: opts.credentialWitness as never,
+    });
+  }
+
+  async function startCodexLogin(w: EnrollmentWizard) {
+    return w.start({
+      id: 'codex-justin', label: 'Codex', provider: 'openai',
+      framework: 'codex-cli', kind: 'device-code', configHome: '/slot/codex',
+    });
+  }
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'enroll-witness-'));
+    clock = T0;
+    store = new PendingLoginStore({ stateDir: dir, now: () => clock });
+  });
+  afterEach(() => {
+    try { SafeFsExecutor.safeRmSync(dir, { recursive: true, force: true, operation: 'tests/unit/enrollment-wizard.test.ts:witness-cleanup' }); } catch { /* @silent-fallback-ok */ }
+  });
+
+  it('completes the login instead of killing its pane and minting a new code', async () => {
+    let drives = 0;
+    // The credential appears five minutes into the flow — the operator approved.
+    const w = wizard({ credentialWitness: () => T0 + 5 * 60_000, onDrive: () => { drives++; } });
+    await startCodexLogin(w);
+    drives = 0; // discount the initial drive; count only re-drives
+
+    clock = T0 + 16 * 60_000; // TTL elapsed
+    const reissued = await w.reissueExpired();
+
+    expect(reissued).toEqual([]);
+    expect(drives).toBe(0); // the succeeded pane was never destroyed
+    expect(store.get('codex-justin')!.status).toBe('completed');
+  });
+
+  it('does not mistake a credential that was already in the slot for this sign-in', async () => {
+    // Re-enrolling a slot that still holds the PREVIOUS account's credential must
+    // not read as instant success — otherwise the pool records an account that
+    // never signed in.
+    let drives = 0;
+    const w = wizard({ credentialWitness: () => T0 - 60 * 60_000, onDrive: () => { drives++; } });
+    await startCodexLogin(w);
+    drives = 0;
+
+    clock = T0 + 16 * 60_000;
+    const reissued = await w.reissueExpired();
+
+    expect(drives).toBe(1);
+    expect(reissued).toHaveLength(1);
+    expect(store.get('codex-justin')!.status).toBe('pending');
+  });
+
+  it('leaves a url-code-paste flow entirely alone', async () => {
+    // Claude completes through the dashboard paste-back route, and its slot's
+    // credential is rewritten by ordinary token refresh — witnessing it would risk
+    // marking a live re-enrolment "done" on an mtime bump that was never this flow.
+    let drives = 0;
+    const w = wizard({ credentialWitness: () => clock, onDrive: () => { drives++; } });
+    await w.start({
+      id: 'claude-1', label: 'Claude', provider: 'anthropic',
+      framework: 'claude-code', kind: 'url-code-paste', configHome: '/slot/claude',
+    });
+    drives = 0;
+
+    clock = T0 + 16 * 60_000;
+    await w.reissueExpired();
+
+    expect(drives).toBe(1);
+    expect(store.get('claude-1')!.status).toBe('pending');
+  });
+
+  it.each([
+    ['no witness is wired at all', undefined],
+    ['the slot holds no credential', () => null],
+    ['the probe throws', () => { throw new Error('EACCES'); }],
+  ])('re-drives exactly as before when %s', async (_label, witness) => {
+    let drives = 0;
+    const w = wizard({ credentialWitness: witness as never, onDrive: () => { drives++; } });
+    await startCodexLogin(w);
+    drives = 0;
+
+    clock = T0 + 16 * 60_000;
+    const reissued = await w.reissueExpired();
+
+    // Every uncertainty answers "not succeeded", so the witness can only ever
+    // PREVENT a destructive re-ask — never strand the operator on a dead code.
+    expect(drives).toBe(1);
+    expect(reissued).toHaveLength(1);
+  });
+
+  it('protects the restart-recovery and dead-pane paths too, not just TTL expiry', async () => {
+    let drives = 0;
+    const w = wizard({ credentialWitness: () => T0 + 5 * 60_000, onDrive: () => { drives++; } });
+    await startCodexLogin(w);
+    drives = 0;
+
+    // recoverAfterRestart() re-drives every non-terminal record at boot; a server
+    // bounce must not destroy a sign-in that already succeeded.
+    const recovered = await w.recoverAfterRestart();
+
+    expect(recovered).toEqual([]);
+    expect(drives).toBe(0);
+    expect(store.get('codex-justin')!.status).toBe('completed');
   });
 });

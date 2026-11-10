@@ -1,3 +1,4 @@
+import { isQuietReceipt, type QuietReceipt } from './NotificationSelectivityGate.js';
 /**
  * NotificationBatcher - Batches non-critical Telegram notifications into periodic digests.
  *
@@ -7,11 +8,74 @@
  * - DIGEST: Batched every 2 hours (routine system notices)
  *
  * Born from: Matthew Berman OpenClaw analysis (2026-02-25)
+ *
+ * Bounded-surface additions (docs/specs/bounded-attention-notification-surface.md):
+ * the batched lane honours `enabled`, persists its suppression + rate-limit state,
+ * and is bounded by a rolling-window limit enforced ONLY by the machine that owns
+ * the topic. IMMEDIATE never enters that machinery.
  */
+
+import { topicRef } from './shared/topicRef.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import { randomUUID } from 'node:crypto';
+import { requireDeliverySink, reportDeliverySinkFailure } from './DeliverySinkFailure.js';
+import { composeAutomationAuthors, unknownAutomationAuthor, type OriginAutomationAuthor } from './telegram-origin/OriginAutomationAuthor.js';
+import { TelegramOriginHoldError } from './telegram-origin/types.js';
+import { mergeDefaults } from '../core/mergeDefaults.js';
 
 export type NotificationTier = 'IMMEDIATE' | 'SUMMARY' | 'DIGEST';
 
+/**
+ * Verdict from the pool's placement record for one topic.
+ * `unresolvable-no-pool` is a single-machine install: this machine is trivially
+ * the owner. `unresolvable-pool` means a pool exists but placement could not be
+ * read — the batched lane HOLDS there, so two machines can never both emit.
+ */
+export type OwnershipVerdict = 'owner' | 'other' | 'unresolvable-no-pool' | 'unresolvable-pool';
+
+export type OwnershipResolver = (topicId: number) => OwnershipVerdict;
+
+/** Trusted in-process producer evidence; incoming request metadata is never
+ * forwarded here. Frozen batches carry it across delays and process restarts. */
+export interface BatcherOrigin {
+  producerId: 'quota-notifier' | 'reap-notifier' | 'notification-batcher';
+  author: OriginAutomationAuthor;
+}
+function snapshotBatcherOrigin(origin: BatcherOrigin | undefined): BatcherOrigin | undefined {
+  if (origin === undefined) return undefined;
+  const evidence = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return false;
+    const e = value as Record<string, unknown>;
+    const bounded = (v: unknown, max: number) => v === null || typeof v === 'string' && v.length <= max;
+    return ['observed', 'configured', 'unknown', 'not-applicable'].includes(String(e.status)) &&
+      bounded(e.value, 128) && bounded(e.sourceEventRef, 512) && bounded(e.reason, 512) &&
+      (e.observedAt === null || Number.isFinite(e.observedAt)) &&
+      (['unknown', 'not-applicable'].includes(String(e.status)) ? e.value === null : typeof e.value === 'string' && e.value.length > 0);
+  };
+  const author = origin?.author;
+  if (!['quota-notifier', 'reap-notifier', 'notification-batcher'].includes(origin?.producerId) || !author ||
+    !evidence(author.model) || !evidence(author.harness) ||
+    (author.authorContributors !== undefined && (!Array.isArray(author.authorContributors) || author.authorContributors.length > 128 ||
+      !author.authorContributors.every(a => a && evidence(a.model) && evidence(a.harness)))) ||
+    (author.omittedAuthorContributors !== undefined && (!Number.isSafeInteger(author.omittedAuthorContributors) || author.omittedAuthorContributors < 0))) {
+    throw new Error('invalid-batcher-origin');
+  }
+  const pickEvidence = (value: OriginAutomationAuthor['model']) => ({ value: value.value, status: value.status,
+    sourceEventRef: value.sourceEventRef, observedAt: value.observedAt, reason: value.reason });
+  return { producerId: origin.producerId, author: { model: pickEvidence(author.model), harness: pickEvidence(author.harness),
+    ...(author.authorContributors ? { authorContributors: author.authorContributors.map(value => ({ model: pickEvidence(value.model), harness: pickEvidence(value.harness) })) } : {}),
+    ...(author.omittedAuthorContributors === undefined ? {} : { omittedAuthorContributors: author.omittedAuthorContributors }) } };
+}
+function composeBatcherOrigins(origins: Array<BatcherOrigin | undefined>): BatcherOrigin | undefined {
+  if (origins.every(origin => origin === undefined)) return undefined;
+  const first = origins[0];
+  return { producerId: first && origins.every(origin => origin?.producerId === first.producerId) ? first.producerId : 'notification-batcher',
+    author: composeAutomationAuthors(origins.map(origin => origin?.author ?? unknownAutomationAuthor('batch-item-author-unavailable'))) };
+}
+
 export interface BatchedNotification {
+  origin?: BatcherOrigin;
   tier: NotificationTier;
   category: string;
   message: string;
@@ -19,24 +83,47 @@ export interface BatchedNotification {
   topicId: number;
 }
 
+export interface BatcherQuietHours {
+  enabled: boolean;
+  start: string;   // "HH:MM"
+  end: string;     // "HH:MM"
+}
+
 export interface BatcherConfig {
   enabled: boolean;
   summaryIntervalMinutes: number;
   digestIntervalMinutes: number;
-  quietHours?: {
-    enabled: boolean;
-    start: string;   // "HH:MM"
-    end: string;     // "HH:MM"
-  };
+  /** Rolling-window limit per topic. 0 disables the limiter entirely. */
+  maxMessagesPerTopicPerHour: number;
+  /** TTL on cross-batch suppression entries. */
+  suppressionTtlHours: number;
+  /**
+   * A topic blocked for a PERSISTENT reason (foreign ownership, unresolved
+   * ownership, corrupt rate state) drops its backlog after this long, with an
+   * audit row and a per-reason counter. Nothing is sent on that path — an
+   * earlier design "collapsed" an aged hold into one digest, which was both
+   * unreachable and forbidden for exactly those reasons.
+   */
+  maxHoldHours: number;
+  /** Storage ceiling on the held queue; overflow folds oldest into a counted aggregate. */
+  maxHeldItemsPerTopic: number;
+  quietHours?: BatcherQuietHours;
 }
 
 interface QueuedNotification {
+  origin?: BatcherOrigin;
   category: string;
   message: string;
   timestamp: Date;
   topicId: number;
   dedupKey: string;
   count: number;
+  /** Epoch ms this item was first held, or null while it has never been held. */
+  heldSince: number | null;
+  /** Count of older items folded into this one by the storage ceiling. */
+  foldedCount?: number;
+  /** This batch has already entered origin custody. Only that operation may retry. */
+  originHold?: { operationId: string | null; outcome: string; reason: string; logicalSendId?: string };
 }
 
 export interface BatcherStats {
@@ -46,9 +133,24 @@ export interface BatcherStats {
   totalSuppressed: number;
   lastSummaryFlush: Date | null;
   lastDigestFlush: Date | null;
+  /** Items currently held by the rolling-window limit or by ownership. */
+  heldCount: number;
+  /** Epoch ms of the oldest current hold, or null when nothing is held. */
+  heldSince: number | null;
+  /** Batched items not sent because another machine owns the topic. */
+  notOwnerSkipped: number;
+  /** Non-owner items that expired on maxHoldHours without ownership arriving. */
+  notOwnerExpired: number;
+  /** Items expired for a non-ownership reason (breaker active, or corrupt rate state). */
+  heldExpired: number;
+  /** Items folded into a counted aggregate by the storage ceiling. */
+  foldedItems: number;
+  /** Whether the persisted rate-limit state could be read. */
+  rateStateReadable: boolean;
+  originHeldCount: number;
 }
 
-export type SendFunction = (topicId: number, text: string) => Promise<{ messageId: number }>;
+export type SendFunction = (topicId: number, text: string, logicalSendId?: string, origin?: BatcherOrigin) => Promise<{ messageId: number } | QuietReceipt>;
 
 const CATEGORY_HEADERS: Record<string, string> = {
   'job-complete': 'JOBS',
@@ -62,32 +164,89 @@ const DEFAULT_CONFIG: BatcherConfig = {
   enabled: true,
   summaryIntervalMinutes: 30,
   digestIntervalMinutes: 120,
+  maxMessagesPerTopicPerHour: 4,
+  suppressionTtlHours: 24,
+  maxHoldHours: 6,
+  maxHeldItemsPerTopic: 200,
 };
+
+const WINDOW_MS = 3_600_000;
+
+interface PersistedState {
+  /** dedupKey → epoch ms it was sent. Replaces the old value-is-the-key scheme. */
+  suppression: Record<string, number>;
+  /** topicId → epoch ms of sends inside the rolling window. */
+  sendTimes: Record<string, number[]>;
+}
+type PersistedOriginHolds = { tier: 'SUMMARY' | 'DIGEST'; item: QueuedNotification }[];
+interface FrozenBatch { origin?: BatcherOrigin; logicalSendId: string; text: string; topicId: number; tier: 'SUMMARY' | 'DIGEST'; attempted: boolean; }
 
 export class NotificationBatcher {
   private summaryQueue: QueuedNotification[] = [];
   private digestQueue: QueuedNotification[] = [];
   private sendFn: SendFunction | null = null;
+  onDelivered: ((topicId: number, at: number) => void) | null = null;
+  private supportsLogicalIds = false;
+  private frozenBatches = new Map<string, FrozenBatch>();
+  private flushTail: Promise<unknown> = Promise.resolve();
+  private originCustodyReadable = true;
+  private stateLoaded = false;
+  private resolveOriginDelivery: ((operationId: string) => Promise<boolean>) | null = null;
+
+  setOriginDeliveryResolver(resolve: (operationId: string) => Promise<boolean>): void {
+    this.resolveOriginDelivery = resolve;
+  }
   private config: BatcherConfig;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private lastSummaryFlush: Date | null = null;
   private lastDigestFlush: Date | null = null;
   private totalFlushed = 0;
   private suppressedCount = 0;
+
+  // ── Bounded-surface state ────────────────────────────────────
+  private stateDir: string | null = null;
+  private ownershipResolver: OwnershipResolver | null = null;
+  private auditPath: string | null = null;
+
+  /** dedupKey → epoch ms sent. Persisted; TTL-expired on load and on write. */
+  private lastSentContent: Map<string, number> = new Map();
+  /** topicId → epoch ms of sends within the rolling window. Persisted. */
+  private sendTimes: Map<number, number[]> = new Map();
+
   /**
-   * Cross-batch suppression: tracks what was sent per dedup key.
-   * If the same dedup key arrives with identical content, it's suppressed.
-   * Only fires again when content CHANGES — "state-change-only" behavior.
-   * Key format: `${topicId}:${dedupKey}` → message content
+   * FALSE when the persisted rate-limit state could not be read. The batched
+   * lane HOLDS while this is false: losing sendTimes would mint fresh capacity,
+   * which is the exact ceiling-bypass this class exists to prevent. The
+   * suppression map fails the opposite way (see loadState).
    */
-  private lastSentContent: Map<string, string> = new Map();
+  private rateStateReadable = true;
+
+  private notOwnerSkipped = 0;
+  private notOwnerExpired = 0;
+  /** Items expired by maxHoldHours for a NON-ownership reason (breaker / corrupt rate state). */
+  private heldExpired = 0;
+  private foldedItems = 0;
 
   constructor(config?: Partial<BatcherConfig>) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
+    this.config = mergeDefaults(DEFAULT_CONFIG, config);
   }
 
-  setSendFunction(sendFn: SendFunction): void {
+  setSendFunction(sendFn: SendFunction, options: { supportsLogicalIds?: boolean } = {}): void {
     this.sendFn = sendFn;
+    this.supportsLogicalIds = options.supportsLogicalIds === true;
+  }
+
+  /**
+   * Wire durable state and the ownership source. Called once at startup.
+   * Absent stateDir keeps the pre-existing in-memory-only behaviour, so tests
+   * and embedders that never call this are unaffected.
+   */
+  configureBounds(opts: { stateDir?: string | null; ownershipResolver?: OwnershipResolver | null }): void {
+    const previousStateDir = this.stateDir;
+    this.stateDir = opts.stateDir ?? null;
+    this.ownershipResolver = opts.ownershipResolver ?? null;
+    this.auditPath = this.stateDir ? path.join(this.stateDir, 'notification-ceiling.jsonl') : null;
+    if (this.stateDir && (!this.stateLoaded || previousStateDir !== this.stateDir)) { this.loadState(); this.stateLoaded = true; }
   }
 
   start(): void {
@@ -108,6 +267,7 @@ export class NotificationBatcher {
   }
 
   async enqueue(notification: BatchedNotification): Promise<void> {
+    const origin = snapshotBatcherOrigin(notification.origin);
     let effectiveTier = notification.tier;
 
     // Quiet hours: demote SUMMARY to DIGEST
@@ -115,40 +275,55 @@ export class NotificationBatcher {
       effectiveTier = 'DIGEST';
     }
 
+    // IMMEDIATE bypasses every gate in this class — the `enabled` kill-switch,
+    // the rolling-window limit, ownership, and the brakes. A kill-switch on
+    // batching must never become a kill-switch on urgency.
     if (effectiveTier === 'IMMEDIATE') {
-      await this.sendDirect(notification.topicId, notification.message);
+      const result = await this.sendDirect(notification.topicId, notification.message, undefined, origin);
+      if (result === true) this.observeDelivery(notification.topicId, Date.now());
+      return;
+    }
+
+    // C2: honour the previously-dead `enabled` flag, batched tiers only.
+    if (!this.config.enabled) {
+      this.suppressedCount++;
       return;
     }
 
     const dedupKey = this.generateDedupKey(notification.category, notification.message);
     const queue = effectiveTier === 'SUMMARY' ? this.summaryQueue : this.digestQueue;
 
-    // Cross-batch suppression: if this dedup key was sent in a previous batch
-    // with identical content, suppress it. Only re-notify when content CHANGES.
-    // This prevents "everything healthy" from appearing in every batch.
-    const crossBatchKey = `${notification.topicId}:${dedupKey}`;
-    const lastContent = this.lastSentContent.get(crossBatchKey);
-    if (lastContent !== undefined && lastContent === dedupKey) {
+    // Cross-batch suppression: an unexpired entry means this exact shape was
+    // already DELIVERED (the map is written after a successful flush, so
+    // presence follows delivery rather than intent).
+    const crossBatchKey = `${notification.topicId}:${origin?.producerId ?? 'notification-batcher'}:${dedupKey}`;
+    const sentAt = this.lastSentContent.get(crossBatchKey);
+    if (sentAt !== undefined && Date.now() - sentAt < this.config.suppressionTtlHours * 3_600_000) {
       this.suppressedCount++;
       return;
     }
 
     // Within-batch dedup: collapse identical shapes into one entry with count
-    const existing = queue.find(q => q.dedupKey === dedupKey && q.topicId === notification.topicId);
+    const existing = queue.find(q => !q.originHold && q.dedupKey === dedupKey && q.topicId === notification.topicId && (q.origin?.producerId ?? 'notification-batcher') === (origin?.producerId ?? 'notification-batcher'));
     if (existing) {
       existing.count++;
+      existing.origin = composeBatcherOrigins([existing.origin, origin]);
       existing.timestamp = notification.timestamp; // Update to latest
       return;
     }
 
     queue.push({
+      ...(origin ? { origin } : {}),
       category: notification.category,
       message: notification.message,
       timestamp: notification.timestamp,
       topicId: notification.topicId,
       dedupKey,
       count: 1,
+      heldSince: null,
     });
+
+    this.enforceStorageCeiling(queue, notification.topicId);
   }
 
   async flushAll(): Promise<number> {
@@ -159,32 +334,96 @@ export class NotificationBatcher {
   }
 
   async flush(tier: 'SUMMARY' | 'DIGEST'): Promise<number> {
+    const pending = this.flushTail.then(() => this.flushSerialized(tier));
+    this.flushTail = pending.catch(() => {
+      // @silent-fallback-ok — only the internal serialization tail recovers;
+      // callers receive the original rejecting pending promise below.
+    });
+    return pending;
+  }
+
+  private async flushSerialized(tier: 'SUMMARY' | 'DIGEST'): Promise<number> {
     const queue = tier === 'SUMMARY' ? this.summaryQueue : this.digestQueue;
-    if (queue.length === 0) return 0;
+    if (queue.length === 0 || !this.originCustodyReadable) return 0;
 
-    const items = queue.splice(0, queue.length);
     const tierLabel = tier === 'SUMMARY' ? 'Summary' : 'Digest';
+    const now = Date.now();
 
-    // Group by topicId
-    const byTopic = new Map<number, QueuedNotification[]>();
-    for (const item of items) {
-      const existing = byTopic.get(item.topicId) || [];
-      existing.push(item);
-      byTopic.set(item.topicId, existing);
-    }
-
-    for (const [topicId, topicItems] of byTopic) {
-      const digestMessage = this.formatDigest(tierLabel, topicItems);
-      await this.sendDirect(topicId, digestMessage);
-
-      // Record sent content for cross-batch suppression
-      for (const item of topicItems) {
-        this.lastSentContent.set(`${topicId}:${item.dedupKey}`, item.dedupKey);
+    // Group by topicId WITHOUT removing from the queue — items for a topic that
+    // cannot send stay queued and release themselves at the next opportunity.
+    const byTopic = new Map<string, { topicId: number; items: QueuedNotification[] }>();
+    const resolved = new Map<string, boolean>();
+    const recordedRecoveries = new Set<string>();
+    const visitedBatches = new Set<string>();
+    let recoveredCount = 0;
+    for (const item of [...queue]) {
+      if (item.originHold) {
+        const batchId = item.originHold.logicalSendId;
+        if (batchId) {
+          if (visitedBatches.has(batchId)) continue;
+          visitedBatches.add(batchId);
+          const batch = this.frozenBatches.get(batchId);
+          if (!batch) continue; // Missing frozen bytes never authorize a new body.
+          const items = queue.filter(value => value.originHold?.logicalSendId === batchId);
+          const id = item.originHold.operationId;
+          let confirmed = false;
+          if (id && this.resolveOriginDelivery && resolved.size < 10) {
+            try { confirmed = await this.resolveOriginDelivery(id); } catch { /* Receipt unavailable means held. */ }
+            resolved.set(id, confirmed);
+          }
+          if (confirmed) recoveredCount += this.completeFrozenBatch(batch, items, now);
+          else if (!id && (!batch.attempted || this.supportsLogicalIds) && this.canSendToTopic(batch.topicId, now, tier).verdict === 'send') {
+            recoveredCount += await this.sendFrozenBatch(batch, items, now);
+          } else this.expireStaleHolds(item.topicId, items, now, 'origin-outcome-unresolved');
+          continue;
+        }
+        const id = item.originHold.operationId;
+        if (id && this.resolveOriginDelivery && !resolved.has(id) && resolved.size < 10) {
+          try { resolved.set(id, await this.resolveOriginDelivery(id)); }
+          catch { resolved.set(id, false); /* Unavailable receipt authority remains held. */ }
+        }
+        if (id && resolved.get(id)) {
+          if (!recordedRecoveries.has(id)) { this.recordSend(item.topicId, now); recordedRecoveries.add(id); }
+          queue.splice(queue.indexOf(item), 1);
+          this.lastSentContent.set(`${item.topicId}:${item.origin?.producerId ?? 'notification-batcher'}:${item.dedupKey}`, now);
+          recoveredCount++;
+          continue;
+        }
+        this.expireStaleHolds(item.topicId, [item], now, 'origin-outcome-unresolved');
+        continue;
       }
+      const groupKey = `${item.topicId}:${item.origin?.producerId ?? 'notification-batcher'}`;
+      const group = byTopic.get(groupKey) ?? { topicId: item.topicId, items: [] };
+      group.items.push(item);
+      byTopic.set(groupKey, group);
     }
 
-    const count = items.length;
-    this.totalFlushed += count;
+    let sentCount = recoveredCount;
+
+    for (const { topicId, items: topicItems } of byTopic.values()) {
+      const decision = this.canSendToTopic(topicId, now, tier);
+
+      if (decision.verdict !== 'send') {
+        this.markHeld(topicItems, now);
+        this.expireStaleHolds(topicId, topicItems, now, decision.reason);
+        this.audit({ event: 'held', topicId, reason: decision.reason, items: topicItems.length });
+        continue;
+      }
+
+      const digestMessage = this.formatDigest(tierLabel, topicItems);
+      if (!this.sendFn) { await this.sendDirect(topicId, digestMessage); continue; }
+      const origin = composeBatcherOrigins(topicItems.map(item => item.origin));
+      const batch: FrozenBatch = { logicalSendId: randomUUID(), text: digestMessage, topicId, tier, attempted: false, ...(origin ? { origin } : {}) };
+      this.frozenBatches.set(batch.logicalSendId, batch);
+      // Freeze before the first await: enqueue cannot mutate these counts or
+      // attach a newly arriving event to the already prepared digest.
+      for (const item of topicItems) item.originHold = { operationId: null, outcome: 'held', reason: 'batch-prepared', logicalSendId: batch.logicalSendId };
+      this.markHeld(topicItems, now);
+      sentCount += await this.sendFrozenBatch(batch, topicItems, now);
+    }
+
+    this.totalFlushed += sentCount;
+    this.persistState();
 
     if (tier === 'SUMMARY') {
       this.lastSummaryFlush = new Date();
@@ -192,7 +431,35 @@ export class NotificationBatcher {
       this.lastDigestFlush = new Date();
     }
 
-    return count;
+    return sentCount;
+  }
+
+  private completeFrozenBatch(batch: FrozenBatch, items: QueuedNotification[], now: number, delivered = true): number {
+    const queue = batch.tier === 'SUMMARY' ? this.summaryQueue : this.digestQueue;
+    for (const item of items) {
+      const index = queue.indexOf(item); if (index >= 0) queue.splice(index, 1);
+      if (delivered) this.lastSentContent.set(`${item.topicId}:${item.origin?.producerId ?? 'notification-batcher'}:${item.dedupKey}`, now);
+    }
+    this.frozenBatches.delete(batch.logicalSendId);
+    if (delivered) this.recordSend(batch.topicId, now);
+    return delivered ? items.length : 0;
+  }
+
+  private async sendFrozenBatch(batch: FrozenBatch, items: QueuedNotification[], now: number): Promise<number> {
+    const attempted = batch.attempted;
+    batch.attempted = true;
+    // Persist both bytes and logical identity BEFORE the sink may dispatch.
+    if (!this.persistState()) { batch.attempted = attempted; return 0; }
+    const delivered = await this.sendDirect(batch.topicId, batch.text, batch.logicalSendId, batch.origin);
+    if (delivered === true) return this.completeFrozenBatch(batch, items, now);
+    if (isQuietReceipt(delivered)) { this.audit({ event: 'quiet-recorded', topicId: batch.topicId, reason: delivered.quietId, items: items.length }); return this.completeFrozenBatch(batch, items, now, false); }
+    const hold = delivered instanceof TelegramOriginHoldError
+      ? { operationId: delivered.operationId, outcome: delivered.outcome, reason: delivered.reason }
+      : { operationId: null, outcome: 'outcome-unknown', reason: 'batch-send-outcome-unavailable' };
+    for (const item of items) item.originHold = { ...hold, logicalSendId: batch.logicalSendId };
+    this.audit({ event: 'origin-held', topicId: batch.topicId, reason: hold.reason, items: items.length });
+    this.persistState();
+    return 0;
   }
 
   getQueueSize(): { summary: number; digest: number } {
@@ -203,6 +470,9 @@ export class NotificationBatcher {
   }
 
   getStats(): BatcherStats {
+    const all = [...this.summaryQueue, ...this.digestQueue];
+    const held = all.filter(q => q.heldSince !== null);
+    const heldSince = held.length ? Math.min(...held.map(q => q.heldSince as number)) : null;
     return {
       summaryQueueSize: this.summaryQueue.length,
       digestQueueSize: this.digestQueue.length,
@@ -210,6 +480,14 @@ export class NotificationBatcher {
       totalSuppressed: this.suppressedCount,
       lastSummaryFlush: this.lastSummaryFlush,
       lastDigestFlush: this.lastDigestFlush,
+      heldCount: held.length,
+      heldSince,
+      notOwnerSkipped: this.notOwnerSkipped,
+      notOwnerExpired: this.notOwnerExpired,
+      heldExpired: this.heldExpired,
+      foldedItems: this.foldedItems,
+      rateStateReadable: this.rateStateReadable,
+      originHeldCount: all.filter(item => item.originHold).length,
     };
   }
 
@@ -227,10 +505,317 @@ export class NotificationBatcher {
     } else {
       this.lastSentContent.clear();
     }
+    this.persistState();
   }
 
   isEnabled(): boolean {
     return this.config.enabled;
+  }
+
+  // ── Rolling-window limit + ownership ─────────────────────────
+
+  /**
+   * The single send decision. Deliberately content-blind: it never reads a
+   * message, so it cannot mis-judge one. See the spec's §Signal vs authority.
+   */
+  private canSendToTopic(
+    topicId: number,
+    now: number,
+    tier: 'SUMMARY' | 'DIGEST',
+  ): { verdict: 'send' | 'hold'; reason: string } {
+    // `0` disables the limiter entirely. This guard is FIRST and load-bearing:
+    // without it `sendTimes.length >= 0` is always true and 0 would hold every
+    // message forever — the opposite of the documented meaning.
+    if (this.config.maxMessagesPerTopicPerHour === 0) return { verdict: 'send', reason: 'limiter-disabled' };
+
+    // Rate state unreadable ⇒ hold. Losing sendTimes would mint fresh capacity.
+    if (!this.rateStateReadable) return { verdict: 'hold', reason: 'rate-state-unreadable' };
+
+
+    const ownership = this.resolveOwnership(topicId);
+    if (ownership === 'other') {
+      this.notOwnerSkipped++;
+      return { verdict: 'hold', reason: 'not-owner' };
+    }
+    if (ownership === 'unresolvable-pool') {
+      return { verdict: 'hold', reason: 'ownership-unresolved' };
+    }
+
+    const times = (this.sendTimes.get(topicId) ?? []).filter(t => now - t < WINDOW_MS);
+    this.sendTimes.set(topicId, times);
+    if (times.length >= this.config.maxMessagesPerTopicPerHour) {
+      return { verdict: 'hold', reason: 'rate-limited' };
+    }
+
+    return { verdict: 'send', reason: 'ok' };
+  }
+
+  private resolveOwnership(topicId: number): OwnershipVerdict {
+    if (!this.ownershipResolver) return 'unresolvable-no-pool';
+    try {
+      return this.ownershipResolver(topicId);
+    } catch {
+      // A throwing resolver is an unreadable placement record on a machine that
+      // HAS a pool wired — hold rather than assume ownership.
+      return 'unresolvable-pool';
+    }
+  }
+
+  private recordSend(topicId: number, now: number): void {
+    const times = (this.sendTimes.get(topicId) ?? []).filter(t => now - t < WINDOW_MS);
+    times.push(now);
+    this.sendTimes.set(topicId, times);
+    this.observeDelivery(topicId, now);
+  }
+
+  private observeDelivery(topicId: number, at: number): void {
+    try { this.onDelivered?.(topicId, at); } catch { /* @silent-fallback-ok: derived mobile push must not change delivery outcome */ }
+  }
+
+  private markHeld(items: QueuedNotification[], now: number): void {
+    for (const item of items) if (item.heldSince === null) item.heldSince = now;
+  }
+
+  /**
+   * maxHoldHours EXPIRY. Returns false always — there is no collapse-to-send.
+   *
+   * An earlier revision converted an aged hold into "one digest sent anyway",
+   * with a breaker counting three such collapses. Writing the test for it showed
+   * the path was UNREACHABLE: the rolling window is 1h and maxHoldHours is 6h,
+   * so a rate-limit hold always drains when its window clears, hours before it
+   * could mature. The only holds that DO persist that long are the ones whose
+   * reason persists — foreign ownership, unresolved ownership, corrupt rate
+   * state — and every one of those must never age into a send (that is the
+   * fail-closed rule). So the collapse fired for nothing, and the breaker that
+   * counted collapses could never trip.
+   *
+   * The spec claimed both as brakes. They were removed rather than repaired:
+   * a documented brake that cannot fire is worse than no brake, because a
+   * reader (including a future audit) records it as protection that exists.
+   *
+   * What remains is honest and load-bearing: a topic blocked for a PERSISTENT
+   * reason drops its backlog after maxHoldHours with an audit row, so the queue
+   * has a terminal state. Bounded size is carried by the storage ceiling.
+   */
+  private expireStaleHolds(
+    topicId: number,
+    items: QueuedNotification[],
+    now: number,
+    reason: string,
+  ): boolean {
+    const oldest = items.reduce<number | null>(
+      (acc, i) => (i.heldSince !== null && (acc === null || i.heldSince < acc) ? i.heldSince : acc),
+      null,
+    );
+    if (oldest === null || now - oldest < this.config.maxHoldHours * 3_600_000) return false;
+
+    // Counted separately per reason: folding a corrupt-state hold into
+    // `notOwnerSkipped` would tell an operator another machine had the topic —
+    // a different, more reassuring story than the truth. A counter that answers
+    // the wrong question is worse than no counter.
+    if (reason === 'not-owner' || reason === 'ownership-unresolved') {
+      this.notOwnerExpired += items.length;
+    } else {
+      this.heldExpired += items.length;
+    }
+
+    for (const item of items) {
+      const q = this.summaryQueue.indexOf(item) !== -1 ? this.summaryQueue : this.digestQueue;
+      const idx = q.indexOf(item);
+      if (idx !== -1) q.splice(idx, 1);
+    }
+    this.audit({ event: 'hold-expired', topicId, reason, items: items.length });
+    return false;
+  }
+
+  /**
+   * Storage ceiling. Dedup bounds REPEATS, not VARIETY — a stream of
+   * structurally distinct notices coalesces to nothing and would grow without
+   * bound. Overflow folds the OLDEST entries into one counted aggregate.
+   */
+  private enforceStorageCeiling(queue: QueuedNotification[], topicId: number): void {
+    const held = queue.filter(q => q.topicId === topicId && q.originHold);
+    while (held.length > 0 && queue.filter(item => item.topicId === topicId).length > this.config.maxHeldItemsPerTopic) {
+      const oldest = held.shift()!;
+      const batchId = oldest.originHold?.logicalSendId;
+      const retired = batchId ? queue.filter(item => item.originHold?.logicalSendId === batchId) : [oldest];
+      for (const item of retired) { const index = queue.indexOf(item); if (index >= 0) queue.splice(index, 1); }
+      if (batchId) this.frozenBatches.delete(batchId);
+      this.heldExpired += retired.length;
+      this.audit({ event: 'origin-reference-retired', topicId, reason: 'storage-ceiling', items: retired.length });
+    }
+    const forTopic = queue.filter(q => q.topicId === topicId && !q.originHold);
+    if (forTopic.length <= this.config.maxHeldItemsPerTopic) return;
+
+    const overflow = forTopic.length - this.config.maxHeldItemsPerTopic;
+    const oldest = forTopic.slice(0, overflow + 1);
+    const folded = oldest.reduce((n, i) => n + i.count + (i.foldedCount ?? 0), 0);
+
+    for (const item of oldest) {
+      const idx = queue.indexOf(item);
+      if (idx !== -1) queue.splice(idx, 1);
+    }
+    this.foldedItems += folded;
+
+    queue.unshift({
+      category: 'system',
+      message: `+${folded} earlier notices`,
+      timestamp: oldest[oldest.length - 1].timestamp,
+      topicId,
+      dedupKey: `${topicId}:__folded__`,
+      count: 1,
+      heldSince: oldest[0].heldSince,
+      foldedCount: folded,
+    });
+    this.audit({ event: 'folded', topicId, items: folded });
+  }
+
+  // ── Persistence ──────────────────────────────────────────────
+
+  private statePath(): string | null {
+    return this.stateDir ? path.join(this.stateDir, 'notification-suppression.json') : null;
+  }
+  private originHoldsPath(): string {
+    // This existing custody prefix is excluded from sync and general backups.
+    return path.join(this.stateDir!, 'state', 'telegram-origin-spool', 'notification-batcher.json');
+  }
+
+  /**
+   * The two persisted states fail in OPPOSITE directions, deliberately:
+   * suppression unreadable ⇒ empty map ⇒ send (at most a duplicate);
+   * rate state unreadable ⇒ hold the batched lane (losing it would mint capacity).
+   */
+  private loadState(): void {
+    const p = this.statePath();
+    if (!p) return;
+    try {
+      const raw = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) as PersistedState : { suppression: {}, sendTimes: {} };
+      const now = Date.now();
+      const ttl = this.config.suppressionTtlHours * 3_600_000;
+
+      this.lastSentContent = new Map(
+        Object.entries(raw.suppression ?? {}).filter(([, at]) => now - at < ttl),
+      );
+      this.sendTimes = new Map(
+        Object.entries(raw.sendTimes ?? {}).map(([k, v]) => [
+          Number(k),
+          (v ?? []).filter(t => now - t < WINDOW_MS),
+        ]),
+      );
+      this.rateStateReadable = true;
+    } catch {
+      // Suppression fails OPEN (empty map, we may repeat).
+      this.lastSentContent = new Map();
+      // Rate state fails CLOSED — hold until a clean write replaces the file.
+      this.sendTimes = new Map();
+      this.rateStateReadable = false;
+      this.audit({ event: 'state-unreadable', topicId: 0, reason: 'parse-failed' });
+      // Visible OUTSIDE this component. With C1 defaulting degradation alerts
+      // off, a batched lane that is quietly holding everything would otherwise be
+      // invisible except in a local JSONL nobody reads — "the bounding works, and
+      // hides that the bounding path is unhealthy" (Phase 5 re-review finding 2).
+      // console.warn reaches logs/server.log, and `rateStateReadable` is carried
+      // on getStats() into the telemetry collector, so both a human tail and the
+      // metrics surface can see it. Deliberately NOT a user message: it is not
+      // something the operator can act on, and adding one would violate the very
+      // discipline this change establishes.
+      console.warn(
+        '[NotificationBatcher] rate-limit state unreadable — the batched lane is HOLDING ' +
+        'until this process restarts. Urgent notices are unaffected.',
+      );
+    }
+    try {
+      const file = this.originHoldsPath();
+      if (!fs.existsSync(file)) return;
+      if (fs.statSync(file).size > 16 * 1024 * 1024) throw new Error('origin-holds-too-large');
+      const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const originHolds: PersistedOriginHolds = Array.isArray(stored) ? stored : stored.version === 2 ? stored.holds : null;
+      if (!Array.isArray(originHolds)) throw new Error('invalid-origin-holds');
+      const batches: FrozenBatch[] = Array.isArray(stored) ? [] : stored.batches;
+      if (!Array.isArray(batches)) throw new Error('invalid-origin-batches');
+      for (const batch of batches) {
+        if (typeof batch.logicalSendId !== 'string' || !batch.logicalSendId || batch.logicalSendId.length > 256 ||
+          typeof batch.text !== 'string' || !Number.isSafeInteger(batch.topicId) || !['SUMMARY', 'DIGEST'].includes(batch.tier) ||
+          typeof batch.attempted !== 'boolean' || this.frozenBatches.has(batch.logicalSendId)) throw new Error('invalid-origin-batch');
+        if (batch.origin) batch.origin = snapshotBatcherOrigin(batch.origin);
+        this.frozenBatches.set(batch.logicalSendId, batch);
+      }
+      for (const held of originHolds) {
+        if (!['SUMMARY', 'DIGEST'].includes(held.tier) || !held.item?.originHold ||
+          !Number.isFinite(held.item.heldSince) || !Number.isSafeInteger(held.item.topicId) ||
+          typeof held.item.message !== 'string' || !Number.isFinite(new Date(held.item.timestamp).getTime())) throw new Error('invalid-origin-hold');
+        const id = held.item.originHold.logicalSendId;
+        if (id && (!this.frozenBatches.has(id) || this.frozenBatches.get(id)!.topicId !== held.item.topicId || this.frozenBatches.get(id)!.tier !== held.tier)) throw new Error('origin-batch-missing');
+        const queue = held.tier === 'SUMMARY' ? this.summaryQueue : this.digestQueue;
+        if (held.item.origin) held.item.origin = snapshotBatcherOrigin(held.item.origin);
+        queue.push({ ...held.item, timestamp: new Date(held.item.timestamp) });
+      }
+    } catch {
+      // @silent-fallback-ok — unreadable custody holds sends; the audit event
+      // and warning below expose the failure without creating another send.
+      this.originCustodyReadable = false;
+      this.audit({ event: 'state-unreadable', topicId: 0, reason: 'origin-custody-unreadable' });
+      console.warn('[NotificationBatcher] origin custody unreadable — batched sends are held until its state is repaired.');
+    }
+  }
+
+  private persistState(): boolean {
+    const p = this.statePath();
+    if (!p) return true;
+    if (!this.originCustodyReadable) return false;
+    const now = Date.now();
+    const ttl = this.config.suppressionTtlHours * 3_600_000;
+    const payload: PersistedState = {
+      suppression: Object.fromEntries(
+        [...this.lastSentContent.entries()].filter(([, at]) => now - at < ttl),
+      ),
+      sendTimes: Object.fromEntries(
+        [...this.sendTimes.entries()].map(([k, v]) => [String(k), v.filter(t => now - t < WINDOW_MS)]),
+      ),
+    };
+    try {
+      fs.writeFileSync(p, JSON.stringify(payload), 'utf8');
+      const holdsPath = this.originHoldsPath();
+      const holds: PersistedOriginHolds = ([['SUMMARY', this.summaryQueue], ['DIGEST', this.digestQueue]] as const)
+        .flatMap(([tier, queue]) => queue.filter(item => item.originHold).map(item => ({ tier, item })));
+      const active = new Set(holds.map(held => held.item.originHold?.logicalSendId));
+      for (const id of this.frozenBatches.keys()) if (!active.has(id)) this.frozenBatches.delete(id);
+      const custody = JSON.stringify({ version: 2, holds, batches: [...this.frozenBatches.values()] });
+      if (Buffer.byteLength(custody) > 16 * 1024 * 1024) throw new Error('origin-holds-too-large');
+      fs.mkdirSync(path.dirname(holdsPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(`${holdsPath}.tmp`, custody, { encoding: 'utf8', mode: 0o600 });
+      const fd = fs.openSync(`${holdsPath}.tmp`, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(`${holdsPath}.tmp`, holdsPath);
+      const dir = fs.openSync(path.dirname(holdsPath), 'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+      // Deliberately does NOT clear `rateStateReadable`. An earlier revision did,
+      // reasoning that a good write means coherent state — but the state being
+      // written is the EMPTY map we failed to load, so clearing the flag turned
+      // corrupt state into minted capacity within the same process. The flag
+      // latches for the process lifetime; recovery is a restart, which loads the
+      // freshly-written valid file. That costs one window of extra capacity once,
+      // after a restart, which is bounded and honest.
+      return true;
+    } catch {
+      // @silent-fallback-ok — self-referential. Reporting a degradation here
+      // would route through notify() → this same batcher → persistState(), i.e.
+      // a failure loop in the component whose whole purpose is bounding message
+      // volume. A failed pre-dispatch write refuses that send. A failed result
+      // write leaves the earlier frozen logical identity available at restart.
+      return false;
+    }
+  }
+
+  /** Metadata-only audit row. Never carries message content. */
+  private audit(row: { event: string; topicId: number; reason?: string; items?: number }): void {
+    if (!this.auditPath) return;
+    try {
+      fs.appendFileSync(this.auditPath, JSON.stringify({ ts: new Date().toISOString(), ...row }) + '\n', 'utf8');
+    } catch {
+      // @silent-fallback-ok — self-referential, same reasoning as persistState():
+      // this is the audit sink for the notification path, so reporting its own
+      // failure through the notification path is a loop. A lost audit row costs
+      // observability of one hold, never a delivery decision.
+    }
   }
 
   formatDigest(_tierLabel: string, items: QueuedNotification[]): string {
@@ -337,16 +922,44 @@ export class NotificationBatcher {
     return `${category}:${normalized}`;
   }
 
-  private async sendDirect(topicId: number, message: string): Promise<void> {
-    if (!this.sendFn) {
-      return;
-    }
+  /**
+   * Returns TRUE only on a CONFIRMED delivery. The caller uses that to decide
+   * whether to dequeue, write suppression, and consume a rate-limit slot.
+   *
+   * An earlier revision returned void and the caller treated every attempt as a
+   * delivery: a failed Telegram send dropped the item AND suppressed it for 24h.
+   * That is silent loss, and it contradicted this class's own invariant that
+   * suppression-presence follows DELIVERY rather than intent. Caught by the
+   * Phase 5 second-pass review.
+   */
+  private async sendDirect(topicId: number, message: string, logicalSendId?: string, origin?: BatcherOrigin): Promise<boolean | QuietReceipt | TelegramOriginHoldError> {
+    if (!requireDeliverySink(this.sendFn, {
+      component: 'NotificationBatcher',
+      primary: 'Deliver queued and immediate notifications through the configured messaging sink',
+      reason: `No delivery sink is configured for ${topicRef(topicId)}`,
+      impact: 'A notification was not delivered; startup composition or messaging configuration is incomplete',
+    })) return false;
 
     try {
-      await this.sendFn(topicId, message);
+      const result = origin ? await this.sendFn!(topicId, message, logicalSendId, snapshotBatcherOrigin(origin)) : await this.sendFn!(topicId, message, logicalSendId);
+      if (isQuietReceipt(result)) return result;
+      return true;
     } catch (err) {
-      // Log but don't throw — batching should never crash the caller
-      console.error('[NotificationBatcher] Failed to send:', err);
+      if (err instanceof TelegramOriginHoldError) return err;
+      // @silent-fallback-ok — NOT silent: reportDeliverySinkFailure() funnels to
+      // DegradationReporter, so the failure is reported, audited, and (since the
+      // Phase 5 fix) returns false so the caller neither dequeues nor suppresses
+      // the item. The ratchet flags this only because its heuristic greps the
+      // literal string "DegradationReporter" inside the catch and the added
+      // `return false` matches its default-value pattern.
+      // Keep batching non-throwing, but never treat a failed send as silence.
+      reportDeliverySinkFailure({
+        component: 'NotificationBatcher',
+        primary: 'Deliver queued and immediate notifications through the configured messaging sink',
+        reason: `Configured sink failed: ${err instanceof Error ? err.message : String(err)}`,
+        impact: 'Delivery was not confirmed; the frozen batch retains its original logical send identity',
+      });
+      return false;
     }
   }
 

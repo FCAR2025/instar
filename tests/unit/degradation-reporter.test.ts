@@ -78,6 +78,58 @@ describe('DegradationReporter', () => {
     expect(persisted[0].feature).toBe('DiskTest');
   });
 
+  it('never sends internal-only events with user notifications enabled and preserves the queue flag', async () => {
+    const reporter = DegradationReporter.getInstance();
+    reporter.configure({ stateDir: tmpDir, agentName: 'test-agent', instarVersion: '0.9.17' });
+    const telegramSender = vi.fn(async () => undefined);
+    reporter.connectDownstream({ telegramSender, alertTopicId: 7, notifyUser: true });
+    reporter.report({ feature: 'lease.test', primary: 'P', fallback: 'F', reason: 'R', impact: 'I', internalOnly: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(telegramSender).not.toHaveBeenCalled();
+
+    const dispatch = vi.fn(async () => undefined);
+    reporter.setRemediator({ dispatch });
+    reporter._setRestartPending(true);
+    reporter.report({ feature: 'lease.queued', primary: 'P', fallback: 'F', reason: 'R', impact: 'I', internalOnly: true });
+    expect(reporter._readRestartPendingQueue()[0]).toMatchObject({ internalOnly: true, legacy: { internalOnly: true } });
+    reporter._setRestartPending(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(telegramSender).not.toHaveBeenCalled();
+  });
+
+  it('blocks immediate and replayed structured internal-only delivery with an unflagged legacy payload', async () => {
+    const reporter = DegradationReporter.getInstance();
+    reporter.configure({ stateDir: tmpDir, agentName: 'test-agent', instarVersion: '0.9.17' });
+    const telegramSender = vi.fn(async () => undefined);
+    const dispatch = vi.fn(async () => undefined);
+    reporter.connectDownstream({ telegramSender, alertTopicId: 7, notifyUser: true });
+    reporter.setRemediator({ dispatch });
+    const structured: NormalizedDegradationEvent = {
+      subsystem: 'lease.structured', errorCode: 'LEASE_DIAGNOSTIC', provenance: 'free-text',
+      reason: { redacted: 'diagnostic', full: 'diagnostic' }, timestamp: new Date().toISOString(), monotonicTs: 1,
+      internalOnly: true,
+      legacy: {
+        feature: 'lease.structured', primary: 'P', fallback: 'F', reason: 'R', impact: 'I',
+        timestamp: new Date().toISOString(), reported: false, alerted: false,
+      },
+    };
+
+    reporter.reportStructured(structured);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(dispatch).not.toHaveBeenCalled();
+
+    reporter._setRestartPending(true);
+    reporter.reportStructured(structured);
+    const queued = reporter._readRestartPendingQueue()[0];
+    expect(queued.internalOnly).toBe(true);
+    expect(queued.legacy?.internalOnly).toBeUndefined();
+    reporter.setRemediator(null);
+    reporter._setRestartPending(false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(telegramSender).not.toHaveBeenCalled();
+  });
+
   it('logs to console with [DEGRADATION] prefix', () => {
     const reporter = DegradationReporter.getInstance();
     reporter.configure({ stateDir: tmpDir, agentName: 'test-agent', instarVersion: '0.9.17' });
@@ -125,6 +177,7 @@ describe('DegradationReporter', () => {
       feedbackSubmitter,
       telegramSender,
       alertTopicId: 42,
+      notifyUser: true, // C1: these tests exercise the ALERT path; the gate now defaults OFF
     });
 
     // Wait for async drain — use vi.waitFor to handle CPU-loaded environments
@@ -270,7 +323,7 @@ describe('DegradationReporter', () => {
 
       const feedbackSubmitter = vi.fn().mockResolvedValue({});
       const telegramSender = vi.fn().mockResolvedValue({});
-      reporter.connectDownstream({ feedbackSubmitter, telegramSender, alertTopicId: 99 });
+      reporter.connectDownstream({ feedbackSubmitter, telegramSender, alertTopicId: 99, notifyUser: true });
 
       const dispatched: NormalizedDegradationEvent[] = [];
       reporter.setRemediator({
@@ -307,7 +360,7 @@ describe('DegradationReporter', () => {
       // NO setRemediator() call — this is the backward-compat path.
       const feedbackSubmitter = vi.fn().mockResolvedValue({});
       const telegramSender = vi.fn().mockResolvedValue({});
-      reporter.connectDownstream({ feedbackSubmitter, telegramSender, alertTopicId: 7 });
+      reporter.connectDownstream({ feedbackSubmitter, telegramSender, alertTopicId: 7, notifyUser: true });
 
       reporter.report({
         feature: 'BackwardCompat',

@@ -52,6 +52,7 @@ const FAR_FUTURE_HOLD_CLAMP_MS = 7 * 24 * 60 * 60 * 1000;
 export type DeliveryState =
   | 'queued'
   | 'claimed'
+  | 'quiet-recorded'
   | 'delivered-recovered'
   | 'delivered-tone-gated'
   | 'delivered-ambiguous'
@@ -80,6 +81,13 @@ export interface PendingRelayRow {
    *  'acked' audit row (spec outbound-jargon-filepath-gap §2.5). Null on
    *  legacy rows (they ride the delivery-id breadcrumb exemption). */
   message_metadata: string | null;
+  /** Disjoint execution lane; legacy redrive must never claim origin children. */
+  entry_kind?: 'legacy' | 'telegram-origin' | 'telegram-origin-notice';
+  /** SHA-256 hex of the session origin credential the reply script held when
+   *  it queued this row (never the credential itself). Lets the origin import
+   *  label a boot-time queued reply with its real session. Null on rows from
+   *  older scripts and from server-side writers. */
+  origin_session_digest?: string | null;
 }
 
 export interface EnqueueInput {
@@ -101,6 +109,9 @@ export interface EnqueueInput {
    * rolled-back binary keeps honoring holds. No schema change.
    */
   next_attempt_at?: string | null;
+  /** SHA-256 hex of the queuing session's origin credential (mirrors the
+   *  reply script's writer). Attribution input for the origin import only. */
+  origin_session_digest?: string | null;
 }
 
 // ── Schema ────────────────────────────────────────────────────────────
@@ -140,6 +151,13 @@ const COLUMN_ADDS: Array<{ name: string; ddl: string }> = [
   // exists on every deployed agent, so the column arrives ONLY via this
   // idempotent ALTER (and its parallel in telegram-reply.sh's two writers).
   { name: 'message_metadata', ddl: 'ALTER TABLE entries ADD COLUMN message_metadata TEXT' },
+  { name: 'entry_kind', ddl: "ALTER TABLE entries ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'legacy'" },
+  { name: 'origin_child_id', ddl: 'ALTER TABLE entries ADD COLUMN origin_child_id TEXT' },
+  { name: 'owner_boot_id', ddl: 'ALTER TABLE entries ADD COLUMN owner_boot_id TEXT' },
+  { name: 'lease_until', ddl: 'ALTER TABLE entries ADD COLUMN lease_until INTEGER' },
+  // Written only by telegram-reply.sh's two queue writers (which add it with
+  // the same idempotent ALTER); read by the origin legacy import.
+  { name: 'origin_session_digest', ddl: 'ALTER TABLE entries ADD COLUMN origin_session_digest TEXT' },
 ];
 
 // ── Path resolution ───────────────────────────────────────────────────
@@ -155,6 +173,45 @@ export function resolvePendingRelayPath(stateDir: string, agentId: string): stri
 
 export function resolvePendingRelayLockPath(stateDir: string, agentId: string): string {
   return path.join(stateDir, 'state', `pending-relay.${sanitizeAgentId(agentId)}.sqlite.lock`);
+}
+
+/**
+ * Quarantine historical zero-byte stores created before the canonical resolver
+ * was shared by the shell, server, and queue route. Rename is atomic within the
+ * directory: even if a legacy writer opens the file between classification and
+ * rename, any later bytes remain preserved under the quarantine name. Nothing
+ * is deleted automatically.
+ */
+export function cleanupLegacyEmptyPendingRelayStores(
+  stateDir: string,
+  agentId: string,
+  beforeQuarantine?: (candidate: string) => void,
+): string[] {
+  const safe = sanitizeAgentId(agentId);
+  const candidates = [
+    path.join(stateDir, 'pending-relay.db'),
+    path.join(stateDir, `pending-relay.${safe}.sqlite`),
+    path.join(stateDir, 'server-data', 'pending-relay.db'),
+    path.join(stateDir, 'server-data', `pending-relay.${safe}.sqlite`),
+    path.join(stateDir, 'state', 'pending-relay.db'),
+    path.join(stateDir, 'state', 'pending-relay.sqlite'),
+    path.join(stateDir, 'state', 'pending-relay.sqlite3'),
+  ];
+  const canonical = resolvePendingRelayPath(stateDir, agentId);
+  const quarantined: string[] = [];
+  for (const candidate of candidates) {
+      if (candidate === canonical) continue;
+    try {
+      if (fs.statSync(candidate).size !== 0) continue;
+      beforeQuarantine?.(candidate);
+      const quarantine = `${candidate}.legacy-empty-quarantine-${process.pid}-${Date.now()}`;
+      fs.renameSync(candidate, quarantine);
+      quarantined.push(quarantine);
+    } catch {
+      // @silent-fallback-ok: missing/non-file/raced candidate; canonical open continues.
+    }
+  }
+  return quarantined;
 }
 
 /**
@@ -179,7 +236,8 @@ export class PendingRelayStore {
     registerSqliteHandle(() => { try { this.db?.close(); } catch { /* already closed */ } });
   }
 
-  static open(agentId: string, stateDir: string): PendingRelayStore {
+  static open(agentId: string, stateDir: string, options: { durability?: 'NORMAL' | 'FULL'; busyTimeoutMs?: number } = {}): PendingRelayStore {
+    cleanupLegacyEmptyPendingRelayStores(stateDir, agentId);
     const dbPath = resolvePendingRelayPath(stateDir, agentId);
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
@@ -202,8 +260,8 @@ export class PendingRelayStore {
 
     // Mandatory pragmas (spec § 2a). WAL + NORMAL + 5s busy timeout.
     db.pragma('journal_mode = WAL');
-    db.pragma('synchronous = NORMAL');
-    db.pragma('busy_timeout = 5000');
+    db.pragma(`synchronous = ${options.durability === 'FULL' ? 'FULL' : 'NORMAL'}`);
+    db.pragma(`busy_timeout = ${Math.max(0, Math.min(5000, Math.floor(options.busyTimeoutMs ?? 5000)))}`);
 
     for (const ddl of SCHEMA) {
       db.exec(ddl);
@@ -244,12 +302,14 @@ export class PendingRelayStore {
          delivery_id, topic_id, text_hash, text, format,
          http_code, error_body, attempted_port,
          attempted_at, attempts, next_attempt_at,
-         state, claimed_by, status_history, truncated, message_metadata
+         state, claimed_by, status_history, truncated, message_metadata,
+         origin_session_digest
        ) VALUES (
          @delivery_id, @topic_id, @text_hash, @text, @format,
          @http_code, @error_body, @attempted_port,
          @attempted_at, 1, @next_attempt_at,
-         'queued', NULL, @status_history, @truncated, @message_metadata
+         'queued', NULL, @status_history, @truncated, @message_metadata,
+         @origin_session_digest
        )`,
     );
     const result = stmt.run({
@@ -266,6 +326,7 @@ export class PendingRelayStore {
       status_history: initialHistory,
       truncated: input.truncated ? 1 : 0,
       message_metadata: input.message_metadata ?? null,
+      origin_session_digest: input.origin_session_digest ?? null,
     });
     return result.changes === 1;
   }
@@ -291,7 +352,7 @@ export class PendingRelayStore {
     const cutoff = new Date(now.getTime() - windowMs).toISOString();
     const stmt = this.db.prepare(
       `SELECT * FROM entries
-         WHERE topic_id = ? AND text_hash = ? AND attempted_at >= ?
+         WHERE topic_id = ? AND text_hash = ? AND attempted_at >= ? AND entry_kind = 'legacy'
          ORDER BY attempted_at DESC LIMIT 1`,
     );
     const row = stmt.get(topicId, textHash, cutoff) as PendingRelayRow | undefined;
@@ -320,7 +381,7 @@ export class PendingRelayStore {
     }> = {},
   ): boolean {
     const tx = this.db.transaction((id: string, state: DeliveryState, extra: typeof additionalFields) => {
-      const current = this.db.prepare('SELECT status_history FROM entries WHERE delivery_id = ?').get(id) as
+      const current = this.db.prepare("SELECT status_history FROM entries WHERE delivery_id = ? AND entry_kind = 'legacy'").get(id) as
         | { status_history: string }
         | undefined;
       if (!current) return false;
@@ -375,7 +436,7 @@ export class PendingRelayStore {
   selectClaimable(nowIso: string, limit = 100): PendingRelayRow[] {
     const stmt = this.db.prepare(
       `SELECT * FROM entries
-         WHERE state IN ('queued', 'claimed')
+         WHERE state IN ('queued', 'claimed') AND entry_kind = 'legacy'
            AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
            AND NOT (delivery_id >= @prefixLower AND delivery_id < @prefixUpper)
          ORDER BY attempted_at ASC
@@ -399,7 +460,7 @@ export class PendingRelayStore {
   selectClaimableReapNotices(nowIso: string, limit = 100): PendingRelayRow[] {
     const stmt = this.db.prepare(
       `SELECT * FROM entries
-         WHERE delivery_id >= @prefixLower AND delivery_id < @prefixUpper
+         WHERE delivery_id >= @prefixLower AND delivery_id < @prefixUpper AND entry_kind = 'legacy'
            AND state IN ('queued', 'claimed')
            AND (next_attempt_at IS NULL OR next_attempt_at <= @now)
          ORDER BY attempted_at ASC
@@ -424,6 +485,7 @@ export class PendingRelayStore {
     deliveryId: string,
     newClaimedBy: string,
     expected: { state: DeliveryState; claimed_by: string | null },
+    entryKind: 'legacy' | 'telegram-origin' = 'legacy',
   ): boolean {
     const tx = this.db.transaction(() => {
       const result = this.db
@@ -432,13 +494,15 @@ export class PendingRelayStore {
              SET state = 'claimed', claimed_by = @newClaimedBy
              WHERE delivery_id = @delivery_id
                AND state = @expectedState
-               AND claimed_by IS @expectedClaimedBy`,
+               AND claimed_by IS @expectedClaimedBy
+               AND entry_kind = @entryKind`,
         )
         .run({
           delivery_id: deliveryId,
           newClaimedBy,
           expectedState: expected.state,
           expectedClaimedBy: expected.claimed_by,
+          entryKind,
         });
       if (result.changes !== 1) return false;
       // Append the status-history row in the same transaction (parity with
@@ -460,6 +524,66 @@ export class PendingRelayStore {
           .run({ h: JSON.stringify(history), id: deliveryId });
       }
       return true;
+    });
+    return tx() as boolean;
+  }
+
+  /** Renew an owned claim without permitting a stale owner to steal it back. */
+  renewClaim(deliveryId: string, expectedClaimedBy: string, newClaimedBy: string, entryKind: 'legacy' | 'telegram-origin' = 'legacy'): boolean {
+    const result = this.db.prepare(
+      `UPDATE entries SET claimed_by = @newClaimedBy
+       WHERE delivery_id = @deliveryId AND state = 'claimed' AND claimed_by = @expectedClaimedBy AND entry_kind = @entryKind`,
+    ).run({ deliveryId, expectedClaimedBy, newClaimedBy, entryKind });
+    return result.changes === 1;
+  }
+
+  /**
+   * Fenced post-claim transition. Only the worker holding the exact current
+   * ownership token may finalize or release the row.
+   */
+  transitionClaimed(
+    deliveryId: string,
+    expectedClaimedBy: string,
+    newState: DeliveryState,
+    additionalFields: Partial<{
+      claimed_by: string | null;
+      next_attempt_at: string | null;
+      attempts: number;
+      http_code: number | null;
+      error_body: string | null;
+    }> = {},
+  ): boolean {
+    const tx = this.db.transaction(() => {
+      const current = this.db.prepare(
+        `SELECT status_history FROM entries
+         WHERE delivery_id = ? AND state = 'claimed' AND claimed_by = ? AND entry_kind = 'legacy'`,
+      ).get(deliveryId, expectedClaimedBy) as { status_history: string } | undefined;
+      if (!current) return false;
+      let history: unknown[];
+      try {
+        const parsed = JSON.parse(current.status_history);
+        history = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        history = [];
+      }
+      history.push({ state: newState, at: new Date().toISOString() });
+      const fields = ['state = @state', 'status_history = @history'];
+      const params: Record<string, unknown> = {
+        deliveryId,
+        expectedClaimedBy,
+        state: newState,
+        history: JSON.stringify(history),
+      };
+      for (const [key, value] of Object.entries(additionalFields)) {
+        if (value === undefined) continue;
+        fields.push(`${key} = @${key}`);
+        params[key] = value;
+      }
+      const result = this.db.prepare(
+        `UPDATE entries SET ${fields.join(', ')}
+         WHERE delivery_id = @deliveryId AND state = 'claimed' AND claimed_by = @expectedClaimedBy`,
+      ).run(params);
+      return result.changes === 1;
     });
     return tx() as boolean;
   }
@@ -489,7 +613,7 @@ export class PendingRelayStore {
     const stmt = this.db.prepare(
       `SELECT delivery_id, topic_id, attempted_at, next_attempt_at, text
          FROM entries
-         WHERE state IN ('queued', 'claimed')
+         WHERE state IN ('queued', 'claimed') AND entry_kind = 'legacy'
            AND attempted_at < @cutoff
            AND (next_attempt_at IS NULL OR next_attempt_at < @cutoff OR next_attempt_at > @farFuture)
          ORDER BY attempted_at ASC`,
@@ -532,7 +656,7 @@ export class PendingRelayStore {
     const farFuture = farFutureClampIso(nowIso);
     const stmt = this.db.prepare(
       `DELETE FROM entries
-         WHERE state IN ('queued', 'claimed')
+         WHERE state IN ('queued', 'claimed') AND entry_kind = 'legacy'
            AND attempted_at < @cutoff
            AND (next_attempt_at IS NULL OR next_attempt_at < @cutoff OR next_attempt_at > @farFuture)`,
     );
@@ -549,7 +673,7 @@ export class PendingRelayStore {
   purgeTerminalReapNotices(beforeIso: string): number {
     const stmt = this.db.prepare(
       `DELETE FROM entries
-         WHERE delivery_id >= @prefixLower AND delivery_id < @prefixUpper
+         WHERE delivery_id >= @prefixLower AND delivery_id < @prefixUpper AND entry_kind = 'legacy'
            AND state NOT IN ('queued', 'claimed')
            AND attempted_at < @before`,
     );

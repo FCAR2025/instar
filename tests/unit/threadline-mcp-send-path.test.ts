@@ -79,7 +79,9 @@ describe('sendMessageViaHttp — honest error surfacing', () => {
         messageId: 'msg-1',
         threadId: 'thread-1',
         deliveryPath: 'relay',
-        deliveryOutcome: 'spawned new session',
+        deliveryOutcome: 'reply received',
+        accepted: true,
+        delivered: true,
         reply: 'hi back',
         replyFrom: 'dawn',
       }),
@@ -91,10 +93,33 @@ describe('sendMessageViaHttp — honest error surfacing', () => {
     expect(result.messageId).toBe('msg-1');
     expect(result.threadId).toBe('thread-1');
     expect(result.deliveryPath).toBe('relay');
-    expect(result.deliveryOutcome).toBe('spawned new session');
+    expect(result.deliveryOutcome).toBe('reply received');
+    expect(result.accepted).toBe(true);
+    expect(result.delivered).toBe(true);
     expect(result.reply).toBe('hi back');
     expect(result.replyFrom).toBe('dawn');
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves an accepted-but-not-delivered receipt instead of upgrading it to delivery', async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse(200, {
+        success: true,
+        messageId: 'msg-accepted',
+        threadId: 'thread-accepted',
+        deliveryPath: 'local',
+        deliveryOutcome: 'accepted for async processing',
+        accepted: true,
+        delivered: false,
+      }),
+    );
+
+    const result = await sendMessageViaHttp(baseParams(), PORT, TOKEN);
+
+    expect(result.success).toBe(true);
+    expect(result.accepted).toBe(true);
+    expect(result.delivered).toBe(false);
+    expect(result.deliveryOutcome).toBe('accepted for async processing');
   });
 
   it('surfaces a 404 agent-not-found error without an envelope fallback', async () => {
@@ -164,5 +189,53 @@ describe('relay URL single source of truth', () => {
     expect(DEFAULT_RELAY_URL).toBe('wss://threadline-relay.fly.dev/v1/connect');
     expect(DEFAULT_RELAY_HOST).toBe('threadline-relay.fly.dev');
     expect(DEFAULT_RELAY_URL).not.toContain('relay.threadline.dev');
+  });
+});
+
+describe('sendMessageViaHttp — A2A relay forward result fields (a2a-cross-machine-route §4)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  beforeEach(() => { fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock); });
+  afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it('a forwarded 200 carries deliveryPath, forwardedTo, replyArrivesIn and the relay verdict through', async () => {
+    fetchMock.mockResolvedValueOnce(fakeResponse(200, {
+      success: true, accepted: true, delivered: false, messageId: 'msg-1', threadId: 't-holder',
+      deliveryPath: 'forwarded', forwardedTo: 'the mini', replyArrivesIn: 'topic-session', reply: null, relayStatus: 'delivered',
+    }));
+    const result = await sendMessageViaHttp(baseParams(), PORT, TOKEN);
+    expect(result).toMatchObject({
+      success: true, messageId: 'msg-1', threadId: 't-holder', deliveryPath: 'forwarded',
+      forwardedTo: 'the mini', replyArrivesIn: 'topic-session', relayStatus: 'delivered', accepted: true, delivered: false,
+    });
+    expect(result.reply).toBeUndefined();
+  });
+
+  it('a forwarded unconfirmed answer keeps relayStatus unconfirmed and accepted false', async () => {
+    fetchMock.mockResolvedValueOnce(fakeResponse(200, {
+      success: true, accepted: false, delivered: false, messageId: 'msg-1', relayStatus: 'unconfirmed',
+      deliveryPath: 'forwarded', forwardedTo: 'the mini', replyArrivesIn: 'holder-hub', reply: null,
+      deliveryOutcome: 'forwarded to the mini; no answer. Do not resend; check delivery on the mini.',
+    }));
+    const result = await sendMessageViaHttp(baseParams(), PORT, TOKEN);
+    expect(result).toMatchObject({ success: true, accepted: false, relayStatus: 'unconfirmed', forwardedTo: 'the mini', replyArrivesIn: 'holder-hub' });
+  });
+
+  it('a forwarded 502 refusal keeps the contract fields and names the machine that carried it', async () => {
+    fetchMock.mockResolvedValueOnce(fakeResponse(502, {
+      success: false, error: 'not delivered: relay refused (rate_limited).', messageId: 'msg-1', threadId: 't',
+      relayStatus: 'rejected', relayReasonCode: 'rate_limited', retryLater: true, deliveryPath: 'forwarded', forwardedTo: 'the mini', reply: null,
+    }));
+    const result = await sendMessageViaHttp(baseParams(), PORT, TOKEN);
+    expect(result).toMatchObject({
+      success: false, relayStatus: 'rejected', relayReasonCode: 'rate_limited', retryLater: true,
+      deliveryPath: 'forwarded', forwardedTo: 'the mini',
+    });
+  });
+
+  it('an ordinary answer carries no forwarded fields', async () => {
+    fetchMock.mockResolvedValueOnce(fakeResponse(200, { success: true, messageId: 'm', threadId: 't', deliveryPath: 'relay', relayStatus: 'delivered' }));
+    const result = await sendMessageViaHttp(baseParams(), PORT, TOKEN);
+    expect(result).not.toHaveProperty('forwardedTo');
+    expect(result).not.toHaveProperty('replyArrivesIn');
   });
 });

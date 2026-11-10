@@ -26,8 +26,8 @@ export interface CoverageGap {
 }
 
 export interface AuditResult {
-  /** Overall content coverage score (0-1) */
-  coverageScore: number;
+  /** Overall content coverage score (0-1), or null when the tree has no nodes. */
+  coverageScore: number | null;
   /** Total nodes in tree */
   totalNodes: number;
   /** Nodes with valid, non-empty sources */
@@ -40,10 +40,10 @@ export interface AuditResult {
 
 export interface HealthSummary {
   totalNodes: number;
-  coverageScore: number;
-  cacheHitRate: number;
-  avgLatencyMs: number;
-  errorRate: number;
+  coverageScore: number | null;
+  cacheHitRate: number | null;
+  avgLatencyMs: number | null;
+  errorRate: number | null;
   searchCount: number;
   degradedSearches: number;
 }
@@ -97,10 +97,11 @@ export class CoverageAuditor {
       }
     }
 
+    const totalNodes = this.countNodes(config);
     return {
       coverageScore: validation.coverageScore,
-      totalNodes: this.countNodes(config),
-      validNodes: Math.round(validation.coverageScore * this.countNodes(config)),
+      totalNodes,
+      validNodes: validation.coverageScore === null ? 0 : Math.round(validation.coverageScore * totalNodes),
       gaps,
       validation,
     };
@@ -145,10 +146,10 @@ export class CoverageAuditor {
     const tracePath = path.join(this.stateDir, 'logs', 'tree-trace.jsonl');
     const defaultSummary: HealthSummary = {
       totalNodes: 0,
-      coverageScore: 0,
-      cacheHitRate: 0,
-      avgLatencyMs: 0,
-      errorRate: 0,
+      coverageScore: null,
+      cacheHitRate: null,
+      avgLatencyMs: null,
+      errorRate: null,
       searchCount: 0,
       degradedSearches: 0,
     };
@@ -187,10 +188,10 @@ export class CoverageAuditor {
 
       return {
         totalNodes: 0, // Caller fills this from config
-        coverageScore: 0, // Caller fills this from validation
-        cacheHitRate: totalCacheOps > 0 ? totalCacheHits / totalCacheOps : 0,
-        avgLatencyMs: entries.length > 0 ? totalLatency / entries.length : 0,
-        errorRate: entries.length > 0 ? totalErrors / entries.length : 0,
+        coverageScore: null, // Caller fills this from validation
+        cacheHitRate: totalCacheOps > 0 ? totalCacheHits / totalCacheOps : null,
+        avgLatencyMs: totalLatency / entries.length,
+        errorRate: totalErrors / entries.length,
         searchCount: entries.length,
         degradedSearches: degradedCount,
       };

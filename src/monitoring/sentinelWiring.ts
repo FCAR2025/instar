@@ -20,6 +20,7 @@
  * Spec: docs/specs/silently-stopped-trio.md
  */
 
+import { topicRef } from '../messaging/shared/topicRef.js';
 import type { SocketDisconnectSentinelDeps } from './SocketDisconnectSentinel.js';
 import type {
   ActiveWorkSilenceSentinelDeps,
@@ -47,6 +48,7 @@ export interface SentinelSessionSurface {
  * block (which is the gate doing its job, not an error to retry).
  */
 export type AttentionPoster = (item: {
+  contextTopicIds?: number[];
   id: string;
   title: string;
   summary: string;
@@ -315,6 +317,12 @@ export function buildActiveWorkSilenceDeps(opts: {
   /** HONEST-PROGRESS-MESSAGING A1/A2 — capture the session's CURRENT live frame
    *  for corroboration before escalating. */
   captureFrame?: (sessionName: string) => string | null;
+  /** A2(b) — is the live frame a CLEAN IDLE PROMPT (a finished turn, not a
+   *  wedge)? Without this the sentinel's A2(b) branch is inert: the sentinel
+   *  defaults it to `false`, so a session sitting at a finished prompt escalates
+   *  as a "genuine freeze". Supply it from the SHARED IDLE_PROMPT_PATTERNS, not
+   *  a parallel copy (see the export docblock on SessionManager.ts). */
+  isCleanIdlePrompt?: (frame: string, sessionName: string) => boolean;
   /** A2(c) — does the session have a live sub-agent (SubagentTracker)? */
   hasActiveSubagents?: (sessionName: string) => boolean;
   /** Resolve the framework so the live-frame "generating now" check is accurate. */
@@ -347,6 +355,7 @@ export function buildActiveWorkSilenceDeps(opts: {
     looksActivelyWorking: opts.captureFrame
       ? (frame, sessionName) => looksGeneratingNow(frame, opts.frameworkForSession?.(sessionName))
       : undefined,
+    isCleanIdlePrompt: opts.isCleanIdlePrompt,
     hasActiveSubagents: opts.hasActiveSubagents,
     recordEvent: opts.recordEvent,
   };
@@ -427,7 +436,7 @@ export function buildRateLimitRecoveryDeps(s: RateLimitRecoverySurface): {
         ok ? 'recovery-reached' : 'recovery-unreachable',
         sessionName,
         ok
-          ? `resume nudge injected via internal recovery channel${topicId != null ? ` (topic ${topicId})` : ''}`
+          ? `resume nudge injected via internal recovery channel${topicId != null ? ` (${topicRef(topicId)})` : ''}`
           : 'internal injection returned false',
         ['internal-injection'],
       );
@@ -500,6 +509,7 @@ export function stripVolatileStatus(
       line
         .replace(/[⠀-⣿]/g, '') // Braille spinner glyphs
         .replace(escPhrase, '') // the "esc to interrupt" affordance phrase
+        .replace(/\b\d+h\s*\d+m\s*\d+s\b/g, '') // elapsed "10h 19m 44s"
         .replace(/\b\d+m\s*\d+s\b/g, '') // elapsed "26m 16s"
         .replace(/\(\s*\d+\s*s\b/g, '(') // "(12s …" working-status seconds
         .replace(/[↑↓]\s*[\d.,]+\s*k?\s*tokens?/gi, '') // token counter

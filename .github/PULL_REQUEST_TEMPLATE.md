@@ -2,6 +2,14 @@
 
 What does this PR do? Why is it needed?
 
+## ELI16
+
+<!-- Gate: write at least 200 characters of plain-English explanation for a non-expert; comments do not count. -->
+
+## UX Impact
+
+<!-- Gate for user-facing paths: name who sees the change, describe the user-visible first contact, and quote an exact string from the diff. -->
+
 ## Type of Change
 
 - [ ] Bug fix (non-breaking change that fixes an issue)

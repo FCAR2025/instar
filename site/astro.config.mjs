@@ -79,10 +79,12 @@ export default defineConfig({
           items: [
             { label: 'Job Scheduler', slug: 'features/scheduler' },
             { label: 'Telegram Integration', slug: 'features/telegram' },
+            { label: 'Tunnels', slug: 'features/tunnel' },
             { label: 'WhatsApp Integration', slug: 'features/whatsapp' },
             { label: 'Slack Integration', slug: 'features/slack' },
             { label: 'Lifeline', slug: 'features/lifeline' },
             { label: 'Conversational Memory', slug: 'features/memory' },
+            { label: 'Memory Privacy', slug: 'features/memory-privacy' },
             { label: 'Evolution System', slug: 'features/evolution' },
             { label: 'Relationships', slug: 'features/relationships' },
             { label: 'Safety Gates', slug: 'features/safety-gates' },
@@ -102,6 +104,7 @@ export default defineConfig({
             { label: 'Self-Healing Remediator', slug: 'features/remediator' },
             { label: 'Task Flows', slug: 'features/task-flows' },
             { label: 'Correction & Preference Learning', slug: 'features/correction-preference-learning' },
+            { label: 'Scope-Accretion Completion Discipline', slug: 'features/scope-accretion' },
           ],
         },
         {
@@ -121,6 +124,7 @@ export default defineConfig({
             { label: 'Hooks', slug: 'reference/hooks' },
             { label: 'Default Jobs', slug: 'reference/default-jobs' },
             { label: 'Threadline Protocol', slug: 'reference/threadline-protocol' },
+            { label: 'Threadline Module Reference', slug: 'reference/threadline-internals' },
           ],
         },
         {

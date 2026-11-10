@@ -48,9 +48,61 @@ export interface GuardManifestEntry {
   /** Implementing component (class/module name) — the lint's join key. */
   component?: string;
   description: string;
+  // ── G3: dark-but-load-bearing classification (g3-dark-but-load-bearing-guards) ──
+  /** A CRITICAL PATH depends on this guard — a silent-unguarded posture is a
+   *  visible gap, not quiet (the "A Dark Feature Guards Nothing" arm). */
+  loadBearing?: boolean;
+  /** REQUIRED when loadBearing — the path the guard protects (e.g. "operator
+   *  inbound message delivery"). Travels on EVERY anomaly of a load-bearing guard. */
+  criticalPath?: string;
+  /** Graduated-rollout soak budget, days from declaredLoadBearingAt (manifest
+   *  constant). 0/absent ⇒ no grace → an on-dry-run guard is immediately a Gap. */
+  soakWindowDays?: number;
+  /** ISO date the loadBearing flag was added (manifest constant). REQUIRED +
+   *  valid-ISO when soakWindowDays>0; absent/malformed at runtime ⇒ the soak
+   *  clause cannot be evaluated → the guard falls to the loud Gap (safe/loud). */
+  declaredLoadBearingAt?: string;
 }
 
 export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
+  {
+    key: 'scheduler.jobCoverage', kind: 'code-default', defaultEnabled: true,
+    expectedTickMs: 300_000, process: 'server', expectRuntime: false,
+    component: 'JobCoverageMonitor',
+    description: 'Signed peer job-catalog observation and lease-handoff coverage alert on multi-machine agents.',
+  },
+  {
+    key: 'multiMachine.identityReannounce.identityDivergenceMonitor',
+    kind: 'config',
+    configPath: 'multiMachine.identityReannounce.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.identityReannounce.dryRun',
+    expectedTickMs: 120_000,
+    process: 'server',
+    expectRuntime: false,
+    component: 'IdentityDivergenceMonitor',
+    description: 'Equal-epoch signing/recovery divergence monitor: compares authenticated live projections, deduplicates durable episodes, and raises a critical attention item while automatic identity recovery remains fail-closed.',
+    loadBearing: true,
+    criticalPath: 'machine identity authenticity and recovery continuity across the pool',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-08-30',
+  },
+  {
+    key: 'multiMachine.peerExecution.enabled',
+    kind: 'config',
+    configPath: 'multiMachine.peerExecution.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.peerExecution.dryRun',
+    expectedTickMs: 60_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'MutualSshRuntime',
+    description: 'Standing peer-machine execution: installs only mutually verified, current-epoch peer keys into this agent home and reports unreachable peers as named readiness blockers.',
+    loadBearing: true,
+    criticalPath: 'autonomous execution on a paired peer machine',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-22',
+  },
   // ── Durable Inbound Message Queue (spec §Observability; keys === configPath) ──
   {
     key: 'multiMachine.sessionPool.inboundQueue.enabled',
@@ -63,6 +115,125 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: false,
     component: 'QueueDrainLoop',
     description: 'Durable custody for undeliverable inbound messages + the drain that delivers them (ships dark).',
+    // G3 load-bearing (g3-dark-but-load-bearing-guards, Decision 2): the durable
+    // inbound-message custody + drain sits directly on the OPERATOR MESSAGE
+    // DELIVERY path the 2026-07-01 silent-loss postmortem named. Ships dry-run-first
+    // (enabled:true,dryRun:true), so a graduating agent SOAKS for the window; a
+    // fully-dark agent is a loud loadBearingGap (force a decision: graduate or
+    // record an owned accept).
+    loadBearing: true,
+    criticalPath: 'operator inbound message delivery (durable custody + drain for undeliverable inbound messages)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-01',
+  },
+  // ── U4.1 — WS1.3 pin persistence (docs/specs/u4-1-pin-persistence.md §2A) ──
+  // ── Standby-Write Reconciliation (docs/specs/standby-write-reconciliation.md §3.5) ──
+  {
+    key: 'writeAdmission',
+    kind: 'config',
+    configPath: 'multiMachine.writeAdmission.enabled',
+    // Dev-gated: `enabled` OMITTED from ConfigDefaults (resolveDevAgentGate) —
+    // dark-default on the fleet, live on a development agent, dry-run FIRST.
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.writeAdmission.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'WriteAdmission',
+    description: 'Ownership-scoped write admission + typed refusal (standby-write reconciliation): classifies every write into a domain and admits or typed-refuses in <2s instead of the blanket standby boolean. Dry-run first — the LEGACY blanket guard keeps enforcing until dryRun:false AND the wave-2 inventory ladder gate.',
+    // §3.5: loadBearing stays FALSE while the legacy blanket guard remains the
+    // enforcing layer — re-reviewed (and expected flipped) at fleet
+    // graduation, when the legacy guard's authority is subsumed.
+    loadBearing: false,
+  },
+  {
+    key: 'multiMachine.seamlessness.ws13Reconcile',
+    kind: 'config',
+    configPath: 'multiMachine.seamlessness.ws13Reconcile',
+    // Dev-gated: `enabled` OMITTED from ConfigDefaults (resolveDevAgentGate) —
+    // dark-default on the fleet, live on a development agent. ws13DryRun is the
+    // in-component "log intended CAS without performing it" rung.
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.seamlessness.ws13DryRun',
+    expectedTickMs: 30_000, // ws13TickMs default
+    process: 'server',
+    // expectRuntime honesty (U4.1 §2A manifest constants): TRUE only because the
+    // reconciler's GuardRegistry self-registration is BUILT (OwnershipReconciler
+    // .guardStatus() registered at boot in server.ts) — a manifest that expects a
+    // runtime report nobody sends is a standing false alarm.
+    expectRuntime: true,
+    component: 'OwnershipReconciler',
+    description: 'U4.1/WS1.3 ownership reconciler — the owning controller that drives a pinned topic to its desired machine within a bounded time (cooperative transfer/adopt; paced; sustained-online gated) or escalates loudly (pin-diverged / pin-pending-aged attention items).',
+    // G3 (U4.1 §2A): pin persistence is the exact "A Dark Feature Guards Nothing"
+    // failure named after the 2026-07-01 incident — a dark/dry-run posture must
+    // classify loadBearingSoaking→loadBearingGap, never sit silent.
+    loadBearing: true,
+    criticalPath: 'deliberate placement persistence (operator pin survives lease handover and machine bounce)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-02',
+  },
+  {
+    key: 'multiMachine.seamlessness.ws13PinReplicate',
+    kind: 'config',
+    configPath: 'multiMachine.seamlessness.ws13PinReplicate',
+    // Dev-gated: OMITTED from ConfigDefaults (resolveDevAgentGate) — dark-default
+    // on the fleet, live on a development agent.
+    defaultEnabled: false,
+    process: 'server',
+    // No single ticking runtime component: emission rides the store-agnostic
+    // ReplicatedRecordEmitter and reads ride the TopicPinFoldView refresh — no
+    // self-registration, so expectRuntime stays honest at false.
+    expectRuntime: false,
+    component: 'TopicPinReplicatedStore',
+    description: 'U4.1/WS1.3 pin replication — the topic-pin-record advisory stream (HLC-ordered, tombstone-respecting, skew-gated answer-complete fold) that lets the owning machine and a new lease-holder SEE an operator pin set elsewhere.',
+    loadBearing: true,
+    criticalPath: 'deliberate placement persistence (operator pin survives lease handover and machine bounce)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-02',
+  },
+  // ── U4.3 — rope-health recovery probe (docs/specs/u4-3-breaker-recovery-probe.md §3) ──
+  {
+    key: 'multiMachine.meshTransport.recoveryProbeEnabled',
+    kind: 'config',
+    configPath: 'multiMachine.meshTransport.recoveryProbeEnabled',
+    // Dev-gated: `enabled` OMITTED from ConfigDefaults (resolveDevAgentGate) —
+    // dark-default on the fleet, live (dry-run) on a development agent.
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.meshTransport.recoveryProbeDryRun',
+    expectedTickMs: 5_000, // rides the ~5s lease-pull tick (the carrier)
+    process: 'server',
+    expectRuntime: false,
+    component: 'RopeRecoveryProber',
+    description: 'U4.3 traffic-independent recovery probe for dead mesh ropes (pinned signed canary dials feeding the one HealthRecord authority; episode-scoped, P19 15-min floor, escalate-once per episode).',
+    // G3 (R-r2-6): this is a GUARD for a live incident class (a healed rope
+    // presumed dead for a week), so a dark/stalled state must classify as
+    // loadBearingGap/loadBearingSoaking — never sit silently off. The soak
+    // constants make the day-one dev dry-run posture classify loadBearingSoaking
+    // (a guard graduating within its bounded window), not an instant Gap alarm.
+    loadBearing: true,
+    criticalPath: 'mesh reachability recovery',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-02',
+  },
+  // ── U4.5 — rope-health alerts monitor (docs/specs/u4-5-rope-health-alerts.md §4) ──
+  {
+    key: 'monitoring.ropeHealth.enabled',
+    kind: 'config',
+    configPath: 'monitoring.ropeHealth.enabled',
+    // Dev-gated: `enabled` OMITTED from ConfigDefaults (resolveDevAgentGate) —
+    // dark-default on the fleet, live on a development agent day one.
+    defaultEnabled: false,
+    expectedTickMs: 30_000, // the monitor's OWN bounded evaluation loop (R-r2-2)
+    process: 'server',
+    expectRuntime: false,
+    component: 'RopeHealthMonitor',
+    description: 'U4.5 rope-health alerts — deterministic sleep-aware mesh-degradation classifier (ok/degraded/peer-offline/urgent) with episode-deduped HIGH partition alerts + Tailscale key-expiry warnings.',
+    // G3: this IS the alerting layer for mesh reachability — a partition with the
+    // monitor dark is exactly the silent-message-loss precondition it exists to
+    // surface, so a dark/stalled state must classify loadBearingGap/Soaking.
+    loadBearing: true,
+    criticalPath: 'mesh partition alerting',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-02',
   },
   {
     key: 'multiMachine.sessionPool.holdForStability.enabled',
@@ -77,6 +248,93 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: true,
     component: 'OwnerHoldVerdict',
     description: 'Hold-for-stability: briefly-wobbly machines get up to holdMaxMs to recover before their conversations move (ships dark; trails inboundQueue one stage).',
+  },
+  {
+    // U4.2 stale-owner release (docs/specs/u4-2-stale-owner-release.md §5) —
+    // `enabled` is deliberately OMITTED from ConfigDefaults (developmentAgent
+    // dark-feature gate: dev-live-in-dryRun, dark fleet; DEV_GATED_FEATURES).
+    // defaultEnabled:false reflects the fleet default.
+    key: 'multiMachine.sessionPool.staleOwnerRelease.enabled',
+    kind: 'config',
+    configPath: 'multiMachine.sessionPool.staleOwnerRelease.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.sessionPool.staleOwnerRelease.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'StaleOwnerReleaseEngine',
+    description:
+      "U4.2 stale-owner release — the serving-lease holder force-claims a provably-dead owner's topics behind the §2.2 evidence bar (ships dev-dry-run / dark fleet; graduation soak-gated).",
+    // G3 load-bearing (spec §5): this feature class is literally on the
+    // postmortem's existed-but-dark list — a stalled dark/dry-run posture must
+    // classify LOUDLY per #1318, never sit quiet.
+    loadBearing: true,
+    criticalPath: 'topic reachability when its owner machine dies (auto-failover of stranded topics)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-02',
+  },
+  {
+    // U4.4 lease hand-back (docs/specs/u4-4-lease-handback.md §5) — ACTION-BEARING
+    // lease authority; ships HARD-DARK everywhere (enabled:false + dryRun:true,
+    // DARK_GATE_EXCLUSIONS) until the live two-machine pair verification passes.
+    key: 'multiMachine.leaseSelfHeal.preferredCaptainHandback.enabled',
+    kind: 'config',
+    configPath: 'multiMachine.leaseSelfHeal.preferredCaptainHandback.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'multiMachine.leaseSelfHeal.preferredCaptainHandback.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'LeaseHandbackReconciler',
+    description:
+      'U4.4 lease hand-back — drives the serving lease back to the F4 preferred captain after a failover (hysteresis-gated, claim-before-release via signed consent token; ships hard-dark, live-pair-verified before enablement).',
+    // G3 load-bearing (spec §5, R-r2-7): deliberately hard-dark past any
+    // reasonable soak until the live-pair drive — the soak constants make the
+    // pre-graduation posture classify loadBearingSoaking within its window; a
+    // stall past it falls to the loud Gap, with the manual captain-flip playbook
+    // as the recorded interim operator fallback.
+    loadBearing: true,
+    criticalPath: 'serving-lease returns to intended captain (mesh drifts off the always-on machine after failover)',
+    soakWindowDays: 60,
+    declaredLoadBearingAt: '2026-07-02',
+  },
+  // ── Swap-continuity anti-thrash guards (swap-continuity-antithrash §6.4) ──
+  {
+    // Piece 1 — the anti-thrash brakes on the proactive account swap. Nested
+    // under the already-opt-in subscriptionPool.proactiveSwap lever (fleet-dark
+    // today); the block resolves `enabled:true, dryRun:true` when ABSENT, so an
+    // opted-in install grades on-dry-run (the rung-2 soak) rather than off.
+    key: 'subscriptionPool.proactiveSwap.antiThrash.enabled',
+    kind: 'config',
+    configPath: 'subscriptionPool.proactiveSwap.antiThrash.enabled',
+    // Runtime-fallback default (`?? true`) — ConfigDefaults deliberately omits
+    // the block per spec §9 (absence = defaults).
+    defaultEnabled: true,
+    dryRunConfigPath: 'subscriptionPool.proactiveSwap.antiThrash.dryRun',
+    // §7.1: every antiThrash knob is re-read via the config getter each tick,
+    // so a config change is already live — diverged-pending-restart would lie.
+    liveConfig: true,
+    process: 'server',
+    expectRuntime: false,
+    component: 'SwapAntiThrashEngine',
+    description:
+      'Anti-thrash brakes on the proactive account swap (all-hot brake, 45-min dwell, target-materially-better, two-tier thrash breaker) — the fix for the 2026-07-02 36-swap thrash day. Dry-run soaks by default; live only at a deliberate dryRun:false.',
+  },
+  {
+    // Piece 2 — the in-flight work gate on every session-killing mutation.
+    // The `enabled` key is OMITTED from shipped config (dev-agent gate: live on
+    // a dev agent, dark on the fleet — the #1001 anti-mechanism); the posture
+    // row exists independently of proactiveSwap (§6.4) and grades dark-default
+    // on the fleet — ships-dark quiet, never a load-bearing gap (no critical
+    // path depends on it until the fleet flip).
+    key: 'subscriptionPool.swapContinuity.enabled',
+    kind: 'config',
+    configPath: 'subscriptionPool.swapContinuity.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'subscriptionPool.swapContinuity.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'SwapWorkGate',
+    description:
+      'In-flight work gate for session-killing mutations (proactive swap defers; reactive gets a bounded grace then proceeds WITH F3 mitigations; interactive refresh gets a structured session-busy refusal + force) — a swap never silently kills builders mid-task.',
   },
   // ── Session lifecycle guards ──
   {
@@ -165,6 +423,77 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     description: 'Detects sessions frozen mid-task (active work gone silent).',
   },
   {
+    key: 'monitoring.permissionPromptAutoResolver.enabled',
+    kind: 'config',
+    // NB: there is NO persisted `enabled` for this floor (a stale `false` could
+    // re-disable the very safety it provides — the trap that caused the bug). The
+    // posture key is COMPUTED in extractGuardPosture from inverted `emergencyDisable`,
+    // defaulting on; this configPath matches that computed key.
+    configPath: 'monitoring.permissionPromptAutoResolver.enabled',
+    defaultEnabled: true,
+    expectedTickMs: 5_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'PermissionPromptAutoResolver',
+    description: 'Always-on floor that auto-answers a framework approval prompt (the cd-redirection wedge); never silently disableable.',
+  },
+  {
+    key: 'intelligence.selfActionGovernor.enabled',
+    kind: 'config',
+    // SYNTHETIC enabled-polarity key (unified-self-action-backpressure
+    // §Fail-direction deliverable 1 — the PermissionPromptAutoResolver
+    // precedent): the governor's only switch is the INVERTED
+    // `intelligence.selfActionGovernor.emergencyDisable` (true = OFF), so
+    // extractGuardPosture COMPUTES `enabled = emergencyDisable !== true`
+    // (absent => on) under this configPath. A deliberate disable then reads as
+    // enabled->disabled — a tripwire incident, never a silent batch-flip.
+    configPath: 'intelligence.selfActionGovernor.enabled',
+    defaultEnabled: true,
+    // emergencyDisable is read live by the governor (a disk/PATCH change takes
+    // effect with no restart) — diverged-pending-restart would lie.
+    liveConfig: true,
+    expectedTickMs: 60_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'SelfActionGovernor',
+    description:
+      'Unified self-action backpressure chokepoint (observe-only rollout): every registered self-triggered action (kill, swap, notify, respawn) rides admit() for would-deny measurement; per-class enforce is the operator FD8 ladder.',
+    loadBearing: true,
+    criticalPath: 'self-action capacity safety (the runaway self-trigger flood brake: reaper kill storms, swap thrash, notify floods)',
+    // G3 manifest lint: every loadBearing entry declares its soak budget. The
+    // governor ships observe-only BY DESIGN (FD1) and its runtime getter does
+    // not report observe as dryRun (the FD8/FD12 ladder owns per-class
+    // graduation), so the soak window exists to satisfy the uniform G3
+    // contract — the guard's own enabled-state (emergencyDisable inversion)
+    // is what the gap classification watches.
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-10',
+  },
+  {
+    key: 'monitoring.externalHogSentinel.enabled',
+    kind: 'config',
+    configPath: 'monitoring.externalHogSentinel.enabled',
+    // Dev-gated: `enabled` OMITTED from ConfigDefaults (resolveDevAgentGate) —
+    // dark-default on the fleet, live (watch-only dryRun) on a development agent.
+    // dryRun is the kill-safety canary: live-on-dev scans/classifies/LOGS would-kills
+    // but signals NOTHING until a deliberate PIN-gated arm.
+    defaultEnabled: false,
+    dryRunConfigPath: 'monitoring.externalHogSentinel.dryRun',
+    expectedTickMs: 60_000, // scanIntervalMs default
+    // The sentinel self-registers its GuardRegistry getter at boot (commands/server.ts →
+    // guardRegistry.register('monitoring.externalHogSentinel.enabled', () =>
+    // sentinel.guardRuntimeStatus())), so /guards expects a runtime report. lastTickAt is the
+    // sampler heartbeat (last SUCCESSFUL parse) → a blind-but-ticking sentinel reads on-stale.
+    process: 'server',
+    expectRuntime: true,
+    component: 'ExternalHogSentinel',
+    description: 'External-hog zombie auto-kill sentinel — surfaces any sustained EXTERNAL CPU hog (broad observability) and, within a mechanical veto-only floor + an intelligence kill/leave/alert verdict, auto-kills exactly one narrow class (orphaned Electron editor extension-host wrappers). Ships dev-gated dark-on-fleet, watch-only dryRun; a live kill needs a deliberate PIN-gated arm.',
+    // loadBearing FALSE: a new watch-only capability nothing else depends on — a dark
+    // posture just means zombies persist (the status quo), not a broken critical path.
+    // Re-reviewed at fleet graduation.
+    loadBearing: false,
+  },
+  {
     key: 'monitoring.contextWedgeSentinel.enabled',
     kind: 'config',
     configPath: 'monitoring.contextWedgeSentinel.enabled',
@@ -198,9 +527,111 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     dryRunConfigPath: 'monitoring.agentWorktreeReaper.dryRun',
     expectedTickMs: 86_400_000,
     process: 'server',
-    expectRuntime: false,
+    expectRuntime: true,
     component: 'AgentWorktreeReaper',
     description: 'Reclaims merged+clean+unused agent worktrees.',
+  },
+  {
+    // B3.1. Previously listed in NOT_A_GUARD as "scheduler-internal mechanics …
+    // not its own guard" — a reason that PRESUMED it ran. It was constructed
+    // eight times in its own unit test file and zero times in production source
+    // while a job failed 492 consecutive times. The exemption was removed
+    // together with the missing construction: once it is wired on its own
+    // cadence and registered, it is a guard, and the inventory must be able to
+    // report whether it is actually on.
+    key: 'monitoring.crashLoopPauser',
+    kind: 'config',
+    configPath: 'monitoring.crashLoopPauser.enabled',
+    defaultEnabled: true,
+    dryRunConfigPath: 'monitoring.crashLoopPauser.dryRun',
+    expectedTickMs: 3_600_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'CrashLoopPauser',
+    description: 'Auto-pauses a job that keeps crash-looping; ships dry-run because pausing disables a job.',
+  },
+  {
+    // Machine-coherence guard (machine-coherence-guard §6/§7, roadmap 4.1
+    // F4/P0-1). `enabled` is deliberately OMITTED from ConfigDefaults — the
+    // runtime resolves it through the developmentAgent dark-feature gate (dark
+    // on the fleet, live on a dev agent; dry-run first). defaultEnabled:false
+    // reflects the fleet default. expectRuntime:true — increment C₁b-i adds the
+    // server-boot construction + guardRegistry.register('monitoring.machineCoherence.enabled')
+    // callsite on the peerPresenceTick path, registered ONLY when the gate
+    // resolves enabled. The `missing` classification requires configEnabled===true
+    // (guardPostureView §precedence), so a dark fleet agent (gate → false) never
+    // constructs, never registers, and is never falsely graded `missing` — the
+    // ws13Reconcile/holdForStability expectRuntime:true precedent.
+    // NOT loadBearing (Frontloaded Decision D6): signal-only, no critical path
+    // consumes it yet, and loadBearing:true would raise G3 gap alarms on every
+    // fleet agent where the guard is deliberately dark.
+    key: 'monitoring.machineCoherence.enabled',
+    kind: 'config',
+    configPath: 'monitoring.machineCoherence.enabled',
+    defaultEnabled: false,
+    expectedTickMs: 30_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'MachineCoherenceSentinel',
+    description: 'Machine-coherence guard evaluator: compares version/resolved-flag/protocol/manifest across the agent\'s own ONLINE machines (the F4 skew class) and will raise ONE episode-scoped attention item from exactly ONE elected machine. Signal-only; MUTATES NOTHING.',
+  },
+  {
+    // Codex device-limit tripwire (codex-device-limit-tripwire §9). `enabled` is
+    // deliberately OMITTED from ConfigDefaults — the runtime resolves it through the
+    // developmentAgent dark-feature gate (live on a dev agent, off on the fleet until
+    // graduation), re-read live on every read and tick. defaultEnabled:false reflects the
+    // fleet default. expectRuntime:false — it registers no runtime getter; its state is the
+    // `deviceLimit` block on GET /subscription-pool. NOT loadBearing: it only reduces autonomy
+    // and nothing depends on it being on.
+    key: 'subscriptionPool.codexDeviceLimit.enabled',
+    kind: 'config',
+    configPath: 'subscriptionPool.codexDeviceLimit.enabled',
+    defaultEnabled: false,
+    liveConfig: true,
+    process: 'server',
+    expectRuntime: false,
+    component: 'CodexDeviceLimitTripwire',
+    description: 'Codex device-limit tripwire: Jev (Luna referee) judges the Codex app-server\'s own refusal; two separate fresh device_limit verdicts 5–60 min apart, with another account here reading clean, bench that account on this machine only (no placement, no repair, sessions moved). Reduces autonomy only; two clean reads release.',
+  },
+  {
+    // `enabled` is deliberately OMITTED from ConfigDefaults — the runtime resolves
+    // it through the developmentAgent dark-feature gate (dark on the fleet, live on
+    // a dev agent). defaultEnabled:false reflects the fleet default. Constructed
+    // ONLY when the gate resolves enabled (a dark fleet agent never constructs,
+    // never registers — never falsely graded `missing`), registering a synchronous
+    // runtime getter (enabled/dryRun + real lastTickAt liveness) — expectRuntime:true.
+    // NOT loadBearing: signal-only, no critical path consumes it, and loadBearing:true
+    // would raise G3 gap alarms on every fleet agent where the guard is deliberately dark.
+    key: 'monitoring.singleMachineFailoverGap.enabled',
+    kind: 'config',
+    configPath: 'monitoring.singleMachineFailoverGap.enabled',
+    dryRunConfigPath: 'monitoring.singleMachineFailoverGap.dryRun',
+    defaultEnabled: false,
+    expectedTickMs: 30_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'SingleMachineFailoverGapDetector',
+    description: 'Single-machine failover-gap detector: raises ONE deduped HIGH attention item when this agent is single-machine (no online mesh peer) WHILE it has active autonomous runs — the "no failover target for active autonomous work" gap. Rides the 30s peerPresenceTick; signal-only, MUTATES NOTHING.',
+  },
+  {
+    // `enabled` is deliberately OMITTED from ConfigDefaults — the runtime resolves
+    // it through the developmentAgent dark-feature gate (dark on the fleet, live on
+    // a dev agent). defaultEnabled:false reflects the fleet default. Constructed
+    // ONLY when the gate resolves enabled (a dark fleet agent never constructs,
+    // never registers — never falsely graded `missing`), registering a synchronous
+    // runtime getter (enabled/dryRun + real lastTickAt liveness) — expectRuntime:true.
+    // NOT loadBearing: signal-only, no critical path consumes it, and loadBearing:true
+    // would raise G3 gap alarms on every fleet agent where the guard is deliberately dark.
+    key: 'monitoring.missingLoginSession.enabled',
+    kind: 'config',
+    configPath: 'monitoring.missingLoginSession.enabled',
+    dryRunConfigPath: 'monitoring.missingLoginSession.dryRun',
+    defaultEnabled: false,
+    expectedTickMs: 30_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'MissingLoginSessionDetector',
+    description: 'Missing-login-session detector: raises ONE deduped HIGH attention item when a live session is running on an account whose local login has gone missing (subscription-pool identity drift owner-relogin-required / missing-local-login) — the "live session about to wall on a missing login" gap. Rides the 30s peerPresenceTick; signal-only, MUTATES NOTHING.',
   },
   {
     // `enabled` is deliberately OMITTED from ConfigDefaults — the runtime resolves
@@ -212,7 +643,7 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     defaultEnabled: false,
     expectedTickMs: 600_000,
     process: 'server',
-    expectRuntime: false,
+    expectRuntime: true,
     component: 'OrphanedWorkSentinel',
     description: 'Detects agent worktrees with uncommitted work whose owning session died + settled.',
   },
@@ -232,6 +663,38 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: true,
     component: 'StrandedTopicSentinel',
     description: 'Pure-signal detector: surfaces a topic whose owner machine is online-but-unable-to-serve (quota-walled / adapter-disconnected) while a healthy machine holds the lease, so inbound is silently dead. Raises ONE aggregated attention item; MUTATES NOTHING.',
+    // G3 load-bearing (g3-dark-but-load-bearing-guards, Decision 2): the ONLY
+    // detector of "inbound is silently dead" — an online-but-unable-to-serve
+    // owner. Directly on the operator-message-reachability critical path. No
+    // dry-run arm, so a dark agent is an immediate loud loadBearingGap (the honest
+    // force-a-decision signal); the soak window applies only where it is graduated.
+    loadBearing: true,
+    criticalPath: 'inbound message reachability (detects an online-but-unable-to-serve owner so inbound is not silently dead)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-01',
+  },
+  {
+    // Durable-Output Hygiene Standard §2 Layer B ("What Persists Must Be Clean",
+    // docs/specs/durable-output-hygiene-standard.md). `enabled` is deliberately
+    // OMITTED from ConfigDefaults — the runtime resolves it through the
+    // developmentAgent dark-feature gate (dark on the fleet, live on a dev
+    // agent); defaultEnabled:false reflects the fleet default. NO expectedTickMs:
+    // it is EVENT-DRIVEN (runs inline at each durable-output persistence write,
+    // not on a tick), so a quiet store is not stale. expectRuntime: false — it is
+    // a pure write-path transform constructed at boot, with no guardRegistry
+    // heartbeat. dryRunConfigPath is the canary arm (dryRun:true computes +
+    // records would-redact metrics but persists the ORIGINAL text; the
+    // dryRun:false flip is the operator's endpoint decision — spec Frontloaded
+    // Decision #4).
+    key: 'monitoring.durableOutputScrub.enabled',
+    kind: 'config',
+    configPath: 'monitoring.durableOutputScrub.enabled',
+    dryRunConfigPath: 'monitoring.durableOutputScrub.dryRun',
+    defaultEnabled: false,
+    process: 'server',
+    expectRuntime: false,
+    component: 'DurableOutputScrubber',
+    description: 'Deterministic credential-SPAN scrub over LLM output at durable-output persistence chokepoints (session summaries first) — redacts known token shapes BEFORE the write, with provenance markers + would-redact telemetry (counts/kind/offset only, never bytes). Content-altering safety floor, never blocking; dark-first + dryRun canary.',
   },
   {
     // tmux Event-Loop Resilience (C). `enabled` is deliberately OMITTED from
@@ -261,6 +724,21 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: false,
     component: 'McpProcessReaper',
     description: 'Reaps orphaned MCP server processes.',
+  },
+  {
+    key: 'monitoring.codexArmSessionSweeper.enabled',
+    kind: 'config',
+    configPath: 'monitoring.codexArmSessionSweeper.enabled',
+    defaultEnabled: true,
+    dryRunConfigPath: 'monitoring.codexArmSessionSweeper.dryRun',
+    expectedTickMs: 600_000,
+    process: 'server',
+    // TRUE because server.ts registers a live getter (enabled/dryRun/lastTickAt), so the
+    // declared cadence is actually evaluated — a declared-but-inert expectedTickMs was
+    // the review's finding #5.
+    expectRuntime: true,
+    component: 'CodexArmSessionSweeper',
+    description: 'Closes orphaned instar-codex-arm-* tmux sessions codexHookArm leaks when its creator dies before teardown (an update restart). Reads tmux, not instar\'s session registry.',
   },
   {
     key: 'monitoring.staleBackstop.enabled',
@@ -294,6 +772,26 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     description: 'Boot-time health beacon endpoint (dev-gated, CMT-1438).',
   },
   {
+    key: 'monitoring.blockerLifecycleLedger.enabled',
+    kind: 'config',
+    configPath: 'monitoring.blockerLifecycleLedger.enabled',
+    defaultEnabled: false,
+    process: 'server',
+    expectRuntime: true,
+    component: 'BlockerLifecycleService',
+    description: 'Observe-only blocker lifecycle timing ledger (dev-gated).',
+  },
+  {
+    key: 'monitoring.enforcedTermination.enabled',
+    kind: 'config',
+    configPath: 'monitoring.enforcedTermination.enabled',
+    defaultEnabled: false,
+    process: 'server',
+    expectRuntime: false,
+    component: 'EnforcedTerminationWatchdog',
+    description: 'External hard-stop for autonomous runs that overrun their budget (dev-gated, F2).',
+  },
+  {
     key: 'monitoring.rateLimitSentinel.enabled',
     kind: 'config',
     configPath: 'monitoring.rateLimitSentinel.enabled',
@@ -308,10 +806,17 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     kind: 'config',
     configPath: 'monitoring.parallelWorkSentinel.enabled',
     defaultEnabled: false,
+    // Default cadence (monitoring.parallelWorkSentinel.cadenceMinutes, 15). The
+    // staleness threshold is 5× this, so an operator cadence above 75 min reads
+    // on-stale between ticks — honest: the guard then genuinely runs that rarely.
+    expectedTickMs: 15 * 60_000,
     process: 'server',
-    expectRuntime: false,
+    // expectRuntime honesty: TRUE only because AgentServer registers
+    // ParallelWorkSentinel.guardStatus() at construction (CMT-810, Defect 2 —
+    // before that the row read on-unverified/not-instrumented forever).
+    expectRuntime: true,
     component: 'ParallelWorkSentinel',
-    description: 'Cross-topic overlap councilor (dev-gated, Phase B).',
+    description: 'Cross-topic overlap councilor (dev-gated, Phase B). Ticks on a cadence over the parallel-activity index; lastTickAt confirms it is genuinely running.',
   },
   {
     key: 'monitoring.resourceLedger.enabled',
@@ -322,6 +827,46 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: false,
     component: 'ResourceLedger',
     description: 'CPU/memory sampling + rate-limit-event ledger (read-only observability).',
+  },
+  {
+    key: 'machineMaintenance.enabled',
+    kind: 'config',
+    configPath: 'machineMaintenance.enabled',
+    defaultEnabled: false, // dark on the fleet; ON for dev agents via the developmentAgent gate
+    process: 'server',
+    expectRuntime: false,
+    component: 'DrainRehearsal',
+    description: 'Machine self-maintenance, watch-only: a nightly paper drain records what a scheduled restart would have done. It cannot restart a machine or stop work.',
+  },
+  {
+    key: 'monitoring.workAdmission.enabled',
+    kind: 'config',
+    configPath: 'monitoring.workAdmission.enabled',
+    defaultEnabled: false, // dark on the fleet; ON (dry-run) for dev agents via the developmentAgent gate
+    process: 'server',
+    expectRuntime: false,
+    component: 'WorkAdmission',
+    description: 'Overload admission (trustworthy-machine-load Part C): closes this machine to new automatic work while its own load verdict is saturated/impaired, keeps one host-wide recovery slot for an operator session; dry-run logs would-refuse only.',
+  },
+  {
+    key: 'monitoring.overloadShed.enabled',
+    kind: 'config',
+    configPath: 'monitoring.overloadShed.enabled',
+    defaultEnabled: false, // dark on the fleet; ON (dry-run) for dev agents via the developmentAgent gate
+    process: 'server',
+    expectRuntime: false,
+    component: 'OverloadShedPlanner',
+    description: 'Overload shed (trustworthy-machine-load Part D): moves existing conversations off a machine that has stayed overloaded, one at a time with a 2/hour breaker; dry-run logs would-move only.',
+  },
+  {
+    key: 'monitoring.processFootprintMonitor.enabled',
+    kind: 'config',
+    configPath: 'monitoring.processFootprintMonitor.enabled',
+    defaultEnabled: false, // dark on the fleet; ON for dev agents via the developmentAgent gate
+    process: 'server',
+    expectRuntime: false,
+    component: 'ProcessFootprintMonitor',
+    description: 'Per-machine process-footprint count + trend (observe-only; the climb measurement missing before the 2026-06-26 panic).',
   },
   {
     key: 'monitoring.memoryMonitoring',
@@ -417,6 +962,32 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     description: 'Correction & preference learning sentinel.',
   },
   {
+    key: 'monitoring.correctionClassReview.enabled',
+    kind: 'config',
+    configPath: 'monitoring.correctionClassReview.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'monitoring.correctionClassReview.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'CorrectionClassReview',
+    description: 'Record-time correction class review plus correspondence-bound instance-fix admission.',
+    loadBearing: true,
+    criticalPath: 'correction-derived instance fixes receive a standards and development-process class review first',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-19',
+  },
+  {
+    key: 'monitoring.completionClaimVerification.enabled',
+    kind: 'config',
+    configPath: 'monitoring.completionClaimVerification.enabled',
+    defaultEnabled: false,
+    dryRunConfigPath: 'monitoring.completionClaimVerification.dryRun',
+    process: 'server',
+    expectRuntime: false,
+    component: 'CompletionClaimVerifier',
+    description: 'Observe-only completion-claim corroboration against structural TurnEvidence.',
+  },
+  {
     // Sub-guard: plain-boolean flag INSIDE the correctionLearning block (not
     // `.enabled`-shaped, so the generic extractor cannot see it).
     key: 'monitoring.correctionLearning.selfViolationSignal',
@@ -481,6 +1052,37 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     description: 'Proactive growth & milestone analyst (dev-gated).',
   },
   {
+    // C1 (maturation-followthrough-fix Standard C): un-droppable digest delivery.
+    // Dev-gated (enabled omitted ⇒ gate-resolved). Registered so /guards grades it
+    // AND the Guard-Posture Tripwire catches an enabled→disabled rollback (the
+    // spec's "louder legacy" — turning off the un-droppable guarantee is a
+    // surfaced, acknowledged act, never a silent re-introduction of the drop).
+    key: 'monitoring.growthAnalyst.blockedDigestEscalation.enabled',
+    kind: 'config',
+    configPath: 'monitoring.growthAnalyst.blockedDigestEscalation.enabled',
+    defaultEnabled: false,
+    process: 'server',
+    expectRuntime: false,
+    component: 'GrowthDigestPublisher',
+    description: 'Un-droppable growth-digest delivery: a retryable blocked send re-queues + escalates instead of consuming its weekly window (dev-gated).',
+  },
+  {
+    // A/B (maturation-followthrough-fix Standards A + B): the engine reads the
+    // real dark-flag inventory and every dark flag gets owner + deadline +
+    // proof-of-life. Registered here deliberately so this feature DOGFOODS its
+    // own guarantee — it is itself a staged switch, so its own registry tracks
+    // it, and the Guard-Posture Tripwire catches an enabled→disabled rollback.
+    key: 'monitoring.growthAnalyst.darkFlagInventory.enabled',
+    kind: 'config',
+    configPath: 'monitoring.growthAnalyst.darkFlagInventory.enabled',
+    dryRunConfigPath: 'monitoring.growthAnalyst.darkFlagInventory.dryRun',
+    defaultEnabled: false,
+    process: 'server',
+    expectRuntime: false,
+    component: 'GrowthMilestoneAnalyst',
+    description: 'Code-derived staged-switch inventory: every dark / dry-run guard gets a durable owner, deadline and proof-of-life instead of only the features whose spec opted in.',
+  },
+  {
     key: 'monitoring.blockerLedger.enabled',
     kind: 'config',
     configPath: 'monitoring.blockerLedger.enabled',
@@ -511,6 +1113,32 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     expectRuntime: false,
     component: 'ModelTierEscalation',
     description: 'Model-tier escalation policy (COST-INCREASING enable).',
+  },
+  {
+    // Test-Runner Concurrency Bound (test-runner-concurrency-bound §2.9/§4).
+    // kind 'code-default': the chokepoint (vitest globalSetup) has NO config
+    // enable — its authority is env + the host tuning file, so this row's
+    // runtime getter serves the SERVER-PROCESS view of the resolved posture
+    // (enabled = posture !== 'off'; dryRun = posture !== 'enforcing'), cached
+    // OUTSIDE the getter (the registry contract forbids file I/O in getters).
+    // A host-wide `INSTAR_HOST_TEST_SEMAPHORE=off` therefore grades
+    // off-runtime-divergent — the spec's "sustained off grades diverged".
+    // loadBearing + 14-day soak (§4): while the ratified dry-run soak runs,
+    // the row grades loadBearingSoaking; if the window lapses with no flip
+    // decision it becomes a LOUD load-bearing gap — the soak structurally
+    // cannot drift into dry-run-forever (Close the Loop).
+    key: 'intelligence.testRunnerCap',
+    kind: 'code-default',
+    defaultEnabled: true,
+    expectedTickMs: 60_000,
+    process: 'server',
+    expectRuntime: true,
+    component: 'HostTestRunnerSemaphore',
+    description: 'Host-wide test-runner concurrency bound (vitest suite/targeted lanes; watch-only soak, then enforce).',
+    loadBearing: true,
+    criticalPath: 'host CPU protection — the multi-actor test-suite storm (2026-07-02 load-stall kill cascade)',
+    soakWindowDays: 14,
+    declaredLoadBearingAt: '2026-07-03',
   },
   {
     // Out-of-process guard (spec §2.1): config-derived states ONLY
@@ -555,6 +1183,30 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     component: 'CoherenceJournal',
     description: 'Cross-machine coherence journal (dev-gated).',
   },
+  // ── Lifeline ingress secret (docs/specs/telegram-internal-route-lifeline-secret.md) ──
+  // Code-default ON with a runtime getter that reports the EFFECTIVE state:
+  // `enabled` only once the guard is armed (the lifeline proved it sends the
+  // secret, or there is no lifeline to wait for) and not bypassed. An unarmed
+  // or bypassed guard therefore derives off-runtime-divergent (loud).
+  // `dryRun` is reported only for observe HELD by config: default observe
+  // already protects the critical path once armed (unproven identity dropped,
+  // unproven taps refused) and ends by its own exit rule, so reporting it as
+  // a dry run would alarm on every healthy fleet agent once the calendar
+  // soak window below has passed. A held observe is a soak that lapses to a
+  // load-bearing gap.
+  {
+    key: 'telegramIngress.lifelineSecret',
+    kind: 'code-default',
+    defaultEnabled: true,
+    process: 'server',
+    expectRuntime: true,
+    component: 'LifelineIngressGuard',
+    description: 'Lifeline ingress secret — the internal Telegram routes accept a sender identity only from a caller that proves it is the lifeline (observe on the fleet until the exit rule, enforce on a development agent).',
+    loadBearing: true,
+    criticalPath: 'operator identity on Telegram ingress (operator binding, button approvals)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-10-12',
+  },
   // ── Code-default guards (no config key; default-ON in code) ──
   {
     key: 'messaging.attentionTopicGuard',
@@ -574,6 +1226,49 @@ export const GUARD_MANIFEST: readonly GuardManifestEntry[] = [
     component: 'TopicCreationBudget',
     description: 'Bounded Notification Surface — last-resort budget on every auto-created topic (default-ON in code).',
   },
+  {
+    // Avoid TCC-Protected Directories (docs/STANDARDS-REGISTRY.md): the
+    // 2026-10-14 ~/Documents TCC withdrawal killed two agents in the same
+    // second. Always-on, no config key (a safety floor that ships dark is no
+    // floor). The boot check runs once (lastTickAt = checkedAt, no cadence);
+    // a failed check reads verdictUnknown, never green. Registered in
+    // src/commands/server.ts beside the worktree detector.
+    key: 'monitoring.tccProtectedPathGuard',
+    kind: 'code-default',
+    defaultEnabled: true,
+    process: 'server',
+    expectRuntime: true,
+    component: 'TccProtectedPathGuard',
+    description: 'TCC-protected path guard — detects agent state under ~/Documents, ~/Desktop, ~/Downloads or iCloud Drive on macOS (the grant can be withdrawn from the whole process tree at once); refuses at init, surfaces at boot, never moves anything.',
+    loadBearing: true,
+    criticalPath: 'agent state durability on macOS — a TCC grant withdrawal kills every agent under the shared tmux server at once (2026-10-14)',
+    // Always-on and never dry-run, so no soak: an unguarded posture would be an
+    // immediate Gap (safe/loud), never a quiet soak.
+    soakWindowDays: 0,
+    declaredLoadBearingAt: '2026-10-15',
+  },
+  // ── Stall-coverage matrix gate (framework-stall-coverage-matrix §3.4) ──
+  {
+    key: 'apprenticeship.stallCoverageGate.enabled',
+    kind: 'config',
+    configPath: 'apprenticeship.stallCoverageGate.enabled',
+    defaultEnabled: true,
+    dryRunConfigPath: 'apprenticeship.stallCoverageGate.dryRun',
+    // Read LIVE at the gate callsite (no restart) → diverged-pending-restart
+    // would lie; suppress it.
+    liveConfig: true,
+    process: 'server',
+    expectRuntime: false,
+    component: 'ApprenticeshipStallGate',
+    description: 'Stall-coverage matrix gate — apprenticeship onboarding transitions verify the framework stall-coverage matrix (provisional at pending→active; full + liveness/posture/acceptance at active→complete). Ships enabled + dry-run; the enforce flip is operator-owned on named evidence.',
+    // §3.4: while dry-run, the gate registers as load-bearing-SOAKING with a
+    // soak deadline so an unflipped gate lapses into visible debt instead of
+    // rotting ("A Dark Feature Guards Nothing" applies to this gate itself).
+    loadBearing: true,
+    criticalPath: 'apprenticeship onboarding sign-off (stall-coverage matrix gate)',
+    soakWindowDays: 30,
+    declaredLoadBearingAt: '2026-07-18',
+  },
 ] as const;
 
 /**
@@ -589,6 +1284,13 @@ export interface NotAGuardEntry {
 }
 
 export const NOT_A_GUARD: readonly NotAGuardEntry[] = [
+  { component: 'pipeErrorGuard', reason: 'Stateless stream helpers that attach error listeners so a closed pipe cannot become an uncaught exception. Always on, with no enable flag, no state to report, and no block or allow decision over agent behavior.' },
+  { component: 'WedgeMonitor', reason: 'Machine self-maintenance Part E wedge sampler, dry-run. It has no enable flag of its own: it is constructed inside the same machineMaintenance.enabled gate as DrainRehearsal, whose GUARD_MANIFEST row already reports that posture, and it can act on nothing (no rung exists). Its live state is GET /machine-maintenance -> wedge.' },
+  { component: 'ThrowawayAgentGuard', reason: 'Pure classification module + init/teardown helpers called inline by installAutoStart, the scheduler admission gate and the server/lifeline startup decision (test-agent-leak-guard). Always-on safety floor with no enabled flag and no boot-constructed monitor, so the /guards inventory has no posture to report for it.' },
+  { component: 'OriginToolGuard', reason: 'Generates an always-on harness hook, not a boot-constructed server monitor. Actual installed hook enrollment is reported by the Telegram origin activation matrix.' },
+  { component: 'AgentIdentityDivergenceDetector', reason: 'Pure decision function over injected peer observations (agree / disagree / cannot-tell). It IS wired at boot in AgentServer and raises one deduped Attention item on a real split, but it registers no runtime getter and carries no enabled flag, so there is nothing for the /guards inventory to report a posture FOR. It moves to GUARD_MANIFEST if it ever gains a config gate or a status surface.' },
+  { component: 'SessionPoolPromotionActivation', reason: 'Evidence-gated rollout actuator selected by promotionModel; it delegates every mutation to StageAdvancer and is not itself a protective guard. Its off/operator/auto posture is surfaced by the promotion route and machine-coherence manifest.' },
+  { component: 'DeferralPatternSentinel', reason: 'Increment-1 core only: pure injected-deps detector over the existing judgment-provenance store; NOT boot-constructed and registers no runtime getter yet, so it is absent from the live /guards inventory. It moves to GUARD_MANIFEST when a later increment wires it at boot.' },
   { component: 'rawTextRequestDetector', reason: 'Pure stateless predicate (high-precision pattern match) feeding the observe-only ask-for-access signal in checkOutboundMessage; no enabled flag, no runtime getter, takes no protective action — a detector that produces a signal, never a guard with posture.' },
   { component: 'GuardPostureTripwire', reason: 'The boot-transition detector OVER the guard inventory — meta-layer, not a guard itself; always-on, no enabled flag.' },
   { component: 'GuardRegistry', reason: 'Infrastructure of this feature: the runtime-getter registry the inventory reads; not a guard.' },
@@ -609,7 +1311,6 @@ export const NOT_A_GUARD: readonly NotAGuardEntry[] = [
   { component: 'TemplatesDriftVerifier', reason: 'Deployed-script drift lint; CI-style verifier, not a runtime guard.' },
   { component: 'TokenLedger', reason: 'Read-only token observability (never gates); the spec class-precedent for always-on read-only features.' },
   { component: 'TokenLedgerPoller', reason: 'Background scanner feeding TokenLedger; observability plumbing.' },
-  { component: 'CrashLoopPauser', reason: 'Auto-pause of runaway jobs is scheduler-internal mechanics; surfaced via scheduler.enabled + job state, not its own guard.' },
   { component: 'QuotaTrackerPoller', reason: 'Polling arm of QuotaTracker; covered by monitoring.quotaTracking.' },
   { component: 'StuckSignatureClassifier', reason: 'Pure classifier (standby honesty); signal-only, no enabled switch, no action.' },
   { component: 'MessageSentinel', reason: 'Emergency-stop message classifier; inbound-dispatch mechanics inseparable from messaging, no operator switch.' },
@@ -624,6 +1325,8 @@ export const NOT_A_GUARD: readonly NotAGuardEntry[] = [
   { component: 'SpawnRequestManager', reason: 'Cross-session spawn coordination; session mechanics, not a guard.' },
   { component: 'SessionManager', reason: 'Core session lifecycle engine; the thing guards act ON, not a guard.' },
   { component: 'StateManager', reason: 'Core state persistence; storage layer.' },
+  { component: 'SigninProfileGuard', reason: 'Always-on profile ownership invariant and generated native hook; stateless boundary validation, no boot lifecycle or posture switch.' },
+  { component: 'BrowserMcpProfileGuard', reason: 'Stateless mandatory MCP startup preflight over registry ownership; not an independently scheduled runtime monitor or switch.' },
   { component: 'SourceTreeGuard', reason: 'Hard invariant on destructive ops against the source tree — always-on by design with NO off switch, so posture (on/off) is meaningless for it.' },
   { component: 'SafeGitExecutor', reason: 'Single-funnel for destructive git ops; hard invariant, no off switch, posture meaningless.' },
   { component: 'SafeFsExecutor', reason: 'Single-funnel for destructive fs ops; hard invariant, no off switch, posture meaningless.' },
@@ -651,10 +1354,12 @@ export const NOT_A_GUARD: readonly NotAGuardEntry[] = [
   { component: 'OverlapGuard', reason: 'Work-overlap detection wrapper around WorkLedger for the intelligent-sync feature; sync mechanics, not a boot-constructed posture guard.' },
   { component: 'PeerVisibilityGuard', reason: 'Pure hygiene-signal helpers over the machine registry (improper-revocation detection); stateless functions, no lifecycle or switch.' },
   { component: 'PrincipalGuard', reason: 'Pure-logic cross-principal crediting detector consumed by the principal-coherence pipeline; library code, the observe-only wiring rides monitoring.principalCoherence.' },
-  { component: 'ProactiveSwapMonitor', reason: 'Pre-limit subscription-account swap engine (subscriptionPool.proactiveSwap); quota-continuity feature lever, not a failure-protecting guard.' },
+  { component: 'ProactiveSwapMonitor', reason: 'Pre-limit subscription-account swap engine (subscriptionPool.proactiveSwap); quota-continuity feature lever, not a failure-protecting guard. RECLASSIFIED (swap-continuity-antithrash §6.4): its anti-thrash BRAKES and the work gate ARE guards and register in the manifest as SwapAntiThrashEngine / SwapWorkGate — this entry now scopes only the swap-optimization lever itself.' },
+  { component: 'SwapLedger', reason: 'Durable JSONL decision ledger for account-swap continuity (single append chokepoint, file IO + outage accounting only); observability substrate consumed by SwapAntiThrashEngine (the manifest-declared guard), no own posture.' },
   { component: 'PromptGuard', reason: 'Prompt-injection defense helpers (filtering/output validation) for LLM conflict resolution; pure library, no boot lifecycle.' },
   { component: 'QuotaExhaustionDetector', reason: 'Post-mortem classifier of why a dead session died (pattern-matching over tmux output); pure library, no lifecycle or switch.' },
   { component: 'ReapGuard', reason: 'Stateless KEEP-check helper consulted by the single ReapAuthority before any terminate; precondition logic inside the reap path, not a posture guard itself.' },
+  { component: 'PlannedRestartVerifyGuard', reason: 'Shared file/PID precondition helper consulted by existing supervisor and foreground restart authorities; no independent boot lifecycle or switch.' },
   { component: 'RevertDetector', reason: 'Read-only git revert scan feeding the FailureLedger; failure-learning ingestion plumbing, fail-open, no operator switch.' },
   { component: 'SelfViolationDetector', reason: 'Observe-only detector arm of the correctionLearning.selfViolationSignal sub-guard, which IS declared in the manifest under component CorrectionLearningLoop.' },
   { component: 'SessionActivitySentinel', reason: 'Mid-session activity digests + completion synthesis; session observability/digest feature, takes no protective action.' },
@@ -685,4 +1390,35 @@ export function manifestComponents(): Set<string> {
 
 export function notAGuardComponents(): Set<string> {
   return new Set(NOT_A_GUARD.map(e => e.component));
+}
+
+/**
+ * G3 manifest lints (g3-dark-but-load-bearing-guards §2.1) — BOTH NEW:
+ *   1. `loadBearing` ⇒ `criticalPath` is REQUIRED (a load-bearing gap with no
+ *      named path is a bare row — the criticalPath must travel on every anomaly).
+ *   2. `soakWindowDays > 0` ⇒ `declaredLoadBearingAt` is REQUIRED and must be a
+ *      valid ISO date (else the soak clause cannot be evaluated).
+ * Returns a list of human-readable violations; empty ⇒ the manifest is well-formed.
+ * A unit test asserts the real GUARD_MANIFEST returns zero violations; the RUNTIME
+ * fallback for a typo'd declaredLoadBearingAt lives in deriveGuardRow (falls to the
+ * loud Gap — the safe, loud direction, never silently non-soaking).
+ */
+export function validateGuardManifest(
+  manifest: readonly GuardManifestEntry[] = GUARD_MANIFEST,
+): string[] {
+  const violations: string[] = [];
+  for (const e of manifest) {
+    if (e.loadBearing && (!e.criticalPath || !e.criticalPath.trim())) {
+      violations.push(`${e.key}: loadBearing is true but criticalPath is missing (criticalPath is REQUIRED when loadBearing).`);
+    }
+    if (typeof e.soakWindowDays === 'number' && e.soakWindowDays > 0) {
+      const d = e.declaredLoadBearingAt;
+      if (!d || !d.trim()) {
+        violations.push(`${e.key}: soakWindowDays>0 but declaredLoadBearingAt is missing (REQUIRED to anchor the soak window).`);
+      } else if (Number.isNaN(Date.parse(d))) {
+        violations.push(`${e.key}: declaredLoadBearingAt "${d}" is not a valid ISO date (soak window cannot be anchored).`);
+      }
+    }
+  }
+  return violations;
 }

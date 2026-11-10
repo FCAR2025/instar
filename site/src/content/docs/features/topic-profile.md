@@ -41,6 +41,41 @@ the pin, reverts to the last-known-good profile, and tells you.
 - **`TopicProfileTransferCarrier`** carries a topic's profile across machines: when another machine
   acquires the topic, it pulls the profile so the pin follows you everywhere.
 
+## How you set it — the agent proposes, you confirm
+
+"Use codex here" is a command; "should we use codex here?" is a question; "codex here keeps
+failing" is commentary. A fixed regex cannot tell those apart, so the server does not try: the
+message reaches the agent, which reads the conversation and, when you asked for a change, proposes
+it through the explicit propose route (`POST /topic-profile/:id/propose`). The server renders the
+proposal into the topic; your "yes" is the explicit confirm trigger that converts it into the
+operator-attributed write. Every proposed value is validated against the closed framework, model
+and thinking-mode sets — nothing outside them can be proposed — and only your confirmation writes.
+
+## Escalation and the pin
+
+A pinned profile is the topic's *baseline*; the heavy-work ultra escalation is a temporary elevation
+on top of it, resolved by `ModelTierEscalation` and admitted by `EscalationGovernor`'s cost guards.
+The default `escalationOverride: 'inherit'` means a baseline pin does not disable escalation — only
+an explicit `'suppress'` opts the topic out. When a topic moves machines mid-escalation, the
+`EscalationHintStore` carries the escalation *trigger* (never the tier itself) so the destination
+re-decides under its own guards. See [Model-Tier Escalation](../architecture/model-tier-escalation/)
+for the full admission model.
+
+## The swap is verified, not assumed
+
+Applying a pin means killing the old session and spawning a new one that reads the pin at launch.
+Both steps are held to their real outcomes:
+
+- The kill's result is **read, not assumed**. A kill that does not take aborts the respawn, restores
+  the parked resume entry so the surviving session keeps its restart ability, and counts toward the
+  circuit breaker as a `kill-failed` attempt — so a session that will not die settles loudly at the
+  breaker (park, revert, notify) instead of retrying on every idle window forever.
+- The success claim is **truth-checked**. After the spawn, the framework the new session actually
+  launched with is compared against the framework the pin resolved to; a divergence is recorded in
+  the audit log as `respawn-profile-mismatch`, never as `respawn-applied`. The check is signal-only —
+  it blocks nothing — but it makes a switch that silently didn't happen impossible to mistake for one
+  that did.
+
 ## Safety & rollout
 
 A profile change is a **routing** decision, never a block — it produces a respawn, not a refusal of

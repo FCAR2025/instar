@@ -173,3 +173,91 @@ describe('PeerPresencePuller — journal-delta drive (REPLICATION-GATED)', () =>
     expect(applyDelta).toHaveBeenCalledWith('m_mini', [served]);
   });
 });
+
+describe('forged-heartbeat-from-non-owner-rejected (U4.2 — freshness binds to the DIALED identity)', () => {
+  it('a response body smuggling a foreign machineId can NEVER refresh that foreign machine\'s observation', async () => {
+    // U4.2's death evidence keys on observer-stamped freshness folded in from
+    // THIS pull path. The observation is recorded under the id of the machine
+    // WE dialed (m.machineId from the registered peer entry) — never an id the
+    // response body asserts. So a live peer cannot keep a dead owner looking
+    // alive (or vice versa) by impersonating it in its capacity payload.
+    const recorded: string[] = [];
+    const forged = {
+      loadAvg: 0.1,
+      selfReportedLastSeen: new Date().toISOString(),
+      // Smuggled identity claim — NOT a PeerCapacity field; cast to prove the
+      // puller ignores unknown body fields entirely.
+      machineId: 'm_owner',
+    } as unknown as PeerCapacity;
+    const puller = new PeerPresencePuller({
+      selfMachineId: 'm_self',
+      listPeers: () => [{ machineId: 'm_mini', url: URL_MINI }],
+      fetchPeerCapacity: async () => forged,
+      recordHeartbeat: (obs) => recorded.push(obs.machineId),
+    });
+    const res = await puller.pullOnce();
+    expect(res.recorded).toEqual(['m_mini']);
+    expect(recorded).toEqual(['m_mini']);
+    expect(recorded).not.toContain('m_owner');
+  });
+});
+
+describe('PeerPresencePuller.pullKindFrom (ownership-nudge)', () => {
+  const stream = (entries: unknown[]): JournalDeltaStream => ({ kind: 'topic-placement', incarnation: 'inc-A', entries } as JournalDeltaStream);
+  function setup(head: number, perPage: number, deltaWired = true) {
+    let held = 0;
+    const requests: Array<{ kind: string; from: number }> = [];
+    const recorded: string[] = [];
+    const puller = new PeerPresencePuller({
+      selfMachineId: 'm_self',
+      listPeers: () => [],
+      fetchPeerCapacity: async () => ({
+        journalAdvert: {
+          'topic-placement': { incarnation: 'inc-A', lastSeq: head },
+          'other-kind': { incarnation: 'inc-A', lastSeq: 99 },
+        },
+      }),
+      recordHeartbeat: (o) => recorded.push(o.machineId),
+      ...(deltaWired ? {
+        requestJournalDelta: async (_m: string, _u: string, kind: string, from: number) => { requests.push({ kind, from }); return stream([]); },
+        applyDelta: () => { held = Math.min(head, held + perPage); },
+        localAdvertFor: () => ({ 'topic-placement': { incarnation: 'inc-A', lastSeq: held } }),
+      } : {}),
+    });
+    return { puller, requests, recorded };
+  }
+
+  it('walks pages to the head, asks for that kind only, and records no presence', async () => {
+    const { puller, requests, recorded } = setup(30, 10);
+    expect(await puller.pullKindFrom('m_mini', URL_MINI, 'topic-placement')).toBe(true);
+    expect(requests.map((r) => r.kind)).toEqual(['topic-placement', 'topic-placement', 'topic-placement']);
+    expect(requests.map((r) => r.from)).toEqual([0, 10, 20]);
+    expect(recorded).toEqual([]);
+  });
+
+  it('a claim past page 3 stops there and reads false', async () => {
+    const { puller, requests } = setup(31, 10);
+    expect(await puller.pullKindFrom('m_mini', URL_MINI, 'topic-placement')).toBe(false);
+    expect(requests).toHaveLength(3);
+  });
+
+  it('a kind the peer does not advertise asks for nothing and reads false', async () => {
+    const { puller, requests } = setup(0, 10);
+    expect(await puller.pullKindFrom('m_mini', URL_MINI, 'missing-kind')).toBe(false);
+    expect(requests).toEqual([]);
+  });
+
+  it('reads false with replication off, or when the peer cannot be reached', async () => {
+    expect(await setup(5, 5, false).puller.pullKindFrom('m_mini', URL_MINI, 'topic-placement')).toBe(false);
+    const dead = new PeerPresencePuller({
+      selfMachineId: 'm_self',
+      listPeers: () => [],
+      fetchPeerCapacity: async () => { throw new Error('fetch failed'); },
+      recordHeartbeat: () => {},
+      requestJournalDelta: async () => null,
+      applyDelta: () => {},
+      localAdvertFor: () => ({}),
+    });
+    expect(await dead.pullKindFrom('m_mini', URL_MINI, 'topic-placement')).toBe(false);
+  });
+});
